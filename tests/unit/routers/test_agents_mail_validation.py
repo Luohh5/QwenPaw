@@ -3,20 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from fastapi import HTTPException
 
 from qwenpaw.app.routers.agents import (
     CreateAgentRequest,
+    _build_copied_agent_config,
     _validate_mail_config,
     create_agent,
+    update_agent,
 )
 from qwenpaw.config.config import (
     AgentMailConfig,
     AgentMailCredential,
     AgentMailPushConfig,
     AgentMailPushRule,
+    AgentProfileConfig,
 )
 
 
@@ -101,3 +106,84 @@ def test_create_agent_rejects_mail_for_third_party_backend():
         asyncio.run(create_agent(request=request, http_request=None))
     assert exc_info.value.status_code == 400
     assert "qwenpaw backend" in exc_info.value.detail
+
+
+def _fake_global_config(agent_id: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        agents=SimpleNamespace(
+            profiles={agent_id: SimpleNamespace(workspace_dir="/tmp/ws")},
+        ),
+    )
+
+
+def test_update_agent_rejects_mail_when_existing_backend_third_party():
+    # Request does not set backend explicitly: the effective backend
+    # must fall back to the existing third-party config.
+    body = AgentProfileConfig(id="a1", name="bot", mail=_valid_mail())
+    with patch(
+        "qwenpaw.app.routers.agents.load_config",
+        return_value=_fake_global_config("a1"),
+    ), patch(
+        "qwenpaw.app.routers.agents.load_agent_config",
+        return_value=SimpleNamespace(backend="claude_code"),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(
+                update_agent(agentId="a1", agent_config=body, request=None),
+            )
+    assert exc_info.value.status_code == 400
+    assert "qwenpaw backend" in exc_info.value.detail
+
+
+def test_update_agent_rejects_mail_with_explicit_third_party_backend():
+    body = AgentProfileConfig(
+        id="a1",
+        name="bot",
+        backend="claude_code",
+        mail=_valid_mail(),
+    )
+    with patch(
+        "qwenpaw.app.routers.agents.load_config",
+        return_value=_fake_global_config("a1"),
+    ), patch(
+        "qwenpaw.app.routers.agents.load_agent_config",
+        return_value=SimpleNamespace(backend="qwenpaw"),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(
+                update_agent(agentId="a1", agent_config=body, request=None),
+            )
+    assert exc_info.value.status_code == 400
+    assert "qwenpaw backend" in exc_info.value.detail
+
+
+def test_copied_agent_drops_mail_for_third_party_backend(tmp_path):
+    source = AgentProfileConfig(
+        id="src",
+        name="src",
+        backend="claude_code",
+        mail=_valid_mail(),
+    )
+    copied = _build_copied_agent_config(
+        source_config=source,
+        new_id="new",
+        new_name="src Copy",
+        workspace_dir=tmp_path,
+    )
+    assert copied.mail is None
+
+
+def test_copied_agent_keeps_mail_for_qwenpaw_backend(tmp_path):
+    source = AgentProfileConfig(
+        id="src",
+        name="src",
+        backend="qwenpaw",
+        mail=_valid_mail(),
+    )
+    copied = _build_copied_agent_config(
+        source_config=source,
+        new_id="new",
+        new_name="src Copy",
+        workspace_dir=tmp_path,
+    )
+    assert copied.mail is not None

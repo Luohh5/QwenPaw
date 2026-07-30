@@ -615,6 +615,11 @@ def _build_copied_agent_config(
     agent_config.name = new_name
     agent_config.workspace_dir = str(workspace_dir)
     agent_config.channels = ChannelConfig()
+    # Mail is only supported for the qwenpaw backend; silently drop it so
+    # copies of legacy "third-party backend + mail" profiles stay valid
+    # and no qwenpawmail driver card is generated for the new agent.
+    if agent_config.backend != "qwenpaw":
+        agent_config.mail = None
     return agent_config
 
 
