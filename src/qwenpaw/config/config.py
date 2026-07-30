@@ -1647,6 +1647,71 @@ class CodingModeConfig(BaseModel):
     )
 
 
+class AgentMailCredential(BaseModel):
+    """Credential for an agent-managed mailbox account."""
+
+    name: str = Field(
+        default="",
+        description="Mailbox account name",
+    )
+    domain: str = Field(
+        default="163.com",
+        description="Mail domain suffix",
+    )
+    auth_code: str = Field(
+        default="",
+        description="16-char authorization code (personal mailbox only)",
+    )
+    password: str = Field(
+        default="",
+        description="Mailbox password",
+    )
+    phone_number: str = Field(
+        default="",
+        description="Phone number bound to the mailbox",
+    )
+
+
+class AgentMailPushRule(BaseModel):
+    """One deterministic rule applied to each incoming email."""
+
+    # "subject" is a legacy alias of "content" (subject + body).
+    field: Literal["from", "subject", "content", "keyword"] = "from"
+    contains: str = ""  
+    action: Literal["mark_read", "move", "notify", "wake_agent"] = "notify"
+    param: str = ""  
+
+
+class AgentMailPushConfig(BaseModel):
+    """Realtime mail push (IMAP IDLE) monitoring configuration."""
+
+    mode: Literal[
+        "off",
+        "rules_only",
+        "rules_then_agent",
+        "agent_all",
+    ] = "off"
+    rules: list[AgentMailPushRule] = Field(default_factory=list)
+    poll_interval_seconds: int = 120
+
+
+class AgentMailConfig(BaseModel):
+    """Mailbox management configuration (stored in agent.json)."""
+
+    is_new_account: bool = Field(
+        default=False,
+        description="True = dedicated new mailbox, False = personal mailbox",
+    )
+    credential: AgentMailCredential = Field(
+        default_factory=AgentMailCredential,
+        description="Mailbox account credential",
+    )
+    push: Optional[AgentMailPushConfig] = Field(
+        default=None,
+        description="Realtime push monitoring config (None = disabled)",
+    )
+
+
 class AgentProfileConfig(BaseModel):
     """Complete Agent Profile configuration (stored in workspace/agent.json).
 
@@ -1731,6 +1796,10 @@ class AgentProfileConfig(BaseModel):
     coding_mode: CodingModeConfig = Field(
         default_factory=CodingModeConfig,
         description="Coding Mode configuration for this agent",
+    )
+    mail: Optional[AgentMailConfig] = Field(
+        default=None,
+        description="Mailbox management configuration",
     )
 
 

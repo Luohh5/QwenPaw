@@ -43,6 +43,9 @@ export default function AgentsPage() {
       workspace_dir: "",
       active_model_provider: undefined,
       active_model_model: undefined,
+      mail_mode: "none",
+      mail_credential: undefined,
+      mail_push: undefined,
     });
     setSelectedSkills([]);
     installedSkillsRef.current = [];
@@ -56,10 +59,26 @@ export default function AgentsPage() {
       invalidateSkillCache({ agentId: agent.id });
       const config = await agentsApi.getAgent(agent.id);
       setEditingAgent(agent);
+      const { mail, ...configRest } = config;
       form.setFieldsValue({
-        ...config,
+        ...configRest,
         active_model_provider: config.active_model?.provider_id || undefined,
         active_model_model: config.active_model?.model || undefined,
+        mail_mode: mail ? (mail.is_new_account ? "dedicated" : "personal") : "none",
+        mail_credential: mail ? mail.credential : undefined,
+        mail_push: mail?.push
+          ? {
+              mode: mail.push.mode ?? "off",
+              // Legacy field "subject" is displayed and saved as
+              // "content" (subject + body matching).
+              rules: (mail.push.rules ?? []).map((rule) =>
+                rule.field === "subject"
+                  ? { ...rule, field: "content" as const }
+                  : rule,
+              ),
+              poll_interval_seconds: mail.push.poll_interval_seconds,
+            }
+          : undefined,
       });
       setModalVisible(true);
     } catch (error) {
@@ -150,8 +169,64 @@ export default function AgentsPage() {
           ? { provider_id: providerId, model: modelId }
           : null;
 
-      const { active_model_provider, active_model_model, ...rest } = values;
-      const payload = { ...rest, workspace_dir, active_model };
+      const {
+        active_model_provider,
+        active_model_model,
+        mail_mode,
+        mail_credential,
+        mail_push,
+        ...rest
+      } = values;
+      const pushMode = mail_push?.mode ?? "off";
+      // agent_all wakes the agent for every email; rules are not applicable.
+      const pushRules =
+        pushMode === "agent_all"
+          ? []
+          : (mail_push?.rules ?? []).map(
+              (rule: {
+                field?: string;
+                contains?: string;
+                action?: string;
+                param?: string;
+              }) => ({
+                // Never submit the legacy "subject" value.
+                field:
+                  rule?.field === "subject"
+                    ? "content"
+                    : rule?.field || "from",
+                contains: (rule?.contains ?? "").trim(),
+                action: rule?.action || "notify",
+                param: (rule?.param ?? "").trim(),
+              }),
+            );
+      const push =
+        pushMode === "off" && pushRules.length === 0
+          ? null
+          : {
+              mode: pushMode,
+              rules: pushRules,
+              ...(mail_push?.poll_interval_seconds != null
+                ? { poll_interval_seconds: mail_push.poll_interval_seconds }
+                : {}),
+            };
+      const mail =
+        mail_mode === "personal" || mail_mode === "dedicated"
+          ? {
+              is_new_account: mail_mode === "dedicated",
+              credential: {
+                name: (mail_credential?.name ?? "").trim(),
+                domain: mail_credential?.domain || "163.com",
+                auth_code:
+                  mail_mode === "personal"
+                    ? mail_credential?.auth_code || ""
+                    : "",
+                password: mail_credential?.password || "",
+                phone_number: mail_credential?.phone_number || "",
+              },
+              ...(push ? { push } : {}),
+            }
+          : null;
+      const payload = { ...rest, workspace_dir, active_model, mail };
 
       if (editingAgent) {
         const previousInstalledSkills = installedSkillsRef.current;

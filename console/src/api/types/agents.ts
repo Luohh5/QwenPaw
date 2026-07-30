@@ -29,6 +29,34 @@ export interface ReorderAgentsResponse {
   agent_ids: string[];
 }
 
+export interface AgentMailCredential {
+  name: string;
+  domain: string;
+  auth_code: string;
+  password: string;
+  phone_number: string;
+}
+
+export interface AgentMailPushRule {
+  // "subject" is a legacy alias of "content" (kept for old configs)
+  field: "from" | "subject" | "content" | "keyword"; // default "from"
+  contains: string;
+  action: "mark_read" | "move" | "notify" | "wake_agent"; // default "notify"
+  param: string;
+}
+
+export interface AgentMailPushConfig {
+  mode: "off" | "rules_only" | "rules_then_agent" | "agent_all"; // default "off"
+  rules: AgentMailPushRule[];
+  poll_interval_seconds?: number; // default 120
+}
+
+export interface AgentMailConfig {
+  is_new_account: boolean;
+  credential: AgentMailCredential;
+  push?: AgentMailPushConfig | null;
+}
+
 export interface AgentProfileConfig {
   id: string;
   name: string;
@@ -44,6 +72,7 @@ export interface AgentProfileConfig {
   system_prompt_files?: string[];
   tools?: unknown;
   security?: unknown;
+  mail?: AgentMailConfig | null;
 }
 
 export interface CreateAgentRequest {
@@ -54,6 +83,7 @@ export interface CreateAgentRequest {
   language?: string;
   skill_names?: string[];
   active_model?: ModelSlotConfig | null;
+  mail?: AgentMailConfig | null;
 }
 
 export interface CopyAgentRequest {

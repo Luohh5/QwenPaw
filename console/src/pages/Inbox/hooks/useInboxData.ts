@@ -78,6 +78,8 @@ const mapEventToPushMessage = (
       ? "wechat"
       : event.source_type === "skill_autoupdate"
       ? "skill"
+      : event.source_type === "mail"
+      ? "email"
       : "email",
   channelName:
     event.source_type === "heartbeat"
@@ -88,6 +90,8 @@ const mapEventToPushMessage = (
       ? "Cron"
       : event.source_type === "skill_autoupdate"
       ? "Auto Sync"
+      : event.source_type === "mail"
+      ? "Mail"
       : "System",
   title:
     event.source_type === "skill_autoupdate"
@@ -172,7 +176,7 @@ export const useInboxData = () => {
     try {
       const res = await api.getInboxEvents({ limit: 200 });
       const events = [...(res?.events || [])].filter((event) =>
-        ["cron", "heartbeat", "memory", "skill_autoupdate"].includes(
+        ["cron", "heartbeat", "memory", "skill_autoupdate", "mail"].includes(
           event.source_type,
         ),
       );

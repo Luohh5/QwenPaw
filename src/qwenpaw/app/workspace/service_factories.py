@@ -160,6 +160,42 @@ async def create_channel_service(ws: "Workspace", _):
     # pylint: enable=protected-access
 
 
+async def create_mail_monitor_service(ws: "Workspace", _):
+    """Create the mail push monitor when enabled for this agent.
+
+    Started only when the agent has a personal mailbox with credentials
+    and ``mail.push.mode != "off"``.  Dedicated new mailboxes
+    (is_new_account=True, no auth_code yet) never start the monitor.
+
+    Args:
+        ws: Workspace instance
+        _: Unused service parameter
+
+    Returns:
+        MailMonitorService instance or None if not enabled
+    """
+    # pylint: disable=protected-access
+    mail = getattr(ws._config, "mail", None)
+    if mail is None or mail.push is None or mail.push.mode == "off":
+        return None
+    if mail.is_new_account:
+        return None
+    credential = mail.credential
+    if not credential.name or not credential.auth_code:
+        return None
+
+    from ..mail.monitor import MailMonitorService
+
+    monitor = MailMonitorService(
+        agent_id=ws.agent_id,
+        workspace=ws,
+        mail_config=mail,
+    )
+    ws._service_manager.services["mail_monitor"] = monitor
+    return monitor
+    # pylint: enable=protected-access
+
+
 async def create_agent_config_watcher(ws: "Workspace", _):
     """Create agent config watcher if channel/cron exists.
 

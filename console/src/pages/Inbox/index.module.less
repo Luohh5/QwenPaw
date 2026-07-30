@@ -129,6 +129,53 @@
   word-break: break-word;
 }
 
+.mailBodyBlock {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  background: #fafafa;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.mailTraceList {
+  margin: 0;
+  padding: 10px 12px 10px 28px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  background: #fafafa;
+  font-size: 12px;
+  line-height: 1.6;
+  max-height: 360px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mailTraceItem {
+  word-break: break-word;
+}
+
+.mailTraceTool {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 600;
+}
+
+.mailTraceSummary {
+  margin: 2px 0 0;
+  font-family: inherit;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .traceLoading,
 .traceEmpty {
   padding: 12px;
@@ -450,7 +497,14 @@
   }
 
   .messageDetailContent,
-  .messageDetailPayload {
+  .messageDetailPayload,
+  .mailBodyBlock {
+    background: #1f1f1f;
+    border-color: rgba(255, 255, 255, 0.08);
+    color: rgba(255, 255, 255, 0.82);
+  }
+
+  .mailTraceList {
     background: #1f1f1f;
     border-color: rgba(255, 255, 255, 0.08);
     color: rgba(255, 255, 255, 0.82);

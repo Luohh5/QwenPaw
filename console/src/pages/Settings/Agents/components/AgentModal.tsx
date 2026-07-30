@@ -5,12 +5,18 @@ import {
   Input,
   Button,
   Select,
+  Radio,
   Space,
   Typography,
   Empty,
   Spin,
+  AutoComplete,
 } from "antd";
-import { CheckOutlined } from "@ant-design/icons";
+import {
+  CheckOutlined,
+  MinusCircleOutlined,
+  PlusOutlined,
+} from "@ant-design/icons";
 import { useTranslation } from "react-i18next";
 import type { AgentSummary } from "@/api/types/agents";
 import type { ProviderInfo } from "@/api/types/provider";
@@ -22,6 +28,30 @@ import { providerIcon } from "../../Models/components/providerIcon";
 import styles from "../index.module.less";
 
 const { Text } = Typography;
+
+const MAIL_DOMAIN_OPTIONS = [
+  "163.com",
+  "126.com",
+  "yeah.net",
+  "qq.com",
+  "foxmail.com",
+].map((domain) => ({ value: domain, label: domain }));
+
+const MAIL_PUSH_MAX_RULES = 50;
+
+const MAIL_PUSH_MODE_DESC_KEYS: Record<string, string> = {
+  off: "agent.mailPushModeOffDesc",
+  rules_only: "agent.mailPushModeRulesOnlyDesc",
+  rules_then_agent: "agent.mailPushModeRulesThenAgentDesc",
+  agent_all: "agent.mailPushModeAgentAllDesc",
+};
+
+const MAIL_PUSH_WAKE_PRESET_KEYS = [
+  "agent.mailPushWakeOptionInvoice",
+  "agent.mailPushWakeOptionReply",
+  "agent.mailPushWakeOptionOtp",
+  "agent.mailPushWakeOptionSummary",
+];
 
 interface EligibleProvider {
   id: string;
@@ -59,6 +89,8 @@ export function AgentModal({
 
   const selectedProviderId = Form.useWatch("active_model_provider", form);
   const selectedModelId = Form.useWatch("active_model_model", form);
+  const mailMode = Form.useWatch("mail_mode", form);
+  const mailPushMode = Form.useWatch(["mail_push", "mode"], form);
 
   const eligibleProviders: EligibleProvider[] = useMemo(() => {
     return providers
@@ -291,6 +323,290 @@ export function AgentModal({
             disabled={!!editingAgent}
           />
         </Form.Item>
+        <Form.Item
+          name="mail_mode"
+          label={t("agent.mailManagement")}
+          initialValue="none"
+        >
+          <Radio.Group>
+            <Radio value="none">{t("agent.mailModeNone")}</Radio>
+            <Radio value="personal">{t("agent.mailModePersonal")}</Radio>
+            <Radio value="dedicated">{t("agent.mailModeDedicated")}</Radio>
+          </Radio.Group>
+        </Form.Item>
+        {mailMode === "personal" && (
+          <>
+            <Form.Item
+              name={["mail_credential", "name"]}
+              label={t("agent.mailName")}
+              rules={[{ required: true, message: t("agent.mailNameRequired") }]}
+            >
+              <Input />
+            </Form.Item>
+            <Form.Item
+              name={["mail_credential", "domain"]}
+              label={t("agent.mailDomain")}
+              initialValue="163.com"
+              rules={[
+                { required: true, message: t("agent.mailDomainRequired") },
+              ]}
+            >
+              <Select options={MAIL_DOMAIN_OPTIONS} />
+            </Form.Item>
+            <Form.Item
+              name={["mail_credential", "password"]}
+              label={t("agent.mailPassword")}
+              rules={[
+                { required: true, message: t("agent.mailPasswordRequired") },
+              ]}
+            >
+              <Input.Password />
+            </Form.Item>
+            <Form.Item
+              name={["mail_credential", "phone_number"]}
+              label={t("agent.mailPhone")}
+              rules={[
+                { required: true, message: t("agent.mailPhoneRequired") },
+              ]}
+            >
+              <Input />
+            </Form.Item>
+            <Form.Item
+              name={["mail_credential", "auth_code"]}
+              label={t("agent.mailAuthCode")}
+              rules={[
+                { required: true, message: t("agent.mailAuthCodeRequired") },
+                { len: 16, message: t("agent.mailAuthCodeLength") },
+              ]}
+            >
+              <Input />
+            </Form.Item>
+          </>
+        )}
+        {mailMode === "dedicated" && (
+          <>
+            <Form.Item
+              name={["mail_credential", "name"]}
+              label={t("agent.mailNameOptional")}
+            >
+              <Input />
+            </Form.Item>
+            <Form.Item
+              name={["mail_credential", "domain"]}
+              label={t("agent.mailDomain")}
+              initialValue="163.com"
+              rules={[
+                { required: true, message: t("agent.mailDomainRequired") },
+              ]}
+            >
+              <Select options={MAIL_DOMAIN_OPTIONS} />
+            </Form.Item>
+            <Form.Item
+              name={["mail_credential", "password"]}
+              label={t("agent.mailPassword")}
+              rules={[
+                { required: true, message: t("agent.mailPasswordRequired") },
+              ]}
+            >
+              <Input.Password />
+            </Form.Item>
+            <Form.Item
+              name={["mail_credential", "phone_number"]}
+              label={t("agent.mailPhone")}
+              rules={[
+                { required: true, message: t("agent.mailPhoneRequired") },
+              ]}
+            >
+              <Input />
+            </Form.Item>
+          </>
+        )}
+        {mailMode && mailMode !== "none" && (
+          <>
+            <Form.Item
+              name={["mail_push", "mode"]}
+              label={t("agent.mailPushTitle")}
+              initialValue="off"
+              extra={t(MAIL_PUSH_MODE_DESC_KEYS[mailPushMode || "off"])}
+            >
+              <Select
+                options={[
+                  { value: "off", label: t("agent.mailPushModeOff") },
+                  {
+                    value: "rules_only",
+                    label: t("agent.mailPushModeRulesOnly"),
+                  },
+                  {
+                    value: "rules_then_agent",
+                    label: t("agent.mailPushModeRulesThenAgent"),
+                  },
+                  {
+                    value: "agent_all",
+                    label: t("agent.mailPushModeAgentAll"),
+                  },
+                ]}
+              />
+            </Form.Item>
+            {(mailPushMode === "rules_only" ||
+              mailPushMode === "rules_then_agent") && (
+              <Form.List name={["mail_push", "rules"]}>
+                {(fields, { add, remove }) => (
+                  <>
+                    {fields.map(({ key, name }) => (
+                      <Space
+                        key={key}
+                        align="start"
+                        wrap
+                        style={{ display: "flex", marginBottom: 4 }}
+                      >
+                        <Form.Item
+                          name={[name, "field"]}
+                          initialValue="from"
+                          style={{ marginBottom: 0 }}
+                        >
+                          <Select
+                            style={{ width: 100 }}
+                            options={[
+                              {
+                                value: "from",
+                                label: t("agent.mailPushFieldFrom"),
+                              },
+                              {
+                                value: "content",
+                                label: t("agent.mailPushFieldContent"),
+                              },
+                              {
+                                value: "keyword",
+                                label: t("agent.mailPushFieldKeyword"),
+                              },
+                            ]}
+                          />
+                        </Form.Item>
+                        <Form.Item
+                          name={[name, "contains"]}
+                          style={{ marginBottom: 0 }}
+                        >
+                          <Input
+                            style={{ width: 130 }}
+                            placeholder={t(
+                              "agent.mailPushContainsPlaceholder",
+                            )}
+                          />
+                        </Form.Item>
+                        <Form.Item
+                          name={[name, "action"]}
+                          initialValue="notify"
+                          style={{ marginBottom: 0 }}
+                        >
+                          <Select
+                            style={{ width: 130 }}
+                            options={[
+                              {
+                                value: "mark_read",
+                                label: t("agent.mailPushActionMarkRead"),
+                              },
+                              {
+                                value: "move",
+                                label: t("agent.mailPushActionMove"),
+                              },
+                              {
+                                value: "notify",
+                                label: t("agent.mailPushActionNotify"),
+                              },
+                              {
+                                value: "wake_agent",
+                                label: t("agent.mailPushActionWakeAgent"),
+                              },
+                            ]}
+                          />
+                        </Form.Item>
+                        <Form.Item
+                          noStyle
+                          shouldUpdate={(prev, cur) =>
+                            prev?.mail_push?.rules?.[name]?.action !==
+                            cur?.mail_push?.rules?.[name]?.action
+                          }
+                        >
+                          {() => {
+                            const action = form.getFieldValue([
+                              "mail_push",
+                              "rules",
+                              name,
+                              "action",
+                            ]);
+                            if (action !== "move" && action !== "wake_agent")
+                              return null;
+                            if (action === "move") {
+                              return (
+                                <Form.Item
+                                  name={[name, "param"]}
+                                  style={{ marginBottom: 0 }}
+                                  rules={[
+                                    {
+                                      required: true,
+                                      message: t(
+                                        "agent.mailPushParamRequired",
+                                      ),
+                                    },
+                                  ]}
+                                >
+                                  <Input
+                                    style={{ width: 140 }}
+                                    placeholder={t(
+                                      "agent.mailPushParamMovePlaceholder",
+                                    )}
+                                  />
+                                </Form.Item>
+                              );
+                            }
+                            return (
+                              <Form.Item
+                                name={[name, "param"]}
+                                style={{ marginBottom: 0 }}
+                              >
+                                <AutoComplete
+                                  style={{ width: 180 }}
+                                  options={MAIL_PUSH_WAKE_PRESET_KEYS.map(
+                                    (key) => ({ value: t(key) }),
+                                  )}
+                                  placeholder={t(
+                                    "agent.mailPushParamWakePlaceholder",
+                                  )}
+                                />
+                              </Form.Item>
+                            );
+                          }}
+                        </Form.Item>
+                        <MinusCircleOutlined
+                          style={{ marginTop: 8 }}
+                          onClick={() => remove(name)}
+                        />
+                      </Space>
+                    ))}
+                    <Form.Item style={{ marginTop: 8 }}>
+                      <Button
+                        type="dashed"
+                        block
+                        icon={<PlusOutlined />}
+                        disabled={fields.length >= MAIL_PUSH_MAX_RULES}
+                        onClick={() =>
+                          add({
+                            field: "from",
+                            contains: "",
+                            action: "notify",
+                            param: "",
+                          })
+                        }
+                      >
+                        {t("agent.mailPushAddRule")}
+                      </Button>
+                    </Form.Item>
+                  </>
+                )}
+              </Form.List>
+            )}
+          </>
+        )}
       </Form>
 
       <div style={{ marginTop: 4 }}>

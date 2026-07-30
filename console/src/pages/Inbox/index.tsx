@@ -37,6 +37,7 @@ import sessionApi from "../Chat/sessionApi";
 import { PushMessageCard } from "./components";
 import { useInboxData } from "./hooks/useInboxData";
 import { useTraceViewer } from "./hooks/useTraceViewer";
+import type { PushMessage } from "./types";
 import { useAgentStore } from "../../stores/agentStore";
 import {
   DEFAULT_AGENT_ID,
@@ -57,6 +58,7 @@ const SOURCE_TYPE_LABEL_KEYS: Record<string, string> = {
   cron: "inbox.sourceTypeCron",
   heartbeat: "inbox.sourceTypeHeartbeat",
   memory: "inbox.sourceTypeMemory",
+  mail: "inbox.sourceTypeMail",
 };
 
 const resolveInitialTab = (): TabKey => {
@@ -80,6 +82,68 @@ const renderMarkdownText = (text: string, className: string) => (
     </ReactMarkdown>
   </div>
 );
+
+interface MailTraceEntry {
+  type: string;
+  name?: string;
+  summary: string;
+}
+
+interface MailDetail {
+  sender: string;
+  subject: string;
+  date: string;
+  bodyPreview: string;
+  isAutoHandled: boolean;
+  trace: MailTraceEntry[];
+}
+
+const readMailTrace = (value: unknown): MailTraceEntry[] => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const entries: MailTraceEntry[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    const summary =
+      typeof record.summary === "string" ? record.summary.trim() : "";
+    if (!summary) {
+      continue;
+    }
+    entries.push({
+      type: typeof record.type === "string" ? record.type : "text",
+      name: typeof record.name === "string" ? record.name : undefined,
+      summary,
+    });
+  }
+  return entries;
+};
+
+const getMailDetail = (messageItem: PushMessage | null): MailDetail | null => {
+  if (
+    !messageItem ||
+    (messageItem.metadata?.sourceType || "").toLowerCase() !== "mail"
+  ) {
+    return null;
+  }
+  const payload = messageItem.metadata?.payload || {};
+  const readString = (key: string): string => {
+    const value = payload[key];
+    return typeof value === "string" ? value.trim() : "";
+  };
+  return {
+    // Backend new_email payload uses "from"; keep "sender" for compatibility.
+    sender: readString("sender") || readString("from"),
+    subject: readString("subject"),
+    date: readString("date"),
+    bodyPreview: readString("body_preview"),
+    isAutoHandled: messageItem.metadata?.eventType === "auto_handled",
+    trace: readMailTrace(payload.trace),
+  };
+};
 
 export default function InboxPage() {
   const { t } = useTranslation();
@@ -230,6 +294,11 @@ export default function InboxPage() {
     copyTraceBlock,
     handleTraceScroll,
   } = useTraceViewer(markMessageAsRead);
+
+  const mailDetail = useMemo(
+    () => getMailDetail(selectedMessage),
+    [selectedMessage],
+  );
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -579,9 +648,66 @@ export default function InboxPage() {
               <Descriptions.Item label={t("inbox.detailTaskId")}>
                 {selectedMessage.id || "-"}
               </Descriptions.Item>
+              {mailDetail ? (
+                <Descriptions.Item label={t("inbox.mailDetailSender")}>
+                  {mailDetail.sender || "-"}
+                </Descriptions.Item>
+              ) : null}
+              {mailDetail ? (
+                <Descriptions.Item label={t("inbox.mailDetailDate")}>
+                  {mailDetail.date || "-"}
+                </Descriptions.Item>
+              ) : null}
+              {mailDetail ? (
+                <Descriptions.Item
+                  label={t("inbox.mailDetailSubject")}
+                  span={2}
+                >
+                  {mailDetail.subject || "-"}
+                </Descriptions.Item>
+              ) : null}
             </Descriptions>
 
-            <div className={styles.messageDetailBlock}>
+            {mailDetail ? (
+              <div className={styles.messageDetailBlock}>
+                <div className={styles.messageDetailLabel}>
+                  {t(
+                    mailDetail.isAutoHandled
+                      ? "inbox.mailDetailProcess"
+                      : "inbox.mailDetailBody",
+                  )}
+                </div>
+                {/* Plain-text rendering only (XSS-safe); preserves newlines */}
+                {mailDetail.isAutoHandled && mailDetail.trace.length > 0 ? (
+                  <ol className={styles.mailTraceList}>
+                    {mailDetail.trace.map((entry, index) => (
+                      <li
+                        key={`mail-trace-${index}`}
+                        className={styles.mailTraceItem}
+                      >
+                        {entry.type === "tool_call" ? (
+                          <span className={styles.mailTraceTool}>
+                            <ToolOutlined /> {entry.name || "tool"}
+                          </span>
+                        ) : null}
+                        <pre className={styles.mailTraceSummary}>
+                          {entry.summary}
+                        </pre>
+                      </li>
+                    ))}
+                  </ol>
+                ) : (
+                  <pre className={styles.mailBodyBlock}>
+                    {mailDetail.isAutoHandled
+                      ? selectedMessage.content || "-"
+                      : mailDetail.bodyPreview ||
+                        selectedMessage.content ||
+                        "-"}
+                  </pre>
+                )}
+              </div>
+            ) : (
+              <div className={styles.messageDetailBlock}>
               <div className={styles.messageDetailLabel}>
                 {t("inbox.detailExecutionTrace")}
               </div>
@@ -790,7 +916,8 @@ export default function InboxPage() {
                   {t("inbox.detailTraceEmpty")}
                 </div>
               )}
-            </div>
+              </div>
+            )}
           </div>
         ) : null}
       </Modal>

@@ -7,6 +7,8 @@ Provides RESTful API for managing multiple agent instances.
 import json
 import logging
 import shutil
+
+import yaml
 from pathlib import Path
 from typing import Literal
 from fastapi import APIRouter, Body, HTTPException, Request
@@ -20,6 +22,7 @@ from qwenpaw.exceptions import (
 from ...agents.utils.file_handling import read_text_file_with_encoding_fallback
 from ..utils import schedule_agent_reload
 from ...config.config import (
+    AgentMailConfig,
     AgentProfileConfig,
     AgentProfileRef,
     ModelSlotConfig,
@@ -81,6 +84,7 @@ class CreateAgentRequest(BaseModel):
     language: str | None = None
     skill_names: list[str] | None = None
     active_model: ModelSlotConfig | None = None
+    mail: AgentMailConfig | None = None
 
     @field_validator("id", mode="before")
     @classmethod
@@ -408,6 +412,9 @@ async def create_agent(
     config = load_config()
     existing_ids = set(config.agents.profiles.keys())
 
+    if request.mail is not None:
+        _validate_mail_config(request.mail)
+
     if request.id:
         try:
             validate_agent_id(request.id, existing_ids)
@@ -458,6 +465,7 @@ async def create_agent(
         heartbeat=HeartbeatConfig(),
         tools=ToolsConfig(),
         active_model=active_model,
+        mail=request.mail,
     )
 
     _initialize_agent_workspace(
@@ -467,6 +475,10 @@ async def create_agent(
         ),
         language=language,
     )
+
+    if request.mail is not None:
+        _generate_qwenpawmail_driver_card(workspace_dir, request.mail)
+        _ensure_contacts_file(workspace_dir, language)
 
     agent_ref = AgentProfileRef(
         id=new_id,
@@ -601,6 +613,10 @@ async def copy_agent(
         workspace_dir=workspace_dir,
     )
 
+    if agent_config.mail is not None:
+        _generate_qwenpawmail_driver_card(workspace_dir, agent_config.mail)
+        _ensure_contacts_file(workspace_dir, language)
+
     agent_ref = AgentProfileRef(
         id=new_id,
         workspace_dir=str(workspace_dir),
@@ -653,6 +669,9 @@ async def update_agent(
 
     existing_config = load_agent_config(agentId)
 
+    if agent_config.mail is not None:
+        _validate_mail_config(agent_config.mail)
+
     update_data = agent_config.model_dump(exclude_unset=True)
     for key, value in update_data.items():
         if key != "id":
@@ -661,6 +680,30 @@ async def update_agent(
     existing_config.id = agentId
     save_agent_config(agentId, existing_config)
     schedule_agent_reload(request, agentId)
+
+    if existing_config.mail is not None:
+        workspace_dir = Path(
+            existing_config.workspace_dir
+            or config.agents.profiles[agentId].workspace_dir,
+        ).expanduser()
+        driver_card = workspace_dir / "drivers" / "mcp" / "qwenpawmail.yaml"
+        if agent_config.mail is not None:
+            # The update explicitly carries mail credentials: regenerate the
+            # driver card unconditionally so endpoint.env always matches the
+            # latest credentials (the MCP subprocess loads them at startup).
+            _generate_qwenpawmail_driver_card(
+                workspace_dir,
+                existing_config.mail,
+            )
+        elif not driver_card.exists():
+            _generate_qwenpawmail_driver_card(
+                workspace_dir,
+                existing_config.mail,
+            )
+        _ensure_contacts_file(
+            workspace_dir,
+            existing_config.language or config.agents.language or "en",
+        )
 
     return agent_config
 
@@ -887,6 +930,216 @@ def _install_initial_skills(
                 workspace_dir,
                 e,
             )
+
+
+_ALLOWED_MAIL_DOMAINS = {
+    "163.com",
+    "126.com",
+    "yeah.net",
+    "qq.com",
+    "foxmail.com",
+}
+
+_QWENPAWMAIL_DRIVER_CARD_TEMPLATE = """name: qwenpawmail
+protocol: mcp
+endpoint:
+  transport: stdio
+  command: /Users/luohh/Documents/mcp/qwenpawmail-mcp/.venv/bin/python
+  args:
+  - -m
+  - qwenpawmail_mcp
+  env: {}
+credentials: {}
+config:
+  display_name: qwenpawmail
+  description: ''
+  tools: null
+enabled: true
+policy:
+  default_effect: ask
+  rules: []
+"""
+
+
+def _validate_mail_config(mail: AgentMailConfig) -> None:
+    """Validate the mailbox management configuration.
+
+    Raises HTTPException(400) when validation fails.
+    """
+    credential = mail.credential
+    if credential.domain not in _ALLOWED_MAIL_DOMAINS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported mail domain '{credential.domain}', "
+                f"allowed: {sorted(_ALLOWED_MAIL_DOMAINS)}"
+            ),
+        )
+
+    if mail.push is not None:
+        if len(mail.push.rules) > 50:
+            raise HTTPException(
+                status_code=400,
+                detail="push.rules supports at most 50 rules",
+            )
+        for index, rule in enumerate(mail.push.rules):
+            if rule.action == "move" and not rule.param.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"push.rules[{index}]: param (target folder) "
+                        "is required when action is 'move'"
+                    ),
+                )
+
+    if mail.is_new_account:
+        if not credential.password or not credential.phone_number:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "password and phone_number are required "
+                    "for a dedicated new mailbox"
+                ),
+            )
+        credential.auth_code = ""
+    else:
+        if len(credential.auth_code) != 16:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "auth_code must be exactly 16 characters "
+                    "for a personal mailbox"
+                ),
+            )
+        if (
+            not credential.name
+            or not credential.password
+            or not credential.phone_number
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "name, password and phone_number are required "
+                    "for a personal mailbox"
+                ),
+            )
+
+
+def _build_qwenpawmail_env(
+    mail: AgentMailConfig | None,
+    workspace_dir: Path | None = None,
+) -> dict[str, str]:
+    """Build the endpoint.env mapping for the qwenpawmail MCP subprocess.
+
+    The qwenpawmail-mcp server's load_config() requires BOTH
+    QWENPAWMAIL_EMAIL (full address) and QWENPAWMAIL_AUTH_CODE, and raises
+    ConfigError when either is missing.  password / phone_number are never
+    read from the environment by the server, so they are not injected.
+
+    For a dedicated new mailbox (is_new_account=True) the auth_code is
+    empty (and name may be empty too), so a partial injection would make
+    load_config() fail at startup.  In that case we keep env empty and
+    preserve the current behavior (agent sets credentials at runtime via
+    the set_credentials tool).
+    """
+    if mail is None or mail.is_new_account:
+        return {}
+    credential = mail.credential
+    if not credential.name or not credential.auth_code:
+        return {}
+    env = {
+        "QWENPAWMAIL_EMAIL": f"{credential.name}@{credential.domain}",
+        "QWENPAWMAIL_AUTH_CODE": credential.auth_code,
+    }
+    if workspace_dir is not None:
+        env["QWENPAWMAIL_STATE_DIR"] = str(workspace_dir / "mail_state")
+    return env
+
+
+def _generate_qwenpawmail_driver_card(
+    workspace_dir: Path,
+    mail: AgentMailConfig | None = None,
+) -> None:
+    """Write the qwenpawmail MCP driver card into the agent workspace.
+
+    When usable personal-mailbox credentials are available, they are
+    injected into endpoint.env so the MCP stdio subprocess can load them
+    at startup (surviving process restarts).
+
+    Failures are logged as warnings and never block agent creation.
+    """
+    try:
+        (workspace_dir / "mail_state").mkdir(parents=True, exist_ok=True)
+        env = _build_qwenpawmail_env(mail, workspace_dir)
+        if env:
+            # yaml.safe_dump guarantees correct escaping of special
+            # characters in credential values; indent to sit under
+            # the endpoint mapping.
+            env_yaml = yaml.safe_dump(
+                {"env": env},
+                default_flow_style=False,
+                allow_unicode=True,
+                sort_keys=False,
+            )
+            env_block = "\n".join(
+                "  " + line for line in env_yaml.strip().splitlines()
+            )
+        else:
+            env_block = "  env: {}"
+        card_text = _QWENPAWMAIL_DRIVER_CARD_TEMPLATE.replace(
+            "  env: {}",
+            env_block,
+            1,
+        )
+        driver_dir = workspace_dir / "drivers" / "mcp"
+        driver_dir.mkdir(parents=True, exist_ok=True)
+        driver_card = driver_dir / "qwenpawmail.yaml"
+        with open(driver_card, "w", encoding="utf-8") as file:
+            file.write(card_text)
+    except Exception as e:
+        logger.warning(
+            "Failed to generate qwenpawmail driver card for %s: %s",
+            workspace_dir,
+            e,
+        )
+
+
+def _ensure_contacts_file(workspace_dir: Path, language: str) -> None:
+    """Copy the CONTACTS.md template into the workspace if missing.
+
+    Idempotent: never overwrites an existing CONTACTS.md.  Reuses the
+    md_files language layout (falling back to English) so the contact
+    book matches the agent language.  Failures are logged and never
+    block agent creation/update.
+    """
+    try:
+        target = workspace_dir / "CONTACTS.md"
+        if target.exists():
+            return
+        md_files_root = (
+            Path(__file__).resolve().parent.parent.parent
+            / "agents"
+            / "md_files"
+        )
+        language = normalize_agent_language(language or "en")
+        source = md_files_root / language / "CONTACTS.md"
+        if not source.is_file():
+            source = md_files_root / "en" / "CONTACTS.md"
+        if not source.is_file():
+            logger.warning(
+                "CONTACTS.md template not found for language %s",
+                language,
+            )
+            return
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        logger.debug("Copied CONTACTS.md [%s] to %s", language, target)
+    except Exception as e:
+        logger.warning(
+            "Failed to ensure CONTACTS.md for %s: %s",
+            workspace_dir,
+            e,
+        )
 
 
 def _initialize_agent_workspace(
