@@ -210,8 +210,11 @@ export default function AgentsPage() {
                 ? { poll_interval_seconds: mail_push.poll_interval_seconds }
                 : {}),
             };
+      // Mail is only supported for the qwenpaw backend; never submit
+      // mail config for third-party backends (the server rejects it).
       const mail =
-        mail_mode === "personal" || mail_mode === "dedicated"
+        values.backend === "qwenpaw" &&
+        (mail_mode === "personal" || mail_mode === "dedicated")
           ? {
               is_new_account: mail_mode === "dedicated",
               credential: {

@@ -2,10 +2,16 @@
 """Unit tests for _validate_mail_config push-rule validation."""
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastapi import HTTPException
 
-from qwenpaw.app.routers.agents import _validate_mail_config
+from qwenpaw.app.routers.agents import (
+    CreateAgentRequest,
+    _validate_mail_config,
+    create_agent,
+)
 from qwenpaw.config.config import (
     AgentMailConfig,
     AgentMailCredential,
@@ -83,3 +89,15 @@ def test_unsupported_domain_still_rejected():
     with pytest.raises(HTTPException) as exc_info:
         _validate_mail_config(mail)
     assert exc_info.value.status_code == 400
+
+
+def test_create_agent_rejects_mail_for_third_party_backend():
+    request = CreateAgentRequest(
+        name="mailbot",
+        backend="claude_code",
+        mail=_valid_mail(),
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(create_agent(request=request, http_request=None))
+    assert exc_info.value.status_code == 400
+    assert "qwenpaw backend" in exc_info.value.detail

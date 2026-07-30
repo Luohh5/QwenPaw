@@ -342,6 +342,7 @@ export function AgentModal({
           name="mail_mode"
           label={t("agent.mailManagement")}
           initialValue="none"
+          hidden={selectedBackend !== "qwenpaw"}
         >
           <Radio.Group>
             <Radio value="none">{t("agent.mailModeNone")}</Radio>
@@ -349,7 +350,7 @@ export function AgentModal({
             <Radio value="dedicated">{t("agent.mailModeDedicated")}</Radio>
           </Radio.Group>
         </Form.Item>
-        {mailMode === "personal" && (
+        {selectedBackend === "qwenpaw" && mailMode === "personal" && (
           <>
             <Form.Item
               name={["mail_credential", "name"]}
@@ -398,7 +399,7 @@ export function AgentModal({
             </Form.Item>
           </>
         )}
-        {mailMode === "dedicated" && (
+        {selectedBackend === "qwenpaw" && mailMode === "dedicated" && (
           <>
             <Form.Item
               name={["mail_credential", "name"]}
@@ -436,7 +437,7 @@ export function AgentModal({
             </Form.Item>
           </>
         )}
-        {mailMode && mailMode !== "none" && (
+        {selectedBackend === "qwenpaw" && mailMode && mailMode !== "none" && (
           <>
             <Form.Item
               name={["mail_push", "mode"]}

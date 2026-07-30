@@ -493,6 +493,13 @@ async def create_agent(
     (validated for URL-safe characters, length, reserved words, and
     uniqueness).  Otherwise a random short UUID is generated.
     """
+    if request.backend != "qwenpaw" and request.mail is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Mail configuration is only supported for qwenpaw backend"
+            ),
+        )
     if request.backend != "qwenpaw":
         _get_available_third_party_provider(request.backend)
 
@@ -762,6 +769,19 @@ async def update_agent(
         )
 
     existing_config = load_agent_config(agentId)
+
+    effective_backend = (
+        agent_config.backend
+        if "backend" in agent_config.model_fields_set
+        else getattr(existing_config, "backend", "qwenpaw")
+    ) or "qwenpaw"
+    if effective_backend != "qwenpaw" and agent_config.mail is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Mail configuration is only supported for qwenpaw backend"
+            ),
+        )
 
     if agent_config.mail is not None:
         _validate_mail_config(agent_config.mail)

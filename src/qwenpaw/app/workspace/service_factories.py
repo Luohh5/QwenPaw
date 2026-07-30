@@ -175,6 +175,11 @@ async def create_mail_monitor_service(ws: "Workspace", _):
         MailMonitorService instance or None if not enabled
     """
     # pylint: disable=protected-access
+    # Mail push is only supported for the qwenpaw backend: third-party
+    # harness runtimes cannot handle the dict wake requests built by the
+    # monitor and would fail on every incoming email.
+    if getattr(ws._config, "backend", "qwenpaw") != "qwenpaw":
+        return None
     mail = getattr(ws._config, "mail", None)
     if mail is None or mail.push is None or mail.push.mode == "off":
         return None
