@@ -46,6 +46,7 @@ export default function AgentsPage() {
       mail_mode: "none",
       mail_credential: undefined,
       mail_push: undefined,
+      backend: "qwenpaw",
     });
     setSelectedSkills([]);
     installedSkillsRef.current = [];
@@ -165,7 +166,7 @@ export default function AgentsPage() {
       const providerId = values.active_model_provider;
       const modelId = values.active_model_model;
       const active_model =
-        providerId && modelId
+        values.backend === "qwenpaw" && providerId && modelId
           ? { provider_id: providerId, model: modelId }
           : null;
 
@@ -230,9 +231,12 @@ export default function AgentsPage() {
 
       if (editingAgent) {
         const previousInstalledSkills = installedSkillsRef.current;
-        const newSkills = selectedSkills.filter(
-          (skill) => !previousInstalledSkills.includes(skill),
-        );
+        const newSkills =
+          values.backend === "qwenpaw"
+            ? selectedSkills.filter(
+                (skill) => !previousInstalledSkills.includes(skill),
+              )
+            : [];
 
         for (const skill of newSkills) {
           await skillApi.downloadSkillPoolSkill({
@@ -253,7 +257,7 @@ export default function AgentsPage() {
         const result = await agentsApi.createAgent({
           ...payload,
           language: i18n.language,
-          skill_names: selectedSkills,
+          skill_names: values.backend === "qwenpaw" ? selectedSkills : [],
         });
         message.success(`${t("agent.createSuccess")} (ID: ${result.id})`);
       }

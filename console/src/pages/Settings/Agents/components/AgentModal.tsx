@@ -26,6 +26,7 @@ import { skillApi } from "@/api/modules/skill";
 import { providerApi } from "@/api/modules/provider";
 import { providerIcon } from "../../Models/components/providerIcon";
 import styles from "../index.module.less";
+import { AgentBackendFields } from "./AgentBackendFields";
 
 const { Text } = Typography;
 
@@ -91,6 +92,7 @@ export function AgentModal({
   const selectedModelId = Form.useWatch("active_model_model", form);
   const mailMode = Form.useWatch("mail_mode", form);
   const mailPushMode = Form.useWatch(["mail_push", "mode"], form);
+  const selectedBackend = Form.useWatch("backend", form) ?? "qwenpaw";
 
   const eligibleProviders: EligibleProvider[] = useMemo(() => {
     return providers
@@ -117,7 +119,7 @@ export function AgentModal({
   }, [selectedProviderId, eligibleProviders]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || selectedBackend !== "qwenpaw") return;
 
     setLoadingProviders(true);
     providerApi
@@ -152,7 +154,13 @@ export function AgentModal({
         }
       })
       .finally(() => setLoadingSkills(false));
-  }, [editingAgent, onInstalledSkillsLoaded, onSelectedSkillsChange, open]);
+  }, [
+    editingAgent,
+    onInstalledSkillsLoaded,
+    onSelectedSkillsChange,
+    open,
+    selectedBackend,
+  ]);
 
   const handleProviderChange = (providerId: string) => {
     form.setFieldsValue({
@@ -209,7 +217,8 @@ export function AgentModal({
       open={open}
       onOk={onSave}
       onCancel={onCancel}
-      width={640}
+      width={760}
+      styles={{ body: { maxHeight: "72vh", overflowY: "auto" } }}
       okText={t("common.save")}
       cancelText={t("common.cancel")}
     >
@@ -220,6 +229,8 @@ export function AgentModal({
         <Form.Item name="active_model_model" hidden>
           <Input />
         </Form.Item>
+
+        <AgentBackendFields form={form} open={open} />
 
         {editingAgent && (
           <Form.Item name="id" label={t("agent.id")}>
@@ -254,7 +265,11 @@ export function AgentModal({
             rows={3}
           />
         </Form.Item>
-        <Form.Item label={t("agent.model")} help={t("agent.modelHelp")}>
+        <Form.Item
+          hidden={selectedBackend !== "qwenpaw"}
+          label={t("agent.model")}
+          help={t("agent.modelHelp")}
+        >
           <Space.Compact style={{ width: "100%" }}>
             <Select
               value={selectedProviderId || undefined}
@@ -609,7 +624,12 @@ export function AgentModal({
         )}
       </Form>
 
-      <div style={{ marginTop: 4 }}>
+      <div
+        style={{
+          marginTop: 4,
+          display: selectedBackend === "qwenpaw" ? undefined : "none",
+        }}
+      >
         <div
           style={{
             display: "flex",
