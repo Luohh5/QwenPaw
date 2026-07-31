@@ -1,6 +1,6 @@
 # QwenPaw-Mail 0.1.0 版本汇报
 
-> 版本：0.1.0　　日期：2026-07-27
+> 版本：0.1.0　　日期：2026-07-27　　最近更新：2026-07-30（新增第 5 章「邮箱服务商扩展」）
 >
 > 本文档汇报 QwenPaw-Mail 邮箱能力的底层实现、与 QwenPaw 智能体的集成方式、现有基础功能，以及可用于演示的典型案例。
 
@@ -15,7 +15,7 @@ QwenPaw-Mail 的邮箱能力由独立的 MCP 服务 **qwenpawmail-mcp** 提供�
 - 基于 **FastMCP** 框架（mcp>=1.28,<2.0）构建 MCP 服务器；
 - 通过 **imap-tools** 库（>=1.13,<2.0），以标准 **IMAP/SMTP** 协议与邮箱服务器通信；
 - 支持 **RFC 2971 ID 命令**（网易系域名登录必需）与 **IMAP modified UTF-7**（中文文件夹名编码）；
-- 内置域名（自动路由 IMAP/SMTP 服务器）：**163.com / 126.com / yeah.net / qq.com / foxmail.com**；其他域名可在运行时通过 `set_credentials` 指定 `imap_host`/`smtp_host` 接入。
+- 内置域名（自动路由 IMAP/SMTP 服务器）：共 **12 个**——**163.com / 126.com / yeah.net / qq.com / foxmail.com / sina.com / sina.cn / aliyun.com / gmail.com / exmail.qq.com / qiye.aliyun.com / qiye.163.com**（详见第 5 章支持矩阵）；企业邮自定义域名可通过 **provider 字段** 路由到三大企业邮服务商；其他域名可在运行时通过 `set_credentials` 指定 `imap_host`/`smtp_host` 接入。
 
 ### 1.2 工具能力全景（22 个工具）
 
@@ -281,6 +281,70 @@ MCP server 当前共实现 **22 个工具**，覆盖「收发搜删分类 + 线�
 **已知边界**
 
 - `get_message` 仅返回附件元数据，附件内容需显式调用 `get_attachment` 下载；
-- 内置自动路由域名限于 163.com / 126.com / yeah.net / qq.com / foxmail.com，其他域名需通过 `set_credentials` 手动指定 IMAP/SMTP 服务器；
+- 内置自动路由域名共 12 个（见第 5 章支持矩阵）；企业邮自定义域名通过 provider 字段路由；其余域名需通过 `set_credentials` 手动指定 IMAP/SMTP 服务器；
 - QQ/Foxmail 的 IMAP 服务器不可靠推送 EXISTS 通知，实时性依赖 2 分钟短节拍兜底，最坏延迟约 2 分钟；
 - `send_message` 当前发送纯文本邮件；系统标签（inbox/sent/spam/trash）为只读，仅自定义标签可增删。
+
+---
+
+## 5. 邮箱服务商扩展（2026-07-30 更新）
+
+本次扩展在原有网易系（163/126/yeah.net）与腾讯系（qq.com/foxmail.com）个人邮箱基础上，新增 **4 个个人邮箱域名**（sina.com / sina.cn / aliyun.com / gmail.com）与 **3 个企业邮 provider**（腾讯企业邮 / 阿里企业邮 / 网易企业邮），内置自动路由域名达到 **12 个**，并支持企业邮**自定义域名**接入。
+
+### 5.1 支持矩阵
+
+**个人邮箱（内置域名自动路由）**
+
+| 域名 | IMAP 服务器 | SMTP 服务器 | 凭据类型 | 开通方式 | 备注 |
+|------|------------|------------|---------|---------|------|
+| 163.com | imap.163.com:993 | smtp.163.com:465 | 16 位授权码 | 网页端设置开启 IMAP/SMTP 服务 | 登录需 RFC 2971 ID 命令 |
+| 126.com | imap.126.com:993 | smtp.126.com:465 | 16 位授权码 | 同上 | 登录需 RFC 2971 ID 命令 |
+| yeah.net | imap.yeah.net:993 | smtp.yeah.net:465 | 16 位授权码 | 同上 | 登录需 RFC 2971 ID 命令 |
+| qq.com | imap.qq.com:993 | smtp.qq.com:465 | 授权码 | 网页端设置开启 IMAP/SMTP 服务 | |
+| foxmail.com | imap.qq.com:993 | smtp.qq.com:465 | 授权码 | 同上 | 与 qq.com 共用服务器 |
+| sina.com（新增） | imap.sina.com:993 | smtp.sina.com:465 | 16 位授权码 | 网页端「客户端 pop/imap/smtp」开启 + 手机短信验证 | 免费 |
+| sina.cn（新增） | imap.sina.cn:993 | smtp.sina.cn:465 | 16 位授权码 | 同 sina.com | 注意服务器后缀为 .cn，与 sina.com 不同 |
+| aliyun.com（新增） | imap.aliyun.com:993 | smtp.aliyun.com:465 | 登录密码 | 默认开启，无需额外操作 | |
+| gmail.com（新增） | imap.gmail.com:993 | smtp.gmail.com:465 | 16 位应用专用密码 | 需先开启两步验证，再生成应用专用密码 | SMTP 465 隐式 SSL；中国大陆网络需代理 |
+
+**企业邮（内置域名 + 自定义域名 provider 路由）**
+
+| 域名 / provider | IMAP 服务器 | SMTP 服务器 | 凭据类型 | 开通方式 |
+|------|------------|------------|---------|---------|
+| exmail.qq.com（新增，provider=`tencent_exmail`） | imap.exmail.qq.com:993 | smtp.exmail.qq.com:465 | 客户端专用密码 | 需管理员在企业微信后台开启 IMAP/SMTP 服务范围；成员开启安全登录并生成客户端专用密码 |
+| qiye.aliyun.com（新增，provider=`aliyun_qiye`） | imap.qiye.aliyun.com:993 | smtp.qiye.aliyun.com:465 | 登录密码或三方客户端安全密码 | 默认开启 |
+| qiye.163.com（新增，provider=`netease_qiye`） | imap.qiye.163.com:993 | smtp.qiye.163.com:**994** | 登录密码或客户端授权密码 | 默认开启；注意 SMTP 端口为 994 而非 465 |
+
+### 5.2 企业邮自定义域名接入
+
+企业邮通常使用自有域名（如 `user@company.com`），无法从域名直接推断服务器，接入方式如下：
+
+- **配置侧**：`AgentMailCredential` 新增 `provider` 字段，取值 `tencent_exmail` / `aliyun_qiye` / `netease_qiye`；前端在用户输入非内置域名时提示选择所属企业邮服务商；
+- **注入机制**：QwenPaw 依据 provider 向 qwenpawmail-mcp 注入 `QWENPAWMAIL_IMAP_HOST` / `QWENPAWMAIL_IMAP_PORT` / `QWENPAWMAIL_SMTP_HOST` / `QWENPAWMAIL_SMTP_PORT` 环境变量覆盖默认路由——复用 MCP 已有的环境变量覆盖机制，**MCP 零改动即支持自定义域名**；
+- **代码位置**：
+  - `src/qwenpaw/config/config.py`：`AgentMailCredential.provider` 字段定义；
+  - `src/qwenpaw/app/routers/agents.py`：域名白名单、`_ENTERPRISE_MAIL_PROVIDERS` 映射、`_build_qwenpawmail_env` 环境变量构造；
+  - `src/qwenpaw/app/mail/monitor.py`：`resolve_imap_host` / `resolve_idle_timeout` 支持按 provider 解析；
+  - MCP 侧 `providers.py`：新增 7 个内置条目（sina.com / sina.cn / aliyun.com / gmail.com / exmail.qq.com / qiye.aliyun.com / qiye.163.com）。
+
+### 5.3 不支持的服务商及理由
+
+**Outlook / Hotmail 个人版**（@outlook.com / @hotmail.com / @live.com / @msn.com 等）：
+
+- Microsoft 自 **2024-09-16** 起彻底禁用 IMAP/SMTP basic auth 与应用密码，仅支持 OAuth2；
+- 其 SMTP 仅支持 **587 STARTTLS**，与当前 MCP 的 `SMTP_SSL`（隐式 SSL）实现不兼容；
+- 后端对 outlook.com / hotmail.com / live.com / msn.com / office365.com 直接返回 **400** 并说明原因。
+
+**Microsoft 365**（含企业自定义域名）：
+
+- Exchange Online 的 IMAP basic auth 已淘汰，SMTP AUTH basic auth 计划 **2026 年底**对现有租户禁用；
+- 接入需 OAuth2（XOAUTH2）+ Azure 应用注册 + token 刷新机制。
+
+二者留待后续 **OAuth2 专项版本**处理，涉及 token 存储/刷新、STARTTLS 支持、前端授权回调流。
+
+### 5.4 验证状态与已知限制
+
+- 新增服务商配置均基于**官方文档**编写，已通过单元测试（provider 路由、配置校验、env 注入）；
+- **尚未使用真实账户进行收发信验证**，标注为「待真实账户验证」；
+- MCP 的 `create_mailbox` 注册引导仅支持网易 / QQ 个人邮箱；新增服务商仅支持「**已有账户 + 授权码/密码**」方式接入，不提供注册引导。
+

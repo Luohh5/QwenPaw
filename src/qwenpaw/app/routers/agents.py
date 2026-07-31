@@ -6,6 +6,7 @@ Provides RESTful API for managing multiple agent instances.
 
 import json
 import logging
+import re
 import shutil
 
 import yaml
@@ -1057,7 +1058,69 @@ _ALLOWED_MAIL_DOMAINS = {
     "yeah.net",
     "qq.com",
     "foxmail.com",
+    "sina.com",
+    "sina.cn",
+    "aliyun.com",
+    "gmail.com",
+    "exmail.qq.com",
+    "qiye.aliyun.com",
+    "qiye.163.com",
 }
+
+# Enterprise mail providers (custom-domain mailboxes).  The qwenpawmail
+# MCP server resolves unknown domains via the QWENPAWMAIL_IMAP_HOST /
+# IMAP_PORT / SMTP_HOST / SMTP_PORT environment overrides, so a
+# provider-selected credential injects these host/port values.
+# NOTE: netease_qiye SMTP uses port 994 (NOT the usual 465) per the
+# official NetEase enterprise mail documentation — do not "fix" it.
+_ENTERPRISE_MAIL_PROVIDERS: dict[str, dict[str, object]] = {
+    "tencent_exmail": {
+        "imap_host": "imap.exmail.qq.com",
+        "imap_port": 993,
+        "smtp_host": "smtp.exmail.qq.com",
+        "smtp_port": 465,
+    },
+    "aliyun_qiye": {
+        "imap_host": "imap.qiye.aliyun.com",
+        "imap_port": 993,
+        "smtp_host": "smtp.qiye.aliyun.com",
+        "smtp_port": 465,
+    },
+    "netease_qiye": {
+        "imap_host": "imap.qiye.163.com",
+        "imap_port": 993,
+        "smtp_host": "smtp.qiye.163.com",
+        "smtp_port": 994,  # NetEase enterprise SMTP SSL port is 994
+    },
+}
+
+# Domains whose authorization codes (or app-specific passwords) are
+# exactly 16 characters.  Other allowed domains use login passwords
+# (or client-specific passwords) of variable length.
+_AUTH_CODE_16_CHAR_DOMAINS = frozenset({
+    "163.com", "126.com", "yeah.net",
+    "qq.com", "foxmail.com",
+    "sina.com", "sina.cn",
+    "gmail.com",
+})
+
+# Microsoft disabled basic auth (and app passwords) for personal
+# IMAP/SMTP in September 2024; only OAuth2 works now, which this
+# version does not support.
+_MICROSOFT_MAIL_DOMAINS = {
+    "outlook.com",
+    "hotmail.com",
+    "live.com",
+    "msn.com",
+    "office365.com",
+}
+
+# Basic sanity check for custom enterprise-mail domains coming from
+# free-form frontend input: labels of alnum/hyphen joined by dots.
+_MAIL_DOMAIN_RE = re.compile(
+    r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)"
+    r"(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$",
+)
 
 _QWENPAWMAIL_DRIVER_CARD_TEMPLATE = """name: qwenpawmail
 protocol: mcp
@@ -1086,7 +1149,40 @@ def _validate_mail_config(mail: AgentMailConfig) -> None:
     Raises HTTPException(400) when validation fails.
     """
     credential = mail.credential
-    if credential.domain not in _ALLOWED_MAIL_DOMAINS:
+    provider = (credential.provider or "").strip()
+    if provider and provider not in _ENTERPRISE_MAIL_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported mail provider '{provider}', allowed: "
+                f"'' (auto-detect) or "
+                f"{sorted(_ENTERPRISE_MAIL_PROVIDERS)}"
+            ),
+        )
+    domain = (credential.domain or "").strip().lower()
+    if domain in _MICROSOFT_MAIL_DOMAINS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Mail domain '{domain}' is not supported: since "
+                "September 2024 Microsoft only allows OAuth2 for "
+                "IMAP/SMTP access (basic auth and app passwords are "
+                "both disabled). This version does not support "
+                "OAuth2 — please use another mailbox."
+            ),
+        )
+    if provider:
+        # Enterprise mail with a custom domain: accept any
+        # syntactically valid domain instead of the whitelist.
+        if not domain or not _MAIL_DOMAIN_RE.match(domain):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid mail domain '{credential.domain}' for "
+                    f"enterprise mail provider '{provider}'"
+                ),
+            )
+    elif domain not in _ALLOWED_MAIL_DOMAINS:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -1122,12 +1218,21 @@ def _validate_mail_config(mail: AgentMailConfig) -> None:
             )
         credential.auth_code = ""
     else:
-        if len(credential.auth_code) != 16:
+        if domain in _AUTH_CODE_16_CHAR_DOMAINS:
+            if len(credential.auth_code) != 16:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "auth_code must be exactly 16 characters "
+                        "(authorization code or app-specific password)"
+                    ),
+                )
+        elif not credential.auth_code:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "auth_code must be exactly 16 characters "
-                    "for a personal mailbox"
+                    "auth_code (login password or client-specific "
+                    "password) is required"
                 ),
             )
         if (
@@ -1170,6 +1275,15 @@ def _build_qwenpawmail_env(
         "QWENPAWMAIL_EMAIL": f"{credential.name}@{credential.domain}",
         "QWENPAWMAIL_AUTH_CODE": credential.auth_code,
     }
+    provider = (credential.provider or "").strip()
+    hosts = _ENTERPRISE_MAIL_PROVIDERS.get(provider)
+    if hosts is not None:
+        # Custom-domain enterprise mail: the MCP server cannot infer
+        # hosts from the domain, so inject explicit overrides.
+        env["QWENPAWMAIL_IMAP_HOST"] = str(hosts["imap_host"])
+        env["QWENPAWMAIL_IMAP_PORT"] = str(hosts["imap_port"])
+        env["QWENPAWMAIL_SMTP_HOST"] = str(hosts["smtp_host"])
+        env["QWENPAWMAIL_SMTP_PORT"] = str(hosts["smtp_port"])
     if workspace_dir is not None:
         env["QWENPAWMAIL_STATE_DIR"] = str(workspace_dir / "mail_state")
     return env

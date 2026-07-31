@@ -39,6 +39,9 @@ export interface ReorderAgentsResponse {
 export interface AgentMailCredential {
   name: string;
   domain: string;
+  // "" for whitelisted domains; enterprise provider id
+  // (tencent_exmail / aliyun_qiye / netease_qiye) for custom domains.
+  provider?: string;
   auth_code: string;
   password: string;
   phone_number: string;

@@ -56,11 +56,29 @@ _IMAP_HOSTS = {
     "yeah.net": "imap.yeah.net",
     "qq.com": "imap.qq.com",
     "foxmail.com": "imap.qq.com",
+    "sina.com": "imap.sina.com",
+    "sina.cn": "imap.sina.cn",
+    "aliyun.com": "imap.aliyun.com",
+    "gmail.com": "imap.gmail.com",
+    "exmail.qq.com": "imap.exmail.qq.com",
+    "qiye.aliyun.com": "imap.qiye.aliyun.com",
+    "qiye.163.com": "imap.qiye.163.com",
+}
+
+# Enterprise mail provider -> IMAP host (custom-domain mailboxes,
+# same providers as agents.py _ENTERPRISE_MAIL_PROVIDERS).  All
+# providers use IMAP over SSL on port 993, so no port table needed.
+_PROVIDER_IMAP_HOSTS = {
+    "tencent_exmail": "imap.exmail.qq.com",
+    "aliyun_qiye": "imap.qiye.aliyun.com",
+    "netease_qiye": "imap.qiye.163.com",
 }
 
 # NetEase servers reject SELECT with "Unsafe Login" unless the client
 # identifies itself via the RFC 2971 ID command right after LOGIN.
-_NETEASE_DOMAINS = {"163.com", "126.com", "yeah.net"}
+# qiye.163.com does not strictly require ID but it is harmless.
+_NETEASE_DOMAINS = {"163.com", "126.com", "yeah.net", "qiye.163.com"}
+_NETEASE_PROVIDERS = {"netease_qiye"}
 
 # Register the RFC 2971 ID command so imaplib accepts it.
 imaplib.Commands.setdefault("ID", ("AUTH", "SELECTED"))
@@ -78,11 +96,27 @@ _IDLE_TIMEOUT_SECONDS = 25 * 60
 _IDLE_TIMEOUT_SECONDS_BY_DOMAIN = {
     "qq.com": 2 * 60,
     "foxmail.com": 2 * 60,
+    # Tencent enterprise mail shares the unreliable-push behaviour of
+    # the QQ family, so reuse the short 2-minute cadence.
+    "exmail.qq.com": 2 * 60,
+}
+
+# Providers whose IDLE push is unreliable (Tencent family) also get
+# the short 2-minute timeout even with a custom domain.
+_IDLE_TIMEOUT_SECONDS_BY_PROVIDER = {
+    "tencent_exmail": 2 * 60,
 }
 
 
-def resolve_idle_timeout(domain: str) -> int:
-    """Return the IDLE re-issue timeout (seconds) for *domain*."""
+def resolve_idle_timeout(domain: str, provider: str = "") -> int:
+    """Return the IDLE re-issue timeout (seconds).
+
+    A non-empty *provider* (enterprise mail) takes precedence over
+    the *domain* lookup.
+    """
+    provider_key = (provider or "").strip().lower()
+    if provider_key in _IDLE_TIMEOUT_SECONDS_BY_PROVIDER:
+        return _IDLE_TIMEOUT_SECONDS_BY_PROVIDER[provider_key]
     key = (domain or "").strip().lower()
     return _IDLE_TIMEOUT_SECONDS_BY_DOMAIN.get(key, _IDLE_TIMEOUT_SECONDS)
 
@@ -308,8 +342,16 @@ def build_wake_prompt(
     )
 
 
-def resolve_imap_host(domain: str) -> Optional[str]:
-    """Return the IMAP host for *domain*, or None when unsupported."""
+def resolve_imap_host(domain: str, provider: str = "") -> Optional[str]:
+    """Return the IMAP host, or None when unsupported.
+
+    A non-empty *provider* (custom-domain enterprise mail) takes
+    precedence over the *domain* table; unknown domains without a
+    provider return None so monitoring is skipped.
+    """
+    provider_key = (provider or "").strip().lower()
+    if provider_key:
+        return _PROVIDER_IMAP_HOSTS.get(provider_key)
     return _IMAP_HOSTS.get((domain or "").strip().lower())
 
 
@@ -529,8 +571,12 @@ class MailMonitorService:
         self.email_address = f"{credential.name}@{credential.domain}"
         self.auth_code = credential.auth_code
         self.domain = (credential.domain or "").strip().lower()
-        self.host = resolve_imap_host(self.domain)
-        self.idle_timeout_seconds = resolve_idle_timeout(self.domain)
+        self.provider = (credential.provider or "").strip().lower()
+        self.host = resolve_imap_host(self.domain, self.provider)
+        self.idle_timeout_seconds = resolve_idle_timeout(
+            self.domain,
+            self.provider,
+        )
         self.state_dir = Path(workspace.workspace_dir) / "mail_state"
         self.state_path = self.state_dir / "monitor.json"
         self._last_uid: Optional[int] = None
@@ -722,7 +768,10 @@ class MailMonitorService:
         conn = imaplib.IMAP4_SSL(self.host, 993)
         try:
             conn.login(self.email_address, self.auth_code)
-            if self.domain in _NETEASE_DOMAINS:
+            if (
+                self.domain in _NETEASE_DOMAINS
+                or self.provider in _NETEASE_PROVIDERS
+            ):
                 # pylint: disable-next=protected-access
                 conn._simple_command("ID", _ID_COMMAND_ARGS)
             conn.select("INBOX")

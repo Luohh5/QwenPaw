@@ -9,6 +9,7 @@ import type { AgentSummary, CopyAgentRequest } from "../../../api/types/agents";
 import { useAgentStore } from "../../../stores/agentStore";
 import { useAgents } from "./useAgents";
 import { AgentTable, AgentModal, CopyAgentModal } from "./components";
+import { MAIL_DOMAIN_WHITELIST } from "./components/mailDomains";
 import { PageHeader } from "@/components/PageHeader";
 import { reorderAgents } from "./reorder";
 import styles from "./index.module.less";
@@ -220,6 +221,13 @@ export default function AgentsPage() {
               credential: {
                 name: (mail_credential?.name ?? "").trim(),
                 domain: mail_credential?.domain || "163.com",
+                // Whitelisted domains must use an empty provider; custom
+                // enterprise domains carry the selected provider.
+                provider: MAIL_DOMAIN_WHITELIST.includes(
+                  mail_credential?.domain || "163.com",
+                )
+                  ? ""
+                  : mail_credential?.provider || "",
                 auth_code:
                   mail_mode === "personal"
                     ? mail_credential?.auth_code || ""

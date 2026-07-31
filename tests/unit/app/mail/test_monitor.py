@@ -294,6 +294,35 @@ def test_resolve_imap_host_table():
     assert resolve_imap_host("163.com") == "imap.163.com"
     assert resolve_imap_host("foxmail.com") == "imap.qq.com"
     assert resolve_imap_host("unknown.example") is None
+    # New personal / enterprise domains.
+    assert resolve_imap_host("sina.com") == "imap.sina.com"
+    assert resolve_imap_host("sina.cn") == "imap.sina.cn"
+    assert resolve_imap_host("aliyun.com") == "imap.aliyun.com"
+    assert resolve_imap_host("gmail.com") == "imap.gmail.com"
+    assert resolve_imap_host("exmail.qq.com") == "imap.exmail.qq.com"
+    assert resolve_imap_host("qiye.aliyun.com") == "imap.qiye.aliyun.com"
+    assert resolve_imap_host("qiye.163.com") == "imap.qiye.163.com"
+
+
+def test_resolve_imap_host_by_provider():
+    # A non-empty provider takes precedence over the domain table,
+    # enabling custom enterprise domains.
+    assert (
+        resolve_imap_host("mycompany.com", "tencent_exmail")
+        == "imap.exmail.qq.com"
+    )
+    assert (
+        resolve_imap_host("mycompany.com", "aliyun_qiye")
+        == "imap.qiye.aliyun.com"
+    )
+    assert (
+        resolve_imap_host("mycompany.com", "netease_qiye")
+        == "imap.qiye.163.com"
+    )
+    # Unknown provider -> None (skip monitoring).
+    assert resolve_imap_host("163.com", "bogus_provider") is None
+    # Empty provider falls back to the domain table.
+    assert resolve_imap_host("163.com", "") == "imap.163.com"
 
 
 def test_resolve_idle_timeout_by_domain():
@@ -302,10 +331,26 @@ def test_resolve_idle_timeout_by_domain():
     assert resolve_idle_timeout("qq.com") == 2 * 60
     assert resolve_idle_timeout("foxmail.com") == 2 * 60
     assert resolve_idle_timeout(" QQ.COM ") == 2 * 60
+    # Tencent enterprise mail shares the QQ family push behaviour.
+    assert resolve_idle_timeout("exmail.qq.com") == 2 * 60
     # NetEase family and unknown domains keep the 25 minute default.
     assert resolve_idle_timeout("163.com") == 25 * 60
     assert resolve_idle_timeout("unknown.example") == 25 * 60
     assert resolve_idle_timeout("") == 25 * 60
+    # New domains use the 25 minute default too.
+    assert resolve_idle_timeout("gmail.com") == 25 * 60
+    assert resolve_idle_timeout("qiye.aliyun.com") == 25 * 60
+    assert resolve_idle_timeout("qiye.163.com") == 25 * 60
+
+
+def test_resolve_idle_timeout_by_provider():
+    # tencent_exmail with a custom domain keeps the 2 minute cadence.
+    assert resolve_idle_timeout("mycompany.com", "tencent_exmail") == 2 * 60
+    # Other providers keep the 25 minute default.
+    assert resolve_idle_timeout("mycompany.com", "aliyun_qiye") == 25 * 60
+    assert resolve_idle_timeout("mycompany.com", "netease_qiye") == 25 * 60
+    # Empty provider falls back to the domain lookup.
+    assert resolve_idle_timeout("qq.com", "") == 2 * 60
 
 
 # ── pipeline: deterministic actions ──────────────────────────────────

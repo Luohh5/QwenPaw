@@ -1691,6 +1691,15 @@ class AgentMailCredential(BaseModel):
         default="",
         description="Phone number bound to the mailbox",
     )
+    provider: str = Field(
+        default="",
+        description=(
+            "Mail service provider for enterprise mailboxes with a "
+            "custom domain. Empty string means auto-detect by domain. "
+            "Allowed values: '', 'tencent_exmail', 'aliyun_qiye', "
+            "'netease_qiye'."
+        ),
+    )
 
 
 class AgentMailPushRule(BaseModel):
