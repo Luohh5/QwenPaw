@@ -68,6 +68,29 @@ export interface AgentMailConfig {
   push?: AgentMailPushConfig | null;
 }
 
+export interface MemoryGraphNode {
+  id: string;
+  path: string;
+  name: string;
+  description: string;
+  indexed: boolean;
+  virtual?: boolean;
+  section?: "daily" | "digest" | null;
+  relative_path?: string | null;
+}
+
+export interface MemoryGraphEdge {
+  source: string;
+  target: string;
+  target_anchor: string | null;
+}
+
+export interface MemoryGraphSnapshot {
+  version: 1;
+  nodes: MemoryGraphNode[];
+  edges: MemoryGraphEdge[];
+}
+
 export interface AgentProfileConfig {
   id: string;
   name: string;
