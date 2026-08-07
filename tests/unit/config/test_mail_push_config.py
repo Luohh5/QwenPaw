@@ -15,6 +15,8 @@ def test_push_defaults():
     assert push.mode == "off"
     assert push.rules == []
     assert push.poll_interval_seconds == 120
+    # Access control is opt-in: new agents start with it disabled.
+    assert push.access_control_enabled is False
 
 
 def test_push_rule_defaults():

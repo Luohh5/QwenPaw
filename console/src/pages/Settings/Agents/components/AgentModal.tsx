@@ -565,7 +565,7 @@ export function AgentModal({
             label={t("agent.mailAccessControl")}
             name={["mail_push", "access_control_enabled"]}
             valuePropName="checked"
-            initialValue={true}
+            initialValue={false}
             extra={t("agent.mailAccessControlTip")}
           >
             <Switch />

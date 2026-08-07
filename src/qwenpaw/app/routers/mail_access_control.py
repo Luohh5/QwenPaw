@@ -64,6 +64,17 @@ def _get_store_for_agent(agent_id: str):
     return get_mail_access_control_store(Path(agent_ref.workspace_dir))
 
 
+def _require_valid_addresses(entries: List["MailACLEntry"]) -> None:
+    """Reject malformed addresses up front (400) before any store write."""
+    from ..mail.mail_access_control import validate_acl_address
+
+    for entry in entries:
+        try:
+            validate_acl_address(entry.address)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 # ── Request / Response schemas ──────────────────────────────────────────────
 
 
@@ -139,6 +150,7 @@ async def get_pending_count():
     summary="Approve one or more pending senders (add to whitelist)",
 )
 async def approve_pending(body: MailACLActionBody, request: Request):
+    _require_valid_addresses(body.entries)
     count = 0
     for entry in body.entries:
         store = _get_store_for_agent(entry.agent_id)
@@ -204,6 +216,7 @@ async def _trigger_wake_after_approve(
     summary="Deny one or more pending senders (add to blacklist)",
 )
 async def deny_pending(body: MailACLActionBody):
+    _require_valid_addresses(body.entries)
     count = 0
     for entry in body.entries:
         store = _get_store_for_agent(entry.agent_id)
@@ -260,6 +273,7 @@ async def update_pending_remark(body: MailACLRemarkBody):
     summary="Add one or more addresses to whitelist",
 )
 async def add_to_whitelist(body: MailACLActionBody):
+    _require_valid_addresses(body.entries)
     count = 0
     for entry in body.entries:
         if entry.agent_id == "":
@@ -306,6 +320,7 @@ async def remove_from_whitelist(body: MailACLActionBody):
     summary="Add one or more addresses to blacklist",
 )
 async def add_to_blacklist(body: MailACLActionBody):
+    _require_valid_addresses(body.entries)
     count = 0
     for entry in body.entries:
         if entry.agent_id == "":

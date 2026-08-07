@@ -79,8 +79,8 @@ export default function AgentsPage() {
                   : rule,
               ),
               poll_interval_seconds: mail.push.poll_interval_seconds,
-              // Missing in legacy configs → backend defaults to true.
-              access_control_enabled: mail.push.access_control_enabled ?? true,
+              // Missing in legacy configs → backend defaults to false.
+              access_control_enabled: mail.push.access_control_enabled ?? false,
             }
           : undefined,
       });
@@ -218,13 +218,12 @@ export default function AgentsPage() {
       const pollIntervalSeconds =
         mail_push?.poll_interval_seconds ??
         storedMailPush?.poll_interval_seconds;
-      // Explicitly persist the access-control switch; a missing field is
-      // treated as true by the backend, so the switch could never be
-      // turned off if we dropped it here.
+      // Explicitly persist the access-control switch; access control is
+      // opt-in, so a missing field falls back to disabled.
       const accessControlEnabled =
         mail_push?.access_control_enabled ??
         storedMailPush?.access_control_enabled ??
-        true;
+        false;
       const push =
         pushMode === "off" && pushRules.length === 0
           ? null

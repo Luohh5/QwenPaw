@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from ...constant import WORKING_DIR
+from ...utils.io_utils import write_json_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,9 @@ _DOMAIN_RE = re.compile(
     r"^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?"
     r"(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)+$"
 )
+
+# Simple sanity check for plain (non-wildcard) email addresses.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 class MailPendingEntry:
@@ -172,10 +176,14 @@ class MailAccessControlStore:
         if not self._path.exists():
             return
         try:
-            self._last_mtime = self._path.stat().st_mtime
+            mtime = self._path.stat().st_mtime
             raw = json.loads(self._path.read_text(encoding="utf-8"))
             self._data = {k: AgentMailACL.from_dict(v) for k, v in raw.items()}
             self._rebuild_domain_sets()
+            # Only remember the mtime after a successful parse so that a
+            # corrupted file keeps triggering reload attempts and is picked
+            # up again by _reload_if_stale once it has been repaired.
+            self._last_mtime = mtime
         except Exception:
             logger.exception(
                 "Failed to load mail access control data from %s",
@@ -197,10 +205,9 @@ class MailAccessControlStore:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             payload = {k: v.to_dict() for k, v in self._data.items()}
-            self._path.write_text(
-                json.dumps(payload, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            # Atomic replace (temp file + rename) so a crash mid-write can
+            # never leave a truncated/corrupted ACL file behind.
+            write_json_atomic(self._path, payload)
             self._last_mtime = self._path.stat().st_mtime
             self._rebuild_domain_sets()
         except Exception:
@@ -552,6 +559,24 @@ class MailAccessControlStore:
                 f"Invalid wildcard address {address!r}: "
                 f"{domain!r} is not a valid domain format."
             )
+
+
+def validate_acl_address(address: str) -> None:
+    """Validate an ACL address (plain email or ``*@domain`` wildcard).
+
+    Raises:
+        ValueError: if the address is malformed.
+    """
+    address = (address or "").lower().strip()
+    if address.startswith("*@"):
+        # pylint: disable-next=protected-access
+        MailAccessControlStore._validate_wildcard(address)
+        return
+    if not _EMAIL_RE.match(address):
+        raise ValueError(
+            f"Invalid email address {address!r}: expected "
+            "'user@domain' or a '*@domain' wildcard."
+        )
 
 
 # Per-workspace store registry keyed by resolved workspace directory path.

@@ -59,7 +59,7 @@ export interface AgentMailPushConfig {
   mode: "off" | "rules_only" | "rules_then_agent" | "agent_all"; // default "off"
   rules: AgentMailPushRule[];
   poll_interval_seconds?: number; // default 120
-  access_control_enabled?: boolean; // default true
+  access_control_enabled?: boolean; // default false
 }
 
 export interface AgentMailConfig {
