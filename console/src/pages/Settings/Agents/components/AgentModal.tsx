@@ -45,7 +45,11 @@ const MAIL_AUTH_CODE_DOMAINS = [
   "gmail.com",
 ];
 
-const MAIL_ENTERPRISE_DOMAINS = ["exmail.qq.com", "qiye.aliyun.com", "qiye.163.com"];
+const MAIL_ENTERPRISE_DOMAINS = [
+  "exmail.qq.com",
+  "qiye.aliyun.com",
+  "qiye.163.com",
+];
 
 const MAIL_PROVIDER_OPTIONS: Array<{ value: string; labelKey: string }> = [
   { value: "tencent_exmail", labelKey: "agent.mailProviderTencentExmail" },
@@ -560,17 +564,21 @@ export function AgentModal({
             />
           </Form.Item>
         )}
-        {selectedBackend === "qwenpaw" && mailMode && mailMode !== "none" && mailPushMode && mailPushMode !== "off" && (
-          <Form.Item
-            label={t("agent.mailAccessControl")}
-            name={["mail_push", "access_control_enabled"]}
-            valuePropName="checked"
-            initialValue={false}
-            extra={t("agent.mailAccessControlTip")}
-          >
-            <Switch />
-          </Form.Item>
-        )}
+        {selectedBackend === "qwenpaw" &&
+          mailMode &&
+          mailMode !== "none" &&
+          mailPushMode &&
+          mailPushMode !== "off" && (
+            <Form.Item
+              label={t("agent.mailAccessControl")}
+              name={["mail_push", "access_control_enabled"]}
+              valuePropName="checked"
+              initialValue={false}
+              extra={t("agent.mailAccessControlTip")}
+            >
+              <Switch />
+            </Form.Item>
+          )}
       </Form>
 
       <div

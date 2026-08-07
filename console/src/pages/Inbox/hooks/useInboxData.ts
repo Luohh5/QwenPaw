@@ -188,8 +188,8 @@ export const useInboxData = () => {
           isPushMessageEvent(event) &&
           // Pending-approval mail events are handled in the mail access
           // control drawer; keep them out of the push message list.
-          (event.payload as Record<string, unknown> | undefined)
-            ?.acl_status !== "pending",
+          (event.payload as Record<string, unknown> | undefined)?.acl_status !==
+            "pending",
       );
       events.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
       const nextItems: PushMessage[] = events.map((event) =>

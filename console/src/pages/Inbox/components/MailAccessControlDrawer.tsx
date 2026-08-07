@@ -573,7 +573,11 @@ export function MailAccessControlDrawer({
             title={t("inbox.confirmDeny")}
             onConfirm={() => handleBatchPendingAction("deny")}
           >
-            <Button size="small" icon={<CloseOutlined />} loading={batchLoading}>
+            <Button
+              size="small"
+              icon={<CloseOutlined />}
+              loading={batchLoading}
+            >
               {t("inbox.batchDeny")}
             </Button>
           </Popconfirm>

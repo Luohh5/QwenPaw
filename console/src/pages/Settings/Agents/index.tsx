@@ -66,7 +66,11 @@ export default function AgentsPage() {
         ...configRest,
         active_model_provider: config.active_model?.provider_id || undefined,
         active_model_model: config.active_model?.model || undefined,
-        mail_mode: mail ? (mail.is_new_account ? "dedicated" : "personal") : "none",
+        mail_mode: mail
+          ? mail.is_new_account
+            ? "dedicated"
+            : "personal"
+          : "none",
         mail_credential: mail ? mail.credential : undefined,
         mail_push: mail?.push
           ? {

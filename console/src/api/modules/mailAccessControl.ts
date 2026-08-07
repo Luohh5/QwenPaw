@@ -29,7 +29,8 @@ export interface MailACLData {
 }
 
 export const mailAccessControlApi = {
-  getMailAclAll: () => request<Record<string, MailACLData>>("/mail-access-control"),
+  getMailAclAll: () =>
+    request<Record<string, MailACLData>>("/mail-access-control"),
 
   getMailAgents: () =>
     request<{ agents: string[] }>("/mail-access-control/agents"),
