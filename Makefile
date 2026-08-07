@@ -1,10 +1,10 @@
 # CoPaw Test & Coverage Makefile
 
-.PHONY: test test-unit test-contract test-integration test-channel test-channel-contract coverage-full clean gen-browser-manual
+.PHONY: test test-unit test-contract test-integration test-channel test-channel-contract coverage-full clean gen-browser-manual install-dev install-mail-mcp
 
-# Python path
-PYTHON := python
-PYTEST := python -m pytest
+# Python path (override with: make PYTHON=python3.12 <target>)
+PYTHON ?= $(shell command -v python3 2>/dev/null || command -v python)
+PYTEST := $(PYTHON) -m pytest
 
 # Default: run all tests
 test:
@@ -60,3 +60,12 @@ test-channel-contract:
 # BaseChannel core unit tests (optional, not enforced)
 test-base-core:
 	$(PYTEST) tests/unit/channels/test_base_core.py -v
+
+## 开发环境一键安装（主项目 + 子包）
+install-dev:
+	$(PYTHON) -m pip install -e .
+	$(PYTHON) -m pip install -e packages/qwenpawmail-mcp
+
+## 仅安装邮箱 MCP 子包
+install-mail-mcp:
+	$(PYTHON) -m pip install -e packages/qwenpawmail-mcp

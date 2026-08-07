@@ -34,7 +34,11 @@ from ...config.config import (
     validate_agent_id,
 )
 from ...config.utils import load_config, save_config
-from ...agents.utils import copy_workspace_md_files, normalize_agent_language
+from ...agents.utils import (
+    copy_workspace_md_files,
+    ensure_workspace_md_file,
+    normalize_agent_language,
+)
 from ...agents.skill_system import SkillPoolService, get_workspace_skills_dir
 from ...harnesses.registry import ProviderCatalogItem, get_provider
 from ..agent_startup import AgentStartupStatus
@@ -580,6 +584,7 @@ async def create_agent(
     if request.mail is not None:
         _generate_qwenpawmail_driver_card(workspace_dir, request.mail)
         _ensure_contacts_file(workspace_dir, language)
+        _ensure_mail_triage_file(workspace_dir, language)
 
     agent_ref = AgentProfileRef(
         id=new_id,
@@ -723,6 +728,7 @@ async def copy_agent(
     if agent_config.mail is not None:
         _generate_qwenpawmail_driver_card(workspace_dir, agent_config.mail)
         _ensure_contacts_file(workspace_dir, language)
+        _ensure_mail_triage_file(workspace_dir, language)
 
     agent_ref = AgentProfileRef(
         id=new_id,
@@ -793,9 +799,11 @@ async def update_agent(
         _validate_mail_config(agent_config.mail)
 
     update_data = agent_config.model_dump(exclude_unset=True)
-    for key, value in update_data.items():
-        if key != "id":
-            setattr(existing_config, key, value)
+    existing_data = existing_config.model_dump()
+    existing_data.update(
+        {k: v for k, v in update_data.items() if k != "id"}
+    )
+    existing_config = AgentProfileConfig.model_validate(existing_data)
 
     existing_config.id = agentId
     save_agent_config(agentId, existing_config)
@@ -821,6 +829,10 @@ async def update_agent(
                 existing_config.mail,
             )
         _ensure_contacts_file(
+            workspace_dir,
+            existing_config.language or config.agents.language or "en",
+        )
+        _ensure_mail_triage_file(
             workspace_dir,
             existing_config.language or config.agents.language or "en",
         )
@@ -1172,6 +1184,18 @@ def _validate_mail_config(mail: AgentMailConfig) -> None:
             ),
         )
     if provider:
+        # Well-known domains resolve their IMAP/SMTP hosts automatically;
+        # combining them with an explicit enterprise provider would inject
+        # mismatched host overrides.
+        if domain in _ALLOWED_MAIL_DOMAINS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Mail domain '{domain}' is a well-known domain and "
+                    "must not be combined with an enterprise mail "
+                    "provider; leave provider empty (auto-detect)"
+                ),
+            )
         # Enterprise mail with a custom domain: accept any
         # syntactically valid domain instead of the whitelist.
         if not domain or not _MAIL_DOMAIN_RE.match(domain):
@@ -1235,17 +1259,10 @@ def _validate_mail_config(mail: AgentMailConfig) -> None:
                     "password) is required"
                 ),
             )
-        if (
-            not credential.name
-            or not credential.password
-            or not credential.phone_number
-        ):
+        if not credential.name:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    "name, password and phone_number are required "
-                    "for a personal mailbox"
-                ),
+                detail="credential name (mailbox username) is required",
             )
 
 
@@ -1286,6 +1303,9 @@ def _build_qwenpawmail_env(
         env["QWENPAWMAIL_SMTP_PORT"] = str(hosts["smtp_port"])
     if workspace_dir is not None:
         env["QWENPAWMAIL_STATE_DIR"] = str(workspace_dir / "mail_state")
+        # The MCP server confines attachment saves to this directory
+        # (older cards without it fall back to STATE_DIR's parent).
+        env["QWENPAWMAIL_WORKSPACE_DIR"] = str(workspace_dir)
     return env
 
 
@@ -1337,42 +1357,27 @@ def _generate_qwenpawmail_driver_card(
         )
 
 
-def _ensure_contacts_file(workspace_dir: Path, language: str) -> None:
-    """Copy the CONTACTS.md template into the workspace if missing.
+def _ensure_workspace_md_file(
+    workspace_dir: Path,
+    language: str,
+    filename: str,
+) -> None:
+    """Copy a md_files template into the workspace if missing.
 
-    Idempotent: never overwrites an existing CONTACTS.md.  Reuses the
-    md_files language layout (falling back to English) so the contact
-    book matches the agent language.  Failures are logged and never
-    block agent creation/update.
+    Thin wrapper over :func:`ensure_workspace_md_file`, kept for the
+    router-local call sites.  Idempotent and never raises.
     """
-    try:
-        target = workspace_dir / "CONTACTS.md"
-        if target.exists():
-            return
-        md_files_root = (
-            Path(__file__).resolve().parent.parent.parent
-            / "agents"
-            / "md_files"
-        )
-        language = normalize_agent_language(language or "en")
-        source = md_files_root / language / "CONTACTS.md"
-        if not source.is_file():
-            source = md_files_root / "en" / "CONTACTS.md"
-        if not source.is_file():
-            logger.warning(
-                "CONTACTS.md template not found for language %s",
-                language,
-            )
-            return
-        workspace_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
-        logger.debug("Copied CONTACTS.md [%s] to %s", language, target)
-    except Exception as e:
-        logger.warning(
-            "Failed to ensure CONTACTS.md for %s: %s",
-            workspace_dir,
-            e,
-        )
+    ensure_workspace_md_file(workspace_dir, language, filename)
+
+
+def _ensure_contacts_file(workspace_dir: Path, language: str) -> None:
+    """Copy the CONTACTS.md template into the workspace if missing."""
+    _ensure_workspace_md_file(workspace_dir, language, "CONTACTS.md")
+
+
+def _ensure_mail_triage_file(workspace_dir: Path, language: str) -> None:
+    """Copy the MAIL_TRIAGE.md seed tree into the workspace if missing."""
+    _ensure_workspace_md_file(workspace_dir, language, "MAIL_TRIAGE.md")
 
 
 def _initialize_agent_workspace(

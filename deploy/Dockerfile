@@ -99,6 +99,10 @@ COPY --from=console-builder /app/console/dist/ ./src/qwenpaw/console/
 COPY --from=uv-src /uv /bin/uv
 RUN uv pip install --no-cache-dir . && rm -rf ./build
 
+# Install qwenpawmail-mcp email service from local subpackage.
+COPY packages/qwenpawmail-mcp /app/packages/qwenpawmail-mcp
+RUN uv pip install --no-cache-dir /app/packages/qwenpawmail-mcp
+
 
 # QwenPaw app port (default 8088). Override at runtime with -e QWENPAW_PORT=3000.
 ENV QWENPAW_PORT=8088

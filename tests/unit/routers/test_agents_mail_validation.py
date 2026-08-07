@@ -13,6 +13,7 @@ from qwenpaw.app.routers.agents import (
     CreateAgentRequest,
     _build_copied_agent_config,
     _build_qwenpawmail_env,
+    _ensure_mail_triage_file,
     _validate_mail_config,
     create_agent,
     update_agent,
@@ -33,8 +34,8 @@ def _valid_mail(push: AgentMailPushConfig | None = None) -> AgentMailConfig:
             name="tester",
             domain="163.com",
             auth_code="a" * 16,
-            password="pw",
-            phone_number="13800000000",
+            password="",
+            phone_number="",
         ),
         push=push,
     )
@@ -130,6 +131,18 @@ def test_enterprise_provider_rejects_malformed_domain():
         assert exc_info.value.status_code == 400
 
 
+def test_enterprise_provider_rejects_whitelisted_domain():
+    """Well-known domains must not carry an enterprise provider."""
+    for domain in ("163.com", "gmail.com", "exmail.qq.com"):
+        mail = _valid_mail()
+        mail.credential.provider = "tencent_exmail"
+        mail.credential.domain = domain
+        with pytest.raises(HTTPException) as exc_info:
+            _validate_mail_config(mail)
+        assert exc_info.value.status_code == 400
+        assert "well-known domain" in exc_info.value.detail
+
+
 def test_invalid_provider_rejected():
     mail = _valid_mail()
     mail.credential.provider = "unknown_provider"
@@ -186,6 +199,18 @@ def test_env_without_provider_has_no_host_overrides(tmp_path):
     assert "QWENPAWMAIL_IMAP_PORT" not in env
     assert "QWENPAWMAIL_SMTP_HOST" not in env
     assert "QWENPAWMAIL_SMTP_PORT" not in env
+
+
+def test_env_injects_workspace_and_state_dirs(tmp_path):
+    env = _build_qwenpawmail_env(_valid_mail(), tmp_path)
+    assert env["QWENPAWMAIL_STATE_DIR"] == str(tmp_path / "mail_state")
+    assert env["QWENPAWMAIL_WORKSPACE_DIR"] == str(tmp_path)
+
+
+def test_env_without_workspace_dir_has_no_dir_vars():
+    env = _build_qwenpawmail_env(_valid_mail())
+    assert "QWENPAWMAIL_STATE_DIR" not in env
+    assert "QWENPAWMAIL_WORKSPACE_DIR" not in env
 
 
 def test_create_agent_rejects_mail_for_third_party_backend():
@@ -289,8 +314,8 @@ def test_aliyun_domain_accepts_non_16_char_auth_code():
             name="tester",
             domain="aliyun.com",
             auth_code="my_login_password_123",
-            password="pw",
-            phone_number="13800000000",
+            password="",
+            phone_number="",
         ),
     )
     _validate_mail_config(mail)
@@ -305,8 +330,8 @@ def test_enterprise_provider_accepts_non_16_char_auth_code():
                 name="tester",
                 domain="mycompany.com",
                 auth_code="enterprise_pwd_8",
-                password="pw",
-                phone_number="13800000000",
+                password="",
+                phone_number="",
                 provider=provider,
             ),
         )
@@ -321,11 +346,70 @@ def test_aliyun_domain_rejects_empty_auth_code():
             name="tester",
             domain="aliyun.com",
             auth_code="",
-            password="pw",
-            phone_number="13800000000",
+            password="",
+            phone_number="",
         ),
     )
     with pytest.raises(HTTPException) as exc_info:
         _validate_mail_config(mail)
     assert exc_info.value.status_code == 400
     assert "auth_code" in exc_info.value.detail
+
+
+def test_personal_mail_without_password_phone_passes():
+    """Personal mailbox only needs name + auth_code, not password/phone."""
+    mail = AgentMailConfig(
+        is_new_account=False,
+        credential=AgentMailCredential(
+            name="tester",
+            domain="163.com",
+            auth_code="a" * 16,
+            password="",
+            phone_number="",
+        ),
+    )
+    # Should not raise
+    _validate_mail_config(mail)
+
+
+def test_personal_mail_without_name_rejected():
+    """Personal mailbox still requires credential name."""
+    mail = AgentMailConfig(
+        is_new_account=False,
+        credential=AgentMailCredential(
+            name="",
+            domain="163.com",
+            auth_code="a" * 16,
+            password="",
+            phone_number="",
+        ),
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_mail_config(mail)
+    assert exc_info.value.status_code == 400
+    assert "credential name" in exc_info.value.detail
+
+
+# ── MAIL_TRIAGE.md seed distribution ──────────────────────────────
+
+
+def test_ensure_mail_triage_file_copies_seed(tmp_path):
+    _ensure_mail_triage_file(tmp_path, "zh")
+    target = tmp_path / "MAIL_TRIAGE.md"
+    assert target.is_file()
+    text = target.read_text("utf-8")
+    assert "邮件分诊树" in text
+    assert "F1 探索处理" in text
+
+
+def test_ensure_mail_triage_file_skips_existing(tmp_path):
+    target = tmp_path / "MAIL_TRIAGE.md"
+    target.write_text("user grown tree", "utf-8")
+    _ensure_mail_triage_file(tmp_path, "zh")
+    assert target.read_text("utf-8") == "user grown tree"
+
+
+def test_ensure_mail_triage_file_falls_back_to_en(tmp_path):
+    # Unsupported language normalizes to en; en also carries the seed.
+    _ensure_mail_triage_file(tmp_path, "fr")
+    assert (tmp_path / "MAIL_TRIAGE.md").is_file()

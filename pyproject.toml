@@ -68,6 +68,8 @@ dependencies = [
     # wheels for all three OSes.
     "ast-grep-cli>=0.20",
     "html2text>=2024.2.26",
+    # qwenpawmail-mcp 邮箱工具包位于 packages/qwenpawmail-mcp/
+    # 通过 Makefile 的 install-dev 或手动 pip install -e packages/qwenpawmail-mcp 安装
 ]
 
 [project.urls]
