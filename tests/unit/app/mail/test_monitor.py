@@ -141,7 +141,14 @@ def _mail_config(
             password="pw",
             phone_number="13800000000",
         ),
-        push=AgentMailPushConfig(mode=mode, rules=rules or []),
+        # Legacy pipeline tests exercise the rules engine directly;
+        # sender access control is covered separately and disabled here
+        # so unknown senders are not held for approval.
+        push=AgentMailPushConfig(
+            mode=mode,
+            rules=rules or [],
+            access_control_enabled=False,
+        ),
     )
 
 
