@@ -262,6 +262,24 @@ async def _policy_tool_check_permissions(
     # ── Effective approval_level check (session > agent) ──
     request_ctx = getattr(self, "_qp_request_context", None) or {}
     effective_level = _resolve_effective_approval_level(request_ctx)
+
+    # ── Mail F1 exploration mode: force STRICT for every tool ──
+    # F1 is a session-level flag registered by the
+    # activate_f1_exploration_mode tool (a module-level registry is used
+    # because per-tool asyncio tasks isolate ContextVar writes). While
+    # active it overrides the session/agent approval_level (including
+    # OFF): all tool calls require user approval.
+    from ..config.context import (
+        get_current_session_id,
+        is_f1_active_for_session,
+    )
+    from ..security.tool_guard.execution_level import ToolExecutionLevel
+
+    _f1_session_id = request_ctx.get("session_id") or get_current_session_id()
+    f1_active = is_f1_active_for_session(_f1_session_id)
+    if f1_active:
+        effective_level = ToolExecutionLevel.STRICT
+
     if effective_level is not None and effective_level.is_disabled():
         # OFF means "never ask the user" — it does NOT mean "skip the
         # sandbox". Sandbox isolation is an execution mechanism, not an
@@ -278,7 +296,9 @@ async def _policy_tool_check_permissions(
 
     # Sync effective approval_level to the governor's policy
     # so the three-phase evaluation uses the correct threshold.
-    if governor is not None and effective_level is not None:
+    # Skipped while F1 is active: F1's STRICT is applied per-evaluation
+    # below (set + restore) so it cannot leak into later requests.
+    if governor is not None and effective_level is not None and not f1_active:
         governor.policy.execution_level = effective_level.value
 
     if governor is None:
@@ -307,7 +327,18 @@ async def _policy_tool_check_permissions(
 
     tc_spec = self._build_tc_spec()
 
-    decision = governor.assert_policy(tc_spec)
+    if f1_active:
+        # Temporarily force STRICT for this evaluation only, then restore
+        # the previous level (assert_policy is synchronous, so this
+        # set/restore is atomic within the event loop).
+        prev_level = governor.policy.execution_level
+        governor.policy.execution_level = ToolExecutionLevel.STRICT.value
+        try:
+            decision = governor.assert_policy(tc_spec)
+        finally:
+            governor.policy.execution_level = prev_level
+    else:
+        decision = governor.assert_policy(tc_spec)
     governor.audit(tc_spec, decision)
 
     # Cache the decision + tc_spec for __call__ to use

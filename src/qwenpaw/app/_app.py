@@ -319,6 +319,7 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
             )
             from ..hooks.request_setup.contextvars_hook import (
                 ContextVarsSetupHook,
+                MailF1CleanupHook,
             )
             from ..hooks.request_setup.media_hook import MediaProcessHook
             from ..hooks.session.session_hook import (
@@ -344,6 +345,7 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
                 MediaProcessHook,
                 ErrorNormalizeHook,
                 CancelCleanupHook,
+                MailF1CleanupHook,
             ]
 
             try:

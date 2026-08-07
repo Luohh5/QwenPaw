@@ -190,3 +190,43 @@ def set_current_agent_state(state: AgentState | None) -> None:
         state: AgentState instance to store in context.
     """
     current_agent_state.set(state)
+
+
+# Session-level registry for mail F1 exploration mode (step-by-step
+# approval). A module-level set is used instead of a ContextVar on
+# purpose: the tool coordinator runs every tool call in its own asyncio
+# task (asyncio.create_task copies the context), so a ContextVar written
+# inside the activation tool would stay isolated in that child task and
+# never be visible to subsequent tool calls. ``set.add``/``discard`` are
+# atomic under the GIL, which is sufficient for concurrent tool tasks.
+_f1_active_sessions: set[str] = set()
+
+
+def activate_f1_for_session(session_id: str) -> None:
+    """Mark mail F1 exploration mode active for the given session.
+
+    Args:
+        session_id: Session ID for which F1 mode is activated.
+    """
+    _f1_active_sessions.add(session_id)
+
+
+def is_f1_active_for_session(session_id: str | None) -> bool:
+    """Return whether mail F1 exploration mode is active for a session.
+
+    Args:
+        session_id: Session ID to check. Falsy values return False.
+    """
+    if not session_id:
+        return False
+    return session_id in _f1_active_sessions
+
+
+def deactivate_f1_for_session(session_id: str | None) -> None:
+    """Clear mail F1 exploration mode for the given session.
+
+    Args:
+        session_id: Session ID to deactivate. Falsy values are a no-op.
+    """
+    if session_id:
+        _f1_active_sessions.discard(session_id)
