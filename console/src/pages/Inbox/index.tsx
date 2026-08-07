@@ -20,9 +20,12 @@ import {
   BulbOutlined,
   CopyOutlined,
   DownOutlined,
+  SafetyOutlined,
   ToolOutlined,
 } from "@ant-design/icons";
 import { PackageOpen, Bell, BellRing } from "lucide-react";
+import { MailAccessControlDrawer } from "./components/MailAccessControlDrawer";
+import { useMailPendingCount } from "./hooks/useMailPendingCount";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useTranslation } from "react-i18next";
@@ -148,6 +151,13 @@ const getMailDetail = (messageItem: PushMessage | null): MailDetail | null => {
 export default function InboxPage() {
   const { t } = useTranslation();
   const [activeTab, setActiveTab] = useState<TabKey>(resolveInitialTab);
+  const [mailAclDrawerOpen, setMailAclDrawerOpen] = useState(false);
+  const {
+    pendingCount,
+    refresh: refreshPendingCount,
+    newArrival: mailAclNewArrival,
+    markSeen: markMailAclSeen,
+  } = useMailPendingCount();
   const [markAllReading, setMarkAllReading] = useState(false);
   const [selectedAgentFilter, setSelectedAgentFilter] = useState<
     string | undefined
@@ -577,7 +587,28 @@ export default function InboxPage() {
 
   return (
     <div className={styles.inboxPage}>
-      <PageHeader items={[{ title: t("inbox.title") }]} extra={null} />
+      <PageHeader
+        items={[{ title: t("inbox.title") }]}
+        extra={
+          <Badge dot={pendingCount > 0} offset={[-4, 4]}>
+            <Button
+              icon={<SafetyOutlined />}
+              className={
+                mailAclNewArrival && wobbleEnabled
+                  ? styles.mailAclShake
+                  : undefined
+              }
+              onMouseEnter={markMailAclSeen}
+              onClick={() => {
+                markMailAclSeen();
+                setMailAclDrawerOpen(true);
+              }}
+            >
+              {t("inbox.mailAccessControl")}
+            </Button>
+          </Badge>
+        }
+      />
 
       <div className={styles.pageContent}>
         <Tabs
@@ -921,6 +952,13 @@ export default function InboxPage() {
           </div>
         ) : null}
       </Modal>
+      <MailAccessControlDrawer
+        open={mailAclDrawerOpen}
+        onClose={() => {
+          setMailAclDrawerOpen(false);
+          void refreshPendingCount();
+        }}
+      />
     </div>
   );
 }

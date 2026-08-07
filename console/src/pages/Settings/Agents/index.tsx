@@ -79,6 +79,8 @@ export default function AgentsPage() {
                   : rule,
               ),
               poll_interval_seconds: mail.push.poll_interval_seconds,
+              // Missing in legacy configs → backend defaults to true.
+              access_control_enabled: mail.push.access_control_enabled ?? true,
             }
           : undefined,
       });
@@ -179,37 +181,60 @@ export default function AgentsPage() {
         mail_push,
         ...rest
       } = values;
-      const pushMode = mail_push?.mode ?? "off";
-      // agent_all wakes the agent for every email; rules are not applicable.
-      const pushRules =
-        pushMode === "agent_all"
-          ? []
-          : (mail_push?.rules ?? []).map(
-              (rule: {
-                field?: string;
-                contains?: string;
-                action?: string;
-                param?: string;
-              }) => ({
-                // Never submit the legacy "subject" value.
-                field:
-                  rule?.field === "subject"
-                    ? "content"
-                    : rule?.field || "from",
-                contains: (rule?.contains ?? "").trim(),
-                action: rule?.action || "notify",
-                param: (rule?.param ?? "").trim(),
-              }),
-            );
+      // 0.2.0: the rules editor UI is hidden, so `mail_push.rules` is no
+      // longer a registered form field and won't appear in validateFields()
+      // results. Read the form store directly to pass legacy rules through
+      // unchanged (hidden-but-preserved policy).
+      const storedMailPush = form.getFieldValue("mail_push") as
+        | {
+            mode?: string;
+            rules?: Array<{
+              field?: string;
+              contains?: string;
+              action?: string;
+              param?: string;
+            }>;
+            poll_interval_seconds?: number;
+            access_control_enabled?: boolean;
+          }
+        | undefined;
+      const pushMode = mail_push?.mode ?? storedMailPush?.mode ?? "off";
+      // Preserve existing rules as-is regardless of mode so editing an old
+      // agent never wipes its rule config on the backend.
+      const pushRules = (
+        (mail_push?.rules ?? storedMailPush?.rules ?? []) as Array<{
+          field?: string;
+          contains?: string;
+          action?: string;
+          param?: string;
+        }>
+      ).map((rule) => ({
+        // Never submit the legacy "subject" value.
+        field: rule?.field === "subject" ? "content" : rule?.field || "from",
+        contains: (rule?.contains ?? "").trim(),
+        action: rule?.action || "notify",
+        param: (rule?.param ?? "").trim(),
+      }));
+      const pollIntervalSeconds =
+        mail_push?.poll_interval_seconds ??
+        storedMailPush?.poll_interval_seconds;
+      // Explicitly persist the access-control switch; a missing field is
+      // treated as true by the backend, so the switch could never be
+      // turned off if we dropped it here.
+      const accessControlEnabled =
+        mail_push?.access_control_enabled ??
+        storedMailPush?.access_control_enabled ??
+        true;
       const push =
         pushMode === "off" && pushRules.length === 0
           ? null
           : {
               mode: pushMode,
               rules: pushRules,
-              ...(mail_push?.poll_interval_seconds != null
-                ? { poll_interval_seconds: mail_push.poll_interval_seconds }
+              ...(pollIntervalSeconds != null
+                ? { poll_interval_seconds: pollIntervalSeconds }
                 : {}),
+              access_control_enabled: accessControlEnabled,
             };
       // Mail is only supported for the qwenpaw backend; never submit
       // mail config for third-party backends (the server rejects it).

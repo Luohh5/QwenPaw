@@ -175,10 +175,15 @@ export const useInboxData = () => {
   const loadPushMessages = useCallback(async () => {
     try {
       const res = await api.getInboxEvents({ limit: 200 });
-      const events = [...(res?.events || [])].filter((event) =>
-        ["cron", "heartbeat", "memory", "skill_autoupdate", "mail"].includes(
-          event.source_type,
-        ),
+      const events = [...(res?.events || [])].filter(
+        (event) =>
+          ["cron", "heartbeat", "memory", "skill_autoupdate", "mail"].includes(
+            event.source_type,
+          ) &&
+          // Pending-approval mail events are handled in the mail access
+          // control drawer; keep them out of the push message list.
+          (event.payload as Record<string, unknown> | undefined)
+            ?.acl_status !== "pending",
       );
       events.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
       const nextItems: PushMessage[] = events.map((event) =>

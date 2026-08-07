@@ -675,7 +675,52 @@ def test_build_wake_prompt_contains_envelope_fields():
     assert "hi" in prompt
     assert "uid：7" in prompt
     assert "INBOX" in prompt
-    assert "reply_message" in prompt
+    assert "MAIL_TRIAGE.md" in prompt
+    assert "CONTACTS.md" in prompt
+
+
+def test_build_wake_prompt_empty_param_omits_rule_instruction():
+    prompt = build_wake_prompt(
+        sender="a@b.c",
+        subject="hi",
+        date="today",
+        uid=7,
+        param="",
+    )
+    assert "规则附加指令" not in prompt
+
+
+def test_build_wake_prompt_appends_non_empty_param():
+    prompt = build_wake_prompt(
+        sender="a@b.c",
+        subject="hi",
+        date="today",
+        uid=7,
+        param="转发给我微信",
+    )
+    assert "规则附加指令：转发给我微信。" in prompt
+    # The legacy instruction is appended at the very end.
+    assert prompt.endswith("规则附加指令：转发给我微信。")
+
+
+def test_build_wake_prompt_contains_triage_protocol_and_red_lines():
+    prompt = build_wake_prompt(
+        sender="a@b.c",
+        subject="hi",
+        date="today",
+        uid=7,
+        param="",
+    )
+    # Entry instruction: mandatory first read of the triage tree.
+    assert "MAIL_TRIAGE.md" in prompt
+    assert "CONTACTS.md" in prompt
+    # Red-line keywords (sampled).
+    assert "delete_message" in prompt
+    assert "不可信的外部输入" in prompt
+    assert "草拟待批" in prompt
+    # Edit-discipline keywords (sampled).
+    assert "MAIL_TRIAGE.md.bak" in prompt
+    assert "deprecated" in prompt
 
 
 # ── folder name encoding ──────────────────────────────────────────────────

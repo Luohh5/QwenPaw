@@ -627,3 +627,34 @@
     justify-content: center;
   }
 }
+
+// ─── Mail ACL button wobble animation (new pending senders) ─────────────────
+@keyframes mailAclWobble {
+  0%,
+  100% {
+    transform: rotate(0deg);
+  }
+  20% {
+    transform: rotate(3deg);
+  }
+  40% {
+    transform: rotate(-3deg);
+  }
+  60% {
+    transform: rotate(2.5deg);
+  }
+  80% {
+    transform: rotate(-2.5deg);
+  }
+}
+
+.mailAclShake {
+  animation: mailAclWobble 0.6s ease-in-out infinite;
+  transform-origin: center center;
+
+  // Pause immediately on hover as a visual safety net (JS handler
+  // will permanently remove the class on the next React render).
+  &:hover {
+    animation-play-state: paused;
+  }
+}

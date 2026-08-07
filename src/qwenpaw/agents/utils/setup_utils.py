@@ -27,6 +27,46 @@ def normalize_agent_language(language: str) -> str:
     return "en"
 
 
+def ensure_workspace_md_file(
+    workspace_dir: Path | str,
+    language: str,
+    filename: str,
+) -> None:
+    """Copy a single md_files template into the workspace if missing.
+
+    Idempotent: never overwrites an existing file.  Reuses the
+    md_files language layout (falling back to English) so the file
+    matches the agent language.  Failures are logged and never raised.
+    """
+    try:
+        workspace_dir = Path(workspace_dir).expanduser()
+        target = workspace_dir / filename
+        if target.exists():
+            return
+        md_files_root = Path(__file__).resolve().parent.parent / "md_files"
+        language = normalize_agent_language(language or "en")
+        source = md_files_root / language / filename
+        if not source.is_file():
+            source = md_files_root / "en" / filename
+        if not source.is_file():
+            logger.warning(
+                "%s template not found for language %s",
+                filename,
+                language,
+            )
+            return
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        logger.debug("Copied %s [%s] to %s", filename, language, target)
+    except Exception as e:
+        logger.warning(
+            "Failed to ensure %s for %s: %s",
+            filename,
+            workspace_dir,
+            e,
+        )
+
+
 def copy_md_files(
     language: str,
     skip_existing: bool = False,

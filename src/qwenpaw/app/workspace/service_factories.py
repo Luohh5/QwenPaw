@@ -219,6 +219,22 @@ async def create_mail_monitor_service(ws: "Workspace", _):
         return None
 
     from ..mail.monitor import MailMonitorService
+    from ...agents.utils import ensure_workspace_md_file
+
+    # The mail wake prompt asks the agent to read CONTACTS.md and
+    # MAIL_TRIAGE.md first thing, so make sure both seed files exist
+    # for workspaces created before these templates were introduced
+    # (agent CRUD APIs are the only other distribution path).
+    language = getattr(ws._config, "language", None)
+    if not language:
+        try:
+            from ...config import load_config as _load_root_config
+
+            language = _load_root_config().agents.language
+        except Exception:  # pragma: no cover - config load best-effort
+            language = None
+    for seed_name in ("CONTACTS.md", "MAIL_TRIAGE.md"):
+        ensure_workspace_md_file(ws.workspace_dir, language or "en", seed_name)
 
     monitor = MailMonitorService(
         agent_id=ws.agent_id,

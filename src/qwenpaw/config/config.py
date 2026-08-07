@@ -1723,6 +1723,7 @@ class AgentMailPushConfig(BaseModel):
     ] = "off"
     rules: list[AgentMailPushRule] = Field(default_factory=list)
     poll_interval_seconds: int = 120
+    access_control_enabled: bool = True
 
 
 class AgentMailConfig(BaseModel):
