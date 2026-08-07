@@ -58,7 +58,8 @@ STATE_DIR_ENV = "QWENPAWMAIL_STATE_DIR"
 
 
 def resolve_attachments_base(
-    email_address: str | None = None, env: dict[str, str] | None = None
+    email_address: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> Path:
     """Resolve the base directory that confines attachment saves.
 
@@ -102,7 +103,7 @@ def resolve_save_path(save_path: str, base: Path) -> Path:
             f"outside the allowed workspace directory '{base_real}'. "
             "Attachments can only be saved inside the agent workspace: pass "
             "a relative path (e.g. 'finance/attachments/') or an absolute "
-            "path under the workspace."
+            "path under the workspace.",
         )
     return resolved
 
@@ -138,7 +139,8 @@ def decode_folder(raw: str | bytes) -> str:
 # first, then standard SMTP reply-code rules (QQ Mail and other providers).
 # Each rule: (predicate(code, upper_text), error class, actionable advice).
 _SMTP_RULES: tuple[
-    tuple[Callable[[int, str], bool], type[MailError], str], ...
+    tuple[Callable[[int, str], bool], type[MailError], str],
+    ...,
 ] = (
     # -- NetEase-specific diagnostic prefixes -----------------------------
     (
@@ -214,7 +216,7 @@ def _map_imap_login_error(exc: Exception) -> MailError:
         return UnsafeLoginError(
             f"NetEase rejected the login as 'Unsafe Login' ({text}). The RFC "
             "2971 ID command was not accepted before SELECT. Make sure IMAP "
-            "is enabled for this account in NetEase webmail settings."
+            "is enabled for this account in NetEase webmail settings.",
         )
     if any(
         k in lowered
@@ -232,7 +234,7 @@ def _map_imap_login_error(exc: Exception) -> MailError:
             "app-specific password, or your login password. Please "
             "confirm IMAP/SMTP service is enabled in your "
             "provider's webmail settings and regenerate the "
-            "credential if needed."
+            "credential if needed.",
         )
     return MailError(f"IMAP login error: {text}")
 
@@ -344,7 +346,9 @@ class MailClient:
         """
         self._throttle()
         conn = imaplib.IMAP4_SSL(
-            self.config.imap_host, self.config.imap_port, timeout=30
+            self.config.imap_host,
+            self.config.imap_port,
+            timeout=30,
         )
         try:
             try:
@@ -352,6 +356,7 @@ class MailClient:
             except imaplib.IMAP4.error as exc:
                 raise _map_imap_login_error(exc) from exc
             if self.config.requires_id_command:
+                # pylint: disable-next=protected-access
                 conn._simple_command("ID", ID_COMMAND_ARGS)
         except BaseException:
             try:
@@ -373,25 +378,31 @@ class MailClient:
                 pass
 
     def _select(
-        self, conn: imaplib.IMAP4_SSL, folder: str, readonly: bool = False
+        self,
+        conn: imaplib.IMAP4_SSL,
+        folder: str,
+        readonly: bool = False,
     ) -> int:
         typ, data = conn.select(encode_folder(folder), readonly=readonly)
         if typ != "OK":
-            detail = data[0] if data else b""
-            if isinstance(detail, bytes):
-                detail = detail.decode("utf-8", errors="replace")
-            if "unsafe login" in str(detail).lower():
+            raw_detail = data[0] if data else b""
+            detail = (
+                raw_detail.decode("utf-8", errors="replace")
+                if isinstance(raw_detail, bytes)
+                else str(raw_detail)
+            )
+            if "unsafe login" in detail.lower():
                 raise UnsafeLoginError(
                     f"NetEase 'Unsafe Login' on SELECT ({detail}). The ID "
                     "command was rejected or IMAP access is not enabled for "
-                    "this account. Enable IMAP in NetEase webmail settings."
+                    "this account. Enable IMAP in NetEase webmail settings.",
                 )
             raise MailError(
                 f"Cannot open folder {folder!r}: {detail}. "
-                "Use list_folders to see available folder names."
+                "Use list_folders to see available folder names.",
             )
         try:
-            return int(data[0])
+            return int(data[0] or 0)
         except (TypeError, ValueError, IndexError):
             return 0
 
@@ -399,7 +410,9 @@ class MailClient:
     def _smtp(self) -> Iterator[smtplib.SMTP_SSL]:
         try:
             conn = smtplib.SMTP_SSL(
-                self.config.smtp_host, self.config.smtp_port, timeout=30
+                self.config.smtp_host,
+                self.config.smtp_port,
+                timeout=30,
             )
         except OSError as exc:
             raise MailError(f"Cannot connect to SMTP server: {exc}") from exc
@@ -413,7 +426,7 @@ class MailClient:
                     "credential may be an authorization code, an app-specific "
                     "password, or your login password. Please confirm SMTP "
                     "service is enabled in your provider's webmail settings "
-                    "and regenerate the credential if needed."
+                    "and regenerate the credential if needed.",
                 ) from exc
             yield conn
         finally:
@@ -426,18 +439,26 @@ class MailClient:
         with self._smtp() as conn:
             try:
                 conn.send_message(
-                    msg, from_addr=self.config.email, to_addrs=recipients
+                    msg,
+                    from_addr=self.config.email,
+                    to_addrs=recipients,
                 )
             except smtplib.SMTPRecipientsRefused as exc:
                 first = next(iter(exc.recipients.values()))
-                code, detail = first[0], first[1]
-                if isinstance(detail, bytes):
-                    detail = detail.decode("utf-8", errors="replace")
+                code, raw = first[0], first[1]
+                detail = (
+                    raw.decode("utf-8", errors="replace")
+                    if isinstance(raw, bytes)
+                    else raw
+                )
                 raise classify_smtp_error(code, detail) from exc
             except smtplib.SMTPResponseException as exc:
-                detail = exc.smtp_error
-                if isinstance(detail, bytes):
-                    detail = detail.decode("utf-8", errors="replace")
+                raw_err = exc.smtp_error
+                detail = (
+                    raw_err.decode("utf-8", errors="replace")
+                    if isinstance(raw_err, bytes)
+                    else raw_err
+                )
                 raise classify_smtp_error(exc.smtp_code, detail) from exc
 
     # -- folder operations ---------------------------------------------------
@@ -447,18 +468,18 @@ class MailClient:
             typ, data = conn.list()
             _check(typ, data, "LIST")
             folders: list[dict[str, Any]] = []
-            for line in data or []:
-                if not line:
+            for item in data or []:
+                if not item:
                     continue
-                if isinstance(line, tuple):
-                    line = line[0]
+                # pylint: disable-next=unsubscriptable-object
+                raw_line = item[0] if isinstance(item, tuple) else item
                 text = (
-                    line.decode("utf-8", errors="replace")
-                    if isinstance(line, bytes)
-                    else str(line)
+                    raw_line.decode("utf-8", errors="replace")
+                    if isinstance(raw_line, bytes)
+                    else str(raw_line)
                 )
                 m = re.match(
-                    r'\((?P<flags>[^)]*)'
+                    r"\((?P<flags>[^)]*)"
                     r'\)\s+"(?P<delim>[^"]*)"\s+(?P<name>.+)',
                     text,
                 )
@@ -470,7 +491,7 @@ class MailClient:
                         "name": decode_folder(raw_name),
                         "raw_name": raw_name,
                         "flags": m.group("flags").split(),
-                    }
+                    },
                 )
             return folders
 
@@ -483,14 +504,17 @@ class MailClient:
     # -- message listing / reading -------------------------------------------
 
     def list_messages(
-        self, folder: str = "INBOX", limit: int = 20, offset: int = 0
+        self,
+        folder: str = "INBOX",
+        limit: int = 20,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """Return envelope metadata only (no bodies), newest first."""
         limit = max(1, min(int(limit), 100))
         offset = max(0, int(offset))
         with self._imap() as conn:
             self._select(conn, folder, readonly=True)
-            typ, data = conn.uid("SEARCH", None, "ALL")
+            typ, data = conn.uid("SEARCH", "ALL")
             _check(typ, data, "SEARCH")
             uids = (data[0] or b"").split()
             uids.reverse()  # newest first
@@ -508,7 +532,10 @@ class MailClient:
     _ENVELOPE_FIELDS = "FROM TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES"
 
     def _fetch_envelope(
-        self, conn: imaplib.IMAP4_SSL, uid: bytes, with_structure: bool = False
+        self,
+        conn: imaplib.IMAP4_SSL,
+        uid: bytes,
+        with_structure: bool = False,
     ) -> dict[str, Any]:
         items = (
             "UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS"
@@ -516,7 +543,7 @@ class MailClient:
         )
         if with_structure:
             items += " BODYSTRUCTURE"
-        typ, data = conn.uid("FETCH", uid, f"({items})")
+        typ, data = conn.uid("FETCH", uid.decode("ascii"), f"({items})")
         _check(typ, data, "FETCH envelope")
         meta = b""
         header_bytes = b""
@@ -559,14 +586,14 @@ class MailClient:
         return result
 
     def _fetch_raw(self, conn: imaplib.IMAP4_SSL, uid: str) -> bytes:
-        typ, data = conn.uid("FETCH", uid.encode("ascii"), "(BODY.PEEK[])")
+        typ, data = conn.uid("FETCH", uid, "(BODY.PEEK[])")
         _check(typ, data, "FETCH body")
         for _, payload in _iter_fetch_items(data or []):
             if payload:
                 return payload
         raise MailError(
             f"Message UID {uid} not found. It may have been moved or deleted; "
-            "run list_messages to refresh UIDs."
+            "run list_messages to refresh UIDs.",
         )
 
     def get_message(self, folder: str, uid: str) -> dict[str, Any]:
@@ -626,7 +653,7 @@ class MailClient:
                 raise MailError(
                     f"Attachment {attachment!r} not found in "
                     f"message UID {uid}. "
-                    f"Available attachments: {names}."
+                    f"Available attachments: {names}.",
                 )
             payload = target.payload or b""
             result: dict[str, Any] = {
@@ -654,7 +681,7 @@ class MailClient:
                 result["saved_to"] = str(path)
             else:
                 result["content_base64"] = base64.b64encode(payload).decode(
-                    "ascii"
+                    "ascii",
                 )
             return result
 
@@ -680,7 +707,7 @@ class MailClient:
             if not from_address.isascii():
                 raise MailError(
                     "Non-ASCII from_address is not supported; use the ASCII "
-                    "email address instead of a display name."
+                    "email address instead of a display name.",
                 )
             criteria += ["FROM", f'"{_escape_imap_string(from_address)}"']
         if since:
@@ -695,7 +722,7 @@ class MailClient:
                 conn.literal = literal
                 typ, data = conn.uid("SEARCH", "CHARSET", "UTF-8", *criteria)
             else:
-                typ, data = conn.uid("SEARCH", None, *criteria)
+                typ, data = conn.uid("SEARCH", *criteria)
             _check(typ, data, "SEARCH")
             uids = (data[0] or b"").split()
             uids.reverse()
@@ -731,21 +758,26 @@ class MailClient:
             uidvalidity = read_uidvalidity(conn)
             if last_seen_uid is not None:
                 typ, data = conn.uid(
-                    "SEARCH", None, "UID", f"{last_seen_uid + 1}:*"
+                    "SEARCH",
+                    "UID",
+                    f"{last_seen_uid + 1}:*",
                 )
             elif since:
                 typ, data = conn.uid(
-                    "SEARCH", None, "SINCE", _imap_date(since)
+                    "SEARCH",
+                    "SINCE",
+                    _imap_date(since),
                 )
             else:
-                typ, data = conn.uid("SEARCH", None, "ALL")
+                typ, data = conn.uid("SEARCH", "ALL")
             _check(typ, data, "SEARCH")
-            uids = [u for u in (data[0] or b"").split()]
+            uids = list((data[0] or b"").split())
             if last_seen_uid is not None:
                 # Servers may echo the last existing UID for a n:* range.
                 uids = [u for u in uids if int(u) > last_seen_uid]
             uids.sort(key=int)
             if limit is not None and len(uids) > limit:
+                # pylint: disable-next=invalid-unary-operand-type
                 uids = uids[-limit:]  # keep the newest N, oldest-first order
             envelopes = []
             for uid in uids:
@@ -755,7 +787,10 @@ class MailClient:
             return envelopes, uidvalidity
 
     def scan_folder_stats(
-        self, folder: str, since: str, max_scan: int = 1000
+        self,
+        folder: str,
+        since: str,
+        max_scan: int = 1000,
     ) -> tuple[list[dict[str, Any]], bool]:
         """Scan a folder for stats: envelopes
         (with attachment flag) since a date.
@@ -765,7 +800,7 @@ class MailClient:
         """
         with self._imap() as conn:
             self._select(conn, folder, readonly=True)
-            typ, data = conn.uid("SEARCH", None, "SINCE", _imap_date(since))
+            typ, data = conn.uid("SEARCH", "SINCE", _imap_date(since))
             _check(typ, data, "SEARCH")
             uids = sorted((data[0] or b"").split(), key=int)
             truncated = len(uids) > max_scan
@@ -796,7 +831,7 @@ class MailClient:
         msg["Subject"] = subject
         msg["Date"] = email.utils.formatdate(localtime=True)
         msg["Message-ID"] = email.utils.make_msgid(
-            domain=self.config.email.rpartition("@")[2]
+            domain=self.config.email.rpartition("@")[2],
         )
         for key, value in (extra_headers or {}).items():
             msg[key] = value
@@ -826,7 +861,10 @@ class MailClient:
         }
 
     def reply_message(
-        self, folder: str, uid: str, body: str
+        self,
+        folder: str,
+        uid: str,
+        body: str,
     ) -> dict[str, Any]:
         with self._imap() as conn:
             self._select(conn, folder, readonly=True)
@@ -835,12 +873,12 @@ class MailClient:
         orig_id = (original.get("Message-ID") or "").strip()
         orig_refs = (original.get("References") or "").strip()
         reply_to = decode_mime_header(
-            original.get("Reply-To") or original.get("From")
+            original.get("Reply-To") or original.get("From"),
         )
         _, addr = email.utils.parseaddr(reply_to)
         if not addr:
             raise MailError(
-                "Cannot determine reply address from the original message."
+                "Cannot determine reply address from the original message.",
             )
         subject = decode_mime_header(original.get("Subject"))
         if not subject.lower().startswith("re:"):
@@ -860,7 +898,11 @@ class MailClient:
         }
 
     def forward_message(
-        self, folder: str, uid: str, to: list[str], body: str = ""
+        self,
+        folder: str,
+        uid: str,
+        to: list[str],
+        body: str = "",
     ) -> dict[str, Any]:
         if not to:
             raise MailError("At least one recipient is required in 'to'.")
@@ -872,7 +914,9 @@ class MailClient:
         if not subject.lower().startswith("fwd:"):
             subject = f"Fwd: {subject}"
         msg = self._build_message(
-            to, subject, body or f"Forwarded message: {subject}"
+            to,
+            subject,
+            body or f"Forwarded message: {subject}",
         )
         msg.add_attachment(
             raw,
@@ -898,12 +942,15 @@ class MailClient:
     }
 
     def mark_messages(
-        self, folder: str, uids: list[str], mark: str
+        self,
+        folder: str,
+        uids: list[str],
+        mark: str,
     ) -> dict[str, Any]:
         mark = mark.lower()
         if mark not in self._MARKS:
             raise MailError(
-                f"Unknown mark {mark!r}. Use one of: {sorted(self._MARKS)}."
+                f"Unknown mark {mark!r}. Use one of: {sorted(self._MARKS)}.",
             )
         op, flag = self._MARKS[mark]
         uid_set = ",".join(str(u) for u in uids)
@@ -927,7 +974,10 @@ class MailClient:
         return typ == "OK"
 
     def move_message(
-        self, folder: str, uid: str, target_folder: str
+        self,
+        folder: str,
+        uid: str,
+        target_folder: str,
     ) -> dict[str, Any]:
         target = encode_folder(target_folder)
         with self._imap() as conn:

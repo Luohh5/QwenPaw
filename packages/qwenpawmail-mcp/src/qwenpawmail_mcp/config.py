@@ -67,11 +67,11 @@ def load_config(env: dict[str, str] | None = None) -> Config:
             "password (Gmail), or your login password "
             "(阿里邮箱/企业邮). For custom domains not in the "
             "built-in provider list, also set "
-            "QWENPAWMAIL_IMAP_HOST and QWENPAWMAIL_SMTP_HOST."
+            "QWENPAWMAIL_IMAP_HOST and QWENPAWMAIL_SMTP_HOST.",
         )
     if "@" not in email:
         raise ConfigError(
-            f"QWENPAWMAIL_EMAIL={email!r} is not a valid email address."
+            f"QWENPAWMAIL_EMAIL={email!r} is not a valid email address.",
         )
 
     provider = provider_for_email(email)
@@ -85,17 +85,17 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         domain = email.rpartition("@")[2]
         raise ConfigError(
             f"Unknown email domain {domain!r}: no built-in provider entry. "
-            "Set QWENPAWMAIL_IMAP_HOST and QWENPAWMAIL_SMTP_HOST explicitly."
+            "Set QWENPAWMAIL_IMAP_HOST and QWENPAWMAIL_SMTP_HOST explicitly.",
         )
 
     try:
         imap_port = int(
             env.get("QWENPAWMAIL_IMAP_PORT")
-            or (provider.imap_port if provider else 993)
+            or (provider.imap_port if provider else 993),
         )
         smtp_port = int(
             env.get("QWENPAWMAIL_SMTP_PORT")
-            or (provider.smtp_port if provider else 465)
+            or (provider.smtp_port if provider else 465),
         )
     except ValueError as exc:
         raise ConfigError(f"Invalid port value in environment: {exc}") from exc

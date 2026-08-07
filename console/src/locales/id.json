@@ -1572,7 +1572,7 @@
     "invalidAddress": "Alamat email tidak valid. Gunakan format seperti user@domain.com atau *@domain.com",
     "whitelist": "Daftar Putih",
     "blacklist": "Daftar Hitam",
-    "approve": "Setujui",
+    "approveSender": "Setujui",
     "deny": "Blokir",
     "dismiss": "Abaikan",
     "batchApprove": "Setujui Massal",

@@ -474,7 +474,7 @@
     "invalidAddress": "Địa chỉ email không hợp lệ. Hãy dùng định dạng như user@domain.com hoặc *@domain.com",
     "whitelist": "Danh sách trắng",
     "blacklist": "Danh sách đen",
-    "approve": "Duyệt",
+    "approveSender": "Duyệt",
     "deny": "Chặn",
     "dismiss": "Bỏ qua",
     "batchApprove": "Duyệt hàng loạt",

@@ -430,7 +430,7 @@ export function MailAccessControlDrawer({
               onClick={() => handlePendingAction(record, "approve")}
               style={{ color: "#52c41a", padding: "0 4px" }}
             >
-              {t("inbox.approve")}
+              {t("inbox.approveSender")}
             </Button>
             <Button
               type="text"

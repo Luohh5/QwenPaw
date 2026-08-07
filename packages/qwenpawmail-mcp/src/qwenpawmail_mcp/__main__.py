@@ -12,7 +12,7 @@ import signal
 import sys
 
 
-def _graceful_shutdown(signum, frame):
+def _graceful_shutdown(_signum, _frame):
     sys.exit(0)
 
 

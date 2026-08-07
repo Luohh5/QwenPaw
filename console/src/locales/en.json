@@ -372,7 +372,7 @@
     "invalidAddress": "Invalid email address. Use a format like user@domain.com or *@domain.com",
     "whitelist": "Whitelist",
     "blacklist": "Blacklist",
-    "approve": "Approve",
+    "approveSender": "Approve",
     "deny": "Block",
     "dismiss": "Dismiss",
     "batchApprove": "Batch Approve",

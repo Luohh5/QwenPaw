@@ -372,7 +372,7 @@
     "invalidAddress": "邮箱地址格式不正确，请输入如 user@domain.com 或 *@domain.com 的地址",
     "whitelist": "白名单",
     "blacklist": "黑名单",
-    "approve": "通过",
+    "approveSender": "通过",
     "deny": "拉黑",
     "dismiss": "忽略",
     "batchApprove": "批量通过",

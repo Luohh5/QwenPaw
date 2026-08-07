@@ -38,6 +38,7 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 
 def coerce_str_list(value: Any) -> list[str]:
+    # pylint: disable=too-many-return-statements
     """Leniently normalize LLM-provided input into a list of strings.
 
     MCP clients (LLMs) frequently serialize array arguments as JSON strings
@@ -106,7 +107,7 @@ def _tool_errors(func: F) -> F:
                 raise ToolError(str(exc)) from exc
             except Exception as exc:  # noqa: BLE001 - tool boundary
                 raise ToolError(
-                    f"Unexpected error ({type(exc).__name__}): {exc}"
+                    f"Unexpected error ({type(exc).__name__}): {exc}",
                 ) from exc
 
         return async_wrapper  # type: ignore[return-value]
@@ -119,15 +120,17 @@ def _tool_errors(func: F) -> F:
             raise ToolError(str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - tool boundary
             raise ToolError(
-                f"Unexpected error ({type(exc).__name__}): {exc}"
+                f"Unexpected error ({type(exc).__name__}): {exc}",
             ) from exc
 
     return wrapper  # type: ignore[return-value]
 
 
 def create_server(
-    config: Config | None = None, client: MailClient | None = None
+    config: Config | None = None,
+    client: MailClient | None = None,
 ) -> FastMCP:
+    # pylint: disable=too-many-statements
     """Build the FastMCP server.
 
     ``client`` can be injected for testing.  When neither *client* nor valid
@@ -141,22 +144,23 @@ def create_server(
     _config_source: list[str] = ["env" if config is not None else "none"]
 
     def _get_client() -> MailClient:
-        if _client_holder[0] is None:
+        client_obj = _client_holder[0]
+        if client_obj is None:
             cfg = _config_holder[0]
             if cfg is None:
                 try:
                     cfg = load_config()
                 except ConfigError as exc:
                     raise ConfigError(
-                        str(exc)
-                        + "\n\n凭据未设置。请向用户询问邮箱地址（如 xxx@163.com 或 "
+                        str(exc) + "\n\n凭据未设置。请向用户询问邮箱地址（如 xxx@163.com 或 "
                         "xxx@qq.com）和 16 位授权码（不是登录密码），然后调用 "
-                        "set_credentials 工具完成设置。"
+                        "set_credentials 工具完成设置。",
                     ) from exc
                 _config_holder[0] = cfg
                 _config_source[0] = "env"
-            _client_holder[0] = MailClient(cfg)
-        return _client_holder[0]
+            client_obj = MailClient(cfg)
+            _client_holder[0] = client_obj
+        return client_obj
 
     _store_holder: list[ThreadStore | None] = [None]
 
@@ -177,7 +181,9 @@ def create_server(
                 _store_holder[0] = ThreadStore.for_email(state_dir, email_addr)
             else:
                 _store_holder[0] = ThreadStore(state_dir)
-        return _store_holder[0]
+        store = _store_holder[0]
+        assert store is not None
+        return store
 
     mcp = FastMCP(
         name="qwenpawmail-mcp",
@@ -209,7 +215,7 @@ def create_server(
         )
 
     @mcp.tool(
-        annotations=_ann("List Folders", read_only=True, idempotent=True)
+        annotations=_ann("List Folders", read_only=True, idempotent=True),
     )
     @_tool_errors
     async def list_folders() -> dict:
@@ -222,11 +228,13 @@ def create_server(
         return {"folders": folders}
 
     @mcp.tool(
-        annotations=_ann("List Messages", read_only=True, idempotent=True)
+        annotations=_ann("List Messages", read_only=True, idempotent=True),
     )
     @_tool_errors
     async def list_messages(
-        folder: str = "INBOX", limit: int | str = 20, offset: int | str = 0
+        folder: str = "INBOX",
+        limit: int | str = 20,
+        offset: int | str = 0,
     ) -> dict:
         """List messages in a folder, newest first,
         envelope metadata only (no bodies).
@@ -243,7 +251,7 @@ def create_server(
                 folder=folder,
                 limit=coerce_int(limit, 20),
                 offset=coerce_int(offset, 0, lo=0, hi=10000),
-            )
+            ),
         )
 
     @mcp.tool(annotations=_ann("Get Message", read_only=True, idempotent=True))
@@ -257,15 +265,18 @@ def create_server(
             uid: Message UID from list_messages or search_messages.
         """
         return await asyncio.to_thread(
-            lambda: _get_client().get_message(folder=folder, uid=uid)
+            lambda: _get_client().get_message(folder=folder, uid=uid),
         )
 
     @mcp.tool(
-        annotations=_ann("Get Attachment", read_only=True, idempotent=True)
+        annotations=_ann("Get Attachment", read_only=True, idempotent=True),
     )
     @_tool_errors
     async def get_attachment(
-        folder: str, uid: str, attachment: str, save_path: str | None = None
+        folder: str,
+        uid: str,
+        attachment: str,
+        save_path: str | None = None,
     ) -> dict:
         """Download one attachment by filename or zero-based index.
 
@@ -289,11 +300,11 @@ def create_server(
                 uid=uid,
                 attachment=attachment,
                 save_path=save_path,
-            )
+            ),
         )
 
     @mcp.tool(
-        annotations=_ann("Search Messages", read_only=True, idempotent=True)
+        annotations=_ann("Search Messages", read_only=True, idempotent=True),
     )
     @_tool_errors
     async def search_messages(
@@ -322,7 +333,7 @@ def create_server(
                 since=since,
                 before=before,
                 limit=coerce_int(limit, 20),
-            )
+            ),
         )
 
     @mcp.tool(annotations=_ann("Send Message"))
@@ -350,7 +361,7 @@ def create_server(
                 body=body,
                 cc=coerce_str_list(cc),
                 bcc=coerce_str_list(bcc),
-            )
+            ),
         )
 
     @mcp.tool(annotations=_ann("Reply to Message"))
@@ -366,14 +377,19 @@ def create_server(
         """
         return await asyncio.to_thread(
             lambda: _get_client().reply_message(
-                folder=folder, uid=uid, body=body
-            )
+                folder=folder,
+                uid=uid,
+                body=body,
+            ),
         )
 
     @mcp.tool(annotations=_ann("Forward Message"))
     @_tool_errors
     async def forward_message(
-        folder: str, uid: str, to: list[str] | str, body: str = ""
+        folder: str,
+        uid: str,
+        to: list[str] | str,
+        body: str = "",
     ) -> dict:
         """Forward a message (attached as message/rfc822)
         with a 'Fwd:' subject prefix.
@@ -386,14 +402,19 @@ def create_server(
         """
         return await asyncio.to_thread(
             lambda: _get_client().forward_message(
-                folder=folder, uid=uid, to=coerce_str_list(to), body=body
-            )
+                folder=folder,
+                uid=uid,
+                to=coerce_str_list(to),
+                body=body,
+            ),
         )
 
     @mcp.tool(annotations=_ann("Mark Messages", idempotent=True))
     @_tool_errors
     async def mark_messages(
-        folder: str, uids: list[str] | str, mark: str
+        folder: str,
+        uids: list[str] | str,
+        mark: str,
     ) -> dict:
         """Mark messages as read/unread or flag/unflag (star) them.
 
@@ -404,8 +425,10 @@ def create_server(
         """
         return await asyncio.to_thread(
             lambda: _get_client().mark_messages(
-                folder=folder, uids=coerce_str_list(uids), mark=mark
-            )
+                folder=folder,
+                uids=coerce_str_list(uids),
+                mark=mark,
+            ),
         )
 
     @mcp.tool(annotations=_ann("Move Message"))
@@ -420,8 +443,10 @@ def create_server(
         """
         return await asyncio.to_thread(
             lambda: _get_client().move_message(
-                folder=folder, uid=uid, target_folder=target_folder
-            )
+                folder=folder,
+                uid=uid,
+                target_folder=target_folder,
+            ),
         )
 
     @mcp.tool(annotations=_ann("Delete Message", destructive=True))
@@ -435,7 +460,7 @@ def create_server(
             uid: Message UID to delete.
         """
         return await asyncio.to_thread(
-            lambda: _get_client().delete_message(folder=folder, uid=uid)
+            lambda: _get_client().delete_message(folder=folder, uid=uid),
         )
 
     @mcp.tool(annotations=_ann("Create Folder", idempotent=True))
@@ -448,13 +473,15 @@ def create_server(
             name: New folder name.
         """
         return await asyncio.to_thread(
-            lambda: _get_client().create_folder(name=name)
+            lambda: _get_client().create_folder(name=name),
         )
 
     @mcp.tool(
         annotations=_ann(
-            "Check Authentication", read_only=True, idempotent=True
-        )
+            "Check Authentication",
+            read_only=True,
+            idempotent=True,
+        ),
     )
     @_tool_errors
     async def check_auth() -> dict:
@@ -464,7 +491,7 @@ def create_server(
         return await asyncio.to_thread(lambda: _get_client().check_auth())
 
     @mcp.tool(
-        annotations=_ann("Create Mailbox", read_only=True, idempotent=True)
+        annotations=_ann("Create Mailbox", read_only=True, idempotent=True),
     )
     @_tool_errors
     async def create_mailbox(domain: str, username: str | None = None) -> dict:
@@ -489,12 +516,12 @@ def create_server(
         if provider is None:
             raise RegistrationError(
                 f"不支持的域名：{domain}，支持的域名为 "
-                "163.com/126.com/yeah.net/qq.com/foxmail.com"
+                "163.com/126.com/yeah.net/qq.com/foxmail.com",
             )
         if provider.provider_type not in REGISTRATION_SUPPORTED_TYPES:
             raise RegistrationError(
                 f"域名 {domain} 已支持收发邮件，但不支持通过 create_mailbox 进行注册引导。"
-                "请自行在服务商网页完成注册并开启 IMAP/SMTP 服务后，使用 set_credentials 设置凭据。"
+                "请自行在服务商网页完成注册并开启 IMAP/SMTP 服务后，使用 set_credentials 设置凭据。",
             )
         if username is None:
             username = generate_random_username(domain)
@@ -585,14 +612,13 @@ def create_server(
         _store_holder[0] = None
         return {
             "cleared": True,
-            "note": "凭据已清除。下次调用邮件工具时将回退到环境变量（如已设置），"
-            "或需重新调用 set_credentials。",
+            "note": "凭据已清除。下次调用邮件工具时将回退到环境变量（如已设置），" "或需重新调用 set_credentials。",
         }
 
     # -- thread management & statistics tools ---------------------------------
 
     @mcp.tool(
-        annotations=_ann("List Threads", read_only=True, idempotent=True)
+        annotations=_ann("List Threads", read_only=True, idempotent=True),
     )
     @_tool_errors
     async def list_threads(
@@ -650,7 +676,7 @@ def create_server(
         return await asyncio.to_thread(_sync)
 
     @mcp.tool(
-        annotations=_ann("Search Threads", read_only=True, idempotent=True)
+        annotations=_ann("Search Threads", read_only=True, idempotent=True),
     )
     @_tool_errors
     async def search_threads(keyword: str, limit: int | str = 20) -> dict:
@@ -676,7 +702,9 @@ def create_server(
             hits: dict[str, int] = {}
             for folder in folders:
                 result = client.search_messages(
-                    folder=folder, keyword=keyword, limit=100
+                    folder=folder,
+                    keyword=keyword,
+                    limit=100,
                 )
                 for msg in result["messages"]:
                     tid = store.thread_for_uid(folder, msg["uid"])
@@ -783,7 +811,7 @@ def create_server(
                 raise ToolError(
                     "No trash folder found (looked for Trash/已删除/Deleted "
                     "Messages/Deleted Items/回收站). Use list_folders to inspect "
-                    "folder names."
+                    "folder names.",
                 )
             moved, errors = [], []
             for m in messages:
@@ -791,7 +819,9 @@ def create_server(
                     continue
                 try:
                     client.move_message(
-                        folder=m["folder"], uid=m["uid"], target_folder=trash
+                        folder=m["folder"],
+                        uid=m["uid"],
+                        target_folder=trash,
                     )
                     moved.append({"folder": m["folder"], "uid": m["uid"]})
                 except MailError as exc:
@@ -800,7 +830,7 @@ def create_server(
                             "folder": m["folder"],
                             "uid": m["uid"],
                             "error": str(exc),
-                        }
+                        },
                     )
             store.remove_thread(thread_id)
             result = {
@@ -817,7 +847,7 @@ def create_server(
         return await asyncio.to_thread(_sync)
 
     @mcp.tool(
-        annotations=_ann("Get Mailbox Stats", read_only=True, idempotent=True)
+        annotations=_ann("Get Mailbox Stats", read_only=True, idempotent=True),
     )
     @_tool_errors
     async def get_mailbox_stats(days: int | str = 30) -> dict:
@@ -843,7 +873,8 @@ def create_server(
             since = (date.today() - timedelta(days=_days)).isoformat()
             special = detect_special_folders(client.list_folders())
             inbox_envs, truncated = client.scan_folder_stats(
-                "INBOX", since=since
+                "INBOX",
+                since=since,
             )
             sent_envs: list[dict] = []
             for folder in special["sent"]:

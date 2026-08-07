@@ -27,7 +27,7 @@ MAIL_ACCESS_CONTROL_FILE = "mail_access_control.json"
 # Regex for validating domain part after *@
 _DOMAIN_RE = re.compile(
     r"^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?"
-    r"(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)+$"
+    r"(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)+$",
 )
 
 # Simple sanity check for plain (non-wildcard) email addresses.
@@ -247,6 +247,7 @@ class MailAccessControlStore:
     # ── Query ───────────────────────────────────────────────────────────
 
     def check_sender(self, agent_id: str, sender_email: str) -> str:
+        # pylint: disable=too-many-return-statements
         """Check sender status.
 
         Returns "allow", "deny", "pending", or "unknown".
@@ -552,12 +553,12 @@ class MailAccessControlStore:
         if not domain or domain == "*":
             raise ValueError(
                 f"Invalid wildcard address {address!r}: "
-                "domain must be a valid domain name, '*@*' is not allowed."
+                "domain must be a valid domain name, '*@*' is not allowed.",
             )
         if not _DOMAIN_RE.match(domain):
             raise ValueError(
                 f"Invalid wildcard address {address!r}: "
-                f"{domain!r} is not a valid domain format."
+                f"{domain!r} is not a valid domain format.",
             )
 
 
@@ -575,7 +576,7 @@ def validate_acl_address(address: str) -> None:
     if not _EMAIL_RE.match(address):
         raise ValueError(
             f"Invalid email address {address!r}: expected "
-            "'user@domain' or a '*@domain' wildcard."
+            "'user@domain' or a '*@domain' wildcard.",
         )
 
 

@@ -3234,7 +3234,7 @@
     "invalidAddress": "メールアドレスの形式が正しくありません。user@domain.com または *@domain.com の形式で入力してください",
     "whitelist": "ホワイトリスト",
     "blacklist": "ブラックリスト",
-    "approve": "承認",
+    "approveSender": "承認",
     "deny": "ブロック",
     "dismiss": "無視",
     "batchApprove": "一括承認",

@@ -25,7 +25,8 @@ router = APIRouter(prefix="/mail-access-control", tags=["mail-access-control"])
 
 
 def _agent_mail_acl_enabled(agent_id: str) -> bool:
-    """Return True if the agent has mailbox management with access control enabled."""
+    """Return True if the agent has mailbox management
+    with access control enabled."""
     from ...config.config import load_agent_config
 
     try:
@@ -49,11 +50,14 @@ def _iter_mail_agent_stores() -> Iterator[Tuple[str, Any]]:
             continue
         if not _agent_mail_acl_enabled(agent_id):
             continue
-        yield agent_id, get_mail_access_control_store(Path(agent_ref.workspace_dir))
+        yield agent_id, get_mail_access_control_store(
+            Path(agent_ref.workspace_dir),
+        )
 
 
 def _get_store_for_agent(agent_id: str):
-    """Get the MailAccessControlStore for a specific agent, or None if unknown."""
+    """Get the MailAccessControlStore for a specific agent,
+    or None if unknown."""
     from ...config.utils import load_config
     from ..mail.mail_access_control import get_mail_access_control_store
 
@@ -207,7 +211,7 @@ async def _trigger_wake_after_approve(
             sender=pending_info.get("display_name") or entry.address,
             subject=pending_info.get("subject", ""),
             date=pending_info.get("date", ""),
-        )
+        ),
     )
 
 

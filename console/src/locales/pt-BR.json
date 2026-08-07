@@ -3289,7 +3289,7 @@
     "invalidAddress": "Endereco de e-mail invalido. Use um formato como user@domain.com ou *@domain.com",
     "whitelist": "Lista Branca",
     "blacklist": "Lista Negra",
-    "approve": "Aprovar",
+    "approveSender": "Aprovar",
     "deny": "Bloquear",
     "dismiss": "Ignorar",
     "batchApprove": "Aprovar em Lote",

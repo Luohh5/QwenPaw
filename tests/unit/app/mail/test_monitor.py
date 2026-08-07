@@ -371,12 +371,17 @@ async def test_pipeline_always_emits_new_email_event(tmp_path, recorder):
     event = recorder.events[0]
     assert event["source_type"] == "mail"
     assert event["payload"]["uid"] == 5
-    assert workspace.queries == []
+    assert not workspace.queries
 
 
 async def test_pipeline_mark_read_action(tmp_path, recorder):
-    rules = [AgentMailPushRule(field="from", contains="alice",
-                               action="mark_read")]
+    rules = [
+        AgentMailPushRule(
+            field="from",
+            contains="alice",
+            action="mark_read",
+        ),
+    ]
     service, _ = _service(tmp_path, mode="rules_only", rules=rules)
     conn = FakeImapConn()
     await _run_pipeline(service, conn)
@@ -384,9 +389,18 @@ async def test_pipeline_mark_read_action(tmp_path, recorder):
     assert recorder.types() == ["new_email"]
 
 
-async def test_pipeline_move_action(tmp_path, recorder):
-    rules = [AgentMailPushRule(field="subject", contains="hello",
-                               action="move", param="Archive")]
+async def test_pipeline_move_action(
+    tmp_path,
+    recorder,  # pylint: disable=unused-argument
+):
+    rules = [
+        AgentMailPushRule(
+            field="subject",
+            contains="hello",
+            action="move",
+            param="Archive",
+        ),
+    ]
     service, _ = _service(tmp_path, mode="rules_only", rules=rules)
     conn = FakeImapConn()
     await _run_pipeline(service, conn)
@@ -396,9 +410,18 @@ async def test_pipeline_move_action(tmp_path, recorder):
     assert ("EXPUNGE",) in conn.calls
 
 
-async def test_pipeline_move_creates_chinese_folder(tmp_path, recorder):
-    rules = [AgentMailPushRule(field="subject", contains="hello",
-                               action="move", param="归档")]
+async def test_pipeline_move_creates_chinese_folder(
+    tmp_path,
+    recorder,  # pylint: disable=unused-argument
+):
+    rules = [
+        AgentMailPushRule(
+            field="subject",
+            contains="hello",
+            action="move",
+            param="归档",
+        ),
+    ]
     service, _ = _service(tmp_path, mode="rules_only", rules=rules)
     conn = FakeImapConn()
     await _run_pipeline(service, conn)
@@ -407,9 +430,18 @@ async def test_pipeline_move_creates_chinese_folder(tmp_path, recorder):
     assert ("COPY", "5", encode_folder("归档")) in conn.calls
 
 
-async def test_pipeline_move_ignores_already_exists(tmp_path, recorder):
-    rules = [AgentMailPushRule(field="subject", contains="hello",
-                               action="move", param="Archive")]
+async def test_pipeline_move_ignores_already_exists(
+    tmp_path,
+    recorder,  # pylint: disable=unused-argument
+):
+    rules = [
+        AgentMailPushRule(
+            field="subject",
+            contains="hello",
+            action="move",
+            param="Archive",
+        ),
+    ]
     service, _ = _service(tmp_path, mode="rules_only", rules=rules)
     conn = FakeImapConn()
     conn.create_typ = "NO"
@@ -424,8 +456,14 @@ async def test_pipeline_move_skipped_on_create_failure(
     tmp_path,
     recorder,
 ):
-    rules = [AgentMailPushRule(field="subject", contains="hello",
-                               action="move", param="Archive")]
+    rules = [
+        AgentMailPushRule(
+            field="subject",
+            contains="hello",
+            action="move",
+            param="Archive",
+        ),
+    ]
     service, _ = _service(tmp_path, mode="rules_only", rules=rules)
     conn = FakeImapConn()
     conn.create_typ = "NO"
@@ -441,8 +479,13 @@ async def test_pipeline_notify_action_appends_extra_event(
     tmp_path,
     recorder,
 ):
-    rules = [AgentMailPushRule(field="keyword", contains="hello",
-                               action="notify")]
+    rules = [
+        AgentMailPushRule(
+            field="keyword",
+            contains="hello",
+            action="notify",
+        ),
+    ]
     service, _ = _service(tmp_path, mode="rules_only", rules=rules)
     await _run_pipeline(service, FakeImapConn())
     # One rule-notify event + one unconditional new_email event.
@@ -457,8 +500,13 @@ async def test_rules_then_agent_wakes_when_no_rule_matches(
     tmp_path,
     recorder,
 ):
-    rules = [AgentMailPushRule(field="from", contains="nobody",
-                               action="mark_read")]
+    rules = [
+        AgentMailPushRule(
+            field="from",
+            contains="nobody",
+            action="mark_read",
+        ),
+    ]
     service, workspace = _service(
         tmp_path,
         mode="rules_then_agent",
@@ -474,15 +522,20 @@ async def test_rules_then_agent_no_wake_when_rule_handles(
     tmp_path,
     recorder,
 ):
-    rules = [AgentMailPushRule(field="from", contains="alice",
-                               action="mark_read")]
+    rules = [
+        AgentMailPushRule(
+            field="from",
+            contains="alice",
+            action="mark_read",
+        ),
+    ]
     service, workspace = _service(
         tmp_path,
         mode="rules_then_agent",
         rules=rules,
     )
     await _run_pipeline(service, FakeImapConn())
-    assert workspace.queries == []
+    assert not workspace.queries
     assert recorder.types() == ["new_email"]
 
 
@@ -490,9 +543,14 @@ async def test_rules_then_agent_wake_agent_action_param(
     tmp_path,
     recorder,
 ):
-    rules = [AgentMailPushRule(field="from", contains="alice",
-                               action="wake_agent",
-                               param="转发给我微信")]
+    rules = [
+        AgentMailPushRule(
+            field="from",
+            contains="alice",
+            action="wake_agent",
+            param="转发给我微信",
+        ),
+    ]
     service, workspace = _service(
         tmp_path,
         mode="rules_then_agent",
@@ -507,8 +565,13 @@ async def test_rules_then_agent_wake_agent_action_param(
 
 
 async def test_agent_all_always_wakes(tmp_path, recorder):
-    rules = [AgentMailPushRule(field="from", contains="alice",
-                               action="mark_read")]
+    rules = [
+        AgentMailPushRule(
+            field="from",
+            contains="alice",
+            action="mark_read",
+        ),
+    ]
     service, workspace = _service(tmp_path, mode="agent_all", rules=rules)
     await _run_pipeline(service, FakeImapConn())
     assert len(workspace.queries) == 1
@@ -593,11 +656,14 @@ def test_reconcile_resets_baseline_on_uidvalidity_change(tmp_path):
     assert service._stored_uidvalidity == 5678
 
 
-@pytest.mark.parametrize("stored,current", [
-    (None, 5678),
-    (1234, None),
-    (None, None),
-])
+@pytest.mark.parametrize(
+    "stored,current",
+    [
+        (None, 5678),
+        (1234, None),
+        (None, None),
+    ],
+)
 def test_reconcile_resets_baseline_when_not_comparable(
     tmp_path,
     stored,
@@ -804,10 +870,7 @@ def test_extract_body_preview_decode_failure_empty():
 
 
 def test_extract_body_preview_truncates_2000():
-    raw = (
-        b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
-        + b"x" * 3000
-    )
+    raw = b"Content-Type: text/plain; charset=utf-8\r\n\r\n" + b"x" * 3000
     preview = extract_body_preview(_message(raw))
     assert len(preview) == 2000
     assert preview == "x" * 2000

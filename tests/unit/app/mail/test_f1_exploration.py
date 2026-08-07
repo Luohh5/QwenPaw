@@ -119,7 +119,7 @@ class _FakeGovernor:
         self.policy = _FakePolicy(execution_level)
         self.seen_levels: list[str] = []
 
-    def assert_policy(self, tc_spec: ToolCallSpec) -> GovernanceDecision:
+    def assert_policy(self, _tc_spec: ToolCallSpec) -> GovernanceDecision:
         self.seen_levels.append(self.policy.execution_level)
         if self.policy.execution_level == "strict":
             return GovernanceDecision(

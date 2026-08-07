@@ -236,7 +236,7 @@ def _prepare_off_mode_sandbox(tool: Any, governor: Any) -> None:
         )
 
 
-# pylint: disable=too-many-return-statements
+# pylint: disable=too-many-return-statements,too-many-branches
 async def _policy_tool_check_permissions(
     self: Any,
     input_data: dict[str, Any] | None = None,

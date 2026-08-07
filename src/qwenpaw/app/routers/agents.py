@@ -8,10 +8,10 @@ import json
 import logging
 import re
 import shutil
-
-import yaml
 from pathlib import Path
 from typing import Any, Literal
+
+import yaml
 from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi import Path as PathParam
 from pydantic import BaseModel, Field, field_validator
@@ -830,7 +830,7 @@ async def update_agent(
     update_data = agent_config.model_dump(exclude_unset=True)
     existing_data = existing_config.model_dump()
     existing_data.update(
-        {k: v for k, v in update_data.items() if k != "id"}
+        {k: v for k, v in update_data.items() if k != "id"},
     )
     existing_config = AgentProfileConfig.model_validate(existing_data)
 
@@ -1206,12 +1206,18 @@ _ENTERPRISE_MAIL_PROVIDERS: dict[str, dict[str, object]] = {
 # Domains whose authorization codes (or app-specific passwords) are
 # exactly 16 characters.  Other allowed domains use login passwords
 # (or client-specific passwords) of variable length.
-_AUTH_CODE_16_CHAR_DOMAINS = frozenset({
-    "163.com", "126.com", "yeah.net",
-    "qq.com", "foxmail.com",
-    "sina.com", "sina.cn",
-    "gmail.com",
-})
+_AUTH_CODE_16_CHAR_DOMAINS = frozenset(
+    {
+        "163.com",
+        "126.com",
+        "yeah.net",
+        "qq.com",
+        "foxmail.com",
+        "sina.com",
+        "sina.cn",
+        "gmail.com",
+    },
+)
 
 # Microsoft disabled basic auth (and app passwords) for personal
 # IMAP/SMTP in September 2024; only OAuth2 works now, which this
@@ -1227,8 +1233,7 @@ _MICROSOFT_MAIL_DOMAINS = {
 # Basic sanity check for custom enterprise-mail domains coming from
 # free-form frontend input: labels of alnum/hyphen joined by dots.
 _MAIL_DOMAIN_RE = re.compile(
-    r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)"
-    r"(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$",
+    r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$",
 )
 
 _QWENPAWMAIL_DRIVER_CARD_TEMPLATE = """name: qwenpawmail
@@ -1253,6 +1258,7 @@ policy:
 
 
 def _validate_mail_config(mail: AgentMailConfig) -> None:
+    # pylint: disable=too-many-branches
     """Validate the mailbox management configuration.
 
     Raises HTTPException(400) when validation fails.

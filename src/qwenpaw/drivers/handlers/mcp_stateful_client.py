@@ -154,6 +154,7 @@ class _MCPClientMixin:
     # ------------------------------------------------------------------
 
     async def _run_lifecycle(self) -> None:  # noqa: C901
+        # pylint: disable=too-many-statements
         """Run MCP client lifecycle in a dedicated task.
 
         This ensures ``__aenter__`` and ``__aexit__`` are called in the

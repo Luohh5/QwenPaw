@@ -3249,7 +3249,7 @@
     "invalidAddress": "Неверный адрес электронной почты. Используйте формат user@domain.com или *@domain.com",
     "whitelist": "Белый список",
     "blacklist": "Чёрный список",
-    "approve": "Одобрить",
+    "approveSender": "Одобрить",
     "deny": "Заблокировать",
     "dismiss": "Игнорировать",
     "batchApprove": "Массовое одобрение",

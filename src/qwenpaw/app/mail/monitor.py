@@ -88,7 +88,7 @@ imaplib.Commands.setdefault("ID", ("AUTH", "SELECTED"))
 
 # Same parameter style as the qwenpawmail-mcp mail client.
 _ID_COMMAND_ARGS = (
-    '("name" "qwenpawmail-mcp" "version" "0.1.0"' ' "vendor" "qwenpaw")'
+    '("name" "qwenpawmail-mcp" "version" "0.1.0" "vendor" "qwenpaw")'
 )
 
 # Re-issue DONE + IDLE proactively (RFC 2177 requires clients to
@@ -479,6 +479,7 @@ def build_wake_trace(
     *,
     max_entries: int = _TRACE_MAX_ENTRIES,
 ) -> list[dict[str, Any]]:
+    # pylint: disable=too-many-branches
     """Structured execution trace from a session message delta.
 
     Walks the delta in order and emits, per contract, entries shaped
@@ -594,7 +595,7 @@ async def _collect_wake_delta(
         )
     except Exception:  # pylint: disable=broad-except
         logger.debug(
-            "mail monitor could not read session delta " "(agent %s)",
+            "mail monitor could not read session delta (agent %s)",
             agent_id,
             exc_info=True,
         )
@@ -762,7 +763,7 @@ class MailMonitorService:
         from .mail_access_control import get_mail_access_control_store
 
         self._mail_acl_store = get_mail_access_control_store(
-            Path(workspace.workspace_dir)
+            Path(workspace.workspace_dir),
         )
 
     # -- lifecycle -----------------------------------------------------
@@ -942,6 +943,10 @@ class MailMonitorService:
 
     def _connect(self) -> imaplib.IMAP4_SSL:
         """LOGIN (+ RFC 2971 ID for NetEase) then SELECT INBOX."""
+        if self.host is None:
+            raise imaplib.IMAP4.error(
+                f"no IMAP host for domain {self.domain!r}",
+            )
         conn = imaplib.IMAP4_SSL(self.host, 993)
         try:
             conn.login(self.email_address, self.auth_code)
@@ -1069,7 +1074,7 @@ class MailMonitorService:
         return got_exists
 
     def _search_uids(self, conn: imaplib.IMAP4_SSL) -> list[int]:
-        typ, data = conn.uid("SEARCH", None, "ALL")
+        typ, data = conn.uid("SEARCH", "ALL")
         if typ != "OK":
             detail = data[0] if data else b""
             raise imaplib.IMAP4.error(
@@ -1138,7 +1143,7 @@ class MailMonitorService:
             return extract_body_preview(message)
         except Exception:  # pylint: disable=broad-except
             logger.debug(
-                "mail monitor body preview fetch failed " "(agent %s, uid %s)",
+                "mail monitor body preview fetch failed (agent %s, uid %s)",
                 self.agent_id,
                 uid,
                 exc_info=True,
@@ -1186,6 +1191,7 @@ class MailMonitorService:
         uid: int,
         envelope: dict[str, str],
     ) -> None:
+        # pylint: disable=too-many-branches
         sender = envelope.get("sender", "")
         subject = envelope.get("subject", "")
         date = envelope.get("date", "")
@@ -1201,7 +1207,8 @@ class MailMonitorService:
             sender_email = (sender_email or sender).lower().strip()
             if sender_email:
                 acl_result = self._mail_acl_store.check_sender(
-                    self.agent_id, sender_email
+                    self.agent_id,
+                    sender_email,
                 )
                 if acl_result == "deny":
                     # Silently mark as read and skip
@@ -1305,7 +1312,7 @@ class MailMonitorService:
                 raise
             except Exception:  # pylint: disable=broad-except
                 logger.exception(
-                    "mail monitor rule action %s failed " "(agent %s, uid %s)",
+                    "mail monitor rule action %s failed (agent %s, uid %s)",
                     rule.action,
                     self.agent_id,
                     uid,
@@ -1359,7 +1366,7 @@ class MailMonitorService:
             raise
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning(
-                "mail monitor could not create folder %r " "(agent %s): %s",
+                "mail monitor could not create folder %r (agent %s): %s",
                 folder,
                 self.agent_id,
                 exc,
@@ -1415,12 +1422,24 @@ class MailMonitorService:
                 self.agent_id,
             )
 
-    def _submit_event(self, **kwargs: Any) -> None:
+    def _submit_event(
+        self,
+        *,
+        event_type: str,
+        status: str,
+        title: str,
+        body: str,
+        **kwargs: Any,
+    ) -> None:
         self._submit(
             append_inbox_event(
                 agent_id=self.agent_id,
                 source_type="mail",
                 source_id=_MAIL_SOURCE_ID,
+                event_type=event_type,
+                status=status,
+                title=title,
+                body=body,
                 **kwargs,
             ),
             timeout=_EVENT_SUBMIT_TIMEOUT_SECONDS,

@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
     async_execution=True,
     tool_type="internal",
     policy_name="ActivateF1ExplorationMode",
-    ui_description="Activate F1 exploration mode for step-by-step mail approval",
+    ui_description=(
+        "Activate F1 exploration mode for step-by-step mail approval"
+    ),
     ui_icon="🔍",
 )
 async def activate_f1_exploration_mode() -> ToolChunk:

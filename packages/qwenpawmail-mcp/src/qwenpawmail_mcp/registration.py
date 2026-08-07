@@ -62,17 +62,17 @@ def validate_username(username: str, domain: str) -> tuple[bool, list[str]]:
     else:
         return False, [
             f"不支持的域名：{domain}，支持的域名为 "
-            "163.com/126.com/yeah.net/qq.com/foxmail.com"
+            "163.com/126.com/yeah.net/qq.com/foxmail.com",
         ]
 
     length = len(username)
     if length < min_len:
         errors.append(
-            f"用户名长度不能少于 {min_len} 个字符（当前 {length} 个）"
+            f"用户名长度不能少于 {min_len} 个字符（当前 {length} 个）",
         )
     if length > max_len:
         errors.append(
-            f"用户名长度不能超过 {max_len} 个字符（当前 {length} 个）"
+            f"用户名长度不能超过 {max_len} 个字符（当前 {length} 个）",
         )
     if username and username[0] not in string.ascii_letters:
         errors.append("用户名必须以字母开头")
@@ -80,7 +80,7 @@ def validate_username(username: str, domain: str) -> tuple[bool, list[str]]:
     bad_chars = sorted({ch for ch in username if ch not in allowed})
     if bad_chars:
         errors.append(
-            f"用户名包含非法字符：{''.join(bad_chars)}，仅允许{char_desc}"
+            f"用户名包含非法字符：{''.join(bad_chars)}，仅允许{char_desc}",
         )
 
     return (len(errors) == 0), errors
@@ -101,13 +101,15 @@ def generate_random_username(domain: str) -> str:
     valid, errs = validate_username(name, domain)
     if not valid:
         raise RegistrationError(
-            f"Generated username {name!r} invalid for {domain}: {errs}"
+            f"Generated username {name!r} invalid for {domain}: {errs}",
         )
     return name
 
 
 def generate_alternatives(
-    username: str, count: int = 3, domain: str = ""
+    username: str,
+    count: int = 3,
+    domain: str = "",
 ) -> list[str]:
     """Generate alternative usernames by appending numeric suffixes.
 
@@ -134,7 +136,9 @@ def generate_alternatives(
 
 
 def build_registration_guide(
-    username: str, domain: str, provider: Provider
+    username: str,
+    domain: str,
+    provider: Provider,
 ) -> dict:
     """Build a structured registration guide for the given provider.
 
@@ -154,8 +158,7 @@ def build_registration_guide(
             "5. 勾选同意服务条款，完成注册",
             f"6. 登录 https://mail.{domain}/ → 设置 → "
             f"POP3/SMTP/IMAP → 开启 IMAP/SMTP 服务",
-            "7. 按提示发送短信完成验证，复制生成的 16 位"
-            "授权码（只显示一次，请立即保存）",
+            "7. 按提示发送短信完成验证，复制生成的 16 位授权码（只显示一次，请立即保存）",
             f"8. 设置环境变量："
             f"QWENPAWMAIL_EMAIL={email} 和 "
             f"QWENPAWMAIL_AUTH_CODE=<你的授权码>",

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Unit tests for the mail access control API router."""
+# pylint: disable=redefined-outer-name,unused-argument
 from __future__ import annotations
 
 import asyncio
@@ -46,8 +47,7 @@ def store(tmp_path):
 def _entries(*addresses, agent_id: str = AGENT) -> MailACLActionBody:
     return MailACLActionBody(
         entries=[
-            MailACLEntry(agent_id=agent_id, address=addr)
-            for addr in addresses
+            MailACLEntry(agent_id=agent_id, address=addr) for addr in addresses
         ],
     )
 

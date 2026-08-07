@@ -61,7 +61,8 @@ _MSGID_RE = re.compile(r"<[^<>\s]+>")
 
 
 def resolve_state_dir(
-    email_address: str | None = None, env: dict[str, str] | None = None
+    email_address: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> Path:
     """Resolve the state directory.
 
@@ -229,7 +230,9 @@ class ThreadStore:
     @staticmethod
     def _atomic_write(path: Path, obj: Any) -> None:
         fd, tmp = tempfile.mkstemp(
-            dir=str(path.parent), prefix=path.name, suffix=".tmp"
+            dir=str(path.parent),
+            prefix=path.name,
+            suffix=".tmp",
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -249,7 +252,10 @@ class ThreadStore:
     # -- thread building -----------------------------------------------------
 
     def add_message(
-        self, envelope: dict[str, Any], folder: str, system_label: str
+        self,
+        envelope: dict[str, Any],
+        folder: str,
+        system_label: str,
     ) -> str:
         """Index one envelope into a thread; returns the thread_id."""
         mids = parse_message_ids(envelope.get("message_id"))
@@ -302,7 +308,7 @@ class ThreadStore:
                     "seen": bool(envelope.get("seen")),
                     "flagged": bool(envelope.get("flagged")),
                     "size": envelope.get("size"),
-                }
+                },
             )
         for known in ([mid] if mid else []) + chain:
             index[known] = tid
@@ -312,7 +318,7 @@ class ThreadStore:
         """Fallback grouping: normalized subject + participant intersection."""
         norm = normalize_subject(envelope.get("subject"))
         participants = set(
-            extract_addresses(envelope.get("from"), envelope.get("to"))
+            extract_addresses(envelope.get("from"), envelope.get("to")),
         )
         for tid, thread in self._data["threads"].items():
             for m in thread["messages"]:
@@ -327,7 +333,9 @@ class ThreadStore:
     # -- incremental sync ------------------------------------------------
 
     def sync(
-        self, client: Any, folders: list[str] | None = None
+        self,
+        client: Any,
+        folders: list[str] | None = None,
     ) -> dict[str, Any]:
         """Incrementally sync new envelopes from INBOX + detected sent folders.
 
@@ -356,7 +364,8 @@ class ThreadStore:
             uidvalidity = None
             if last_seen:
                 envelopes, uidvalidity = client.fetch_envelopes_after(
-                    folder, last_seen_uid=last_seen
+                    folder,
+                    last_seen_uid=last_seen,
                 )
                 if (
                     stored_validity is not None
@@ -373,7 +382,9 @@ class ThreadStore:
                     date.today() - timedelta(days=FIRST_SYNC_DAYS)
                 ).isoformat()
                 envelopes, uidvalidity = client.fetch_envelopes_after(
-                    folder, since=since, limit=FIRST_SYNC_LIMIT
+                    folder,
+                    since=since,
+                    limit=FIRST_SYNC_LIMIT,
                 )
             max_uid = last_seen or 0
             for env in envelopes:
@@ -420,15 +431,17 @@ class ThreadStore:
     # -- queries -------------------------------------------------------------
 
     def _thread_sorted_messages(
-        self, thread: dict[str, Any]
+        self,
+        thread: dict[str, Any],
     ) -> list[dict[str, Any]]:
         return sorted(
-            thread["messages"], key=lambda m: m.get("timestamp") or 0.0
+            thread["messages"],
+            key=lambda m: m.get("timestamp") or 0.0,
         )
 
     def system_labels_for(self, thread: dict[str, Any]) -> list[str]:
         return sorted(
-            {m.get("system_label", "inbox") for m in thread["messages"]}
+            {m.get("system_label", "inbox") for m in thread["messages"]},
         )
 
     def custom_labels_for(self, thread_id: str) -> list[str]:
@@ -443,11 +456,11 @@ class ThreadStore:
                 a
                 for m in msgs
                 for a in extract_addresses(m.get("from"), m.get("to"))
-            }
+            },
         )
         labels = sorted(
             set(self.system_labels_for(thread))
-            | set(self.custom_labels_for(thread_id))
+            | set(self.custom_labels_for(thread_id)),
         )
         return {
             "thread_id": thread_id,
@@ -501,7 +514,8 @@ class ThreadStore:
                 continue
             summaries.append(summ)
         summaries.sort(
-            key=lambda s: s["latest_timestamp"] or 0.0, reverse=True
+            key=lambda s: s["latest_timestamp"] or 0.0,
+            reverse=True,
         )
         total = len(summaries)
         page = summaries[offset : offset + limit]
@@ -514,7 +528,7 @@ class ThreadStore:
         if thread is None:
             raise MailError(
                 f"Thread {thread_id!r} not found. Use list_threads to see "
-                "available thread ids."
+                "available thread ids.",
             )
         msgs = self._thread_sorted_messages(thread)
         summ = self.thread_summary(thread_id)
@@ -551,7 +565,7 @@ class ThreadStore:
         if thread is None:
             raise MailError(
                 f"Thread {thread_id!r} not found. Use list_threads to see "
-                "available thread ids."
+                "available thread ids.",
             )
         return self._thread_sorted_messages(thread)
 
@@ -566,14 +580,14 @@ class ThreadStore:
         if thread_id not in self._data["threads"]:
             raise MailError(
                 f"Thread {thread_id!r} not found. Use list_threads to see "
-                "available thread ids."
+                "available thread ids.",
             )
         for label in list(add or []) + list(remove or []):
             if label.strip().lower() in SYSTEM_LABELS:
                 raise MailError(
                     f"Label {label!r} is a reserved system label "
                     "(inbox/sent/spam/trash) derived from message folders; "
-                    "it cannot be added or removed."
+                    "it cannot be added or removed.",
                 )
         current = list(self._labels.get(thread_id, []))
         for label in add or []:
@@ -628,7 +642,8 @@ class ThreadStore:
 
 
 def _top_counter(
-    entries: list[tuple[str, str]], top_n: int = 10
+    entries: list[tuple[str, str]],
+    top_n: int = 10,
 ) -> list[dict[str, Any]]:
     counts: dict[str, int] = {}
     names: dict[str, str] = {}

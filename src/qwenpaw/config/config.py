@@ -1705,9 +1705,9 @@ class AgentMailPushRule(BaseModel):
 
     # "subject" is a legacy alias of "content" (subject + body).
     field: Literal["from", "subject", "content", "keyword"] = "from"
-    contains: str = ""  
+    contains: str = ""
     action: Literal["mark_read", "move", "notify", "wake_agent"] = "notify"
-    param: str = ""  
+    param: str = ""
 
 
 class AgentMailPushConfig(BaseModel):

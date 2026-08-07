@@ -165,6 +165,7 @@ def test_pending_deduplicates(tmp_path):
 
 def test_pending_max_limit_evicts_oldest(tmp_path):
     store = _store(tmp_path)
+    # pylint: disable-next=protected-access
     store._MAX_PENDING = 3  # keep the test fast
     for i in range(4):
         store.add_pending(AGENT, f"user{i}@example.com")

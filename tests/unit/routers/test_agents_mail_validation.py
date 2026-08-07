@@ -55,8 +55,11 @@ def test_valid_push_config_passes():
                 action="move",
                 param="Archive",
             ),
-            AgentMailPushRule(field="from", contains="mom",
-                              action="wake_agent"),
+            AgentMailPushRule(
+                field="from",
+                contains="mom",
+                action="wake_agent",
+            ),
         ],
     )
     _validate_mail_config(_valid_mail(push))
@@ -66,8 +69,12 @@ def test_move_rule_without_param_rejected():
     push = AgentMailPushConfig(
         mode="rules_only",
         rules=[
-            AgentMailPushRule(field="subject", contains="x",
-                              action="move", param="  "),
+            AgentMailPushRule(
+                field="subject",
+                contains="x",
+                action="move",
+                param="  ",
+            ),
         ],
     )
     with pytest.raises(HTTPException) as exc_info:
@@ -121,8 +128,14 @@ def test_enterprise_provider_allows_custom_domain():
 
 
 def test_enterprise_provider_rejects_malformed_domain():
-    for bad_domain in ("", "nodot", "bad domain.com", "foo..com",
-                       "-bad.com", "evil.com;rm"):
+    for bad_domain in (
+        "",
+        "nodot",
+        "bad domain.com",
+        "foo..com",
+        "-bad.com",
+        "evil.com;rm",
+    ):
         mail = _valid_mail()
         mail.credential.provider = "aliyun_qiye"
         mail.credential.domain = bad_domain
