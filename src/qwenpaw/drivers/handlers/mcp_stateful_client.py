@@ -399,7 +399,7 @@ class _MCPClientMixin:
         """
         if self._circuit_open:
             raise RuntimeError(
-                f"MCP mail service unavailable (circuit open after "
+                f"MCP client '{self.name}' unavailable (circuit open after "
                 f"{self._consecutive_failures} consecutive failures)",
             )
 
@@ -664,7 +664,7 @@ class _MCPClientMixin:
         """
         if self._circuit_open:
             raise RuntimeError(
-                f"MCP mail service unavailable (circuit open after "
+                f"MCP client '{self.name}' unavailable (circuit open after "
                 f"{self._consecutive_failures} consecutive failures)",
             )
 

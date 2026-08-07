@@ -174,8 +174,12 @@ export default function AgentsPage() {
           : null;
 
       const {
-        active_model_provider,
-        active_model_model,
+        // Destructured only to keep them out of `rest` (already read
+        // above via `values.*`); underscore + disable per project style.
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        active_model_provider: _active_model_provider,
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        active_model_model: _active_model_model,
         mail_mode,
         mail_credential,
         mail_push,
@@ -299,12 +303,14 @@ export default function AgentsPage() {
 
       setModalVisible(false);
       await loadAgents();
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.error("Failed to save agent:", error);
       if (editingAgent) {
         invalidateSkillCache({ agentId: editingAgent.id });
       }
-      message.error(error.message || t("agent.saveFailed"));
+      message.error(
+        error instanceof Error ? error.message : t("agent.saveFailed"),
+      );
     }
   };
 
