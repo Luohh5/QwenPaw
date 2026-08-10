@@ -278,6 +278,32 @@ The engine also runs **`ShellEvasionGuardian`** on `execute_shell_command`. It t
 
 ---
 
+## Mailbox Security
+
+A mailbox authorization code grants full IMAP/SMTP send and receive access. Mail
+configuration is stored in the workspace's `agent.json`. For an existing
+mailbox, its address and authentication credential are also written to
+`drivers/mcp/qwenpawmail.yaml`; a pending dedicated account's password and phone
+number remain only in `agent.json`. These values do not live only under
+`$QWENPAW_SECRET_DIR`. Restrict workspace access, do not commit these files, and
+do not share backups containing that agent workspace. Revoke and rotate the
+credential with the provider if exposure is suspected.
+
+Treat every message body as untrusted external input. Automatic processing must
+not follow instructions embedded in email and is barred from permanent deletion
+by default. Outbound mail is limited to the original sender or a known contact in
+`CONTACTS.md`; money, commitments, and sensitive relationships require a draft
+and confirmation. When a message cannot be classified, the exploration path
+raises every subsequent tool call to strict approval.
+
+When automation is enabled, also consider **Mail access control**. Unknown
+senders remain pending until allowed; denied senders' later messages are marked
+read and skipped. Among the tools, `delete_message` is permanent, while
+`delete_thread` moves messages to Trash; verify the target before either action.
+See [Mailbox Management and Automation](./mailbox#Mail-Access-Control).
+
+---
+
 ## File Guard
 
 The **File Guard** blocks agent tools from accessing sensitive files and directories. It runs automatically on **every tool call**, scanning all file-path-related parameters to enforce a deny list of protected paths.

@@ -157,6 +157,21 @@ Tavily is an AI-optimized web search service that enables agents to perform real
 }
 ```
 
+#### Built-in Mail MCP
+
+When mail is configured for a native QwenPaw agent, the system creates and
+enables a `qwenpawmail` MCP driver card in that agent's workspace. It starts the
+`qwenpawmail-mcp` package over stdio and injects the state and workspace
+directories; a usable existing-mailbox credential is injected when available.
+The client exposes 22 tools for reading, sending, attachments, organization,
+threads, and statistics.
+
+You do not create this client manually on the general MCP page, but a source
+installation must include the mail package. Load the built-in `mailbox` Skill as
+well so the agent has the account setup, contact, automation, and safety workflow.
+See [Mailbox Management and Automation](./mailbox) for installation, providers,
+tools, and security details.
+
 ---
 
 ### Advanced Options

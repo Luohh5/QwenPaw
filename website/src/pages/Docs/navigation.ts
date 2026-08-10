@@ -22,6 +22,7 @@ export const DOC_GROUPS: DocGroup[] = [
     titleKey: "docs.groupControl",
     children: [
       { slug: "console", titleKey: "docs.console" },
+      { slug: "mailbox", titleKey: "docs.mailbox" },
       { slug: "tui", titleKey: "docs.tui" },
       { slug: "channels", titleKey: "docs.channels" },
       { slug: "commands", titleKey: "docs.commands" },

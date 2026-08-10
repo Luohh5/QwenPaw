@@ -31,6 +31,11 @@ $QWENPAW_WORKING_DIR/                      # 默认 ~/.qwenpaw
 │   │   ├── PROFILE.md                   # 人设文件
 │   │   ├── BOOTSTRAP.md                 # 首次引导文件（完成后自动删除）
 │   │   ├── MEMORY.md                    # 长期记忆
+│   │   ├── MAIL_TRIAGE.md               # 邮件自动处理规则（配置邮箱后生成）
+│   │   ├── CONTACTS.md                  # 邮件联系人（配置邮箱后生成）
+│   │   ├── mail_access_control.json     # 邮件白/黑名单与待处理发件人
+│   │   ├── mail_state/                  # 邮件监控、线程和标签本地状态
+│   │   ├── drivers/mcp/qwenpawmail.yaml # 自动生成的邮箱 MCP 驱动卡
 │   │   ├── skills/                      # 本地技能目录
 │   │   ├── skill.json                   # 技能启用状态与配置
 │   │   ├── memory/                      # 每日记忆文件
@@ -203,6 +208,23 @@ $QWENPAW_SECRET_DIR/                       # 默认 ~/.qwenpaw.secret
     "timeoutSeconds": 300,
     "activeHours": null
   },
+  "mail": {
+    "is_new_account": false,
+    "credential": {
+      "name": "alex",
+      "domain": "163.com",
+      "auth_code": "your-authorization-code",
+      "password": "",
+      "phone_number": "",
+      "provider": ""
+    },
+    "push": {
+      "mode": "agent_all",
+      "rules": [],
+      "poll_interval_seconds": 120,
+      "access_control_enabled": true
+    }
+  },
   "running": {
     "max_iters": 50,
     "llm_retry_enabled": true,
@@ -286,6 +308,38 @@ MCP（模型上下文协议）允许智能体连接外部服务（如 Filesystem
 > **完整配置说明：** MCP 客户端的完整字段说明、配置格式、示例和使用方式请参见 [MCP](./mcp)。
 
 管理方式：控制台（智能体 → MCP）或直接编辑 `agent.json`。
+
+---
+
+#### `mail` — 邮箱配置
+
+邮箱配置仅适用于 QwenPaw 原生后端。通常应通过控制台 **设置 → 智能体管理 → 邮箱管理**
+填写，以便同时创建 qwenpawmail MCP 驱动卡和工作区文件。
+
+| 字段                          | 类型           | 默认值      | 说明                                                                                  |
+| ----------------------------- | -------------- | ----------- | ------------------------------------------------------------------------------------- |
+| `is_new_account`              | bool           | `false`     | `false` 连接已有邮箱；`true` 表示待注册的智能体专用邮箱                               |
+| `credential.name`             | string         | `""`        | `@` 前的邮箱账户名                                                                    |
+| `credential.domain`           | string         | `"163.com"` | 邮箱域名                                                                              |
+| `credential.auth_code`        | string         | `""`        | 已有邮箱凭据；可能是授权码、应用专用密码或登录/安全密码                               |
+| `credential.password`         | string         | `""`        | 注册专用邮箱时准备的账户密码                                                          |
+| `credential.phone_number`     | string         | `""`        | 注册专用邮箱时绑定的手机号                                                            |
+| `credential.provider`         | string         | `""`        | 自定义企业域名服务商：`tencent_exmail`、`aliyun_qiye` 或 `netease_qiye`；已知域名留空 |
+| `push`                        | object \| null | `null`      | 新邮件监控配置；省略或设为 `null` 时不启动监控                                        |
+| `push.mode`                   | string         | `"off"`     | `off` 或 `agent_all`；`rules_only`、`rules_then_agent` 为旧配置兼容模式               |
+| `push.rules`                  | array          | `[]`        | 旧配置的确定性新邮件规则                                                              |
+| `push.poll_interval_seconds`  | int            | `120`       | IMAP IDLE 失败后的轮询间隔，运行时最小 10 秒                                          |
+| `push.access_control_enabled` | bool           | `false`     | 自动处理前是否检查发件人白名单、黑名单和待处理状态                                    |
+
+`push.rules` 每项包含 `field`（`from` / `content` / `keyword`，`subject` 为旧别名）、
+`contains`、`action`（`mark_read` / `move` / `notify` / `wake_agent`）和 `param`。
+当前控制台重点提供 **关闭** 与 **每封唤醒** 两种模式；旧规则会继续读取，但不建议
+把它们作为新配置的主要入口。
+
+已有邮箱的地址和认证凭据还会写入工作区的 `drivers/mcp/qwenpawmail.yaml`；待注册邮箱的
+密码和手机号只保存在 `agent.json`。这些都是本地明文配置，不要提交到版本库或分享包含
+它们的备份。完整设置、自动处理和服务商说明见
+[邮箱管理与自动化](./mailbox)。
 
 ---
 
@@ -652,3 +706,4 @@ QwenPaw 需要 LLM 提供商才能运行。配置存储在 `$QWENPAW_SECRET_DIR/
 - [记忆](./memory) — 记忆系统详解
 - [技能](./skills) — 技能系统详解
 - [MCP](./mcp) — MCP 客户端配置
+- [邮箱管理与自动化](./mailbox) — 邮箱配置、工具、自动处理和访问控制
