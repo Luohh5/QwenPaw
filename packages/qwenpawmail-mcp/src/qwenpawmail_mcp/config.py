@@ -26,10 +26,10 @@ domain):
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .errors import ConfigError
-from .providers import provider_for_email
+from .providers import ProviderCapabilities, provider_for_email
 
 CLIENT_NAME = "qwenpawmail-mcp"
 CLIENT_VERSION = "0.1.0"
@@ -45,6 +45,9 @@ class Config:
     smtp_host: str
     smtp_port: int
     requires_id_command: bool
+    capabilities: ProviderCapabilities = field(
+        default_factory=ProviderCapabilities,
+    )
 
 
 def load_config(env: dict[str, str] | None = None) -> Config:
@@ -108,4 +111,7 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         smtp_host=smtp_host,
         smtp_port=smtp_port,
         requires_id_command=provider.requires_id_command if provider else True,
+        capabilities=(
+            provider.capabilities if provider else ProviderCapabilities()
+        ),
     )

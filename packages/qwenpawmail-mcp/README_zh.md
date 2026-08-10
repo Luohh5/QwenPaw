@@ -130,7 +130,7 @@ export QWENPAWMAIL_SMTP_HOST="smtp.mycompany.com"
 
 | 工具 | 说明 |
 | --- | --- |
-| `delete_message` | 删除邮件（`\Deleted` + RFC 4315 UID EXPUNGE，仅删指定 UID） |
+| `delete_message` | 永久删除邮件（`\Deleted` + RFC 4315 UID EXPUNGE，仅删指定 UID），不会留在“已删除”文件夹中 |
 | `delete_thread` | 将线程内所有消息移入已删除文件夹并从索引中移除线程 |
 
 域名不在内置服务商表中时，需在 `env` 中额外添加 `QWENPAWMAIL_IMAP_HOST` 与 `QWENPAWMAIL_SMTP_HOST`。

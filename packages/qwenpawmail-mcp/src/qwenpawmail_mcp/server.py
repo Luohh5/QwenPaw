@@ -18,7 +18,12 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from .config import Config, load_config
-from .errors import ConfigError, MailError, RegistrationError
+from .errors import (
+    CapabilityError,
+    ConfigError,
+    MailError,
+    RegistrationError,
+)
 from .mail_client import MailClient
 from .providers import PROVIDERS, REGISTRATION_SUPPORTED_TYPES
 from .registration import (
@@ -701,11 +706,27 @@ def create_server(
             ]  # spam/trash excluded
             hits: dict[str, int] = {}
             for folder in folders:
-                result = client.search_messages(
-                    folder=folder,
-                    keyword=keyword,
-                    limit=100,
-                )
+                try:
+                    result = client.search_messages(
+                        folder=folder,
+                        keyword=keyword,
+                        limit=100,
+                    )
+                except CapabilityError:
+                    # Server lacks IMAP full-text search: degrade to
+                    # local thread-subject matching over the synced index.
+                    local = store.list_threads(
+                        subject=keyword,
+                        limit=_limit,
+                    )
+                    return {
+                        "keyword": keyword,
+                        "threads": local["threads"],
+                        "total": local["total"],
+                        "note": (
+                            "服务商不支持 IMAP 全文搜索，已降级为本地线程" "主题匹配（仅覆盖已同步邮件头）"
+                        ),
+                    }
                 for msg in result["messages"]:
                     tid = store.thread_for_uid(folder, msg["uid"])
                     if tid is None and msg.get("message_id"):
@@ -832,6 +853,14 @@ def create_server(
                             "error": str(exc),
                         },
                     )
+            if messages and not moved and errors:
+                raise ToolError(
+                    "delete_thread 全部失败："
+                    f"{len(errors)} 封邮件均未能移入回收站。"
+                    f"首个错误: {errors[0]['error']} "
+                    "建议改用 delete_message 逐封删除，"
+                    "或在网页版邮箱手动操作。",
+                )
             store.remove_thread(thread_id)
             result = {
                 "thread_id": thread_id,

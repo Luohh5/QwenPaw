@@ -41,3 +41,21 @@ class PermanentSendError(MailError):
 class RegistrationError(MailError):
     """Registration guidance errors, e.g. unsupported
     domain or invalid username format."""
+
+
+class CapabilityError(MailError):
+    """Operation not supported by the provider's IMAP server."""
+
+    def __init__(
+        self,
+        operation: str,
+        provider_name: str,
+        alternatives: list[str],
+    ):
+        self.operation = operation
+        self.provider_name = provider_name
+        self.alternatives = alternatives
+        alt_text = "; ".join(alternatives)
+        super().__init__(
+            f"{provider_name} 的 IMAP 服务器不支持 {operation}。" f"替代方案: {alt_text}",
+        )

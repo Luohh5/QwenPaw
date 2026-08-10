@@ -3,7 +3,37 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class ProviderCapabilities:
+    """IMAP capabilities verified per provider (default: full support)."""
+
+    move: bool = True
+    copy: bool = True
+    uid_expunge: bool = True
+    search_text: bool = True
+    search_from: bool = True
+    append: bool = True
+
+
+#: Full IMAP support (QQ/foxmail/exmail/Gmail): safe default.
+_FULL_CAPS = ProviderCapabilities()
+
+#: NetEase (163/126/yeah.net/qiye.163.com) and Sina: no UID MOVE/COPY,
+#: no UIDPLUS (UID EXPUNGE); UID SEARCH only supports SINCE/BEFORE.
+_RESTRICTED_CAPS = ProviderCapabilities(
+    move=False,
+    copy=False,
+    uid_expunge=False,
+    search_text=False,
+    search_from=False,
+)
+
+#: Aliyun (personal & enterprise): no MOVE, but UID COPY + UIDPLUS work;
+#: SEARCH TEXT is unsupported.
+_ALIYUN_CAPS = ProviderCapabilities(move=False, search_text=False)
 
 
 @dataclass(frozen=True)
@@ -20,6 +50,7 @@ class Provider:
     provider_type: str = (
         ""  # "netease" / "tencent" / "sina" / "aliyun" / "gmail" etc.
     )
+    capabilities: ProviderCapabilities = field(default=_FULL_CAPS)
 
 
 _QQ_PROVIDER = Provider(
@@ -47,6 +78,7 @@ PROVIDERS: dict[str, Provider] = {
         requires_id_command=True,
         registration_url="https://zc.reg.163.com/regInitialized",
         provider_type="netease",
+        capabilities=_RESTRICTED_CAPS,
     ),
     "126.com": Provider(
         name="NetEase 126",
@@ -57,6 +89,7 @@ PROVIDERS: dict[str, Provider] = {
         requires_id_command=True,
         registration_url="https://zc.reg.163.com/regInitialized",
         provider_type="netease",
+        capabilities=_RESTRICTED_CAPS,
     ),
     "yeah.net": Provider(
         name="NetEase yeah.net",
@@ -67,6 +100,7 @@ PROVIDERS: dict[str, Provider] = {
         requires_id_command=True,
         registration_url="https://zc.reg.163.com/regInitialized",
         provider_type="netease",
+        capabilities=_RESTRICTED_CAPS,
     ),
     # QQ Mail sends the ID command too: QQ does not require it, but it is
     # harmless and avoids protocol-compatibility quirks. foxmail.com is an
@@ -83,6 +117,7 @@ PROVIDERS: dict[str, Provider] = {
         requires_id_command=False,
         registration_url="https://mail.sina.com.cn/",
         provider_type="sina",
+        capabilities=_RESTRICTED_CAPS,
     ),
     # sina.cn uses different servers from sina.com (auth code)
     "sina.cn": Provider(
@@ -94,6 +129,7 @@ PROVIDERS: dict[str, Provider] = {
         requires_id_command=False,
         registration_url="https://mail.sina.com.cn/",
         provider_type="sina",
+        capabilities=_RESTRICTED_CAPS,
     ),
     # --- Aliyun Mail (login password, no auth code mechanism) ---
     "aliyun.com": Provider(
@@ -105,6 +141,7 @@ PROVIDERS: dict[str, Provider] = {
         requires_id_command=False,
         registration_url="https://mail.aliyun.com/",
         provider_type="aliyun",
+        capabilities=_ALIYUN_CAPS,
     ),
     # --- Gmail (16-char app-specific password;
     # requires 2-Step Verification) ---
@@ -139,6 +176,7 @@ PROVIDERS: dict[str, Provider] = {
         requires_id_command=False,
         registration_url="https://qiye.aliyun.com/",
         provider_type="aliyun_qiye",
+        capabilities=_ALIYUN_CAPS,
     ),
     # --- NetEase Enterprise Mail ---
     # requires_id_command=True: not officially required,
@@ -154,6 +192,7 @@ PROVIDERS: dict[str, Provider] = {
         requires_id_command=True,
         registration_url="https://qiye.163.com/",
         provider_type="netease_qiye",
+        capabilities=_RESTRICTED_CAPS,
     ),
 }
 
