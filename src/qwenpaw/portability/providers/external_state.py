@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """Read-only discovery for external memory and plugin source state.
 
-Installed plugin caches are intentionally used only as metadata.  A plugin is
-installable only when its Marketplace resolves to an independent source that
-already contains a valid QwenPaw ``plugin.json`` entry point.
+Installed plugin caches are intentionally used only as metadata. Marketplace
+plugins remain installable only from an independent source. Qoder's explicit
+``plugins/custom`` store is treated differently: it is user-authored source,
+not a downloaded cache, and a narrowly compatible Skill-only plugin can be
+translated by the importer before going through QwenPaw's native installer.
 """
 
 from __future__ import annotations
@@ -13,11 +15,14 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from ..qoder_plugin_adapter import discover_qoder_custom_skill_adapter
 from ..models import (
+    SourceMCPServer,
     SourceMarketplace,
     SourceMemoryFile,
     SourceMemoryProject,
     SourcePlugin,
+    SourceSkill,
 )
 
 _CODEX_BUILTIN_MARKETPLACES = {
@@ -103,15 +108,14 @@ def discover_codex_memory(codex_home: Path) -> list[SourceMemoryProject]:
             if not files:
                 continue
             scope = _read_json(project_root / "scope.json")
-            cwd = (
-                str(scope.get("cwd") or "") if isinstance(scope, dict) else ""
-            )
+            cwd = ""
+            if isinstance(scope, dict):
+                cwd = str(scope.get("cwd") or "")
+            source_id = f"codex:extension:{extension.name}:"
+            source_id += project_root.name
             projects.append(
                 SourceMemoryProject(
-                    source_id=(
-                        f"codex:extension:{extension.name}:"
-                        f"{project_root.name}"
-                    ),
+                    source_id=source_id,
                     project_key=f"{extension.name}-{project_root.name}",
                     cwd=cwd,
                     files=files,
@@ -202,6 +206,257 @@ def discover_project_memory(agent_home: Path) -> list[SourceMemoryProject]:
     return projects
 
 
+def _qoder_project_cwds(qoder_home: Path) -> dict[str, str]:
+    """Map Qoder's encoded project keys back to transcript CWDs."""
+    projects_root = qoder_home.expanduser() / "projects"
+    mapping: dict[str, str] = {}
+    if not projects_root.is_dir() or projects_root.is_symlink():
+        return mapping
+    try:
+        project_roots = sorted(projects_root.iterdir())
+    except OSError:
+        return mapping
+    for project_root in project_roots:
+        if project_root.is_symlink() or not project_root.is_dir():
+            continue
+        cwd = _project_cwd_from_transcripts(project_root)
+        if not cwd:
+            continue
+        encoded = cwd.lstrip("/\\").replace("/", "-").replace("\\", "-")
+        mapping[encoded] = cwd
+    return mapping
+
+
+def _match_qoder_path(base: Path, encoded: str, depth: int = 0) -> str:
+    """Resolve an encoded Qoder project key without guessing hyphen splits."""
+    if not encoded or depth > 32 or not base.is_dir():
+        return str(base) if not encoded else ""
+    try:
+        children = [
+            child
+            for child in base.iterdir()
+            if child.is_dir() and not child.is_symlink()
+        ]
+    except OSError:
+        return ""
+    children.sort(key=lambda item: len(item.name), reverse=True)
+    for child in children:
+        if encoded == child.name:
+            return str(child.resolve())
+        prefix = f"{child.name}-"
+        if encoded.startswith(prefix):
+            remainder = encoded.removeprefix(prefix)
+            resolved = _match_qoder_path(
+                child,
+                remainder,
+                depth + 1,
+            )
+            if resolved:
+                return resolved
+    return ""
+
+
+def _qoder_memory_cwd(project_key: str, cwd_map: dict[str, str]) -> str:
+    cwd = cwd_map.get(project_key, "")
+    if cwd:
+        return cwd
+    home = Path.home().resolve()
+    home_key = str(home).lstrip("/\\").replace("/", "-").replace("\\", "-")
+    if project_key == home_key:
+        return str(home)
+    prefix = f"{home_key}-"
+    if not project_key.startswith(prefix):
+        return ""
+    remainder = project_key.removeprefix(prefix)
+    return _match_qoder_path(home, remainder)
+
+
+def discover_qoder_memory(qoder_home: Path) -> list[SourceMemoryProject]:
+    """Discover current ``memories/<account>/{global,projects}`` stores."""
+    qoder_home = qoder_home.expanduser()
+    memories_root = qoder_home / "memories"
+    if not memories_root.is_dir() or memories_root.is_symlink():
+        return discover_project_memory(qoder_home)
+    cwd_map = _qoder_project_cwds(qoder_home)
+    projects: list[SourceMemoryProject] = []
+    try:
+        accounts = sorted(memories_root.iterdir())
+    except OSError:
+        return projects
+    for account in accounts:
+        if account.is_symlink() or not account.is_dir():
+            continue
+        global_files = _markdown_files(account / "global")
+        if global_files:
+            projects.append(
+                SourceMemoryProject(
+                    source_id=f"qoder-memory:{account.name}:global",
+                    project_key=f"{account.name}-global",
+                    files=global_files,
+                    metadata={
+                        "layout": "qoder_memory_v2",
+                        "scope": "global",
+                        "account": account.name,
+                    },
+                ),
+            )
+        scoped_root = account / "projects"
+        if not scoped_root.is_dir() or scoped_root.is_symlink():
+            continue
+        try:
+            scoped_projects = sorted(scoped_root.iterdir())
+        except OSError:
+            continue
+        for source in scoped_projects:
+            if source.is_symlink() or not source.is_dir():
+                continue
+            files = _markdown_files(source)
+            if not files:
+                continue
+            source_id = f"qoder-memory:{account.name}:project:"
+            source_id += source.name
+            projects.append(
+                SourceMemoryProject(
+                    source_id=source_id,
+                    project_key=f"{account.name}-{source.name}",
+                    cwd=_qoder_memory_cwd(source.name, cwd_map),
+                    files=files,
+                    metadata={
+                        "layout": "qoder_memory_v2",
+                        "scope": "project",
+                        "account": account.name,
+                        "source_project_key": source.name,
+                    },
+                ),
+            )
+    # Older Qoder/Claude-style project-local memory remains a valid fallback.
+    projects.extend(discover_project_memory(qoder_home))
+    return projects
+
+
+def _skill_directories(root: Path) -> list[Path]:
+    if not root.is_dir() or root.is_symlink():
+        return []
+    if (root / "SKILL.md").is_file():
+        return [root]
+    try:
+        children = sorted(root.iterdir())
+    except OSError:
+        return []
+    skill_dirs = []
+    for child in children:
+        if child.is_dir() and not child.is_symlink():
+            if (child / "SKILL.md").is_file():
+                skill_dirs.append(child)
+    return skill_dirs
+
+
+def discover_qoder_skills(qoder_home: Path) -> list[SourceSkill]:
+    """Discover standalone global/project Skills, excluding plugin caches."""
+    qoder_home = qoder_home.expanduser()
+    roots: list[tuple[Path, str]] = [(qoder_home / "skills", "user")]
+    for cwd in sorted(set(_qoder_project_cwds(qoder_home).values())):
+        roots.append((Path(cwd) / ".qoder" / "skills", "project"))
+    skills: list[SourceSkill] = []
+    seen: set[Path] = set()
+    for root, scope in roots:
+        for directory in _skill_directories(root):
+            try:
+                resolved = directory.resolve(strict=True)
+            except OSError:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            skills.append(
+                SourceSkill(
+                    source_id=f"qoder-skill:{scope}:{resolved}",
+                    name=directory.name,
+                    directory=resolved,
+                    scope=scope,
+                ),
+            )
+    return skills
+
+
+def _credential_placeholders(values: Any) -> dict[str, str]:
+    if not isinstance(values, dict):
+        return {}
+    placeholders: dict[str, str] = {}
+    for key in values:
+        name = str(key)
+        safe_name = "".join(
+            character if character.isalnum() else "_" for character in name
+        ).upper()
+        placeholders[name] = f"${{{safe_name or 'VALUE'}}}"
+    return placeholders
+
+
+# pylint: disable-next=too-many-locals
+def discover_qoder_mcp(
+    qoder_home: Path,
+) -> tuple[list[SourceMCPServer], list[str], int]:
+    """Translate Qoder's standard user-level ``mcp.json`` safely."""
+    qoder_home = qoder_home.expanduser()
+    config = _read_json(qoder_home / "mcp.json")
+    records = config.get("mcpServers") if isinstance(config, dict) else None
+    if not isinstance(records, dict):
+        return [], [], 0
+    servers: list[SourceMCPServer] = []
+    warnings: list[str] = []
+    for name, raw in sorted(records.items()):
+        if not isinstance(raw, dict):
+            warnings.append(
+                f"Qoder MCP {name!r} has an invalid configuration.",
+            )
+            continue
+        command = str(raw.get("command") or "")
+        url = str(raw.get("url") or "")
+        raw_type = str(raw.get("type") or raw.get("transport") or "")
+        if command:
+            transport = "stdio"
+        elif raw_type in {"sse"}:
+            transport = "sse"
+        elif url:
+            transport = "streamable_http"
+        else:
+            warning = f"Qoder MCP {name!r} has neither a command nor URL"
+            warnings.append(
+                f"{warning} and was skipped.",
+            )
+            continue
+        args = raw.get("args")
+        if not isinstance(args, list):
+            args = []
+        env = _credential_placeholders(raw.get("env"))
+        headers = _credential_placeholders(raw.get("headers"))
+        credentials_removed = bool(env or headers)
+        runtime_bound = ".qoder/plugins/cache" in command.replace("\\", "/")
+        servers.append(
+            SourceMCPServer(
+                source_id=f"qoder:mcp:{name}",
+                name=str(name),
+                transport=transport,
+                enabled=bool(
+                    raw.get("enabled", not raw.get("disabled", False)),
+                ),
+                command=command,
+                args=[str(item) for item in args],
+                env=env,
+                cwd=str(raw.get("cwd") or ""),
+                url=url,
+                headers=headers,
+                auth_status="reauthorize" if credentials_removed else "",
+                metadata={
+                    "source_manifest": "qoder_mcp_json",
+                    "credentials_removed": credentials_removed,
+                    "source_runtime_bound": runtime_bound,
+                },
+            ),
+        )
+    return servers, warnings, len(records)
+
+
 def _marketplace_source(config: dict[str, Any], base: Path) -> tuple[str, str]:
     source_type = str(config.get("source_type") or config.get("type") or "")
     source = str(
@@ -232,9 +487,9 @@ def _qwen_plugin_source(  # pylint: disable=too-many-return-statements
     manifest_path = _marketplace_manifest(root)
     if manifest_path is None:
         direct = root / plugin_name
-        return (
-            str(direct.resolve()) if (direct / "plugin.json").is_file() else ""
-        )
+        if (direct / "plugin.json").is_file():
+            return str(direct.resolve())
+        return ""
     manifest = _read_json(manifest_path)
     entries = manifest.get("plugins") if isinstance(manifest, dict) else None
     if not isinstance(entries, list):
@@ -262,9 +517,9 @@ def _qwen_plugin_source(  # pylint: disable=too-many-return-statements
             source_path = source_path.resolve()
         except OSError:
             return ""
-        return (
-            str(source_path) if (source_path / "plugin.json").is_file() else ""
-        )
+        if (source_path / "plugin.json").is_file():
+            return str(source_path)
+        return ""
     return ""
 
 
@@ -279,11 +534,9 @@ def _cached_plugin_version(
         return ""
     manifests.sort(key=lambda path: path.stat().st_mtime, reverse=True)
     manifest = _read_json(manifests[0])
-    return (
-        str(manifest.get("version") or "")
-        if isinstance(manifest, dict)
-        else ""
-    )
+    if isinstance(manifest, dict):
+        return str(manifest.get("version") or "")
+    return ""
 
 
 # pylint: disable-next=too-many-locals,too-many-branches
@@ -378,12 +631,19 @@ def discover_codex_plugins(
     return marketplaces, plugins
 
 
+# pylint: disable-next=too-many-locals,too-many-branches,too-many-statements
 def discover_qoder_plugins(
     qoder_home: Path,
 ) -> tuple[list[SourceMarketplace], list[SourcePlugin]]:
     """Read Qoder's installed-plugin ledger without copying its cache."""
     qoder_home = qoder_home.expanduser()
     ledger = _read_json(qoder_home / "plugins" / "installed_plugins_v2.json")
+    settings = _read_json(qoder_home / "settings.json")
+    enabled_settings = (
+        settings.get("enabledPlugins") if isinstance(settings, dict) else None
+    )
+    if not isinstance(enabled_settings, dict):
+        enabled_settings = {}
     records = ledger.get("plugins") if isinstance(ledger, dict) else None
     if not isinstance(records, dict):
         return [], []
@@ -392,18 +652,54 @@ def discover_qoder_plugins(
     for plugin_id, installs in sorted(records.items()):
         if "@" not in str(plugin_id) or not isinstance(installs, list):
             continue
-        enabled_records = [
-            item
-            for item in installs
-            if isinstance(item, dict) and bool(item.get("enabled", True))
-        ]
+        valid_records = [item for item in installs if isinstance(item, dict)]
+        setting = enabled_settings.get(str(plugin_id))
+        enabled_records = valid_records
+        if setting is False:
+            enabled_records = []
+        elif setting is not True:
+            enabled_records = []
+            for item in valid_records:
+                if bool(item.get("enabled", True)):
+                    enabled_records.append(item)
         if not enabled_records:
             continue
         name, marketplace = str(plugin_id).rsplit("@", 1)
         marketplace_names.add(marketplace)
         version = str(enabled_records[0].get("version") or "")
-        marketplace_root = (
-            qoder_home / "plugins" / "marketplaces" / marketplace
+        raw_install_path = str(enabled_records[0].get("installPath") or "")
+        install_path = None
+        if raw_install_path:
+            install_path = Path(raw_install_path).expanduser()
+        manifest = (
+            _read_json(install_path / ".qoder-plugin" / "plugin.json")
+            if install_path is not None
+            else None
+        )
+        if not isinstance(manifest, dict) and install_path is not None:
+            manifest = _read_json(install_path / "plugin.json")
+        declared_skills = None
+        if isinstance(manifest, dict):
+            declared_skills = manifest.get("skills")
+        plugin_skill_count = 0
+        if isinstance(declared_skills, str) and declared_skills:
+            plugin_skill_count = 1
+        elif isinstance(declared_skills, list):
+            plugin_skill_count = len(declared_skills)
+        if install_path is not None:
+            plugin_skill_count = max(
+                plugin_skill_count,
+                len(_skill_directories(install_path / "skills")),
+            )
+        if not version and isinstance(manifest, dict):
+            version = str(manifest.get("version") or "")
+        marketplace_root = qoder_home / "plugins" / "marketplaces"
+        marketplace_root = marketplace_root / marketplace
+        custom_adapter = discover_qoder_custom_skill_adapter(
+            qoder_home,
+            install_path,
+            manifest,
+            enabled_records[0],
         )
         plugins.append(
             SourcePlugin(
@@ -412,22 +708,37 @@ def discover_qoder_plugins(
                 marketplace=marketplace,
                 version=version,
                 install_source=(
-                    _qwen_plugin_source(marketplace_root, name)
-                    if marketplace_root.is_dir()
-                    else ""
+                    str(install_path.resolve())
+                    if custom_adapter is not None and install_path is not None
+                    else (
+                        _qwen_plugin_source(marketplace_root, name)
+                        if marketplace_root.is_dir()
+                        else ""
+                    )
                 ),
-                metadata={"source_manifest": "qoder"},
+                metadata={
+                    "source_manifest": "qoder",
+                    "install_path": str(install_path or ""),
+                    "plugin_owned_skill_count": plugin_skill_count,
+                    "qoder_manifest": bool(manifest),
+                    **(custom_adapter or {}),
+                },
             ),
         )
     marketplaces = []
     for name in sorted(marketplace_names):
-        root = qoder_home / "plugins" / "marketplaces" / name
+        if name == "local-custom":
+            root = qoder_home / "plugins" / "custom"
+            source_type = "local_custom"
+        else:
+            root = qoder_home / "plugins" / "marketplaces" / name
+            source_type = "directory" if root.is_dir() else "builtin"
         marketplaces.append(
             SourceMarketplace(
                 source_id=f"qoder:{name}",
                 name=name,
                 source=str(root.resolve()) if root.is_dir() else "",
-                source_type="directory" if root.is_dir() else "builtin",
+                source_type=source_type,
             ),
         )
     return marketplaces, plugins
@@ -437,5 +748,8 @@ __all__ = [
     "discover_codex_memory",
     "discover_codex_plugins",
     "discover_project_memory",
+    "discover_qoder_mcp",
+    "discover_qoder_memory",
     "discover_qoder_plugins",
+    "discover_qoder_skills",
 ]

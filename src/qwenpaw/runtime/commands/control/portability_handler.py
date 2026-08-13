@@ -144,10 +144,8 @@ class ImportCommandHandler(BaseControlCommandHandler):
             except BackupValidationError as exc:
                 trust_hint = ""
                 if exc.code == "backup_signature_mismatch":
-                    trust_hint = (
-                        "\n\nIf you trust its origin, retry with "
-                        "`--trust-foreign`."
-                    )
+                    trust_hint = "\n\nIf you trust its origin, retry with "
+                    trust_hint += "`--trust-foreign`."
                 elif exc.code == "backup_legacy_unsigned":
                     trust_hint = (
                         "\n\nIf you trust this unsigned legacy archive, "
@@ -187,6 +185,8 @@ class ImportCommandHandler(BaseControlCommandHandler):
             f"- Sessions imported: {len(receipt.imported_sessions)}\n"
             f"- Sessions already present/skipped: "
             f"{len(receipt.skipped_sessions)}\n"
+            f"- Internal execution traces archived: "
+            f"{len(receipt.archived_internal_sessions)}\n"
             f"- Skills imported disabled: {len(receipt.imported_skills)}\n"
             f"- Skills kept/quarantined: {len(receipt.skipped_skills)}\n"
             f"- MCP imported disabled: "

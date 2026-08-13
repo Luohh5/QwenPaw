@@ -99,6 +99,7 @@ class ProviderInventory(BaseModel):
     detected: bool
     locator: str = ""
     sessions: list[SourceSession] = Field(default_factory=list)
+    ignored_session_ids: list[str] = Field(default_factory=list)
     skills: list[SourceSkill] = Field(default_factory=list)
     mcp_servers: list[SourceMCPServer] = Field(default_factory=list)
     memory_projects: list[SourceMemoryProject] = Field(default_factory=list)
@@ -120,6 +121,7 @@ class ImportReceipt(BaseModel):
     completed_at: datetime
     imported_sessions: list[str] = Field(default_factory=list)
     skipped_sessions: list[str] = Field(default_factory=list)
+    archived_internal_sessions: list[str] = Field(default_factory=list)
     imported_skills: list[str] = Field(default_factory=list)
     skipped_skills: list[str] = Field(default_factory=list)
     imported_mcp_servers: list[str] = Field(default_factory=list)

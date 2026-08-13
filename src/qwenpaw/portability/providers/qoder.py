@@ -9,7 +9,12 @@ from typing import Any
 
 from ..models import ProviderInventory, SourceSession
 from .base import ProgressReporter
-from .external_state import discover_project_memory, discover_qoder_plugins
+from .external_state import (
+    discover_qoder_mcp,
+    discover_qoder_memory,
+    discover_qoder_plugins,
+    discover_qoder_skills,
+)
 from .qoder_sessions import (
     default_qoder_user_data,
     discover_qoder_transcripts,
@@ -44,7 +49,7 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
         self._qoder_home = qoder_home or (Path.home() / ".qoder")
         self._qoder_user_data = qoder_user_data or default_qoder_user_data()
 
-    # pylint: disable-next=too-many-locals,too-many-statements
+    # pylint: disable-next=R0914,R0915,R0912
     async def inventory(
         self,
         *,
@@ -53,32 +58,38 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
     ) -> ProviderInventory:
         """Discover and normalize local Qoder JSONL sessions."""
         discovery = await asyncio.gather(
-            asyncio.to_thread(discover_project_memory, self._qoder_home),
+            asyncio.to_thread(discover_qoder_memory, self._qoder_home),
             asyncio.to_thread(discover_qoder_plugins, self._qoder_home),
+            asyncio.to_thread(discover_qoder_skills, self._qoder_home),
+            asyncio.to_thread(discover_qoder_mcp, self._qoder_home),
             asyncio.to_thread(discover_qoder_transcripts, self._qoder_home),
             asyncio.to_thread(load_qoder_index, self._qoder_user_data),
         )
-        memory_projects, plugin_state, records, index_state = discovery
+        (
+            memory_projects,
+            plugin_state,
+            skills,
+            mcp_state,
+            records,
+            index_state,
+        ) = discovery
         marketplaces, plugins = plugin_state
+        mcp_servers, mcp_warnings, discovered_mcp_count = mcp_state
         qoder_index, index_warnings = index_state
 
         total_records = len(records)
-        records = records[:limit]
         sessions: list[SourceSession] = []
-        warnings: list[str] = list(index_warnings)
+        warnings: list[str] = [*index_warnings, *mcp_warnings]
         warnings.append(
-            "Qoder settings, hooks, agents, tool policies, credentials and "
-            "runtime state are harness-bound and were not copied.",
+            "Qoder built-in IDE tools, hooks, Agent definitions, tool "
+            "policies, credentials and runtime state are harness-bound and "
+            "were not copied. Portable custom tools are migrated only when "
+            "represented by a standalone Skill or MCP configuration.",
         )
-        if total_records > limit:
-            warnings.append(
-                f"Qoder session safety limit ({limit}) was reached; older "
-                "sessions beyond this bounded import were not read.",
-            )
         if progress is not None:
             await progress(
-                f"发现 {total_records} 个 Qoder 会话文件，本次读取 "
-                f"{len(records)} 个（最多 4 个同时读取）…",
+                f"发现 {total_records} 个 Qoder 会话候选文件，正在区分 "
+                "用户会话与内部 Agent 轨迹（最多 4 个同时读取）…",
             )
 
         semaphore = asyncio.Semaphore(_READ_CONCURRENCY)
@@ -87,7 +98,7 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
 
         async def _read_one(
             record: Any,
-        ) -> tuple[SourceSession | None, list[str]]:
+        ) -> tuple[SourceSession | None, list[str], bool]:
             nonlocal completed
             try:
                 async with semaphore:
@@ -106,6 +117,7 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
                         f"Could not read Qoder session {record.source_id}: "
                         "timed out after 60s.",
                     ],
+                    False,
                 )
             except Exception as exc:  # pylint: disable=broad-except
                 warning = "Could not read Qoder session "
@@ -113,6 +125,7 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
                 result = (
                     None,
                     [warning],
+                    False,
                 )
             async with progress_lock:
                 completed += 1
@@ -128,9 +141,13 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
         results = await asyncio.gather(
             *(_read_one(record) for record in records),
         )
-        for session, session_warnings in results:
+        ignored_session_ids: list[str] = []
+        for record, result in zip(records, results):
+            session, session_warnings, internal_trace = result
             if session is not None:
                 sessions.append(session)
+            if internal_trace:
+                ignored_session_ids.append(record.source_id)
             warnings.extend(session_warnings)
 
         # The filename is normally the session id. De-duplicate once more by
@@ -139,20 +156,86 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
         for session in sessions:
             unique_sessions.setdefault(session.source_id, session)
         sessions = list(unique_sessions.values())
+        visible_total = len(sessions)
+        if visible_total > limit:
+            sessions = sessions[:limit]
+            warnings.append(
+                f"Qoder session safety limit ({limit}) was reached; older "
+                "user-visible sessions beyond this bounded import were not "
+                "imported.",
+            )
+        if ignored_session_ids:
+            warnings.append(
+                f"Ignored {len(ignored_session_ids)} Qoder internal "
+                "Agent/Experts execution traces. Their worker names, roles "
+                "and final results remain available in parent conversations.",
+            )
+        if progress is not None:
+            await progress(
+                f"识别出 {visible_total} 个用户可见 Qoder 会话；已忽略 "
+                f"{len(ignored_session_ids)} 条内部 Agent 执行轨迹。",
+            )
 
         if memory_projects:
+            scoped_memory = [
+                item
+                for item in memory_projects
+                if item.metadata.get("scope") == "project"
+            ]
+            missing_cwd = sum(not item.cwd for item in scoped_memory)
             warnings.append(
                 f"Prepared {len(memory_projects)} Qoder memory scope(s) as "
                 "project-scoped source resources, without merging them into "
                 "QwenPaw MEMORY.md.",
             )
+            if missing_cwd:
+                warnings.append(
+                    f"{missing_cwd} Qoder Memory scope(s) refer to projects "
+                    "that are no longer available at their original path. "
+                    "Their source keys and content were preserved without a "
+                    "working-directory binding.",
+                )
         if plugins:
             compatible = sum(bool(item.install_source) for item in plugins)
+            adapted_custom = sum(
+                item.metadata.get("adapter") == "qoder_skill_only_v1"
+                for item in plugins
+            )
+            plugin_owned_skills = sum(
+                int(item.metadata.get("plugin_owned_skill_count") or 0)
+                for item in plugins
+                if item.metadata.get("adapter") != "qoder_skill_only_v1"
+            )
             warnings.append(
                 f"Found {len(plugins)} enabled Qoder plugin(s) across "
                 f"{len(marketplaces)} Marketplace source(s); {compatible} "
                 "expose a QwenPaw-compatible native install source. Qoder "
                 "cache directories are never copied.",
+            )
+            if plugin_owned_skills:
+                warnings.append(
+                    f"Found {plugin_owned_skills} Skill declaration(s) owned "
+                    "by enabled Qoder plugins. They were not detached from "
+                    "their plugins because their scripts/references and "
+                    "Qoder-specific runtime contracts would be incomplete.",
+                )
+            if adapted_custom:
+                warnings.append(
+                    f"Prepared {adapted_custom} enabled local Qoder "
+                    "Skill-only plugin(s) for a constrained QwenPaw native "
+                    "wrapper. Harness-bound Skills remain disabled until "
+                    "reviewed.",
+                )
+        if not skills:
+            warnings.append(
+                "No standalone user/project Qoder Skills were found outside "
+                "plugin-owned directories.",
+            )
+        if discovered_mcp_count == 0:
+            warnings.append(
+                "Qoder's user-level mcp.json currently contains no MCP "
+                "servers. Plugin-owned or built-in MCP runtimes are not "
+                "copied as standalone servers.",
             )
         projects = self._qoder_home / "projects"
         return ProviderInventory(
@@ -166,9 +249,13 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
             ),
             locator=str(projects),
             sessions=sessions,
+            ignored_session_ids=ignored_session_ids,
+            skills=skills,
+            mcp_servers=mcp_servers,
             memory_projects=memory_projects,
             marketplaces=marketplaces,
             plugins=plugins,
+            discovered_mcp_count=discovered_mcp_count,
             warnings=warnings,
         )
 

@@ -118,6 +118,47 @@ async def test_provider_import_is_additive_and_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_qoder_reimport_archives_internal_traces_from_old_import(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A rerun cleans up tool-only Qoder workers imported by older code."""
+    workspace = _workspace(tmp_path)
+    inventory = ProviderInventory(
+        provider_id="qoder",
+        provider_name="Qoder",
+        detected=True,
+        sessions=[
+            SourceSession(
+                source_id="worker-1",
+                title="Qoder worker-1",
+                history=[
+                    HarnessHistoryItem(
+                        kind=HarnessHistoryKind.TOOL_CALL,
+                        tool_name="Bash",
+                    ),
+                ],
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        "qwenpaw.portability.importer.create_migration_provider",
+        lambda _source, _workspace: _Provider(inventory),
+    )
+
+    await ProviderImportService(workspace).import_from("qoder")
+    inventory.sessions = []
+    inventory.ignored_session_ids = ["worker-1"]
+    receipt = await ProviderImportService(workspace).import_from("qoder")
+
+    assert receipt.archived_internal_sessions == ["worker-1"]
+    assert await workspace.chat_manager.list_chats(archived=False) == []
+    archived = await workspace.chat_manager.list_chats(archived=True)
+    assert len(archived) == 1
+    assert archived[0].meta["portability"]["source_id"] == "worker-1"
+
+
+@pytest.mark.asyncio
 async def test_provider_import_reports_progress(tmp_path, monkeypatch):
     workspace = _workspace(tmp_path)
     inventory = ProviderInventory(
@@ -289,9 +330,8 @@ async def test_provider_skill_uses_existing_scanner_and_stays_disabled(
     receipt = await ProviderImportService(workspace).import_from("codex")
 
     assert receipt.imported_skills == ["provider-demo"]
-    assert (
-        workspace.workspace_dir / "skills/provider-demo/SKILL.md"
-    ).is_file()
+    skill_path = workspace.workspace_dir / "skills/provider-demo/SKILL.md"
+    assert skill_path.is_file()
     manifest = json.loads(
         (workspace.workspace_dir / "skill.json").read_text(encoding="utf-8"),
     )
@@ -531,6 +571,107 @@ async def test_provider_plugin_never_falls_back_to_installed_cache(
     assert receipt.installed_plugins == []
     assert receipt.skipped_plugins == ["demo@qoder-bundler"]
     assert not (workspace.workspace_dir / "plugins").exists()
+
+
+@pytest.mark.asyncio
+async def test_qoder_custom_skill_plugin_uses_native_adapter(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A registered custom Skill plugin uses a reviewed native wrapper."""
+    workspace = _workspace(tmp_path)
+    workspace.marketplace_registry_path = tmp_path / "marketplaces.json"
+    custom_root = tmp_path / ".qoder/plugins/custom"
+    source = custom_root / "test-report-0.1.0"
+    skill = source / "skills/test-report"
+    manifest_dir = source / ".qoder-plugin"
+    skill.mkdir(parents=True)
+    manifest_dir.mkdir()
+    (skill / "SKILL.md").write_text(
+        "Read ~/.qoder/mcp.json",
+        encoding="utf-8",
+    )
+    (manifest_dir / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "test-report",
+                "displayName": "Test Report",
+                "version": "0.1.0",
+                "author": {"name": "User"},
+                "skills": "./skills/",
+            },
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    async def _install(source_path, *, app, force, reload_agents):
+        del app, force, reload_agents
+        staged = Path(source_path)
+        captured["manifest"] = json.loads(
+            (staged / "plugin.json").read_text(encoding="utf-8"),
+        )
+        captured["backend"] = (staged / "plugin.py").read_text(
+            encoding="utf-8",
+        )
+        captured["skill"] = (staged / "skills/test-report/SKILL.md").read_text(
+            encoding="utf-8",
+        )
+        return SimpleNamespace(
+            manifest=SimpleNamespace(id="test-report"),
+        )
+
+    app = SimpleNamespace(state=SimpleNamespace(plugin_loader=object()))
+    monkeypatch.setattr(
+        "qwenpaw.plugins.registry.PluginRegistry.get_plugin_http_app",
+        lambda _self: app,
+    )
+    monkeypatch.setattr(
+        "qwenpaw.app.routers.plugins.install_plugin_source",
+        _install,
+    )
+    inventory = ProviderInventory(
+        provider_id="qoder",
+        provider_name="Qoder",
+        detected=True,
+        marketplaces=[
+            SourceMarketplace(
+                source_id="qoder:local-custom",
+                name="local-custom",
+                source=str(custom_root),
+                source_type="local_custom",
+            ),
+        ],
+        plugins=[
+            SourcePlugin(
+                source_id="test-report-0.1.0@local-custom",
+                name="test-report-0.1.0",
+                marketplace="local-custom",
+                version="0.1.0",
+                install_source=str(source),
+                metadata={
+                    "adapter": "qoder_skill_only_v1",
+                    "canonical_custom_root": str(custom_root.resolve()),
+                    "skills_relative_path": "skills",
+                    "harness_bound": True,
+                    "skills_enabled_by_default": False,
+                },
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        "qwenpaw.portability.importer.create_migration_provider",
+        lambda _source, _workspace: _Provider(inventory),
+    )
+
+    receipt = await ProviderImportService(workspace).import_from("qoder")
+
+    assert receipt.installed_plugins == ["test-report"]
+    assert captured["manifest"]["id"] == "test-report"
+    assert captured["manifest"]["meta"]["migration"]["harness_bound"] is True
+    assert "enabled_by_default=False" in captured["backend"]
+    assert captured["skill"] == "Read ~/.qoder/mcp.json"
+    assert any("disabled" in warning for warning in receipt.warnings)
 
 
 @pytest.mark.asyncio

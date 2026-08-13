@@ -41,6 +41,7 @@ from .models import (
 )
 from .providers import create_migration_provider
 from .providers.base import ProgressReporter
+from .qoder_plugin_adapter import stage_qoder_skill_plugin
 
 logger = logging.getLogger(__name__)
 
@@ -405,6 +406,7 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
 
         imported_sessions: list[str] = []
         skipped_sessions: list[str] = []
+        archived_internal_sessions: list[str] = []
         imported_skills: list[str] = []
         skipped_skills: list[str] = []
         imported_mcp_servers: list[str] = []
@@ -419,6 +421,7 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
         created_chats: list[str] = []
         created_states: list[tuple[str, str, str]] = []
         patched_project_dirs: list[tuple[str, str | None]] = []
+        archived_chats: list[str] = []
         created_mcp: list[tuple[str, str]] = []
         memory_changes: list[tuple[Path, dict[Path, bytes] | None]] = []
         skill_service = SkillService(self._workspace.workspace_dir)
@@ -512,25 +515,55 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                         "/import after startup completes.",
                     )
                     continue
+                staged_plugin: Path | None = None
                 try:
                     # pylint: disable-next=C0415
                     from ..app.routers.plugins import (
                         install_plugin_source,
                     )
 
+                    install_source = plugin.install_source
+                    if plugin.metadata.get("adapter") == "qoder_skill_only_v1":
+                        staged_plugin = await run_sync_io(
+                            stage_qoder_skill_plugin,
+                            plugin,
+                        )
+                        install_source = str(staged_plugin)
                     record = await install_plugin_source(
-                        plugin.install_source,
+                        install_source,
                         app=plugin_app,
                         force=False,
                         reload_agents=False,
                     )
                     installed_plugins.append(record.manifest.id)
+                    if staged_plugin is not None:
+                        binding = bool(
+                            plugin.metadata.get("harness_bound", False),
+                        )
+                        warnings.append(
+                            f"Adapted local Qoder Skill-only plugin "
+                            f"{plugin.source_id!r} into a QwenPaw native "
+                            "wrapper. Its Skills were installed "
+                            + (
+                                "disabled because Qoder-specific paths or "
+                                "runtime contracts require review."
+                                if binding
+                                else "enabled after structural validation."
+                            ),
+                        )
                 except Exception as exc:  # pylint: disable=broad-except
                     skipped_plugins.append(plugin.source_id)
                     warnings.append(
                         f"Plugin {plugin.source_id!r} failed native "
                         f"installation: {type(exc).__name__}: {exc}",
                     )
+                finally:
+                    if staged_plugin is not None:
+                        await run_sync_io(
+                            shutil.rmtree,
+                            staged_plugin.parent,
+                            True,
+                        )
             if installed_plugins:
                 warnings.append(
                     "Compatible plugins were installed and hot-loaded "
@@ -685,6 +718,31 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                     )
 
             bridge = HarnessSessionBridge(self._workspace.session)
+            ignored_total = len(inventory.ignored_session_ids)
+            if ignored_total:
+                await _report(
+                    progress,
+                    "正在整理此前误导入的内部执行轨迹…",
+                )
+            for source_id in inventory.ignored_session_ids:
+                chat = existing_by_source.get(
+                    (inventory.provider_id, source_id),
+                )
+                if chat is None or chat.archived:
+                    continue
+                archived = await self._workspace.chat_manager.archive_chat(
+                    chat.id,
+                )
+                if archived is not None:
+                    archived_chats.append(chat.id)
+                    archived_internal_sessions.append(source_id)
+            if archived_internal_sessions:
+                warnings.append(
+                    f"Archived {len(archived_internal_sessions)} previously "
+                    "imported Qoder internal Agent/Experts execution traces. "
+                    "They remain recoverable from the archived chat list.",
+                )
+
             session_total = len(sessions)
             for session_index, session in enumerate(sessions, start=1):
                 if _progress_milestone(session_index, session_total):
@@ -697,14 +755,10 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                 project_dir = _project_directory(session, warnings)
                 if existing_chat is not None:
                     if project_dir:
-                        current = str(
-                            (
-                                existing_chat.meta.get("runtime_context") or {}
-                            ).get(
-                                "project_dir",
-                            )
-                            or "",
+                        runtime_context = (
+                            existing_chat.meta.get("runtime_context") or {}
                         )
+                        current = str(runtime_context.get("project_dir") or "")
                         if current != project_dir:
                             patched_project_dirs.append(
                                 (existing_chat.id, current or None),
@@ -756,6 +810,11 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                     chat_meta["runtime_context"] = {
                         "project_dir": project_dir,
                     }
+                updated_at = session.updated_at
+                if updated_at is None:
+                    updated_at = session.created_at
+                if updated_at is None:
+                    updated_at = started_at
                 spec = ChatSpec(
                     id=_chat_id(inventory.provider_id, session.source_id),
                     name=session.title,
@@ -763,9 +822,7 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                     user_id=user_id,
                     channel=channel,
                     created_at=session.created_at or started_at,
-                    updated_at=session.updated_at
-                    or session.created_at
-                    or started_at,
+                    updated_at=updated_at,
                     meta=chat_meta,
                 )
                 await self._workspace.chat_manager.create_chat(spec)
@@ -784,6 +841,7 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                 completed_at=completed_at,
                 imported_sessions=imported_sessions,
                 skipped_sessions=skipped_sessions,
+                archived_internal_sessions=archived_internal_sessions,
                 imported_skills=imported_skills,
                 skipped_skills=skipped_skills,
                 imported_mcp_servers=imported_mcp_servers,
@@ -797,9 +855,8 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                 discovered_mcp_count=inventory.discovered_mcp_count,
                 warnings=warnings,
             )
-            receipt_dir = (
-                self._workspace.workspace_dir / ".qwenpaw" / "imports"
-            )
+            receipt_dir = self._workspace.workspace_dir / ".qwenpaw"
+            receipt_dir = receipt_dir / "imports"
             receipt_dir.mkdir(parents=True, exist_ok=True)
             await write_json_atomic_async(
                 receipt_dir / f"{migration_id}.json",
@@ -824,6 +881,8 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                     chat_id,
                     previous,
                 )
+            for chat_id in reversed(archived_chats):
+                await self._workspace.chat_manager.unarchive_chat(chat_id)
             for card_name, credential_ref in reversed(created_mcp):
                 try:
                     await driver_config.card_store.delete(card_name)

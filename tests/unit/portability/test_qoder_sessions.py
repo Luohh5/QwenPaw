@@ -212,7 +212,8 @@ async def test_provider_imports_ide_editor_and_quest_transcripts(
     }
     quest_kinds = {item.kind for item in quest.history}
     assert HarnessHistoryKind.TOOL_CALL in quest_kinds
-    assert any("发现 2 个 Qoder 会话文件" in item for item in progress)
+    assert any("发现 2 个 Qoder 会话候选文件" in item for item in progress)
+    assert any("识别出 2 个用户可见 Qoder 会话" in item for item in progress)
 
 
 @pytest.mark.asyncio
@@ -273,3 +274,68 @@ def test_discovery_prefers_ide_layout_over_legacy_sdk_copy(
     assert len(records) == 1
     assert records[0].layout == "ide"
     assert records[0].path.parent.name == "transcript"
+
+
+@pytest.mark.asyncio
+async def test_provider_filters_internal_agent_tool_only_traces(
+    tmp_path: Path,
+) -> None:
+    """Experts child workers stay in their parent instead of chat history."""
+    qoder_home = tmp_path / ".qoder"
+    transcript = qoder_home / "projects" / "-project" / "transcript"
+    worker_id = "22222222-2222-4222-8222-222222222222"
+    visible_id = "33333333-3333-4333-8333-333333333333"
+    _write_jsonl(
+        transcript / f"{worker_id}.jsonl",
+        [
+            _message(
+                worker_id,
+                "assistant",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "Bash",
+                        "input": {"command": "pwd"},
+                    },
+                ],
+                cwd="/project",
+                timestamp="2026-08-04T01:00:00Z",
+            ),
+            _message(
+                worker_id,
+                "user",
+                [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "/project",
+                    },
+                ],
+                cwd="/project",
+                timestamp="2026-08-04T01:00:01Z",
+            ),
+        ],
+    )
+    _write_jsonl(
+        transcript / f"{visible_id}.jsonl",
+        [
+            _message(
+                visible_id,
+                "user",
+                "Visible conversation",
+                cwd="/project",
+                timestamp="2026-08-03T01:00:00Z",
+            ),
+        ],
+    )
+
+    inventory = await QoderMigrationProvider(
+        SimpleNamespace(workspace_dir=tmp_path),
+        qoder_home=qoder_home,
+        qoder_user_data=tmp_path / "missing-user-data",
+    ).inventory(limit=1)
+
+    assert [item.source_id for item in inventory.sessions] == [visible_id]
+    assert inventory.ignored_session_ids == [worker_id]
+    assert any("internal Agent/Experts" in item for item in inventory.warnings)

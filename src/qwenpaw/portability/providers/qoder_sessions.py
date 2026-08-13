@@ -311,7 +311,7 @@ def _parse_timestamp(value: Any) -> datetime | None:
 def read_qoder_transcript(
     transcript: QoderTranscript,
     index: QoderIndex,
-) -> tuple[SourceSession | None, list[str]]:
+) -> tuple[SourceSession | None, list[str], bool]:
     """Parse one Qoder transcript into a provider-neutral conversation."""
     history: list[HarnessHistoryItem] = []
     warnings: list[str] = []
@@ -352,7 +352,8 @@ def read_qoder_transcript(
                 if not first_user_text and raw.get("type") == "user":
                     first_user_text = _message_text(raw.get("message"))
     except OSError as exc:
-        return None, [f"Could not read Qoder session {source_id}: {exc}"]
+        warning = f"Could not read Qoder session {source_id}: {exc}"
+        return None, [warning], False
 
     if malformed:
         warnings.append(
@@ -364,7 +365,24 @@ def read_qoder_transcript(
             f"Skipped Qoder transcript {transcript.path.name} because it "
             "contains no supported conversation messages.",
         )
-        return None, warnings
+        return None, warnings, False
+
+    conversational_kinds = {
+        HarnessHistoryKind.USER,
+        HarnessHistoryKind.MESSAGE,
+        HarnessHistoryKind.REASONING,
+    }
+    has_conversation = False
+    for item in history:
+        if item.kind in conversational_kinds and item.text.strip():
+            has_conversation = True
+            break
+    if not has_conversation:
+        # Qoder writes each Experts/Agent child worker into the same
+        # ``transcript`` directory as user-visible sessions. Those child
+        # files contain only tool calls/results; the parent conversation
+        # already preserves the worker name, role and final output.
+        return None, warnings, True
 
     history_info = index.history.get(source_id, _HistoryInfo())
     quest = index.quests.get(source_id)
@@ -409,6 +427,7 @@ def read_qoder_transcript(
             metadata=metadata,
         ),
         warnings,
+        False,
     )
 
 
