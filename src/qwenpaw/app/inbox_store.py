@@ -167,6 +167,36 @@ async def mark_all_read() -> int:
     return updated
 
 
+async def mark_read_by_acl_sender(sender_address: str) -> int:
+    """Mark all unread inbox events with payload.acl_status=='pending'
+    and whose payload.from contains *sender_address* as read.
+
+    Called when the user approves / denies / dismisses an ACL pending sender
+    so the corresponding notification is cleared from the unread count.
+    """
+    if not sender_address:
+        return 0
+    needle = sender_address.lower()
+    updated = 0
+    async with _LOCK:
+        events = await run_sync_io(_load_events)
+        for event in events:
+            if bool(event.get("read")):
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("acl_status") != "pending":
+                continue
+            from_field = (payload.get("from") or "").lower()
+            if needle in from_field:
+                event["read"] = True
+                updated += 1
+        if updated:
+            await run_sync_io(_save_events, events)
+    return updated
+
+
 async def delete_event(event_id: str) -> tuple[bool, str | None, bool]:
     if not event_id:
         return False, None, False

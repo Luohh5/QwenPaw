@@ -154,6 +154,8 @@ async def get_pending_count():
     summary="Approve one or more pending senders (add to whitelist)",
 )
 async def approve_pending(body: MailACLActionBody, request: Request):
+    from ..inbox_store import mark_read_by_acl_sender
+
     _require_valid_addresses(body.entries)
     count = 0
     for entry in body.entries:
@@ -170,6 +172,9 @@ async def approve_pending(body: MailACLActionBody, request: Request):
             entry.remark or "",
         )
         count += 1
+        # Mark the corresponding inbox "pending" notification as read so
+        # the unread badge decreases after approval.
+        await mark_read_by_acl_sender(entry.address)
         try:
             await _trigger_wake_after_approve(request, entry, pending_info)
         except Exception:  # pylint: disable=broad-except
@@ -220,6 +225,8 @@ async def _trigger_wake_after_approve(
     summary="Deny one or more pending senders (add to blacklist)",
 )
 async def deny_pending(body: MailACLActionBody):
+    from ..inbox_store import mark_read_by_acl_sender
+
     _require_valid_addresses(body.entries)
     count = 0
     for entry in body.entries:
@@ -232,6 +239,7 @@ async def deny_pending(body: MailACLActionBody):
             entry.remark or "",
         )
         count += 1
+        await mark_read_by_acl_sender(entry.address)
     return {"status": "ok", "count": count}
 
 
@@ -240,6 +248,8 @@ async def deny_pending(body: MailACLActionBody):
     summary="Dismiss one or more pending senders (remove w/o action)",
 )
 async def dismiss_pending(body: MailACLActionBody):
+    from ..inbox_store import mark_read_by_acl_sender
+
     count = 0
     for entry in body.entries:
         store = _get_store_for_agent(entry.agent_id)
@@ -247,6 +257,7 @@ async def dismiss_pending(body: MailACLActionBody):
             continue
         store.dismiss_pending(entry.agent_id, entry.address)
         count += 1
+        await mark_read_by_acl_sender(entry.address)
     return {"status": "ok", "count": count}
 
 

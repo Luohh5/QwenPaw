@@ -7,7 +7,7 @@
  * - Events sorted by created_at descending
  * - Heartbeat content uses getHeartbeatSummary(status)
  * - markMessageAsRead optimistically sets read:true, decrements unread, calls api
- * - markAllMessagesAsRead returns 0 without calling api when no unread
+ * - markAllMessagesAsRead returns 0 and still calls api when no visible unread
  * - markAllMessagesAsRead marks all read, zeroes unread, returns unread count
  * - deleteMessages removes specified messages and returns count
  * - deleteMessages dedupes/trims empty ids (does not delete nothing)
@@ -267,7 +267,7 @@ describe("useInboxData", () => {
     expect(result.current.summary.pushMessages.unread).toBe(0);
   });
 
-  it("markAllMessagesAsRead returns 0 without calling api when no unread", async () => {
+  it("markAllMessagesAsRead returns 0 and still calls api when no visible unread", async () => {
     const events = [makeEvent({ id: "m1", read: true })];
     mockGetInboxEvents.mockResolvedValue(makeResolvedEvents(events));
 
@@ -281,7 +281,9 @@ describe("useInboxData", () => {
     });
 
     expect(count).toBe(0);
-    expect(mockMarkInboxRead).not.toHaveBeenCalled();
+    // API is still called — backend may have hidden unread events
+    // (e.g. ACL pending notifications filtered client-side).
+    expect(mockMarkInboxRead).toHaveBeenCalledWith({ all: true });
   });
 
   it("markAllMessagesAsRead marks all read, zeroes unread, returns unread count", async () => {

@@ -267,9 +267,8 @@ export const useInboxData = () => {
     const unreadIds = pushMessagesRef.current
       .filter((message) => !message.read)
       .map((m) => m.id);
-    if (!unreadIds.length) {
-      return 0;
-    }
+    // Always call the backend — there may be unread events hidden from the
+    // local list (e.g. ACL pending notifications filtered client-side).
     await api.markInboxRead({ all: true });
     setPushMessages((prev) =>
       prev.map((message) =>
