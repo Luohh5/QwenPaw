@@ -400,7 +400,7 @@ class ADBPGMemoryManager(BaseMemoryManager):
 
         memory_dir = workspace / "memory"
         if memory_dir.is_dir():
-            candidates.extend(sorted(memory_dir.glob("*.md")))
+            candidates.extend(sorted(memory_dir.rglob("*.md")))
 
         if not candidates:
             return []

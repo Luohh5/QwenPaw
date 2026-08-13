@@ -72,10 +72,51 @@ class Runtime:
             # --- [fixed 1] slash command dispatch ---
             text = _get_last_user_text(ctx.input_msgs)
             cmd_registry = self.workspace.plugins.slash_command_registry
-            cmd_msg = await cmd_registry.dispatch(text or "", ctx)
+            progress_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
+
+            async def _report_command_progress(message: str) -> None:
+                await progress_queue.put(f"⏳ {message}\n")
+
+            ctx.extras["_command_progress_reporter"] = _report_command_progress
+            cmd_task = asyncio.create_task(
+                cmd_registry.dispatch(text or "", ctx),
+            )
+            progress_started = False
+            try:
+                while not cmd_task.done():
+                    try:
+                        progress_text = await asyncio.wait_for(
+                            progress_queue.get(),
+                            timeout=0.1,
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+                    if not progress_started:
+                        async for ev in envelope.emit_response_created():
+                            yield ev
+                        progress_started = True
+                    async for ev in envelope.command_delta(progress_text):
+                        yield ev
+                cmd_msg = await cmd_task
+                while not progress_queue.empty():
+                    progress_text = progress_queue.get_nowait()
+                    if not progress_started:
+                        async for ev in envelope.emit_response_created():
+                            yield ev
+                        progress_started = True
+                    async for ev in envelope.command_delta(progress_text):
+                        yield ev
+            finally:
+                ctx.extras.pop("_command_progress_reporter", None)
+                if not cmd_task.done():
+                    cmd_task.cancel()
             if cmd_msg is not None:
-                async for ev in envelope.from_msg(cmd_msg):
-                    yield ev
+                if progress_started:
+                    async for ev in envelope.complete_command(cmd_msg):
+                        yield ev
+                else:
+                    async for ev in envelope.from_msg(cmd_msg):
+                        yield ev
                 skip_agent = True
             else:
                 # --- [phase 2] POST_DISPATCH ---

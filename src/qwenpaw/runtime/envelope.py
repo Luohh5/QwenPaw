@@ -770,6 +770,73 @@ class Envelope:
     # Command short-circuit
     # ------------------------------------------------------------------
 
+    async def command_delta(self, text: str) -> AsyncGenerator[Any, None]:
+        """Append a live text delta for a long-running slash command."""
+        from ..schemas import ContentType, TextContent
+
+        delta = str(text or "")
+        if not delta:
+            return
+        if not self._message_started:
+            yield self._tag_seq(self._completed_message)
+            self._message_started = True
+
+        state = self._text_blocks.setdefault(
+            "__command__",
+            {"index": 0, "text": ""},
+        )
+        state["text"] += delta
+        chunk = TextContent(
+            type=ContentType.TEXT,
+            text=delta,
+            delta=True,
+            index=0,
+        )
+        chunk.msg_id = self._message_id
+        yield self._tag_seq(chunk)
+
+    async def complete_command(
+        self,
+        cmd_msg: Any,
+    ) -> AsyncGenerator[Any, None]:
+        """Finish a slash command after one or more live progress deltas."""
+        from ..schemas import ContentType, RunStatus, TextContent
+
+        final_text = cmd_msg.get_text_content() or ""
+        state = self._text_blocks.setdefault(
+            "__command__",
+            {"index": 0, "text": ""},
+        )
+        if final_text:
+            separator = "\n\n" if state["text"] else ""
+            async for item in self.command_delta(separator + final_text):
+                yield item
+
+        full_text = str(state.get("text") or "")
+        tc = TextContent(
+            type=ContentType.TEXT,
+            text=full_text,
+            delta=False,
+            index=0,
+        )
+        tc.msg_id = self._message_id
+        yield self._tag_seq(tc)
+
+        self._completed_message.content.append(tc)
+        self._completed_message.status = RunStatus.Completed
+        self._completed_message.metadata = (
+            getattr(cmd_msg, "metadata", None) or {}
+        )
+        self._response.output.append(self._completed_message)
+        yield self._tag_seq(self._completed_message)
+
+        self._response.status = RunStatus.Completed
+        self._response.completed_at = datetime.now(timezone.utc).isoformat(
+            timespec="seconds",
+        )
+        yield self._tag_seq(self._response)
+        self._finalized = True
+
     async def from_msg(self, cmd_msg: Any) -> AsyncGenerator[Any, None]:
         """Translate a completed ``Msg`` from a slash
         command into a full envelope sequence.

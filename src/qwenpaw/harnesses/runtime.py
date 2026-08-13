@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -120,15 +120,25 @@ class HarnessRuntime:
         """Run a harness turn and emit the established QwenPaw protocol."""
         settings = dict(settings or {})
         request_context = dict(settings.get("_request_context") or {})
-        settings[
-            "_runtime_capabilities"
-        ] = await self._capability_resolver.resolve(request_context)
-        adapter = await self.adapter(backend, settings)
         session_id = str(getattr(request, "session_id", "") or "default")
         prompt, attachments = self._content_from_request(request)
         command, arguments = (
             self._parse_command(prompt) if not attachments else ("", "")
         )
+        # Delayed import avoids a package cycle:
+        # control -> portability -> harnesses.events -> harnesses.runtime.
+        # pylint: disable=import-outside-toplevel
+        from ..runtime.commands.control import (
+            is_control_command,
+        )
+
+        local_control = not attachments and is_control_command(prompt)
+        adapter: HarnessAdapter | None = None
+        if not local_control:
+            settings[
+                "_runtime_capabilities"
+            ] = await self._capability_resolver.resolve(request_context)
+            adapter = await self.adapter(backend, settings)
         response = AgentResponse(
             id=f"response_{uuid.uuid4().hex}",
             output=[],
@@ -158,7 +168,14 @@ class HarnessRuntime:
         task_cancelled = False
 
         try:
-            if command in {"new", "clear"}:
+            if local_control:
+                event_stream = self._stream_local_control(
+                    prompt=prompt,
+                    request=request,
+                    session_id=session_id,
+                )
+            elif command in {"new", "clear"}:
+                assert adapter is not None
                 await adapter.reset_session(session_id)
                 events = [
                     HarnessEvent(
@@ -169,6 +186,7 @@ class HarnessRuntime:
                 ]
                 event_stream = self._iter_events(events)
             elif command:
+                assert adapter is not None
                 provider = get_provider(backend)
                 supported = {
                     item.name for item in provider.capabilities.commands
@@ -186,6 +204,7 @@ class HarnessRuntime:
                 )
                 event_stream = self._iter_events(events)
             else:
+                assert adapter is not None
                 event_stream = adapter.run_turn(
                     session_id=session_id,
                     prompt=prompt,
@@ -247,7 +266,12 @@ class HarnessRuntime:
         response.completed_at = datetime.now(timezone.utc).isoformat(
             timespec="seconds",
         )
-        if self._session_bridge is not None and clear_history:
+        if local_control:
+            # Administrative commands are not conversation training data and
+            # can contain local export paths. Match the native command path by
+            # keeping them out of persisted provider transcripts.
+            pass
+        elif self._session_bridge is not None and clear_history:
             try:
                 await self._session_bridge.clear(
                     session_id=session_id,
@@ -278,6 +302,91 @@ class HarnessRuntime:
         if task_cancelled:
             raise asyncio.CancelledError
         yield tagged(response)
+
+    async def _handle_local_control(
+        self,
+        *,
+        prompt: str,
+        request: Any,
+        session_id: str,
+        progress_reporter: Callable[[str], Awaitable[None]] | None = None,
+    ) -> str:
+        """Execute QwenPaw-owned controls before provider command routing."""
+        workspace = self._capability_resolver.workspace
+        if workspace is None:
+            raise RuntimeError("QwenPaw workspace is unavailable.")
+        # pylint: disable=import-outside-toplevel
+        from ..runtime.commands.control import (
+            handle_control_command,
+        )
+        from ..runtime.commands.control.base import (
+            ControlContext,
+        )
+
+        context = ControlContext(
+            workspace=workspace,
+            payload=request,
+            channel=None,
+            session_id=session_id,
+            user_id=str(getattr(request, "user_id", "") or session_id),
+            agent_id=self._agent_id,
+            args={},
+            progress_reporter=progress_reporter,
+        )
+        return await handle_control_command(prompt, context)
+
+    async def _stream_local_control(
+        self,
+        *,
+        prompt: str,
+        request: Any,
+        session_id: str,
+    ) -> AsyncGenerator[HarnessEvent, None]:
+        """Run a QwenPaw control command with transport-neutral progress."""
+        progress_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
+
+        async def _report(message: str) -> None:
+            await progress_queue.put(f"⏳ {message}\n")
+
+        task = asyncio.create_task(
+            self._handle_local_control(
+                prompt=prompt,
+                request=request,
+                session_id=session_id,
+                progress_reporter=_report,
+            ),
+        )
+        progress_started = False
+        try:
+            while not task.done():
+                try:
+                    text = await asyncio.wait_for(
+                        progress_queue.get(),
+                        timeout=0.1,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                progress_started = True
+                yield HarnessEvent(
+                    kind=HarnessEventKind.TEXT_DELTA,
+                    text=text,
+                )
+            final_text = await task
+            while not progress_queue.empty():
+                progress_started = True
+                yield HarnessEvent(
+                    kind=HarnessEventKind.TEXT_DELTA,
+                    text=progress_queue.get_nowait(),
+                )
+            if final_text:
+                yield HarnessEvent(
+                    kind=HarnessEventKind.TEXT_DELTA,
+                    text=("\n" if progress_started else "") + final_text,
+                )
+            yield HarnessEvent(kind=HarnessEventKind.COMPLETED)
+        finally:
+            if not task.done():
+                task.cancel()
 
     async def stop(self) -> None:
         """Stop every initialized adapter."""

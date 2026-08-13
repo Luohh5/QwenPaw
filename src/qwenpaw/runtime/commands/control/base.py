@@ -8,6 +8,7 @@ immediate response and special handling outside the normal agent flow.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict
 
@@ -28,6 +29,9 @@ class ControlContext:
         user_id: User ID from request
         agent_id: Agent ID for permission checks
         args: Parsed command arguments (command-specific)
+        progress_reporter: Optional callback used by long-running commands to
+            stream user-visible progress without coupling the command to an
+            HTTP, ACP, or third-party Harness transport.
     """
 
     workspace: "Workspace"
@@ -37,6 +41,15 @@ class ControlContext:
     user_id: str
     agent_id: str
     args: Dict[str, Any]
+    progress_reporter: Callable[[str], Awaitable[None]] | None = None
+
+    async def report_progress(self, message: str) -> None:
+        """Emit best-effort progress when the transport supports it."""
+        reporter = self.progress_reporter
+        text = str(message or "").strip()
+        if reporter is None or not text:
+            return
+        await reporter(text)
 
 
 class BaseControlCommandHandler(ABC):

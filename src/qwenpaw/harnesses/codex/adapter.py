@@ -202,6 +202,32 @@ class CodexAdapter(HarnessAdapter):
         cwd: Path,
     ) -> list[HarnessDiscoveredMCPServer]:
         """Discover Codex-owned MCP servers without exposing configuration."""
+        payload = await self.external_mcp_records(cwd)
+        return [
+            HarnessDiscoveredMCPServer(
+                name=str(item.get("name") or ""),
+                provider_id="codex",
+                transport=str(
+                    (item.get("transport") or {}).get("type") or "",
+                ),
+                enabled=bool(item.get("enabled")),
+                auth_status=str(item.get("auth_status") or ""),
+            )
+            for item in payload
+            if item.get("name")
+        ]
+
+    async def external_mcp_records(
+        self,
+        cwd: Path,
+    ) -> list[dict[str, Any]]:
+        """Return full MCP records only for the trusted migration boundary.
+
+        Regular capability discovery remains redacted through
+        :meth:`discover_mcp`.  The import service needs launch configuration
+        so it can translate it into disabled QwenPaw DriverCards and move
+        any literal credentials into the encrypted credential store.
+        """
         resolution = getattr(self._client, "binary_resolution", None)
         if resolution is None:
             return []
@@ -228,19 +254,7 @@ class CodexAdapter(HarnessAdapter):
             ) from exc
         if not isinstance(payload, list):
             return []
-        return [
-            HarnessDiscoveredMCPServer(
-                name=str(item.get("name") or ""),
-                provider_id="codex",
-                transport=str(
-                    (item.get("transport") or {}).get("type") or "",
-                ),
-                enabled=bool(item.get("enabled")),
-                auth_status=str(item.get("auth_status") or ""),
-            )
-            for item in payload
-            if isinstance(item, dict) and item.get("name")
-        ]
+        return [dict(item) for item in payload if isinstance(item, dict)]
 
     async def discover_skills(
         self,
@@ -276,6 +290,94 @@ class CodexAdapter(HarnessAdapter):
                     ),
                 )
         return discovered
+
+    async def external_skill_records(
+        self,
+        cwd: Path,
+    ) -> list[dict[str, Any]]:
+        """Return full Codex Skill records for the migration boundary.
+
+        Normal runtime discovery deliberately returns a small, read-only
+        view. Migration additionally needs the provider-owned ``SKILL.md``
+        path so the portability core can copy it into staging and run the
+        existing QwenPaw Skill scanner. No Skill file is read or changed here.
+        """
+        await self._client.start()
+        result = await self._client.request(
+            "skills/list",
+            {"cwds": [str(cwd)], "forceReload": False},
+        )
+        records: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for entry in (result or {}).get("data", []):
+            if not isinstance(entry, dict):
+                continue
+            for item in entry.get("skills") or []:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path") or "")
+                if not path or path in seen:
+                    continue
+                seen.add(path)
+                records.append(dict(item))
+        return records
+
+    async def list_external_threads(
+        self,
+        *,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """List pre-existing Codex threads through the app-server.
+
+        The adapter previously persisted only QwenPaw-created thread
+        mappings. This paginated method is intentionally read-only and is
+        consumed by ``CodexMigrationProvider`` to import older Codex history.
+        """
+        await self._client.start()
+        remaining = max(0, min(int(limit), 5000))
+        cursor: str | None = None
+        records: list[dict[str, Any]] = []
+        while remaining:
+            page_size = min(remaining, 100)
+            params: dict[str, Any] = {"limit": page_size}
+            if cursor:
+                params["cursor"] = cursor
+            result = await self._client.request("thread/list", params)
+            page = (result or {}).get("data")
+            if not isinstance(page, list):
+                page = (result or {}).get("threads") or []
+            added = 0
+            for item in page:
+                if not isinstance(item, dict):
+                    continue
+                records.append(dict(item))
+                added += 1
+                if len(records) >= limit:
+                    return records
+            remaining -= added
+            cursor = str((result or {}).get("nextCursor") or "") or None
+            if not cursor or not added:
+                break
+        return records
+
+    async def read_external_thread(
+        self,
+        thread_id: str,
+    ) -> list[HarnessHistoryItem]:
+        """Normalize one arbitrary Codex thread without resuming it."""
+        await self._client.start()
+        result = await self._client.request(
+            "thread/read",
+            {"threadId": thread_id, "includeTurns": True},
+        )
+        history: list[HarnessHistoryItem] = []
+        for turn in (result or {}).get("thread", {}).get("turns", []):
+            if not isinstance(turn, dict):
+                continue
+            for item in turn.get("items") or []:
+                if isinstance(item, dict):
+                    history.extend(self._history_item(item))
+        return history
 
     async def history(self, session_id: str) -> list[HarnessHistoryItem]:
         """Read the lossy persisted Codex thread for recovery."""
