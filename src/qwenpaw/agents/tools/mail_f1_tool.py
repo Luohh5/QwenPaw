@@ -31,10 +31,13 @@ async def activate_f1_exploration_mode() -> ToolChunk:
     classified by the triage tree (MAIL_TRIAGE.md) and you need to
     attempt handling it with per-tool user approval.
 
-    After activation, the SYSTEM automatically intercepts every tool
-    call (mail read/write, file ops, browser use, shell, etc.) and asks
-    the user for approval before execution, for the remainder of this
-    request.
+    After activation, work in two phases: first ANALYZE the email from
+    the recipient's (user's) perspective — its intent and how the user
+    would handle it — and output a brief plan; then ACT step by step,
+    stating a one-sentence reason before each tool call. The SYSTEM
+    automatically intercepts every tool call (mail read/write, file
+    ops, browser use, shell, etc.) and shows your reason and action to
+    the user for approval, for the remainder of this request.
 
     IMPORTANT: Do NOT ask the user for approval yourself in your chat
     output. Just call the tools you need as usual; approval is handled
@@ -76,12 +79,16 @@ async def activate_f1_exploration_mode() -> ToolChunk:
             TextBlock(
                 type="text",
                 text=(
-                    "F1 探索模式已激活。系统将自动拦截你后续的每个工具调用"
-                    "（邮件读写/文件操作/浏览器等）并向用户请求审批。"
-                    "重要：你无需也不应在对话中自行询问用户是否批准——"
-                    "请直接正常调用所需工具，审批由系统自动处理："
-                    "用户同意则工具正常返回结果；用户拒绝则工具返回拒绝信息，"
-                    "此时你应换一种思路重试。"
+                    "F1 探索模式已激活。请按以下方式工作：\n"
+                    "1. 先分析：代入收件人（用户）的身份通读这封邮件，"
+                    "判断邮件意图、用户在这个场景下会怎么处理，"
+                    "输出简短分析和处理计划。\n"
+                    "2. 再行动：每次调用工具前，先用一句话说明理由"
+                    "（例如“我想再仔细阅读一下这封邮件的细节”），"
+                    "然后直接调用工具。\n"
+                    "系统会自动拦截每个工具调用，"
+                    "把你的理由和操作展示给用户审批：同意则执行；"
+                    "拒绝则换一种思路。不要在对话中自行询问用户是否批准。"
                 ),
             ),
         ],

@@ -3461,11 +3461,13 @@
   },
   "approval": {
     "title": "Security Approval Required",
+    "agent": "Agent",
     "ownerAgent": "Owner Agent",
     "executingAgent": "Executing Agent",
     "tool": "Tool",
     "severity": "Severity",
     "findings": "Findings",
+    "reason": "Reason",
     "parameters": "Parameters",
     "approve": "Approve",
     "deny": "Deny",

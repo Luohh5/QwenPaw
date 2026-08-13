@@ -537,6 +537,7 @@ export default function InboxPage() {
                   findingsCount={approval.findings_count}
                   findingsSummary={approval.findings_summary}
                   toolParams={approval.tool_params}
+                  reasoning={approval.reasoning}
                   createdAt={approval.created_at}
                   timeoutSeconds={approval.timeout_seconds}
                   sessionId={approval.session_id}

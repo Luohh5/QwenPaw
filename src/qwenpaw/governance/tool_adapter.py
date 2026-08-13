@@ -675,6 +675,8 @@ async def _ask_user_approval(
     if session_id and tool_call_id:
         await svc.cancel_stale_pending_for_tool_call(session_id, tool_call_id)
 
+    from ..config.context import get_f1_reasoning
+
     pending = await svc.create_pending(
         session_id=session_id,
         root_session_id=root_session_id,
@@ -700,6 +702,7 @@ async def _ask_user_approval(
             },
             "channel_meta": ctx.get("channel_meta"),
             "_channel_instance": ctx.get("_channel_instance"),
+            "reasoning": get_f1_reasoning(session_id),
             **(
                 {"_spawn_subagent": True} if ctx.get("_spawn_subagent") else {}
             ),
