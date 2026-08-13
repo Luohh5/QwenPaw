@@ -4,10 +4,13 @@
 Provides RESTful API for managing multiple agent instances.
 """
 
+import importlib.util
 import json
 import logging
+import os
 import re
 import shutil
+import sys
 from pathlib import Path
 from typing import Any, Literal
 
@@ -886,6 +889,21 @@ async def update_agent(
         requested = AgentProfileConfig.model_validate(
             {**existing_config.model_dump(), **update_data},
         )
+        # Re-check the backend/mail exclusivity on the merged config
+        # inside the file lock: a concurrent update may have switched
+        # the persisted backend after the unlocked snapshot check.
+        effective_backend_locked = requested.backend or "qwenpaw"
+        if (
+            requested.mail is not None
+            and effective_backend_locked != "qwenpaw"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Mail configuration is only supported for "
+                    "qwenpaw backend"
+                ),
+            )
         old_memory = existing_config.running.reme_light_memory_config
         old_embedding = old_memory.embedding_model_config
         requested_running = update_data.get("running")
@@ -1426,7 +1444,7 @@ _QWENPAWMAIL_DRIVER_CARD_TEMPLATE = """name: qwenpawmail
 protocol: mcp
 endpoint:
   transport: stdio
-  command: /Users/luohh/Documents/mcp/qwenpawmail-mcp/.venv/bin/python
+  command: __QWENPAWMAIL_PYTHON__
   args:
   - -m
   - qwenpawmail_mcp
@@ -1441,6 +1459,25 @@ policy:
   default_effect: ask
   rules: []
 """
+
+
+def _resolve_qwenpawmail_command() -> str:
+    """Resolve the interpreter used to launch the qwenpawmail MCP server.
+
+    Priority: the QWENPAWMAIL_PYTHON environment variable, then the
+    current interpreter when qwenpawmail_mcp is importable (the
+    monorepo make install-dev / install-mail-mcp setup), then a bare
+    "python" resolved from PATH at MCP subprocess startup.
+    """
+    override = os.environ.get("QWENPAWMAIL_PYTHON", "").strip()
+    if override:
+        return override
+    try:
+        if importlib.util.find_spec("qwenpawmail_mcp") is not None:
+            return sys.executable
+    except (ImportError, ValueError):
+        pass
+    return "python"
 
 
 def _validate_mail_config(mail: AgentMailConfig) -> None:
@@ -1629,6 +1666,10 @@ def _generate_qwenpawmail_driver_card(
         else:
             env_block = "  env: {}"
         card_text = _QWENPAWMAIL_DRIVER_CARD_TEMPLATE.replace(
+            "__QWENPAWMAIL_PYTHON__",
+            _resolve_qwenpawmail_command(),
+            1,
+        ).replace(
             "  env: {}",
             env_block,
             1,

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import yaml
 from fastapi import HTTPException
 
 from qwenpaw.app.routers.agents import (
@@ -14,6 +16,8 @@ from qwenpaw.app.routers.agents import (
     _build_copied_agent_config,
     _build_qwenpawmail_env,
     _ensure_mail_triage_file,
+    _generate_qwenpawmail_driver_card,
+    _resolve_qwenpawmail_command,
     _validate_mail_config,
     create_agent,
     update_agent,
@@ -285,6 +289,80 @@ def test_update_agent_rejects_mail_with_explicit_third_party_backend():
             )
     assert exc_info.value.status_code == 400
     assert "qwenpaw backend" in exc_info.value.detail
+
+
+def test_update_agent_lock_recheck_rejects_stale_backend_snapshot():
+    """The in-lock re-check must catch a concurrent backend switch.
+
+    The unlocked snapshot still reports the qwenpaw backend, but by the
+    time the file lock is taken a concurrent request has persisted a
+    third-party backend: the merged config must be rejected inside the
+    lock instead of persisting the illegal backend+mail combination.
+    """
+    body = AgentProfileConfig(id="a1", name="bot", mail=_valid_mail())
+
+    async def _fake_update_locked(agent_id, apply_update):
+        stale = AgentProfileConfig(
+            id=agent_id,
+            name="bot",
+            backend="claude_code",
+        )
+        apply_update(stale)
+
+    with patch(
+        "qwenpaw.app.routers.agents.load_config",
+        return_value=_fake_global_config("a1"),
+    ), patch(
+        "qwenpaw.app.routers.agents.load_agent_config",
+        return_value=SimpleNamespace(backend="qwenpaw"),
+    ), patch(
+        "qwenpaw.app.routers.agents.update_agent_config_async",
+        new=_fake_update_locked,
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(
+                update_agent(agentId="a1", agent_config=body, request=None),
+            )
+    assert exc_info.value.status_code == 400
+    assert "qwenpaw backend" in exc_info.value.detail
+
+
+# ── qwenpawmail MCP command resolution ──────────────────────────────
+
+
+def test_resolve_qwenpawmail_command_env_override(monkeypatch):
+    monkeypatch.setenv("QWENPAWMAIL_PYTHON", "/custom/bin/python")
+    assert _resolve_qwenpawmail_command() == "/custom/bin/python"
+
+
+def test_resolve_qwenpawmail_command_uses_current_env(monkeypatch):
+    monkeypatch.delenv("QWENPAWMAIL_PYTHON", raising=False)
+    with patch(
+        "importlib.util.find_spec",
+        return_value=object(),
+    ):
+        assert _resolve_qwenpawmail_command() == sys.executable
+
+
+def test_resolve_qwenpawmail_command_falls_back_to_path(monkeypatch):
+    monkeypatch.delenv("QWENPAWMAIL_PYTHON", raising=False)
+    with patch(
+        "importlib.util.find_spec",
+        return_value=None,
+    ):
+        assert _resolve_qwenpawmail_command() == "python"
+
+
+def test_driver_card_uses_resolved_command(tmp_path, monkeypatch):
+    monkeypatch.setenv("QWENPAWMAIL_PYTHON", "/custom/bin/python")
+    _generate_qwenpawmail_driver_card(tmp_path, _valid_mail())
+    card_path = tmp_path / "drivers" / "mcp" / "qwenpawmail.yaml"
+    card = yaml.safe_load(card_path.read_text(encoding="utf-8"))
+    assert card["endpoint"]["command"] == "/custom/bin/python"
+    assert card["endpoint"]["args"] == ["-m", "qwenpawmail_mcp"]
+    # The old personal-machine interpreter path must never leak in.
+    card_text = card_path.read_text(encoding="utf-8")
+    assert "/Users/luohh/Documents/mcp" not in card_text
 
 
 def test_copied_agent_drops_mail_for_third_party_backend(tmp_path):
