@@ -61,11 +61,10 @@ test-channel-contract:
 test-base-core:
 	$(PYTEST) tests/unit/channels/test_base_core.py -v
 
-## 开发环境一键安装（主项目 + 子包）
+## Install the project and bundled mail MCP for development.
 install-dev:
 	$(PYTHON) -m pip install -e .
-	$(PYTHON) -m pip install -e packages/qwenpawmail-mcp
 
-## 仅安装邮箱 MCP 子包
+## Install only the standalone mail MCP package.
 install-mail-mcp:
 	$(PYTHON) -m pip install -e packages/qwenpawmail-mcp
