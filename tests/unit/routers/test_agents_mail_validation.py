@@ -274,19 +274,15 @@ def test_create_mail_agent_driver_failure_is_not_committed(tmp_path):
             return_value=False,
         ),
         patch(
-            "qwenpaw.app.routers.agents.save_config",
-        ) as save_root,
-        patch(
-            "qwenpaw.app.routers.agents.save_agent_config",
-        ) as save_agent,
+            "qwenpaw.app.routers.agents._persist_created_agent",
+        ) as persist_agent,
     ):
         with pytest.raises(HTTPException) as exc_info:
             asyncio.run(create_agent(request=request, http_request=None))
 
     assert exc_info.value.status_code == 500
     assert config.agents.profiles == {}
-    save_root.assert_not_called()
-    save_agent.assert_not_called()
+    persist_agent.assert_not_called()
 
 
 def test_copy_mail_agent_driver_failure_is_not_committed(
@@ -331,22 +327,14 @@ def test_copy_mail_agent_driver_failure_is_not_committed(
             "qwenpaw.app.routers.agents._generate_unique_id",
             return_value="copy-failure",
         ),
-        patch(
-            "qwenpaw.app.routers.agents._initialize_agent_workspace",
-        ),
-        patch(
-            "qwenpaw.app.routers.agents._copy_selected_workspace_files",
-        ),
+        patch("qwenpaw.app.routers.agents._prepare_copied_workspace"),
         patch(
             "qwenpaw.app.routers.agents._sync_qwenpawmail_driver_card",
             return_value=False,
         ),
         patch(
-            "qwenpaw.app.routers.agents.save_config",
-        ) as save_root,
-        patch(
-            "qwenpaw.app.routers.agents.save_agent_config",
-        ) as save_agent,
+            "qwenpaw.app.routers.agents._persist_created_agent",
+        ) as persist_agent,
     ):
         with pytest.raises(HTTPException) as exc_info:
             asyncio.run(
@@ -359,8 +347,7 @@ def test_copy_mail_agent_driver_failure_is_not_committed(
 
     assert exc_info.value.status_code == 500
     assert set(config.agents.profiles) == {"source"}
-    save_root.assert_not_called()
-    save_agent.assert_not_called()
+    persist_agent.assert_not_called()
 
 
 def _fake_global_config(agent_id: str) -> SimpleNamespace:
