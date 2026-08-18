@@ -17,6 +17,15 @@ from ..errors import CredentialNotFoundError, DriverCardError
 from ...security.secret_store import decrypt, encrypt, is_encrypted
 
 _STORE_VERSION = 1
+_STORE_LOCKS_GUARD = threading.Lock()
+_STORE_LOCKS: dict[Path, threading.RLock] = {}
+
+
+def _store_lock(path: Path) -> threading.RLock:
+    """Return one in-process lock shared by all stores for *path*."""
+    key = path.expanduser().resolve()
+    with _STORE_LOCKS_GUARD:
+        return _STORE_LOCKS.setdefault(key, threading.RLock())
 
 
 class AsyncCredentialStore:
@@ -30,26 +39,31 @@ class AsyncCredentialStore:
 
     def __init__(self, credentials_path: Path) -> None:
         self._path = credentials_path
-        self._lock = threading.RLock()
+        self._lock = _store_lock(credentials_path)
 
     async def get(self, ref: str) -> CredentialRecord:
         """Read one CredentialRecord and decrypt values under secrets."""
-        return await asyncio.to_thread(self._get_sync, ref)
+        return await asyncio.to_thread(self.get_sync, ref)
 
     async def put(self, record: CredentialRecord) -> None:
         """Encrypt all string secrets and atomically write YAML."""
-        await asyncio.to_thread(self._put_sync, record)
+        await asyncio.to_thread(self.put_sync, record)
 
     async def delete(self, ref: str) -> None:
         """Remove one credential entry if present."""
-        await asyncio.to_thread(self._delete_sync, ref)
+        await asyncio.to_thread(self.delete_sync, ref)
 
     async def list_refs(self) -> list[str]:
         """Return sorted credential refs."""
-        return await asyncio.to_thread(self._list_refs_sync)
+        return await asyncio.to_thread(self.list_refs_sync)
 
-    def _get_sync(self, ref: str) -> CredentialRecord:
-        """Read one CredentialRecord and decrypt values under secrets."""
+    def get_sync(self, ref: str) -> CredentialRecord:
+        """Synchronously read and decrypt one credential record.
+
+        Configuration loading and migrations already run in worker threads and
+        need a non-async entry point.  Keeping that entry point on the same
+        store avoids a second credential-file implementation.
+        """
         if ref.startswith("env:"):
             var = ref[len("env:") :]
             return CredentialRecord(
@@ -85,8 +99,8 @@ class AsyncCredentialStore:
             meta=dict(meta),
         )
 
-    def _put_sync(self, record: CredentialRecord) -> None:
-        """Encrypt all string secrets and atomically write YAML."""
+    def put_sync(self, record: CredentialRecord) -> None:
+        """Synchronously encrypt and persist one credential record."""
         if record.ref.startswith("env:"):
             raise DriverCardError("Cannot persist env: credential refs")
         if not record.ref:
@@ -107,8 +121,8 @@ class AsyncCredentialStore:
             root["credentials"] = credentials
             self._write_root(root)
 
-    def _delete_sync(self, ref: str) -> None:
-        """Remove one credential entry if present."""
+    def delete_sync(self, ref: str) -> None:
+        """Synchronously remove one credential entry if present."""
         with self._lock:
             root = self._read_root()
             credentials = dict(root["credentials"])
@@ -117,8 +131,8 @@ class AsyncCredentialStore:
                 root["credentials"] = credentials
                 self._write_root(root)
 
-    def _list_refs_sync(self) -> list[str]:
-        """Return sorted credential refs."""
+    def list_refs_sync(self) -> list[str]:
+        """Synchronously return sorted credential refs."""
         return sorted(self._read_credentials().keys())
 
     def _read_root(self) -> dict[str, Any]:

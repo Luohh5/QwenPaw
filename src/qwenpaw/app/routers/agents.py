@@ -4,18 +4,14 @@
 Provides RESTful API for managing multiple agent instances.
 """
 
-import importlib.util
 import json
 import logging
-import os
 import re
 import shutil
-import sys
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
 
-import yaml
 from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi import Path as PathParam
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -25,6 +21,13 @@ from qwenpaw.exceptions import (
 )
 
 from ...agents.utils.file_handling import read_text_file_with_encoding_fallback
+from ..mail.driver_config import (
+    ENTERPRISE_MAIL_PROVIDERS as _ENTERPRISE_MAIL_PROVIDERS,
+    build_qwenpawmail_env as _build_qwenpawmail_env,
+    generate_qwenpawmail_driver_card as _generate_qwenpawmail_driver_card,
+    resolve_qwenpawmail_command as _resolve_qwenpawmail_command,
+    sync_qwenpawmail_driver_card as _sync_qwenpawmail_driver_card,
+)
 from ..utils import safe_join, schedule_agent_reload
 from ...config.config import (
     AgentMailConfig,
@@ -34,6 +37,7 @@ from ...config.config import (
     ModelSlotConfig,
     load_agent_config,
     mutate_agent_config,
+    save_agent_mail_credentials,
     save_agent_config,
     update_agent_config_async,
     generate_short_agent_id,
@@ -51,7 +55,7 @@ from ...harnesses.registry import ProviderCatalogItem, get_provider
 from ..agent_startup import AgentStartupStatus
 from ..multi_agent_manager import MultiAgentManager
 from ...constant import WORKING_DIR
-from ...utils.io_utils import run_sync_io, write_json_atomic, write_text_atomic
+from ...utils.io_utils import run_sync_io, write_json_atomic
 from ...utils.logging import sanitize_log_value
 
 logger = logging.getLogger(__name__)
@@ -967,6 +971,8 @@ def _persist_created_agent(
                 detail=f"Agent ID '{agent_id}' already exists",
             )
         agent_path = Path(agent_ref.workspace_dir).expanduser() / "agent.json"
+        if agent_config.mail is not None:
+            save_agent_mail_credentials(agent_path.parent, agent_config.mail)
         write_json_atomic(
             agent_path,
             agent_config.model_dump(exclude_none=True),
@@ -1082,7 +1088,7 @@ async def copy_agent(
     summary="Update agent",
     description="Update agent configuration and trigger reload",
 )
-async def update_agent(
+async def update_agent(  # pylint: disable=too-many-statements
     agentId: str = PathParam(...),
     agent_config: AgentProfileConfig = Body(...),
     request: Request = None,
@@ -1116,13 +1122,23 @@ async def update_agent(
         if "backend" in agent_config.model_fields_set
         else getattr(existing_config_snap, "backend", "qwenpaw")
     ) or "qwenpaw"
+    mail_was_set = "mail" in agent_config.model_fields_set
+    existing_mail_snap = getattr(existing_config_snap, "mail", None)
+    effective_mail = (
+        _merge_unchanged_mail_secrets(
+            agent_config.mail,
+            existing_mail_snap,
+        )
+        if mail_was_set and agent_config.mail is not None
+        else (None if mail_was_set else existing_mail_snap)
+    )
     _validate_mail_backend_compatibility(
         effective_backend,
-        agent_config.mail,
+        effective_mail,
     )
 
-    if agent_config.mail is not None:
-        _validate_mail_config(agent_config.mail)
+    if effective_mail is not None:
+        _validate_mail_config(effective_mail)
 
     update_data = agent_config.model_dump(exclude_unset=True)
     previous_config = existing_config_snap
@@ -1135,6 +1151,20 @@ async def update_agent(
         requested = AgentProfileConfig.model_validate(
             {**existing_config.model_dump(), **update_data},
         )
+        if mail_was_set:
+            requested.mail = (
+                _merge_unchanged_mail_secrets(
+                    agent_config.mail,
+                    existing_config.mail,
+                )
+                if agent_config.mail is not None
+                else None
+            )
+        else:
+            # Secret fields are intentionally excluded from model_dump(), so
+            # restore the authoritative in-memory mail model after validating
+            # the ordinary merged fields.
+            requested.mail = deepcopy(existing_config.mail)
         # Re-check the backend/mail exclusivity on the merged config
         # inside the file lock: a concurrent update may have switched
         # the persisted backend after the unlocked snapshot check.
@@ -1142,6 +1172,8 @@ async def update_agent(
             requested.backend,
             requested.mail,
         )
+        if requested.mail is not None:
+            _validate_mail_config(requested.mail)
         old_memory = existing_config.running.reme_light_memory_config
         old_embedding = old_memory.embedding_model_config
         requested_running = update_data.get("running")
@@ -1171,7 +1203,7 @@ async def update_agent(
     except (ValueError, AppBaseException) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    # Keep the generated credential-bearing DriverCard in lockstep with the
+    # Keep the secret-free DriverCard and encrypted credential in lockstep with
     # *persisted* final configuration.  In particular, an explicit mail=null
     # or a backend switch must revoke the old MCP capability before reload.
     try:
@@ -1180,7 +1212,7 @@ async def update_agent(
             workspace_dir,
             updated_config.mail,
             updated_config.backend,
-            force_rewrite=agent_config.mail is not None,
+            force_rewrite=mail_was_set,
         )
     except Exception:  # pylint: disable=broad-except
         logger.warning(
@@ -1700,33 +1732,6 @@ _ALLOWED_MAIL_DOMAINS = {
     "qiye.163.com",
 }
 
-# Enterprise mail providers (custom-domain mailboxes).  The qwenpawmail
-# MCP server resolves unknown domains via the QWENPAWMAIL_IMAP_HOST /
-# IMAP_PORT / SMTP_HOST / SMTP_PORT environment overrides, so a
-# provider-selected credential injects these host/port values.
-# NOTE: netease_qiye SMTP uses port 994 (NOT the usual 465) per the
-# official NetEase enterprise mail documentation — do not "fix" it.
-_ENTERPRISE_MAIL_PROVIDERS: dict[str, dict[str, object]] = {
-    "tencent_exmail": {
-        "imap_host": "imap.exmail.qq.com",
-        "imap_port": 993,
-        "smtp_host": "smtp.exmail.qq.com",
-        "smtp_port": 465,
-    },
-    "aliyun_qiye": {
-        "imap_host": "imap.qiye.aliyun.com",
-        "imap_port": 993,
-        "smtp_host": "smtp.qiye.aliyun.com",
-        "smtp_port": 465,
-    },
-    "netease_qiye": {
-        "imap_host": "imap.qiye.163.com",
-        "imap_port": 993,
-        "smtp_host": "smtp.qiye.163.com",
-        "smtp_port": 994,  # NetEase enterprise SMTP SSL port is 994
-    },
-}
-
 # Domains whose authorization codes (or app-specific passwords) are
 # exactly 16 characters.  Other allowed domains use login passwords
 # (or client-specific passwords) of variable length.
@@ -1760,45 +1765,6 @@ _MAIL_DOMAIN_RE = re.compile(
     r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$",
 )
 
-_QWENPAWMAIL_DRIVER_CARD_TEMPLATE = """name: qwenpawmail
-protocol: mcp
-endpoint:
-  transport: stdio
-  command: __QWENPAWMAIL_PYTHON__
-  args:
-  - -m
-  - qwenpawmail_mcp
-  env: {}
-credentials: {}
-config:
-  display_name: qwenpawmail
-  description: ''
-  tools: null
-enabled: true
-policy:
-  default_effect: ask
-  rules: []
-"""
-
-
-def _resolve_qwenpawmail_command() -> str:
-    """Resolve the interpreter used to launch the qwenpawmail MCP server.
-
-    Priority: the QWENPAWMAIL_PYTHON environment variable, then the
-    current interpreter when qwenpawmail_mcp is importable (the
-    monorepo make install-dev / install-mail-mcp setup), then a bare
-    "python" resolved from PATH at MCP subprocess startup.
-    """
-    override = os.environ.get("QWENPAWMAIL_PYTHON", "").strip()
-    if override:
-        return override
-    try:
-        if importlib.util.find_spec("qwenpawmail_mcp") is not None:
-            return sys.executable
-    except (ImportError, ValueError):
-        pass
-    return "python"
-
 
 def _validate_mail_backend_compatibility(
     backend: str | None,
@@ -1810,6 +1776,42 @@ def _validate_mail_backend_compatibility(
             status_code=400,
             detail="Mail configuration is only supported for qwenpaw backend",
         )
+
+
+def _merge_unchanged_mail_secrets(
+    incoming: AgentMailConfig,
+    existing: AgentMailConfig | None,
+) -> AgentMailConfig:
+    """Treat blank edit-form secrets as "keep existing" for one mailbox.
+
+    GET responses omit secret fields, so the Console submits blanks when a
+    user edits unrelated agent settings.  Secrets are inherited only when the
+    mailbox mode and public identity are unchanged; changing the account still
+    requires fresh credentials and is validated normally.
+    """
+    merged = incoming.model_copy(deep=True)
+    if existing is None:
+        return merged
+
+    def identity(mail: AgentMailConfig) -> tuple[bool, str, str, str]:
+        credential = mail.credential
+        return (
+            mail.is_new_account,
+            (credential.name or "").strip().lower(),
+            (credential.domain or "").strip().lower(),
+            (credential.provider or "").strip().lower(),
+        )
+
+    if identity(merged) != identity(existing):
+        return merged
+    for field_name in ("auth_code", "password", "phone_number"):
+        if not getattr(merged.credential, field_name):
+            setattr(
+                merged.credential,
+                field_name,
+                getattr(existing.credential, field_name),
+            )
+    return merged
 
 
 def _validate_mail_config(mail: AgentMailConfig) -> None:
@@ -1922,137 +1924,6 @@ def _validate_mail_config(mail: AgentMailConfig) -> None:
                 status_code=400,
                 detail="credential name (mailbox username) is required",
             )
-
-
-def _build_qwenpawmail_env(
-    mail: AgentMailConfig | None,
-    workspace_dir: Path | None = None,
-) -> dict[str, str]:
-    """Build the endpoint.env mapping for the qwenpawmail MCP subprocess.
-
-    The qwenpawmail-mcp server's load_config() requires BOTH
-    QWENPAWMAIL_EMAIL (full address) and QWENPAWMAIL_AUTH_CODE, and raises
-    ConfigError when either is missing.  password / phone_number are never
-    read from the environment by the server, so they are not injected.
-
-    For a dedicated new mailbox (is_new_account=True) the auth_code is
-    empty (and name may be empty too), so a partial injection would make
-    load_config() fail at startup.  In that case we keep env empty and
-    preserve the current behavior (agent sets credentials at runtime via
-    the set_credentials tool).
-    """
-    if mail is None or mail.is_new_account:
-        return {}
-    credential = mail.credential
-    if not credential.name or not credential.auth_code:
-        return {}
-    env = {
-        "QWENPAWMAIL_EMAIL": f"{credential.name}@{credential.domain}",
-        "QWENPAWMAIL_AUTH_CODE": credential.auth_code,
-    }
-    provider = (credential.provider or "").strip()
-    hosts = _ENTERPRISE_MAIL_PROVIDERS.get(provider)
-    if hosts is not None:
-        # Custom-domain enterprise mail: the MCP server cannot infer
-        # hosts from the domain, so inject explicit overrides.
-        env["QWENPAWMAIL_IMAP_HOST"] = str(hosts["imap_host"])
-        env["QWENPAWMAIL_IMAP_PORT"] = str(hosts["imap_port"])
-        env["QWENPAWMAIL_SMTP_HOST"] = str(hosts["smtp_host"])
-        env["QWENPAWMAIL_SMTP_PORT"] = str(hosts["smtp_port"])
-    if workspace_dir is not None:
-        env["QWENPAWMAIL_STATE_DIR"] = str(workspace_dir / "mail_state")
-        # The MCP server confines attachment saves to this directory
-        # (older cards without it fall back to STATE_DIR's parent).
-        env["QWENPAWMAIL_WORKSPACE_DIR"] = str(workspace_dir)
-    return env
-
-
-def _generate_qwenpawmail_driver_card(
-    workspace_dir: Path,
-    mail: AgentMailConfig | None = None,
-) -> bool:
-    """Write the qwenpawmail MCP driver card into the agent workspace.
-
-    When usable personal-mailbox credentials are available, they are
-    injected into endpoint.env so the MCP stdio subprocess can load them
-    at startup (surviving process restarts).
-
-    Failures are logged and reported through the boolean return value. Agent
-    create/copy/update callers must not commit a mail configuration when this
-    function returns ``False``.
-    """
-    try:
-        (workspace_dir / "mail_state").mkdir(parents=True, exist_ok=True)
-        env = _build_qwenpawmail_env(mail, workspace_dir)
-        if env:
-            # yaml.safe_dump guarantees correct escaping of special
-            # characters in credential values; indent to sit under
-            # the endpoint mapping.
-            env_yaml = yaml.safe_dump(
-                {"env": env},
-                default_flow_style=False,
-                allow_unicode=True,
-                sort_keys=False,
-            )
-            env_block = "\n".join(
-                "  " + line for line in env_yaml.strip().splitlines()
-            )
-        else:
-            env_block = "  env: {}"
-        card_text = _QWENPAWMAIL_DRIVER_CARD_TEMPLATE.replace(
-            "__QWENPAWMAIL_PYTHON__",
-            _resolve_qwenpawmail_command(),
-            1,
-        ).replace(
-            "  env: {}",
-            env_block,
-            1,
-        )
-        driver_dir = workspace_dir / "drivers" / "mcp"
-        driver_dir.mkdir(parents=True, exist_ok=True)
-        driver_card = driver_dir / "qwenpawmail.yaml"
-        # The card may contain plaintext mailbox credentials.  Publish a
-        # complete replacement atomically and keep it owner-only even when an
-        # older installation created the file with broader permissions.
-        if driver_card.exists():
-            driver_card.chmod(0o600)
-        write_text_atomic(driver_card, card_text, new_file_mode=0o600)
-        driver_card.chmod(0o600)
-        return True
-    except Exception as e:
-        logger.warning(
-            "Failed to generate qwenpawmail driver card for %s: %s",
-            sanitize_log_value(workspace_dir),
-            sanitize_log_value(e),
-        )
-        return False
-
-
-def _sync_qwenpawmail_driver_card(
-    workspace_dir: Path,
-    mail: AgentMailConfig | None,
-    backend: str,
-    *,
-    force_rewrite: bool = False,
-) -> bool:
-    """Synchronize the generated qwenpawmail card with final agent state.
-
-    Only the exact generated card is removed.  User-managed DriverCards and
-    the mailbox state directory are intentionally left untouched.
-    """
-    driver_card = workspace_dir / "drivers" / "mcp" / "qwenpawmail.yaml"
-    if backend != "qwenpaw" or mail is None:
-        driver_card.unlink(missing_ok=True)
-        return True
-    if (force_rewrite or not driver_card.exists()) and not (
-        _generate_qwenpawmail_driver_card(workspace_dir, mail)
-    ):
-        # Never leave an enabled card containing superseded credentials when
-        # the replacement failed.  The persisted config remains authoritative
-        # and a retry can regenerate the card safely.
-        driver_card.unlink(missing_ok=True)
-        return False
-    return True
 
 
 def _ensure_workspace_md_file(

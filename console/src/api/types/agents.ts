@@ -46,9 +46,10 @@ export interface AgentMailCredential {
   // "" for whitelisted domains; enterprise provider id
   // (tencent_exmail / aliyun_qiye / netease_qiye) for custom domains.
   provider?: string;
-  auth_code: string;
-  password: string;
-  phone_number: string;
+  // Write-only: GET /agents/{id} intentionally omits mailbox secrets.
+  auth_code?: string;
+  password?: string;
+  phone_number?: string;
 }
 
 export interface AgentMailPushRule {

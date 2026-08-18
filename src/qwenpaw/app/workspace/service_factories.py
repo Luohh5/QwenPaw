@@ -6,8 +6,9 @@ and initialize service components. Extracted from local functions to
 improve testability and code organization.
 """
 
-from typing import TYPE_CHECKING
+import asyncio
 import logging
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .workspace import Workspace
@@ -31,6 +32,33 @@ async def create_driver_service(ws: "Workspace", _service):
     from ...drivers.handlers.mcp import validate_mcp_endpoint
     from ...drivers.manager import DriverManager
     from ..approvals.driver_gate import QwenPawDriverApprovalGate
+    from ..mail.driver_config import (
+        is_managed_qwenpawmail_card,
+        sync_qwenpawmail_driver_card,
+    )
+
+    # Upgrade legacy qwenpawmail cards before DriverManager can launch them.
+    # ``load_agent_config`` has already hydrated the in-memory secrets from the
+    # encrypted store at this point.
+    mail = getattr(ws._config, "mail", None)
+    existing_mail_card = (
+        ws.workspace_dir / "drivers" / "mcp" / "qwenpawmail.yaml"
+    )
+    should_sync_mail_card = mail is not None or await asyncio.to_thread(
+        is_managed_qwenpawmail_card,
+        existing_mail_card,
+    )
+    if should_sync_mail_card and not await asyncio.to_thread(
+        sync_qwenpawmail_driver_card,
+        ws.workspace_dir,
+        mail,
+        getattr(ws._config, "backend", "qwenpaw"),
+    ):
+        logger.warning(
+            "qwenpawmail DriverCard could not be synchronized for agent %s; "
+            "mail capability remains disabled",
+            ws.agent_id,
+        )
 
     credential_store = AsyncCredentialStore(
         ws.workspace_dir / "credentials.yaml",

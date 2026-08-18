@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import stat
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -28,12 +27,20 @@ from qwenpaw.app.routers.agents import (
     update_agent,
 )
 from qwenpaw.config.config import (
+    AGENT_MAIL_CREDENTIAL_REF,
     AgentMailConfig,
     AgentMailCredential,
     AgentMailPushConfig,
     AgentMailPushRule,
     AgentProfileConfig,
 )
+from qwenpaw.drivers.credentials.store import AsyncCredentialStore
+from qwenpaw.drivers.credentials.bindings import (
+    resolve_binding,
+    resolve_credentials,
+)
+from qwenpaw.drivers.credentials.providers import build_provider
+from qwenpaw.drivers.storage import load_card
 
 
 def _valid_mail(push: AgentMailPushConfig | None = None) -> AgentMailConfig:
@@ -196,6 +203,11 @@ def test_env_injects_hosts_for_enterprise_provider(tmp_path):
     mail.credential.domain = "mycompany.com"
     env = _build_qwenpawmail_env(mail, tmp_path)
     assert env["QWENPAWMAIL_EMAIL"] == "tester@mycompany.com"
+    assert env["QWENPAWMAIL_AUTH_CODE"] == {
+        "source": "credential",
+        "credential": "mail",
+        "field": "auth_code",
+    }
     assert env["QWENPAWMAIL_IMAP_HOST"] == "imap.qiye.163.com"
     assert env["QWENPAWMAIL_IMAP_PORT"] == "993"
     assert env["QWENPAWMAIL_SMTP_HOST"] == "smtp.qiye.163.com"
@@ -481,7 +493,59 @@ def test_driver_card_uses_resolved_command(tmp_path, monkeypatch):
     # The old personal-machine interpreter path must never leak in.
     card_text = card_path.read_text(encoding="utf-8")
     assert "/Users/luohh/Documents/mcp" not in card_text
-    assert stat.S_IMODE(card_path.stat().st_mode) == 0o600
+    assert "a" * 16 not in card_text
+    assert card["credentials"]["mail"] == {
+        "kind": "static",
+        "ref": AGENT_MAIL_CREDENTIAL_REF,
+    }
+    credential_text = (tmp_path / "credentials.yaml").read_text("utf-8")
+    assert "a" * 16 not in credential_text
+    assert "ENC:" in credential_text
+
+
+def test_driver_runtime_resolves_mail_secret_from_credential_store(tmp_path):
+    assert _generate_qwenpawmail_driver_card(tmp_path, _valid_mail())
+    card = load_card(tmp_path / "drivers" / "mcp" / "qwenpawmail.yaml")
+    store = AsyncCredentialStore(tmp_path / "credentials.yaml")
+    providers = {
+        alias: build_provider(reference, store)
+        for alias, reference in card.credentials.items()
+    }
+
+    resolved = asyncio.run(resolve_credentials(providers))
+    env = resolve_binding(card.endpoint["env"], resolved)
+
+    assert env["QWENPAWMAIL_EMAIL"] == "tester@163.com"
+    assert env["QWENPAWMAIL_AUTH_CODE"] == "a" * 16
+
+
+def test_sync_upgrades_legacy_plaintext_driver_card(tmp_path):
+    card_path = tmp_path / "drivers" / "mcp" / "qwenpawmail.yaml"
+    card_path.parent.mkdir(parents=True)
+    card_path.write_text(
+        """name: qwenpawmail
+protocol: mcp
+endpoint:
+  transport: stdio
+  command: python
+  args: [-m, qwenpawmail_mcp]
+  env:
+    QWENPAWMAIL_EMAIL: tester@163.com
+    QWENPAWMAIL_AUTH_CODE: aaaaaaaaaaaaaaaa
+credentials: {}
+""",
+        encoding="utf-8",
+    )
+
+    assert _sync_qwenpawmail_driver_card(
+        tmp_path,
+        _valid_mail(),
+        "qwenpaw",
+    )
+
+    rewritten = card_path.read_text("utf-8")
+    assert "a" * 16 not in rewritten
+    assert AGENT_MAIL_CREDENTIAL_REF in rewritten
 
 
 def _run_mail_revocation_update(tmp_path, body: AgentProfileConfig):
@@ -582,12 +646,44 @@ def test_update_cannot_relocate_mail_driver_writes(tmp_path):
     assert not requested_workspace.exists()
 
 
+def test_update_omitted_secret_keeps_existing_mail_credential(tmp_path):
+    incoming = _valid_mail()
+    incoming.credential.auth_code = ""
+
+    updated = _run_mail_revocation_update(
+        tmp_path,
+        AgentProfileConfig(id="a1", name="bot", mail=incoming),
+    )
+
+    assert updated.mail is not None
+    assert updated.mail.credential.auth_code == "a" * 16
+    stored = AsyncCredentialStore(tmp_path / "credentials.yaml").get_sync(
+        AGENT_MAIL_CREDENTIAL_REF,
+    )
+    assert stored.secrets["auth_code"] == "a" * 16
+
+
+def test_update_changed_mailbox_requires_fresh_secret(tmp_path):
+    incoming = _valid_mail()
+    incoming.credential.name = "different"
+    incoming.credential.auth_code = ""
+
+    with pytest.raises(HTTPException) as exc_info:
+        _run_mail_revocation_update(
+            tmp_path,
+            AgentProfileConfig(id="a1", name="bot", mail=incoming),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "auth_code" in exc_info.value.detail
+
+
 def test_failed_driver_rewrite_revokes_stale_credentials(tmp_path):
     card_path = tmp_path / "drivers" / "mcp" / "qwenpawmail.yaml"
     card_path.parent.mkdir(parents=True)
     card_path.write_text("old plaintext credentials", encoding="utf-8")
     with patch(
-        "qwenpaw.app.routers.agents._generate_qwenpawmail_driver_card",
+        "qwenpaw.app.mail.driver_config.generate_qwenpawmail_driver_card",
         return_value=False,
     ):
         assert not _sync_qwenpawmail_driver_card(
@@ -730,7 +826,7 @@ def test_update_failed_new_card_rebuilds_old_credentials(tmp_path):
             side_effect=_fake_save,
         ),
         patch(
-            "qwenpaw.app.routers.agents._generate_qwenpawmail_driver_card",
+            "qwenpaw.app.mail.driver_config.generate_qwenpawmail_driver_card",
             side_effect=_fail_only_new_credentials,
         ),
         patch(
@@ -750,7 +846,15 @@ def test_update_failed_new_card_rebuilds_old_credentials(tmp_path):
     card = yaml.safe_load(card_path.read_text("utf-8"))
     assert persisted[0].mail is not None
     assert persisted[0].mail.credential.auth_code == "a" * 16
-    assert card["endpoint"]["env"]["QWENPAWMAIL_AUTH_CODE"] == "a" * 16
+    assert card["endpoint"]["env"]["QWENPAWMAIL_AUTH_CODE"] == {
+        "source": "credential",
+        "credential": "mail",
+        "field": "auth_code",
+    }
+    stored = AsyncCredentialStore(tmp_path / "credentials.yaml").get_sync(
+        AGENT_MAIL_CREDENTIAL_REF,
+    )
+    assert stored.secrets["auth_code"] == "a" * 16
     reload_agent.assert_not_called()
 
 

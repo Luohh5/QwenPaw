@@ -447,7 +447,7 @@ export function AgentModal({
               extra={t(mailCredentialHintKey)}
               rules={[
                 {
-                  required: true,
+                  required: !editingAgent,
                   message: isAuthCodeDomain
                     ? t("agent.mailAuthCodeRequired")
                     : t("agent.mailCredentialRequired"),
@@ -457,7 +457,7 @@ export function AgentModal({
                   : []),
               ]}
             >
-              <Input placeholder={t(mailCredentialHintKey)} />
+              <Input.Password placeholder={t(mailCredentialHintKey)} />
             </Form.Item>
           </>
         )}
@@ -507,7 +507,10 @@ export function AgentModal({
               name={["mail_credential", "password"]}
               label={t("agent.mailPassword")}
               rules={[
-                { required: true, message: t("agent.mailPasswordRequired") },
+                {
+                  required: !editingAgent,
+                  message: t("agent.mailPasswordRequired"),
+                },
               ]}
             >
               <Input.Password />
@@ -516,7 +519,10 @@ export function AgentModal({
               name={["mail_credential", "phone_number"]}
               label={t("agent.mailPhone")}
               rules={[
-                { required: true, message: t("agent.mailPhoneRequired") },
+                {
+                  required: !editingAgent,
+                  message: t("agent.mailPhoneRequired"),
+                },
               ]}
             >
               <Input />

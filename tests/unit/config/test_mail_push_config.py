@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Unit tests for AgentMailPushConfig serialization semantics."""
+
 from __future__ import annotations
 
 from qwenpaw.config.config import (
@@ -34,6 +35,26 @@ def test_push_none_is_not_serialized():
     )
     dumped = mail.model_dump(exclude_none=True)
     assert "push" not in dumped
+
+
+def test_mail_secrets_are_write_only():
+    mail = AgentMailConfig(
+        credential=AgentMailCredential(
+            name="tester",
+            auth_code="a" * 16,
+            password="secret-password",
+            phone_number="13800000000",
+        ),
+    )
+
+    credential = mail.model_dump()["credential"]
+    assert "auth_code" not in credential
+    assert "password" not in credential
+    assert "phone_number" not in credential
+    representation = repr(mail)
+    assert "a" * 16 not in representation
+    assert "secret-password" not in representation
+    assert "13800000000" not in representation
 
 
 def test_legacy_mail_config_without_push_loads():
