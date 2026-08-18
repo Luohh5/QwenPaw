@@ -24,7 +24,7 @@ from datetime import datetime
 from email.header import decode_header, make_header
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Any, Callable, Iterator, cast
+from typing import Any, Callable, Iterator
 
 from imap_tools import imap_utf7
 from imap_tools.message import MailMessage
@@ -37,6 +37,13 @@ from .errors import (
     PermanentSendError,
     RateLimitError,
     UnsafeLoginError,
+)
+from .imap_ops import (
+    check_response as _check,
+    encode_folder,
+    ensure_folder,
+    move_message as move_message_on_connection,
+    uid_expunge,
 )
 
 # Register the RFC 2971 ID command so imaplib accepts it
@@ -119,13 +126,6 @@ def decode_mime_header(value: str | bytes | None) -> str:
         return str(make_header(decode_header(value))).strip()
     except Exception:
         return value.strip()
-
-
-def encode_folder(name: str) -> str:
-    """Encode a (possibly Chinese) folder name to
-    quoted IMAP modified UTF-7."""
-    encoded = imap_utf7.utf7_encode(name).decode("ascii")
-    return f'"{encoded}"'
 
 
 def decode_folder(raw: str | bytes) -> str:
@@ -263,14 +263,6 @@ def _imap_date(date_str: str) -> str:
 def _escape_imap_string(value: str) -> str:
     """Escape backslashes and double quotes for an IMAP quoted string."""
     return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def _check(typ: str, data: Any, action: str) -> None:
-    if typ != "OK":
-        detail = data[0] if isinstance(data, (list, tuple)) and data else data
-        if isinstance(detail, bytes):
-            detail = detail.decode("utf-8", errors="replace")
-        raise MailError(f"IMAP {action} failed: {typ} {detail}")
 
 
 def read_uidvalidity(conn: imaplib.IMAP4_SSL) -> int | None:
@@ -498,9 +490,11 @@ class MailClient:
 
     def create_folder(self, name: str) -> dict[str, Any]:
         with self._imap() as conn:
-            typ, data = conn.create(encode_folder(name))
-            _check(typ, data, f"CREATE {name!r}")
-            return {"created": name}
+            result = ensure_folder(conn, name)
+            return {
+                "created": name,
+                "already_exists": result["already_exists"],
+            }
 
     # -- message listing / reading -------------------------------------------
 
@@ -981,196 +975,41 @@ class MailClient:
             _check(typ, data, "STORE")
             return {"folder": folder, "uids": list(uids), "mark": mark}
 
-    def _uid_expunge(self, conn: imaplib.IMAP4_SSL, uid: str) -> bool:
-        """Try RFC 4315 UID EXPUNGE (removes only the given UID).
-
-        Returns False when the server lacks the UIDPLUS capability. We never
-        fall back to a global EXPUNGE, which would purge every \\Deleted
-        message in the folder.
-        """
-        try:
-            typ, _ = conn.uid("EXPUNGE", uid)
-        except imaplib.IMAP4.error:
-            return False
-        return typ == "OK"
-
     def move_message(
         self,
         folder: str,
         uid: str,
         target_folder: str,
     ) -> dict[str, Any]:
-        caps = self.config.capabilities
-        target = encode_folder(target_folder)
         with self._imap() as conn:
             self._select(conn, folder)
-            # Level 1: UID MOVE (RFC 6851).
-            if caps.move:
-                try:
-                    typ, data = conn.uid("MOVE", uid, target)
-                except imaplib.IMAP4.error:
-                    typ = "NO"
-                if typ == "OK":
-                    return {
-                        "moved": True,
-                        "uid": uid,
-                        "from": folder,
-                        "to": target_folder,
-                    }
-            # Level 2: UID COPY + STORE \Deleted + UID EXPUNGE.
-            if caps.copy:
-                try:
-                    typ, data = conn.uid("COPY", uid, target)
-                except imaplib.IMAP4.error:
-                    typ = "NO"
-                if typ == "OK":
-                    typ, data = conn.uid(
-                        "STORE",
-                        uid,
-                        "+FLAGS",
-                        "(\\Deleted)",
-                    )
-                    _check(typ, data, "STORE \\Deleted")
-                    expunged = self._uid_expunge(conn, uid)
-                    result: dict[str, Any] = {
-                        "moved": True,
-                        "uid": uid,
-                        "from": folder,
-                        "to": target_folder,
-                        "expunged": expunged,
-                    }
-                    if not expunged:
-                        result["note"] = (
-                            "copied to target and marked \\Deleted in "
-                            "source; server lacks UID EXPUNGE so the "
-                            "original remains until expunged by another "
-                            "client"
-                        )
-                    return result
-            # Level 3: FETCH + APPEND + delete original.
-            return self._move_via_append(
+            return move_message_on_connection(
                 conn,
-                folder,
-                uid,
-                target,
-                target_folder,
+                source_folder=folder,
+                uid=uid,
+                target_folder=target_folder,
+                capabilities=self.config.capabilities,
+                select_folder=self._select,
+                provider_name=self.config.email.rpartition("@")[2],
             )
-
-    def _move_via_append(
-        self,
-        conn: imaplib.IMAP4_SSL,
-        folder: str,
-        uid: str,
-        target: str,
-        target_folder: str,
-    ) -> dict[str, Any]:
-        """Move by FETCH + APPEND + delete-original.
-
-        Works on servers without MOVE/COPY (e.g. NetEase/Sina): APPEND is
-        mandatory per RFC 3501, and thread grouping is based on Message-ID
-        headers rather than UIDs, so the appended copy keeps its thread.
-        """
-        provider_name = self.config.email.rpartition("@")[2]
-        raw = self._fetch_raw(conn, uid)
-        # Preserve original flags (\Recent cannot be set via APPEND).
-        flags_str: str | None = None
-        try:
-            typ, data = conn.uid("FETCH", uid, "(FLAGS)")
-            if typ == "OK":
-                blob = b" ".join(
-                    part for part in (data or []) if isinstance(part, bytes)
-                ).decode("ascii", errors="replace")
-                m = re.search(r"FLAGS \(([^)]*)\)", blob)
-                if m:
-                    flags = [
-                        f
-                        for f in m.group(1).split()
-                        if f.lower() != "\\recent"
-                    ]
-                    flags_str = f"({' '.join(flags)})" if flags else None
-        except imaplib.IMAP4.error:
-            flags_str = None
-        # Message-ID for idempotent duplicate detection in the target.
-        try:
-            message_id = (
-                email.message_from_bytes(raw).get("Message-ID") or ""
-            ).strip()
-        except Exception:  # noqa: BLE001 - header parsing is best-effort
-            message_id = ""
-        already_in_target = False
-        if message_id:
-            try:
-                conn.select(target)
-                typ, data = conn.uid(
-                    "SEARCH",
-                    "HEADER",
-                    "Message-ID",
-                    f'"{_escape_imap_string(message_id)}"',
-                )
-                already_in_target = typ == "OK" and bool(
-                    (data[0] or b"").split(),
-                )
-            except Exception:  # noqa: BLE001 - dup check is best-effort
-                already_in_target = False
-            self._select(conn, folder)
-        if not already_in_target:
-            try:
-                # typeshed declares IMAP4.append() as returning str and
-                # disallows None, but the stdlib API returns (typ, data) and
-                # explicitly accepts None for flags/date_time.
-                typ, _ = cast(Any, conn.append)(
-                    target,
-                    flags_str,
-                    None,
-                    raw,
-                )
-            except imaplib.IMAP4.error:
-                typ = "NO"
-            if typ != "OK":
-                raise CapabilityError(
-                    operation="move_message",
-                    provider_name=provider_name,
-                    alternatives=[
-                        "使用 mark_messages 标记邮件",
-                        "使用 delete_message 删除邮件",
-                        "在网页版邮箱手动移动",
-                    ],
-                )
-        # APPEND may change the selected state; re-select the source
-        # folder before deleting the original.
-        self._select(conn, folder)
-        typ, data = conn.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
-        _check(typ, data, "STORE \\Deleted")
-        expunged = self._uid_expunge(conn, uid)
-        result: dict[str, Any] = {
-            "moved": True,
-            "uid": uid,
-            "from": folder,
-            "to": target_folder,
-            "via": "fetch_append_delete",
-            "expunged": expunged,
-        }
-        if not expunged:
-            result["note"] = (
-                "appended to target and marked \\Deleted in source; "
-                "server lacks UID EXPUNGE so the original remains "
-                "until expunged by another client"
-            )
-        return result
 
     def delete_message(self, folder: str, uid: str) -> dict[str, Any]:
         with self._imap() as conn:
             self._select(conn, folder)
             typ, data = conn.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
             _check(typ, data, "STORE \\Deleted")
-            expunged = self._uid_expunge(conn, uid)
+            expunge = uid_expunge(
+                conn,
+                uid,
+                supported=self.config.capabilities.uid_expunge,
+            )
             result: dict[str, Any] = {
                 "deleted": True,
                 "uid": uid,
                 "folder": folder,
-                "expunged": expunged,
+                "expunged": expunge.expunged,
             }
-            if not expunged:
+            if not expunge.expunged:
                 if not self.config.capabilities.uid_expunge:
                     result["note"] = (
                         "该服务商不支持 UID EXPUNGE 即时清除，邮件已标记删除，" + "将由服务器或其他客户端清理"
@@ -1178,7 +1017,9 @@ class MailClient:
                 else:
                     result[
                         "note"
-                    ] = "marked \\Deleted; server lacks UID EXPUNGE"
+                    ] = "marked \\Deleted; UID EXPUNGE did not complete"
+                    if expunge.detail:
+                        result["expunge_error"] = expunge.detail
             return result
 
     # -- diagnostics -------------------------------------------------------

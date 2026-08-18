@@ -201,3 +201,20 @@ def provider_for_email(email: str) -> Provider | None:
     """Return the Provider matching the email domain, or None if unknown."""
     _, _, domain = email.rpartition("@")
     return PROVIDERS.get(domain.lower())
+
+
+def provider_for_imap_host(imap_host: str) -> Provider | None:
+    """Return provider semantics for a custom domain routed to *imap_host*.
+
+    Enterprise mailboxes often use a customer-owned address domain, so email
+    suffix lookup cannot recover their verified IMAP capability profile.
+    """
+    host = (imap_host or "").strip().lower()
+    return next(
+        (
+            provider
+            for provider in PROVIDERS.values()
+            if provider.imap_host.lower() == host
+        ),
+        None,
+    )

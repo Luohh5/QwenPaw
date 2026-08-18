@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from qwenpawmail_mcp.providers import ProviderCapabilities
 
 from qwenpaw.app.mail.mail_access_control import MailAccessControlStore
 from qwenpaw.config.config import (
@@ -62,7 +63,17 @@ class FakeImapConn:
         self.fetch_typ = "OK"
         self.create_typ = "OK"
         self.create_detail = b"CREATE completed"
+        self.move_typ = "OK"
+        self.copy_typ = "OK"
+        self.store_typ = "OK"
+        self.uid_expunge_typ = "OK"
+        self.append_typ = "OK"
+        self.select_typ = "OK"
+        self.status_typ = "NO"
         self.created: list[str] = []
+        self.selected = "INBOX"
+        self.global_expunge_called = False
+        self.deleted_uids = {"99"}
         self.body_bytes: bytes | None = None
         self.header_bytes = (
             b"From: alice@example.com\r\n"
@@ -72,7 +83,20 @@ class FakeImapConn:
         )
 
     def uid(self, command, *args):
+        # pylint: disable=too-many-return-statements
         self.calls.append((command, *args))
+        if command == "MOVE":
+            return (self.move_typ, [b"MOVE response"])
+        if command == "COPY":
+            return (self.copy_typ, [b"COPY response"])
+        if command == "STORE":
+            if self.store_typ == "OK" and r"(\Deleted)" in args:
+                self.deleted_uids.add(str(args[0]))
+            return (self.store_typ, [b"STORE response"])
+        if command == "EXPUNGE":
+            if self.uid_expunge_typ == "OK":
+                self.deleted_uids.discard(str(args[0]))
+            return (self.uid_expunge_typ, [b"UID EXPUNGE response"])
         if command == "SEARCH":
             return (self.search_typ, [self.search_result])
         if command == "FETCH":
@@ -88,7 +112,23 @@ class FakeImapConn:
         self.created.append(folder)
         return (self.create_typ, [self.create_detail])
 
+    def status(self, folder, items):
+        self.calls.append(("STATUS", folder, items))
+        return (self.status_typ, [b""])
+
+    def select(self, folder, readonly=False):
+        self.calls.append(("SELECT", folder, readonly))
+        if self.select_typ == "OK":
+            self.selected = folder
+        return (self.select_typ, [b"1"])
+
+    def append(self, folder, flags, date_time, raw):
+        self.calls.append(("APPEND", folder, flags, date_time, raw))
+        return (self.append_typ, [b"APPEND response"])
+
     def expunge(self):
+        self.global_expunge_called = True
+        self.deleted_uids.clear()
         self.calls.append(("EXPUNGE",))
         return ("OK", [b""])
 
@@ -631,12 +671,16 @@ async def test_pipeline_move_action(
         ),
     ]
     service, _ = _service(tmp_path, mode="rules_only", rules=rules)
+    service._move_capabilities = ProviderCapabilities()
     conn = FakeImapConn()
     await _run_pipeline(service, conn)
     assert conn.created == ['"Archive"']
-    assert ("COPY", "5", encode_folder("Archive")) in conn.calls
-    assert ("STORE", "5", "+FLAGS", r"(\Deleted)") in conn.calls
-    assert ("EXPUNGE",) in conn.calls
+    assert ("MOVE", "5", encode_folder("Archive")) in conn.calls
+    assert ("STORE", "5", "+FLAGS", r"(\Deleted)") not in conn.calls
+    assert not conn.global_expunge_called
+    action = recorder.events[0]["payload"]["action_results"][0]
+    assert action["status"] == "success"
+    assert action["result"]["via"] == "uid_move"
 
 
 async def test_pipeline_move_creates_chinese_folder(
@@ -652,11 +696,12 @@ async def test_pipeline_move_creates_chinese_folder(
         ),
     ]
     service, _ = _service(tmp_path, mode="rules_only", rules=rules)
+    service._move_capabilities = ProviderCapabilities()
     conn = FakeImapConn()
     await _run_pipeline(service, conn)
     # Chinese folder names are CREATEd in IMAP modified UTF-7.
     assert conn.created == ['"&X1JoYw-"']
-    assert ("COPY", "5", encode_folder("归档")) in conn.calls
+    assert ("MOVE", "5", encode_folder("归档")) in conn.calls
 
 
 async def test_pipeline_move_ignores_already_exists(
@@ -672,13 +717,14 @@ async def test_pipeline_move_ignores_already_exists(
         ),
     ]
     service, _ = _service(tmp_path, mode="rules_only", rules=rules)
+    service._move_capabilities = ProviderCapabilities()
     conn = FakeImapConn()
     conn.create_typ = "NO"
     conn.create_detail = b"[ALREADYEXISTS] Mailbox already exists"
     await _run_pipeline(service, conn)
     # "already exists" is not an error: the move still runs.
-    assert ("COPY", "5", encode_folder("Archive")) in conn.calls
-    assert ("EXPUNGE",) in conn.calls
+    assert ("MOVE", "5", encode_folder("Archive")) in conn.calls
+    assert not conn.global_expunge_called
 
 
 async def test_pipeline_move_skipped_on_create_failure(
@@ -698,10 +744,220 @@ async def test_pipeline_move_skipped_on_create_failure(
     conn.create_typ = "NO"
     conn.create_detail = b"[NOPERM] Permission denied"
     await _run_pipeline(service, conn)
-    # Move skipped, pipeline not interrupted: new_email still emitted.
-    assert ("COPY", "5", "Archive") not in conn.calls
-    assert ("EXPUNGE",) not in conn.calls
+    # Move fails observably, but the pipeline still emits new_email.
+    assert ("COPY", "5", encode_folder("Archive")) not in conn.calls
+    assert not conn.global_expunge_called
     assert recorder.types() == ["new_email"]
+    payload = recorder.events[0]["payload"]
+    assert payload["matched_actions"] == []
+    assert payload["failed_actions"] == ["move"]
+    assert payload["action_results"] == [
+        {"action": "move", "status": "error"},
+    ]
+
+
+async def test_pipeline_move_copy_fallback_is_uid_scoped(
+    tmp_path,
+    recorder,
+):
+    rules = [
+        AgentMailPushRule(
+            field="subject",
+            contains="hello",
+            action="move",
+            param="Archive",
+        ),
+    ]
+    service, _ = _service(tmp_path, mode="rules_only", rules=rules)
+    service._move_capabilities = ProviderCapabilities()
+    conn = FakeImapConn()
+    conn.move_typ = "NO"
+
+    await _run_pipeline(service, conn)
+
+    assert ("COPY", "5", encode_folder("Archive")) in conn.calls
+    assert ("STORE", "5", "+FLAGS", r"(\Deleted)") in conn.calls
+    assert ("EXPUNGE", "5") in conn.calls
+    assert not conn.global_expunge_called
+    # A different client's pre-existing \Deleted message is untouched.
+    assert conn.deleted_uids == {"99"}
+    payload = recorder.events[0]["payload"]
+    assert payload["matched_actions"] == ["move"]
+    assert payload["failed_actions"] == []
+    assert payload["action_results"][0]["result"]["via"] == "uid_copy"
+
+
+async def test_pipeline_move_copy_failure_never_deletes_source(
+    tmp_path,
+    recorder,
+):
+    rules = [
+        AgentMailPushRule(
+            field="subject",
+            contains="hello",
+            action="move",
+            param="Archive",
+        ),
+    ]
+    service, _ = _service(tmp_path, mode="rules_only", rules=rules)
+    service._move_capabilities = ProviderCapabilities()
+    conn = FakeImapConn()
+    conn.move_typ = "NO"
+    conn.copy_typ = "NO"
+    conn.append_typ = "NO"
+
+    await _run_pipeline(service, conn)
+
+    assert ("COPY", "5", encode_folder("Archive")) in conn.calls
+    assert any(call[0] == "APPEND" for call in conn.calls)
+    assert ("STORE", "5", "+FLAGS", r"(\Deleted)") not in conn.calls
+    assert not any(
+        call[0] == "EXPUNGE" and len(call) > 1 for call in conn.calls
+    )
+    assert not conn.global_expunge_called
+    assert conn.deleted_uids == {"99"}
+    payload = recorder.events[0]["payload"]
+    assert payload["matched_actions"] == []
+    assert payload["failed_actions"] == ["move"]
+
+
+async def test_pipeline_move_store_failure_is_not_applied(
+    tmp_path,
+    recorder,
+):
+    rules = [
+        AgentMailPushRule(
+            field="subject",
+            contains="hello",
+            action="move",
+            param="Archive",
+        ),
+    ]
+    service, _ = _service(tmp_path, mode="rules_only", rules=rules)
+    service._move_capabilities = ProviderCapabilities()
+    conn = FakeImapConn()
+    conn.move_typ = "NO"
+    conn.store_typ = "NO"
+
+    await _run_pipeline(service, conn)
+
+    assert ("COPY", "5", encode_folder("Archive")) in conn.calls
+    assert ("STORE", "5", "+FLAGS", r"(\Deleted)") in conn.calls
+    assert not any(
+        call[0] == "EXPUNGE" and len(call) > 1 for call in conn.calls
+    )
+    assert not conn.global_expunge_called
+    payload = recorder.events[0]["payload"]
+    assert payload["matched_actions"] == []
+    assert payload["failed_actions"] == ["move"]
+
+
+async def test_pipeline_move_uid_expunge_failure_defers_only_target_cleanup(
+    tmp_path,
+    recorder,
+):
+    rules = [
+        AgentMailPushRule(
+            field="subject",
+            contains="hello",
+            action="move",
+            param="Archive",
+        ),
+    ]
+    service, _ = _service(tmp_path, mode="rules_only", rules=rules)
+    service._move_capabilities = ProviderCapabilities()
+    conn = FakeImapConn()
+    conn.move_typ = "NO"
+    conn.uid_expunge_typ = "NO"
+
+    await _run_pipeline(service, conn)
+
+    assert ("EXPUNGE", "5") in conn.calls
+    assert not conn.global_expunge_called
+    assert conn.deleted_uids == {"5", "99"}
+    payload = recorder.events[0]["payload"]
+    assert payload["matched_actions"] == ["move"]
+    result = payload["action_results"][0]["result"]
+    assert result["moved"] is True
+    assert result["expunged"] is False
+    assert result["cleanup_pending"] is True
+
+
+async def test_pipeline_move_without_uidplus_never_calls_any_expunge(
+    tmp_path,
+    recorder,
+):
+    rules = [
+        AgentMailPushRule(
+            field="subject",
+            contains="hello",
+            action="move",
+            param="Archive",
+        ),
+    ]
+    service, _ = _service(tmp_path, mode="rules_only", rules=rules)
+    service._move_capabilities = ProviderCapabilities(
+        move=False,
+        copy=True,
+        uid_expunge=False,
+    )
+    conn = FakeImapConn()
+
+    await _run_pipeline(service, conn)
+
+    assert ("COPY", "5", encode_folder("Archive")) in conn.calls
+    assert not any(call[0] == "EXPUNGE" for call in conn.calls)
+    assert conn.deleted_uids == {"5", "99"}
+    result = recorder.events[0]["payload"]["action_results"][0]["result"]
+    assert result["cleanup_pending"] is True
+
+
+async def test_pipeline_move_netease_uses_append_fallback(
+    tmp_path,
+    recorder,
+):
+    rules = [
+        AgentMailPushRule(
+            field="subject",
+            contains="hello",
+            action="move",
+            param="Archive",
+        ),
+    ]
+    # The default fixture is a 163.com account, whose verified profile has
+    # neither UID MOVE/COPY nor UIDPLUS.
+    service, _ = _service(tmp_path, mode="rules_only", rules=rules)
+    conn = FakeImapConn()
+
+    await _run_pipeline(service, conn)
+
+    assert not any(
+        call[0] in {"MOVE", "COPY", "EXPUNGE"} for call in conn.calls
+    )
+    assert any(call[0] == "APPEND" for call in conn.calls)
+    assert ("STORE", "5", "+FLAGS", r"(\Deleted)") in conn.calls
+    result = recorder.events[0]["payload"]["action_results"][0]["result"]
+    assert result["via"] == "fetch_append_delete"
+    assert result["cleanup_pending"] is True
+
+
+async def test_pipeline_mark_read_failure_is_not_applied(tmp_path, recorder):
+    rules = [
+        AgentMailPushRule(
+            field="from",
+            contains="alice",
+            action="mark_read",
+        ),
+    ]
+    service, _ = _service(tmp_path, mode="rules_only", rules=rules)
+    conn = FakeImapConn()
+    conn.store_typ = "NO"
+
+    await _run_pipeline(service, conn)
+
+    payload = recorder.events[0]["payload"]
+    assert payload["matched_actions"] == []
+    assert payload["failed_actions"] == ["mark_read"]
 
 
 async def test_pipeline_notify_action_appends_extra_event(

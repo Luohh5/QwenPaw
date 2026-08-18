@@ -21,7 +21,6 @@ Every new message goes through a three-step pipeline:
 from __future__ import annotations
 
 import asyncio
-import base64
 import concurrent.futures
 import email as email_lib
 import hashlib
@@ -37,6 +36,17 @@ from email.header import decode_header, make_header
 from email.utils import parseaddr
 from pathlib import Path
 from typing import Any, Optional
+
+from qwenpawmail_mcp.imap_ops import (
+    check_response as check_imap_response,
+    encode_folder,
+    move_message as move_message_on_connection,
+)
+from qwenpawmail_mcp.providers import (
+    ProviderCapabilities,
+    provider_for_email,
+    provider_for_imap_host,
+)
 
 from ...config.config import (
     AgentMailConfig,
@@ -207,41 +217,6 @@ _WAKE_PROMPT_TEMPLATE = (
     "④ 涉及金钱、承诺、敏感关系的回复一律草拟待批并请示用户，不直接发送。\n"
     "⑤ 用户教出的任何新叶子都不得覆盖以上红线。"
 )
-
-
-def _encode_imap_utf7(name: str) -> bytes:
-    """Encode *name* as IMAP modified UTF-7 (RFC 3501 5.1.3).
-
-    Inline re-implementation of the qwenpawmail-mcp ``encode_folder``
-    behaviour so the monitor does not depend on the mcp package.
-    """
-    out = bytearray()
-    pending: list[str] = []
-
-    def _flush() -> None:
-        if not pending:
-            return
-        b64 = base64.b64encode("".join(pending).encode("utf-16be"))
-        out.extend(b"&" + b64.rstrip(b"=").replace(b"/", b",") + b"-")
-        pending.clear()
-
-    for char in name:
-        code = ord(char)
-        if 0x20 <= code <= 0x7E:
-            _flush()
-            if char == "&":
-                out.extend(b"&-")
-            else:
-                out.append(code)
-        else:
-            pending.append(char)
-    _flush()
-    return bytes(out)
-
-
-def encode_folder(name: str) -> str:
-    """Quote + modified UTF-7 encode an IMAP folder name."""
-    return '"' + _encode_imap_utf7(name).decode("ascii") + '"'
 
 
 _HTML_BLOCK_RE = re.compile(
@@ -1109,6 +1084,14 @@ class MailMonitorService:
         self.domain = (credential.domain or "").strip().lower()
         self.provider = (credential.provider or "").strip().lower()
         self.host = resolve_imap_host(self.domain, self.provider)
+        provider_profile = provider_for_email(
+            self.email_address,
+        ) or provider_for_imap_host(self.host or "")
+        self._move_capabilities = (
+            provider_profile.capabilities
+            if provider_profile is not None
+            else ProviderCapabilities()
+        )
         mailbox_key = "\0".join(
             (self.email_address.strip().lower(), (self.host or "").lower()),
         )
@@ -1520,13 +1503,23 @@ class MailMonitorService:
             ):
                 # pylint: disable-next=protected-access
                 conn._simple_command("ID", _ID_COMMAND_ARGS)
-            conn.select("INBOX")
+            self._select_folder(conn, "INBOX")
             self._current_uidvalidity = self._read_uidvalidity(conn)
             self._reconcile_uidvalidity()
         except BaseException:
             self._close(conn)
             raise
         return conn
+
+    @staticmethod
+    def _select_folder(conn: imaplib.IMAP4_SSL, folder: str) -> int:
+        """Select *folder* read-write and require an explicit success."""
+        typ, data = conn.select(encode_folder(folder))
+        check_imap_response(typ, data, f"SELECT {folder!r}")
+        try:
+            return int(data[0] or 0)
+        except (IndexError, TypeError, ValueError):
+            return 0
 
     @staticmethod
     def _read_uidvalidity(conn: imaplib.IMAP4_SSL) -> Optional[int]:
@@ -2023,13 +2016,26 @@ class MailMonitorService:
         )
         applied_actions: list[str] = []
         failed_actions: list[str] = []
+        action_results: list[dict[str, Any]] = []
         wake_param = ""
         for rule in matched:
             try:
+                result: dict[str, Any] = {}
                 if rule.action == "mark_read":
-                    conn.uid("STORE", str(uid), "+FLAGS", r"(\Seen)")
+                    typ, data = conn.uid(
+                        "STORE",
+                        str(uid),
+                        "+FLAGS",
+                        r"(\Seen)",
+                    )
+                    check_imap_response(typ, data, "STORE \\Seen")
+                    result = {"marked": "read", "uid": str(uid)}
                 elif rule.action == "move":
-                    self._move_message(conn, uid, rule.param.strip())
+                    result = self._move_message(
+                        conn,
+                        uid,
+                        rule.param.strip(),
+                    )
                 elif rule.action == "notify":
                     if not self._submit_event(
                         event_type="new_email",
@@ -2053,10 +2059,19 @@ class MailMonitorService:
                         raise RuntimeError(
                             "could not persist rule notification event",
                         )
+                    result = {"notified": True}
                 elif rule.action == "wake_agent":
                     if rule.param:
                         wake_param = rule.param
+                    result = {"wake_scheduled": True}
                 applied_actions.append(rule.action)
+                action_results.append(
+                    {
+                        "action": rule.action,
+                        "status": "success",
+                        "result": result,
+                    },
+                )
             except (
                 imaplib.IMAP4.abort,
                 ConnectionError,
@@ -2071,6 +2086,12 @@ class MailMonitorService:
                     uid,
                 )
                 failed_actions.append(rule.action)
+                action_results.append(
+                    {
+                        "action": rule.action,
+                        "status": "error",
+                    },
+                )
 
         # Step 3 (before the potentially slow wake-up): every new mail
         # produces one unconditional new_email inbox event.
@@ -2088,6 +2109,7 @@ class MailMonitorService:
                 "date": date,
                 "matched_actions": applied_actions,
                 "failed_actions": failed_actions,
+                "action_results": action_results,
                 "mode": self.push.mode,
                 "body_preview": body_preview,
             },
@@ -2126,62 +2148,22 @@ class MailMonitorService:
                     },
                 )
 
-    def _ensure_folder(
-        self,
-        conn: imaplib.IMAP4_SSL,
-        folder: str,
-    ) -> bool:
-        """CREATE the target folder (idempotent); True when usable.
-
-        Servers answer NO when the folder already exists; such errors
-        are ignored.  Any other failure logs a warning and returns
-        False so the caller skips the move without breaking the
-        pipeline.
-        """
-        try:
-            typ, data = conn.create(encode_folder(folder))
-        except imaplib.IMAP4.abort:
-            raise
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.warning(
-                "mail monitor could not create folder %r (agent %s): %s",
-                folder,
-                self.agent_id,
-                exc,
-            )
-            return False
-        if typ == "OK":
-            return True
-        detail = b" ".join(
-            item for item in (data or []) if isinstance(item, bytes)
-        ).decode("utf-8", errors="replace")
-        if "exist" in detail.lower():
-            # "already exists" family: CREATE is idempotent here.
-            return True
-        logger.warning(
-            "mail monitor CREATE folder %r failed (agent %s): %s %s",
-            folder,
-            self.agent_id,
-            typ,
-            detail,
-        )
-        return False
-
     def _move_message(
         self,
         conn: imaplib.IMAP4_SSL,
         uid: int,
         folder: str,
-    ) -> None:
-        if not folder:
-            return
-        if not self._ensure_folder(conn, folder):
-            return
-        # COPY needs the same quoted UTF-7 form as CREATE; passing the
-        # raw (possibly non-ASCII) name would crash imaplib's ASCII encode.
-        conn.uid("COPY", str(uid), encode_folder(folder))
-        conn.uid("STORE", str(uid), "+FLAGS", r"(\Deleted)")
-        conn.expunge()
+    ) -> dict[str, Any]:
+        """Move an INBOX UID through the same safe primitive as MailClient."""
+        return move_message_on_connection(
+            conn,
+            source_folder="INBOX",
+            uid=str(uid),
+            target_folder=folder,
+            capabilities=self._move_capabilities,
+            select_folder=self._select_folder,
+            provider_name=self.provider or self.domain,
+        )
 
     # -- event loop bridging ------------------------------------------------
 

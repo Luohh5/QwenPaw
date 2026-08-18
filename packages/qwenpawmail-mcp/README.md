@@ -132,7 +132,7 @@ export QWENPAWMAIL_SMTP_HOST="smtp.mycompany.com"
 
 | Tool | Description |
 | --- | --- |
-| `delete_message` | Permanently delete a message (`\Deleted` + RFC 4315 UID EXPUNGE, scoped to the given UID). This cannot be undone |
+| `delete_message` | Mark a message `\Deleted` and immediately remove it with RFC 4315 UID EXPUNGE when supported. Cleanup is scoped to the given UID; global EXPUNGE is never used |
 | `delete_thread` | Move every message in a thread to Trash and drop the thread from the index |
 
 For domains outside the built-in provider table, add `QWENPAWMAIL_IMAP_HOST` and `QWENPAWMAIL_SMTP_HOST` to `env`.

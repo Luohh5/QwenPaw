@@ -490,8 +490,11 @@ def create_server(
     @mcp.tool(annotations=_ann("Delete Message", destructive=True))
     @_tool_errors
     async def delete_message(folder: str, uid: str) -> dict:
-        """Permanently delete a message (\\Deleted flag
-        + EXPUNGE). This cannot be undone.
+        """Mark a message \\Deleted and UID-expunge it when supported.
+
+        Cleanup is always scoped to the requested UID. On servers without
+        UIDPLUS, the marked message remains pending server/client cleanup;
+        global EXPUNGE is never used.
 
         Args:
             folder: Folder containing the message.

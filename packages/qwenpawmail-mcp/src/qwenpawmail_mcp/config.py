@@ -29,7 +29,11 @@ import os
 from dataclasses import dataclass, field
 
 from .errors import ConfigError
-from .providers import ProviderCapabilities, provider_for_email
+from .providers import (
+    ProviderCapabilities,
+    provider_for_email,
+    provider_for_imap_host,
+)
 
 CLIENT_NAME = "qwenpawmail-mcp"
 CLIENT_VERSION = "0.1.0"
@@ -103,6 +107,10 @@ def load_config(env: dict[str, str] | None = None) -> Config:
     except ValueError as exc:
         raise ConfigError(f"Invalid port value in environment: {exc}") from exc
 
+    # A custom enterprise address has no built-in domain entry, but its IMAP
+    # host still identifies the provider's verified capability profile.
+    capability_provider = provider or provider_for_imap_host(imap_host)
+
     return Config(
         email=email,
         auth_code=auth_code,
@@ -110,8 +118,14 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         imap_port=imap_port,
         smtp_host=smtp_host,
         smtp_port=smtp_port,
-        requires_id_command=provider.requires_id_command if provider else True,
+        requires_id_command=(
+            capability_provider.requires_id_command
+            if capability_provider
+            else True
+        ),
         capabilities=(
-            provider.capabilities if provider else ProviderCapabilities()
+            capability_provider.capabilities
+            if capability_provider
+            else ProviderCapabilities()
         ),
     )
