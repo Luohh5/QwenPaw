@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import sys
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
 
@@ -49,6 +50,7 @@ from ..agent_startup import AgentStartupStatus
 from ..multi_agent_manager import MultiAgentManager
 from ...constant import WORKING_DIR
 from ...utils.io_utils import run_sync_io, write_text_atomic
+from ...utils.logging import sanitize_log_value
 
 logger = logging.getLogger(__name__)
 
@@ -583,8 +585,8 @@ async def _require_qwenpawmail_driver_card(
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning(
             "Failed to prepare qwenpawmail driver during agent %s: %s",
-            operation,
-            exc,
+            sanitize_log_value(operation),
+            sanitize_log_value(exc),
         )
         synced = False
     if not synced:
@@ -601,8 +603,7 @@ async def _require_qwenpawmail_driver_card(
 async def _rollback_qwenpawmail_update(
     agent_id: str,
     previous_config: AgentProfileConfig,
-    previous_workspace: Path,
-    rejected_workspace: Path,
+    workspace_dir: Path,
 ) -> tuple[bool, bool]:
     """Restore the config/card pair after a failed driver publication."""
     config_restored = True
@@ -614,14 +615,14 @@ async def _rollback_qwenpawmail_update(
         logger.exception(
             "Failed to roll back agent config after driver sync failure "
             "for %s",
-            agent_id,
+            sanitize_log_value(agent_id),
         )
 
     if config_restored:
         try:
             driver_restored = await run_sync_io(
                 _sync_qwenpawmail_driver_card,
-                previous_workspace,
+                workspace_dir,
                 previous_config.mail,
                 previous_config.backend or "qwenpaw",
                 force_rewrite=previous_config.mail is not None,
@@ -630,21 +631,7 @@ async def _rollback_qwenpawmail_update(
             driver_restored = False
             logger.exception(
                 "Failed to restore qwenpawmail driver for agent %s",
-                agent_id,
-            )
-
-    if rejected_workspace != previous_workspace:
-        try:
-            await run_sync_io(
-                _sync_qwenpawmail_driver_card,
-                rejected_workspace,
-                None,
-                "qwenpaw",
-            )
-        except Exception:  # pylint: disable=broad-except
-            logger.exception(
-                "Failed to clean qwenpawmail card from rejected workspace %s",
-                rejected_workspace,
+                sanitize_log_value(agent_id),
             )
     return config_restored, driver_restored
 
@@ -956,7 +943,20 @@ async def update_agent(
             detail=f"Agent '{agentId}' not found",
         )
 
-    existing_config_snap = await run_sync_io(load_agent_config, agentId)
+    # The root profile is the canonical workspace location.  Updating an
+    # agent does not move its workspace, so request-body workspace_dir must
+    # never redirect driver-card or template writes to another path.
+    workspace_dir = Path(
+        config.agents.profiles[agentId].workspace_dir,
+    ).expanduser()
+    canonical_workspace_dir = str(workspace_dir)
+
+    existing_config_snap = deepcopy(
+        await run_sync_io(load_agent_config, agentId),
+    )
+    # Older versions allowed the request body to drift from the registered
+    # workspace. Keep rollback snapshots on the canonical path too.
+    existing_config_snap.workspace_dir = canonical_workspace_dir
 
     effective_backend = (
         agent_config.backend
@@ -1011,17 +1011,14 @@ async def update_agent(
                     ),
                 )
         for key in update_data:
-            if key != "id":
+            if key not in {"id", "workspace_dir"}:
                 setattr(existing_config, key, getattr(requested, key))
         existing_config.id = agentId
+        existing_config.workspace_dir = canonical_workspace_dir
 
     await update_agent_config_async(agentId, apply_update)
 
     updated_config = await run_sync_io(load_agent_config, agentId)
-    workspace_dir = Path(
-        updated_config.workspace_dir
-        or config.agents.profiles[agentId].workspace_dir,
-    ).expanduser()
     # Keep the generated credential-bearing DriverCard in lockstep with the
     # *persisted* final configuration.  In particular, an explicit mail=null
     # or a backend switch must revoke the old MCP capability before reload.
@@ -1036,7 +1033,7 @@ async def update_agent(
     except Exception:  # pylint: disable=broad-except
         logger.warning(
             "Failed to synchronize qwenpawmail driver for agent %s",
-            agentId,
+            sanitize_log_value(agentId),
             exc_info=True,
         )
         driver_card_synced = False
@@ -1046,17 +1043,12 @@ async def update_agent(
         # config keeps its live state coherent. The failed sync already
         # revokes a card containing superseded credentials; regenerate the
         # previous card only after the old config is durable again.
-        old_workspace_dir = Path(
-            existing_config_snap.workspace_dir
-            or config.agents.profiles[agentId].workspace_dir,
-        ).expanduser()
         (
             rollback_configured,
             rollback_driver,
         ) = await _rollback_qwenpawmail_update(
             agentId,
             existing_config_snap,
-            old_workspace_dir,
             workspace_dir,
         )
 
@@ -1087,7 +1079,7 @@ async def update_agent(
 
     schedule_agent_reload(request, agentId)
 
-    return agent_config
+    return updated_config
 
 
 @router.post(
@@ -1816,8 +1808,8 @@ def _generate_qwenpawmail_driver_card(
     except Exception as e:
         logger.warning(
             "Failed to generate qwenpawmail driver card for %s: %s",
-            workspace_dir,
-            e,
+            sanitize_log_value(workspace_dir),
+            sanitize_log_value(e),
         )
         return False
 

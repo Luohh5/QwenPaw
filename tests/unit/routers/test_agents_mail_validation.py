@@ -574,6 +574,27 @@ def test_update_qwenpaw_to_third_party_revokes_driver_card(tmp_path):
     assert not (tmp_path / "drivers" / "mcp" / "qwenpawmail.yaml").exists()
 
 
+def test_update_cannot_relocate_mail_driver_writes(tmp_path):
+    registered_workspace = tmp_path / "registered"
+    requested_workspace = tmp_path / "request-controlled"
+
+    updated = _run_mail_revocation_update(
+        registered_workspace,
+        AgentProfileConfig(
+            id="a1",
+            name="bot",
+            workspace_dir=str(requested_workspace),
+            mail=None,
+        ),
+    )
+
+    assert updated.workspace_dir == str(registered_workspace)
+    assert not (
+        registered_workspace / "drivers" / "mcp" / "qwenpawmail.yaml"
+    ).exists()
+    assert not requested_workspace.exists()
+
+
 def test_failed_driver_rewrite_revokes_stale_credentials(tmp_path):
     card_path = tmp_path / "drivers" / "mcp" / "qwenpawmail.yaml"
     card_path.parent.mkdir(parents=True)
@@ -595,11 +616,12 @@ def test_update_driver_failure_restores_previous_config(tmp_path):
     previous_mail = _valid_mail()
     updated_mail = _valid_mail()
     updated_mail.credential.auth_code = "b" * 16
+    stale_workspace = tmp_path / "legacy-request-path"
     persisted = [
         AgentProfileConfig(
             id="a1",
             name="bot",
-            workspace_dir=str(tmp_path),
+            workspace_dir=str(stale_workspace),
             backend="qwenpaw",
             mail=previous_mail,
         ),
@@ -660,7 +682,9 @@ def test_update_driver_failure_restores_previous_config(tmp_path):
     assert "previous mail configuration was restored" in exc_info.value.detail
     assert persisted[0].mail is not None
     assert persisted[0].mail.credential.auth_code == "a" * 16
+    assert persisted[0].workspace_dir == str(tmp_path)
     assert sync_driver.call_count == 2
+    assert all(call.args[0] == tmp_path for call in sync_driver.call_args_list)
     reload_agent.assert_not_called()
 
 
