@@ -27,7 +27,7 @@ from .embedding_model import (
 )
 from .prompts import build_memory_guidance_prompt
 from .reme_config import get_reme_app_config
-from ..model_factory import create_model_and_formatter
+from ..model_factory import create_model_and_formatter_async
 from ...app.inbox_store import append_event as append_inbox_event
 from ...app.crons.contracts import ServiceCronJob
 from ...config import load_config
@@ -225,8 +225,9 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         cfg = agent_config.running.reme_light_memory_config
         return build_memory_guidance_prompt(
             agent_config.language,
-            daily_dir=cfg.daily_dir,
             memory_search_enabled=cfg.memory_search_enabled,
+            daily_dir=getattr(cfg, "daily_dir", "memory"),
+            digest_dir=getattr(cfg, "digest_dir", "digest"),
         )
 
     def get_memory_config(self) -> Any:
@@ -284,7 +285,9 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         if self._reme is None:
             return
 
-        model, _formatter = create_model_and_formatter(self.agent_id)
+        model, _formatter = await create_model_and_formatter_async(
+            self.agent_id,
+        )
         await self._reme.update_component(
             "as_llm",
             "default",
@@ -1129,6 +1132,9 @@ class ReMeLightMemoryManager(BaseMemoryManager):
             query=query,
             max_results=cap,
             text=text,
+            estimate_divisor=self._resolve_token_estimate_divisor(
+                agent_config,
+            ),
         )
         return {
             "query": query,
