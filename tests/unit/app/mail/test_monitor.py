@@ -9,6 +9,7 @@ import email as email_lib
 import imaplib
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -35,6 +36,7 @@ from qwenpaw.app.mail.monitor import (
     should_wake_agent,
     wake_agent_for_mail,
 )
+from qwenpaw.utils.io_utils import run_sync_io
 
 # ── test doubles ─────────────────────────────────────────────────────
 
@@ -1231,9 +1233,19 @@ async def test_pending_sender_retains_all_uids_and_restart_does_not_repeat(
     recorder,
 ):
     service, _ = _service(tmp_path, mode="rules_only")
+    service.domain = "sina.com"
+    service.host = "imap.sina.com"
     service.push.access_control_enabled = True
     service._last_uid = 100
     conn = FakeImapConn(uids=b"100 101 102")
+    conn.header_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Received: from sender.example by sina.com with SMTP id abc123;\r\n"
+        b"Authentication-Results: sina.com; spf=pass "
+        b"smtp.mailfrom=alice@example.com\r\n"
+        b"Subject: hello\r\n"
+        b"Date: Tue, 28 Jul 2026 10:00:00 +0800\r\n\r\n"
+    )
     service._loop = asyncio.get_running_loop()
 
     await asyncio.to_thread(service._check_new_messages, conn)
@@ -1619,28 +1631,47 @@ async def test_acl_qq_internal_fallback_rejects_explicit_auth_failure(
     assert recorder.events[-1]["payload"]["acl_status"] == "pending"
 
 
-async def test_acl_spoofed_from_uses_return_path_identity(tmp_path, recorder):
+@pytest.mark.parametrize(
+    ("whitelist_entry", "return_path"),
+    [
+        ("trusted@example.com", "trusted@example.com"),
+        ("*@example.com", "attacker@example.com"),
+    ],
+)
+async def test_acl_unverified_return_path_cannot_bypass_whitelist(
+    tmp_path,
+    recorder,
+    whitelist_entry,
+    return_path,
+):
     service, _ = _service(tmp_path, mode="rules_only")
+    service.domain = "sina.com"
+    service.host = "imap.sina.com"
     service.push.access_control_enabled = True
     service._last_uid = 100
     service._loop = asyncio.get_running_loop()
     service._mail_acl_store.add_to_whitelist(
         "test-agent",
-        "trusted@example.com",
+        whitelist_entry,
     )
     conn = FakeImapConn(uids=b"100 101")
     conn.header_bytes = (
-        b"From: trusted@example.com\r\n"
-        b"Return-Path: <attacker@evil.example>\r\n"
-        b"Subject: forged\r\n"
-        b"Date: Tue, 28 Jul 2026 10:00:00 +0800\r\n\r\n"
+        f"From: trusted@example.com\r\n"
+        f"Return-Path: <{return_path}>\r\n"
+        "Received: from attacker.example by sina.com with SMTP id abc123;\r\n"
+        f"Authentication-Results: sina.com; spf=fail dmarc=fail "
+        f"smtp.mailfrom={return_path}\r\n"
+        "Subject: forged\r\n"
+        "Date: Tue, 28 Jul 2026 10:00:00 +0800\r\n\r\n"
+    ).encode(
+        "ascii",
     )
 
     await asyncio.to_thread(service._check_new_messages, conn)
 
     pending = service._mail_acl_store.get_pending_entry(
         "test-agent",
-        "attacker@evil.example",
+        "unverified-101@invalid.local",
     )
     assert pending is not None
     assert recorder.events[-1]["payload"]["acl_status"] == "pending"
@@ -1648,6 +1679,8 @@ async def test_acl_spoofed_from_uses_return_path_identity(tmp_path, recorder):
 
 async def test_acl_aligned_sender_keeps_whitelist_behavior(tmp_path, recorder):
     service, _ = _service(tmp_path, mode="rules_only")
+    service.domain = "sina.com"
+    service.host = "imap.sina.com"
     service.push.access_control_enabled = True
     service._last_uid = 100
     service._loop = asyncio.get_running_loop()
@@ -1656,6 +1689,15 @@ async def test_acl_aligned_sender_keeps_whitelist_behavior(tmp_path, recorder):
         "alice@example.com",
     )
     conn = FakeImapConn(uids=b"100 101")
+    conn.header_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Return-Path: <alice@example.com>\r\n"
+        b"Received: from sender.example by sina.com with SMTP id abc123;\r\n"
+        b"Authentication-Results: sina.com; spf=pass "
+        b"smtp.mailfrom=alice@example.com\r\n"
+        b"Subject: authenticated\r\n"
+        b"Date: Tue, 28 Jul 2026 10:00:00 +0800\r\n\r\n"
+    )
 
     await asyncio.to_thread(service._check_new_messages, conn)
 
@@ -1882,6 +1924,130 @@ async def test_stop_cancels_never_returning_wake_and_joins_worker(tmp_path):
     assert service._task is None
     assert service._submission_tasks == set()
     assert service._submission_completions == set()
+
+
+async def test_many_monitors_leave_default_executor_available(tmp_path):
+    loop = asyncio.get_running_loop()
+    original_executor = (
+        loop._default_executor
+    )  # pylint: disable=protected-access
+    executor = ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(executor)
+    services: list[MailMonitorService] = []
+    started: list[threading.Event] = []
+    try:
+        for index in range(4):
+            service, _ = _service(tmp_path / str(index))
+            worker_started = threading.Event()
+
+            def _worker(
+                current=service,
+                ready=worker_started,
+            ):
+                ready.set()
+                current._stop_event.wait()
+
+            service._worker = _worker
+            services.append(service)
+            started.append(worker_started)
+            await service.start()
+
+        for _ in range(100):
+            if all(event.is_set() for event in started):
+                break
+            await asyncio.sleep(0.01)
+        assert all(event.is_set() for event in started)
+        assert await asyncio.wait_for(run_sync_io(lambda: "ok"), 1) == "ok"
+        assert all(
+            service._worker_thread is not None
+            and service._worker_thread.name.startswith("mail-monitor-")
+            for service in services
+        )
+    finally:
+        await asyncio.gather(*(service.stop() for service in services))
+        loop._default_executor = (
+            original_executor  # pylint: disable=protected-access
+        )
+        executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("blocked_phase", ["login", "readline", "logout"])
+async def test_stop_interrupts_blocked_imap_calls(
+    tmp_path,
+    blocked_phase,
+):
+    service, _ = _service(tmp_path)
+    blocked = threading.Event()
+    released = threading.Event()
+    constructor_args: list[tuple[tuple, dict]] = []
+
+    class BlockingConnection:
+        capabilities = ("IDLE",)
+
+        def _block(self, phase):
+            if blocked_phase == phase:
+                blocked.set()
+                released.wait()
+                raise OSError(f"{phase} interrupted")
+
+        def login(self, *_args):
+            self._block("login")
+
+        def _simple_command(self, *_args):
+            return "OK", [b"ID completed"]
+
+        def select(self, *_args):
+            return "OK", [b"0"]
+
+        def response(self, *_args):
+            return "OK", [b"1"]
+
+        def _new_tag(self):
+            return b"A001"
+
+        def send(self, *_args):
+            return None
+
+        def readline(self):
+            self._block("readline")
+            return b"+ idling\r\n"
+
+        def logout(self):
+            self._block("logout")
+            return "BYE", [b"closed"]
+
+        def shutdown(self):
+            released.set()
+
+    connection = BlockingConnection()
+
+    def _imap_factory(*args, **kwargs):
+        constructor_args.append((args, kwargs))
+        return connection
+
+    if blocked_phase == "logout":
+        service._poll_loop = lambda conn=None: service._close(conn)
+        connection.capabilities = ()
+    else:
+        service._check_new_messages = lambda _conn: None
+
+    with patch(
+        "qwenpaw.app.mail.monitor.imaplib.IMAP4_SSL",
+        new=_imap_factory,
+    ):
+        await service.start()
+        for _ in range(100):
+            if blocked.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert blocked.is_set()
+        await asyncio.wait_for(service.stop(), timeout=2)
+
+    assert released.is_set()
+    assert constructor_args == [
+        (("imap.163.com", 993), {"timeout": 10.0}),
+    ]
+    assert service._active_connection is None
 
 
 def test_state_round_trip(tmp_path):

@@ -874,11 +874,11 @@ def create_server(
     @mcp.tool(annotations=_ann("Delete Thread", destructive=True))
     @_tool_errors
     async def delete_thread(thread_id: str) -> dict:
-        """Move every message of a thread into the trash
-        folder and drop the thread.
+        """Move every message of a thread into the trash folder.
 
         The trash folder is auto-detected (Trash / 已删除 / Deleted Messages
-        etc.). Messages already in trash are left untouched.
+        etc.). Messages already in trash are left untouched. If only some
+        moves succeed, failed messages remain indexed and ``partial`` is true.
 
         Args:
             thread_id: Thread id from list_threads or search_threads.
@@ -907,7 +907,7 @@ def create_server(
                         target_folder=trash,
                     )
                     moved.append({"folder": m["folder"], "uid": m["uid"]})
-                except MailError as exc:
+                except Exception as exc:  # pylint: disable=broad-except
                     errors.append(
                         {
                             "folder": m["folder"],
@@ -923,6 +923,20 @@ def create_server(
                     "建议改用 delete_message 逐封删除，"
                     "或在网页版邮箱手动操作。",
                 )
+            if errors:
+                # Trash is intentionally excluded from the active thread
+                # index. Drop only the messages that were actually moved and
+                # retain failed messages so they remain addressable/retryable.
+                store.remove_messages(thread_id, moved)
+                return {
+                    "thread_id": thread_id,
+                    "deleted": False,
+                    "partial": True,
+                    "trash_folder": trash,
+                    "moved_count": len(moved),
+                    "moved": moved,
+                    "errors": errors,
+                }
             store.remove_thread(thread_id)
             result = {
                 "thread_id": thread_id,
@@ -931,8 +945,6 @@ def create_server(
                 "moved_count": len(moved),
                 "moved": moved,
             }
-            if errors:
-                result["errors"] = errors
             return result
 
         return await _run_store_operation(

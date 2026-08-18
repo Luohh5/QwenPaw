@@ -719,6 +719,31 @@ class ThreadStore:
     # -- deletion ----------------------------------------------------------
 
     @_synchronized
+    def remove_messages(
+        self,
+        thread_id: str,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Remove indexed folder/UID pairs while preserving the thread."""
+        thread = self._data["threads"].get(thread_id)
+        if thread is None:
+            return
+        removed = {
+            (str(message.get("folder")), str(message.get("uid")))
+            for message in messages
+        }
+        thread["messages"] = [
+            message
+            for message in thread["messages"]
+            if (str(message.get("folder")), str(message.get("uid")))
+            not in removed
+        ]
+        if not thread["messages"]:
+            self.remove_thread(thread_id)
+        else:
+            self.save()
+
+    @_synchronized
     def remove_thread(self, thread_id: str) -> None:
         self._data["threads"].pop(thread_id, None)
         self._labels.pop(thread_id, None)

@@ -2,7 +2,7 @@
 """Realtime mail push monitoring (IMAP IDLE) for agent mailboxes.
 
 ``MailMonitorService`` keeps a long-lived IMAP connection to the agent
-mailbox inside a worker thread (wrapped by a background asyncio task).
+mailbox inside a dedicated worker thread (tracked by an asyncio task).
 New messages are detected via IDLE (RFC 2177); on repeated IDLE
 failures the service degrades to plain ``NOOP + UID SEARCH`` polling.
 
@@ -162,6 +162,7 @@ def resolve_idle_timeout(domain: str, provider: str = "") -> int:
 
 
 _IDLE_SELECT_SLICE_SECONDS = 5.0
+_IMAP_NETWORK_TIMEOUT_SECONDS = 10.0
 _BODY_PREVIEW_MAX_CHARS = 2000
 # Partial-fetch cap so a single BODY.PEEK never downloads large
 # attachments while still covering the leading text parts.
@@ -578,27 +579,21 @@ def _authenticated_sender_from_message(
     return authenticated_sender
 
 
-def resolve_acl_sender(sender: str, return_path: str) -> tuple[str, bool]:
+def resolve_acl_sender(
+    sender: str,
+    authenticated_sender: str,
+) -> tuple[str, bool]:
     """Resolve the identity used by ACL decisions.
 
-    ``From`` is author-controlled.  When its domain is not aligned with the
-    delivery ``Return-Path``, use the latter as the ACL identity so a forged
-    display address cannot inherit an existing whitelist decision.  Without a
-    valid Return-Path there is no transport-backed identity and callers must
-    fail closed.
+    ``authenticated_sender`` has already been derived from trusted receiver
+    SPF/DKIM/DMARC results (or a provider-specific authenticated path).  A raw
+    Return-Path is intentionally not accepted as transport proof.
     """
     claimed = _parse_acl_address(sender)
-    transport = _parse_acl_address(return_path)
-    if not transport:
+    authenticated = _parse_acl_address(authenticated_sender)
+    if not authenticated:
         return claimed, False
-    if not claimed:
-        return transport, True
-
-    aligned = _domain_matches(
-        claimed.rsplit("@", 1)[1],
-        transport.rsplit("@", 1)[1],
-    )
-    return (claimed if aligned else transport), True
+    return authenticated, True
 
 
 def rule_matches(
@@ -1116,7 +1111,10 @@ class MailMonitorService:
         self._delivery_failures: dict[int, dict[str, Any]] = {}
         self._stop_event = threading.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._task: Optional[asyncio.Task] = None
+        self._task: Optional[asyncio.Future[Any]] = None
+        self._worker_thread: Optional[threading.Thread] = None
+        self._connection_lock = threading.Lock()
+        self._active_connection: Optional[imaplib.IMAP4_SSL] = None
         # Coroutines submitted by the worker are real Tasks on the main loop;
         # completion futures let the worker wait without hiding task lifetime.
         self._submission_tasks: set[asyncio.Task[Any]] = set()
@@ -1160,10 +1158,26 @@ class MailMonitorService:
         self._loop = asyncio.get_running_loop()
         self._stop_event.clear()
         self._load_state()
-        self._task = asyncio.create_task(
-            asyncio.to_thread(self._worker),
+        worker_stopped: concurrent.futures.Future[
+            None
+        ] = concurrent.futures.Future()
+
+        def _run_worker() -> None:
+            try:
+                self._worker()
+            except BaseException as exc:
+                worker_stopped.set_exception(exc)
+            else:
+                worker_stopped.set_result(None)
+
+        worker_thread = threading.Thread(
+            target=_run_worker,
             name=f"mail-monitor-{self.agent_id}",
+            daemon=True,
         )
+        self._worker_thread = worker_thread
+        worker_thread.start()
+        self._task = asyncio.wrap_future(worker_stopped)
         self.schedule_approved_replay()
         logger.info(
             "mail monitor started for agent %s (%s, mode=%s)",
@@ -1175,6 +1189,7 @@ class MailMonitorService:
     async def stop(self) -> None:
         """Cancel submitted work and wait until the worker actually exits."""
         self._stop_event.set()
+        self._interrupt_active_connection()
         task = self._task
         replay_task = self._approved_replay_task
         if task is None and replay_task is None:
@@ -1226,6 +1241,7 @@ class MailMonitorService:
             if task is not None and task.done():
                 self._task = None
                 self._loop = None
+                self._worker_thread = None
             if replay_task is not None and replay_task.done():
                 self._approved_replay_task = None
 
@@ -1494,8 +1510,17 @@ class MailMonitorService:
             raise imaplib.IMAP4.error(
                 f"no IMAP host for domain {self.domain!r}",
             )
-        conn = imaplib.IMAP4_SSL(self.host, 993)
+        conn = imaplib.IMAP4_SSL(
+            self.host,
+            993,
+            timeout=_IMAP_NETWORK_TIMEOUT_SECONDS,
+        )
+        with self._connection_lock:
+            self._active_connection = conn
         try:
+            if self._stop_event.is_set():
+                self._interrupt_active_connection()
+                raise imaplib.IMAP4.abort("mail monitor is stopping")
             conn.login(self.email_address, self.auth_code)
             if (
                 self.domain in _NETEASE_DOMAINS
@@ -1573,8 +1598,7 @@ class MailMonitorService:
         ):
             raise OSError("could not persist mail monitor mailbox identity")
 
-    @staticmethod
-    def _close(conn: Optional[imaplib.IMAP4_SSL]) -> None:
+    def _close(self, conn: Optional[imaplib.IMAP4_SSL]) -> None:
         if conn is None:
             return
         try:
@@ -1584,6 +1608,26 @@ class MailMonitorService:
                 conn.shutdown()
             except Exception:  # pylint: disable=broad-except
                 pass
+        finally:
+            with self._connection_lock:
+                if self._active_connection is conn:
+                    self._active_connection = None
+
+    def _interrupt_active_connection(self) -> None:
+        """Close the current socket so a blocking IMAP call exits promptly."""
+        with self._connection_lock:
+            conn = self._active_connection
+            self._active_connection = None
+        if conn is None:
+            return
+        try:
+            conn.shutdown()
+        except Exception:  # pylint: disable=broad-except
+            logger.debug(
+                "mail monitor socket shutdown failed for agent %s",
+                self.agent_id,
+                exc_info=True,
+            )
 
     def _idle_wait(self, conn: imaplib.IMAP4_SSL) -> bool:
         """Enter IDLE; return True when an EXISTS notification arrives.
@@ -1925,8 +1969,7 @@ class MailMonitorService:
         if self.push.access_control_enabled:
             sender_email, transport_backed = resolve_acl_sender(
                 sender,
-                envelope.get("return_path", "")
-                or envelope.get("authenticated_sender", ""),
+                envelope.get("authenticated_sender", ""),
             )
             # Header-only identities are trivially forgeable.  They still enter
             # the approval queue, but each message gets an isolated identity so
