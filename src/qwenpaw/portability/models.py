@@ -12,6 +12,20 @@ from pydantic import BaseModel, Field
 from ..harnesses.events import HarnessHistoryItem
 
 
+class SourceLocation(BaseModel):
+    """Resolved provider data roots and the evidence used to choose them."""
+
+    provider_id: str
+    data_home: str
+    data_home_source: str = "default"
+    user_data_home: str = ""
+    user_data_home_source: str = ""
+    runtime_path: str = ""
+    data_home_exists: bool = False
+    user_data_home_exists: bool = False
+    evidence: list[str] = Field(default_factory=list)
+
+
 class SourceSkill(BaseModel):
     """One provider-owned Skill that can be staged into QwenPaw."""
 
@@ -98,6 +112,7 @@ class ProviderInventory(BaseModel):
     provider_name: str
     detected: bool
     locator: str = ""
+    source_location: SourceLocation | None = None
     sessions: list[SourceSession] = Field(default_factory=list)
     ignored_session_ids: list[str] = Field(default_factory=list)
     skills: list[SourceSkill] = Field(default_factory=list)
@@ -107,12 +122,62 @@ class ProviderInventory(BaseModel):
     plugins: list[SourcePlugin] = Field(default_factory=list)
     discovered_mcp_count: int = 0
     warnings: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MigrationAssetPlan(BaseModel):
+    """One reviewable action in a provider migration plan."""
+
+    asset_type: str
+    source_id: str
+    name: str
+    action: str
+    fidelity: str
+    default_enabled: bool = False
+    reason_zh: str = ""
+
+
+class MigrationPlan(BaseModel):
+    """Persisted dry-run plan that can be verified again before apply."""
+
+    plan_id: str
+    schema_version: str = "1"
+    source: str
+    source_home: str = ""
+    source_location: SourceLocation | None = None
+    agent_id: str
+    created_at: datetime
+    inventory_fingerprint: str
+    inventory_counts: dict[str, int] = Field(default_factory=dict)
+    actions: list[MigrationAssetPlan] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    state: str = "ready"
+    migration_id: str = ""
+
+
+class MigrationDoctorCheck(BaseModel):
+    """One Chinese post-import verification result."""
+
+    category: str
+    status: str
+    title_zh: str
+    detail_zh: str
+
+
+class MigrationDoctorReport(BaseModel):
+    """Post-import health report attached to an import receipt."""
+
+    status: str
+    summary_zh: str
+    checked_at: datetime
+    checks: list[MigrationDoctorCheck] = Field(default_factory=list)
 
 
 class ImportReceipt(BaseModel):
     """Durable receipt for one additive provider migration."""
 
     migration_id: str
+    plan_id: str = ""
     schema_version: str = "1"
     source: str
     source_locator: str = ""
@@ -135,6 +200,7 @@ class ImportReceipt(BaseModel):
     discovered_mcp_count: int = 0
     warnings: list[str] = Field(default_factory=list)
     backend_changed: bool = False
+    doctor_report: MigrationDoctorReport | None = None
 
 
 class TraceExportResult(BaseModel):
@@ -150,6 +216,10 @@ class TraceExportResult(BaseModel):
 
 __all__ = [
     "ImportReceipt",
+    "MigrationAssetPlan",
+    "MigrationDoctorCheck",
+    "MigrationDoctorReport",
+    "MigrationPlan",
     "ProviderInventory",
     "SourceMarketplace",
     "SourceMemoryFile",
@@ -158,5 +228,6 @@ __all__ = [
     "SourceSession",
     "SourceSkill",
     "SourceMCPServer",
+    "SourceLocation",
     "TraceExportResult",
 ]

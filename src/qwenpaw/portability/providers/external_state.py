@@ -11,6 +11,7 @@ translated by the importer before going through QwenPaw's native installer.
 from __future__ import annotations
 
 import json
+import sqlite3
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,11 @@ _CODEX_BUILTIN_MARKETPLACES = {
 }
 _CWD_KEYS = ("cwd", "directory", "project_path", "projectPath")
 _MAX_TRANSCRIPT_PROBE_BYTES = 1024 * 1024
+_CODEX_CURATED_MEMORY_FILES = ("MEMORY.md", "memory_summary.md")
+_CODEX_INTERNAL_MEMORY_FILES = (
+    "raw_memories.md",
+    "phase2_workspace_diff.md",
+)
 
 
 def _read_json(path: Path) -> Any:
@@ -67,15 +73,78 @@ def _markdown_files(root: Path) -> list[SourceMemoryFile]:
     return files
 
 
+def _codex_stage1_count(codex_home: Path) -> int:
+    database = codex_home / "memories_1.sqlite"
+    if database.is_symlink() or not database.is_file():
+        return 0
+    try:
+        uri = f"{database.resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=2.0) as connection:
+            value = connection.execute(
+                "SELECT COUNT(*) FROM stage1_outputs WHERE "
+                "length(trim(raw_memory)) > 0 OR "
+                "length(trim(rollout_summary)) > 0",
+            ).fetchone()
+    except sqlite3.Error:
+        return 0
+    return int(value[0]) if value else 0
+
+
+def codex_memory_status(codex_home: Path) -> dict[str, Any]:
+    """Classify Codex memory without treating pipeline artifacts as memory."""
+    codex_home = codex_home.expanduser()
+    root = codex_home / "memories"
+    curated = [
+        name
+        for name in _CODEX_CURATED_MEMORY_FILES
+        if not (root / name).is_symlink() and (root / name).is_file()
+    ]
+    notes_root = root / "extensions" / "ad_hoc" / "notes"
+    note_count = len(_markdown_files(notes_root))
+    internal = [
+        name
+        for name in _CODEX_INTERNAL_MEMORY_FILES
+        if not (root / name).is_symlink() and (root / name).is_file()
+    ]
+    stage1_count = _codex_stage1_count(codex_home)
+    if curated:
+        state = (
+            "consolidated_with_internal_residue"
+            if internal
+            else "consolidated"
+        )
+    elif "phase2_workspace_diff.md" in internal:
+        state = "consolidation_incomplete"
+    elif note_count:
+        state = "pending_ad_hoc"
+    elif stage1_count:
+        state = "phase1_only"
+    elif internal:
+        state = "consolidation_incomplete"
+    else:
+        state = "empty"
+    return {
+        "state": state,
+        "curated_files": curated,
+        "ad_hoc_note_count": note_count,
+        "stage1_output_count": stage1_count,
+        "ignored_internal_files": internal,
+    }
+
+
+# pylint: disable-next=too-many-branches
 def discover_codex_memory(codex_home: Path) -> list[SourceMemoryProject]:
-    """Discover Codex's global memory and scoped extension resources."""
-    memories_root = codex_home.expanduser() / "memories"
+    """Discover only curated Codex memory and safe scoped source resources."""
+    codex_home = codex_home.expanduser()
+    memories_root = codex_home / "memories"
     projects: list[SourceMemoryProject] = []
     if not memories_root.is_dir():
         return projects
 
-    global_files = []
-    for path in sorted(memories_root.glob("*.md")):
+    status = codex_memory_status(codex_home)
+    global_files: list[SourceMemoryFile] = []
+    for name in _CODEX_CURATED_MEMORY_FILES:
+        path = memories_root / name
         if path.is_symlink() or not path.is_file():
             continue
         global_files.append(
@@ -90,9 +159,32 @@ def discover_codex_memory(codex_home: Path) -> list[SourceMemoryProject]:
                 source_id="codex:global",
                 project_key="global",
                 files=global_files,
-                metadata={"layout": "codex_global_memory"},
+                metadata={
+                    "layout": "codex_global_memory",
+                    "memory_state": status["state"],
+                    "ignored_internal_files": status["ignored_internal_files"],
+                },
             ),
         )
+
+    # Explicit user notes are useful source material when Codex has not yet
+    # produced its curated Phase-2 artifacts. Once consolidated, importing
+    # both would duplicate the same facts.
+    if not global_files:
+        notes_root = memories_root / "extensions" / "ad_hoc" / "notes"
+        note_files = _markdown_files(notes_root)
+        if note_files:
+            projects.append(
+                SourceMemoryProject(
+                    source_id="codex:ad-hoc",
+                    project_key="ad-hoc-notes",
+                    files=note_files,
+                    metadata={
+                        "layout": "codex_ad_hoc_notes",
+                        "memory_state": status["state"],
+                    },
+                ),
+            )
 
     extensions_root = memories_root / "extensions"
     if not extensions_root.is_dir():
@@ -746,6 +838,7 @@ def discover_qoder_plugins(
 
 __all__ = [
     "discover_codex_memory",
+    "codex_memory_status",
     "discover_codex_plugins",
     "discover_project_memory",
     "discover_qoder_mcp",

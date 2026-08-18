@@ -10,13 +10,19 @@ from typing import Any
 from ...harnesses.codex.rollout_reader import CodexRolloutReader
 from ..models import (
     ProviderInventory,
+    SourceLocation,
     SourceMCPServer,
     SourceSession,
     SourceSkill,
 )
 from ._utils import parse_datetime
 from .base import ProgressReporter
-from .external_state import discover_codex_memory, discover_codex_plugins
+from .external_state import (
+    codex_memory_status,
+    discover_codex_memory,
+    discover_codex_plugins,
+)
+from .locator import resolve_source_location
 
 _DISCOVERY_TIMEOUT_SECONDS = 60
 _SESSION_TIMEOUT_SECONDS = 90
@@ -43,11 +49,24 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
         self,
         workspace: Any,
         rollout_reader: CodexRolloutReader | None = None,
+        source_location: SourceLocation | None = None,
     ) -> None:
         self._workspace = workspace
-        self._rollout_reader = rollout_reader
+        if source_location is None:
+            source_location = resolve_source_location(
+                "codex",
+                source_home=(
+                    rollout_reader.codex_home if rollout_reader else None
+                ),
+            )
+            if rollout_reader is not None:
+                source_location.data_home_source = "injected"
+        self._source_location = source_location
+        self._rollout_reader = rollout_reader or CodexRolloutReader(
+            Path(source_location.data_home),
+        )
 
-    # pylint: disable-next=too-many-locals,too-many-branches
+    # pylint: disable-next=R0914,R0912,R0915
     async def inventory(
         self,
         *,
@@ -64,7 +83,7 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             self.provider_id,
             settings,
         )
-        rollout_reader = self._rollout_reader or CodexRolloutReader()
+        rollout_reader = self._rollout_reader
         offline_threads = await asyncio.to_thread(
             rollout_reader.list_threads,
             limit=limit,
@@ -78,41 +97,35 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
         except asyncio.TimeoutError:
             status = None
         installed = bool(status is not None and status.installed)
-        if not installed and not offline_threads:
-            detail = (
-                getattr(status, "error", "")
-                if status is not None
-                else "Codex runtime detection timed out after 60s."
-            )
-            return ProviderInventory(
-                provider_id=self.provider_id,
-                provider_name="Codex",
-                detected=False,
-                warnings=[
-                    detail
-                    or "Codex runtime and local rollouts were not found.",
-                ],
-            )
-
         warnings: list[str] = []
         if not installed:
-            warnings.append(
-                "Codex CLI was unavailable, so local rollout JSONL files "
-                "were used for session recovery.",
-            )
+            if offline_threads:
+                warnings.append(
+                    "Codex CLI was unavailable, so local rollout JSONL files "
+                    "were used for session recovery.",
+                )
+            else:
+                warnings.append(
+                    "Codex CLI was unavailable; only portable local assets "
+                    "from the resolved Codex data directory can be imported.",
+                )
 
         if progress is not None:
             await progress(
                 "已连接 Codex，正在检查 Memory、插件、Skill 与 MCP 配置…",
             )
 
-        memory_projects, plugin_state = await asyncio.gather(
+        memory_projects, plugin_state, memory_state = await asyncio.gather(
             asyncio.to_thread(
                 discover_codex_memory,
                 rollout_reader.codex_home,
             ),
             asyncio.to_thread(
                 discover_codex_plugins,
+                rollout_reader.codex_home,
+            ),
+            asyncio.to_thread(
+                codex_memory_status,
                 rollout_reader.codex_home,
             ),
         )
@@ -129,6 +142,51 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             installed=installed,
             warnings=warnings,
         )
+        if memory_state["ignored_internal_files"]:
+            warnings.append(
+                "Ignored Codex memory pipeline artifacts: "
+                + ", ".join(memory_state["ignored_internal_files"])
+                + ".",
+            )
+        if memory_state["state"] in {
+            "pending_ad_hoc",
+            "phase1_only",
+            "consolidation_incomplete",
+        }:
+            warnings.append(
+                "Codex memory is not fully consolidated; its state is "
+                f"{memory_state['state']}. Only safe source material that "
+                "can be represented in QwenPaw was prepared.",
+            )
+
+        detected = bool(
+            installed
+            or offline_threads
+            or memory_projects
+            or skills
+            or plugins
+            or marketplaces,
+        )
+        if not detected:
+            detail = (
+                getattr(status, "error", "")
+                if status is not None
+                else "Codex runtime detection timed out after 60s."
+            )
+            return ProviderInventory(
+                provider_id=self.provider_id,
+                provider_name="Codex",
+                detected=False,
+                locator=str(rollout_reader.codex_home),
+                source_location=self._source_location,
+                metadata={"memory": memory_state},
+                warnings=[
+                    *warnings,
+                    detail
+                    or "Codex runtime and portable local state were not "
+                    "found.",
+                ],
+            )
 
         if progress is not None:
             await progress("正在合并 Codex 会话索引与本地 JSONL 备份…")
@@ -207,11 +265,16 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             if status is not None
             else ""
         )
+        self._source_location.runtime_path = locator
+        self._source_location.data_home_exists = (
+            rollout_reader.codex_home.is_dir()
+        )
         return ProviderInventory(
             provider_id=self.provider_id,
             provider_name="Codex",
             detected=True,
             locator=locator or str(rollout_reader.codex_home),
+            source_location=self._source_location,
             sessions=sessions,
             skills=skills,
             mcp_servers=mcp_servers,
@@ -220,6 +283,7 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             plugins=plugins,
             discovered_mcp_count=len(mcp_servers),
             warnings=warnings,
+            metadata={"memory": memory_state},
         )
 
     async def _discover_skills(

@@ -118,6 +118,112 @@ async def test_provider_import_is_additive_and_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_dry_run_plan_can_be_revalidated_and_applied(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    inventory = ProviderInventory(
+        provider_id="codex",
+        provider_name="Codex",
+        detected=True,
+        sessions=[
+            SourceSession(
+                source_id="planned-thread",
+                title="Planned migration",
+                history=[
+                    HarnessHistoryItem(
+                        kind=HarnessHistoryKind.USER,
+                        text="Continue the planned task",
+                    ),
+                ],
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        "qwenpaw.portability.importer.create_migration_provider",
+        lambda _source, _workspace: _Provider(inventory),
+    )
+    service = ProviderImportService(workspace)
+
+    plan = await service.plan_from("codex")
+
+    assert plan.state == "ready"
+    assert plan.inventory_counts["sessions"] == 1
+    assert plan.actions[0].action == "import_history"
+    assert await workspace.chat_manager.list_chats(archived=None) == []
+    receipt_root = workspace.workspace_dir / ".qwenpaw/imports"
+    assert not list(
+        receipt_root.glob("migration-*.json"),
+    )
+
+    receipt = await service.apply_plan(plan.plan_id)
+
+    assert receipt.plan_id == plan.plan_id
+    assert receipt.imported_sessions == ["planned-thread"]
+    assert receipt.doctor_report is not None
+    assert receipt.doctor_report.status == "pass"
+    assert receipt.doctor_report.summary_zh == "迁移完成，已检查的项目全部通过。"
+    persisted = json.loads(
+        (
+            workspace.workspace_dir
+            / ".qwenpaw/imports/plans"
+            / f"{plan.plan_id}.json"
+        ).read_text(encoding="utf-8"),
+    )
+    assert persisted["state"] == "applied"
+    assert persisted["migration_id"] == receipt.migration_id
+
+
+@pytest.mark.asyncio
+async def test_apply_plan_refuses_changed_source_files(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    memory = tmp_path / "source-memory" / "fact.md"
+    memory.parent.mkdir()
+    memory.write_text("version one", encoding="utf-8")
+    inventory = ProviderInventory(
+        provider_id="codex",
+        provider_name="Codex",
+        detected=True,
+        memory_projects=[
+            SourceMemoryProject(
+                source_id="memory-scope",
+                project_key="project",
+                files=[
+                    SourceMemoryFile(
+                        source_path=memory,
+                        relative_path=Path("fact.md"),
+                    ),
+                ],
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        "qwenpaw.portability.importer.create_migration_provider",
+        lambda _source, _workspace: _Provider(inventory),
+    )
+    service = ProviderImportService(workspace)
+    plan = await service.plan_from("codex")
+    memory.write_text("version two", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="来源数据.*发生了变化"):
+        await service.apply_plan(plan.plan_id)
+
+    assert await workspace.chat_manager.list_chats(archived=None) == []
+    persisted = json.loads(
+        (
+            workspace.workspace_dir
+            / ".qwenpaw/imports/plans"
+            / f"{plan.plan_id}.json"
+        ).read_text(encoding="utf-8"),
+    )
+    assert persisted["state"] == "ready"
+
+
+@pytest.mark.asyncio
 async def test_qoder_reimport_archives_internal_traces_from_old_import(
     tmp_path: Path,
     monkeypatch,

@@ -16,7 +16,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 from urllib.parse import unquote, urlparse
 
 from ...harnesses.events import (
@@ -81,17 +81,29 @@ class QoderIndex:
     quests: dict[str, QoderQuestInfo] = field(default_factory=dict)
 
 
-def default_qoder_user_data() -> Path:
+def default_qoder_user_data(
+    home: Path | None = None,
+    *,
+    platform_name: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
     """Return Qoder's platform-specific ``User`` data directory."""
-    home = Path.home()
-    if sys.platform == "darwin":
-        return home / "Library" / "Application Support" / "Qoder" / "User"
-    if sys.platform == "win32":
-        app_data = os.environ.get("APPDATA")
-        base = Path(app_data) if app_data else home / "AppData" / "Roaming"
+    user_home = home or Path.home()
+    platform_value = platform_name or sys.platform
+    environment = environ if environ is not None else os.environ
+    configured = str(environment.get("QODER_USER_DATA_HOME") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    if platform_value == "darwin":
+        return user_home / "Library" / "Application Support" / "Qoder" / "User"
+    if platform_value == "win32":
+        app_data = environment.get("APPDATA")
+        base = (
+            Path(app_data) if app_data else user_home / "AppData" / "Roaming"
+        )
         return base / "Qoder" / "User"
-    config_home = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(config_home) if config_home else home / ".config"
+    config_home = environment.get("XDG_CONFIG_HOME")
+    base = Path(config_home) if config_home else user_home / ".config"
     return base / "Qoder" / "User"
 
 

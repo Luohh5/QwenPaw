@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 from qwenpaw.portability.providers.external_state import (
+    codex_memory_status,
     discover_codex_memory,
     discover_codex_plugins,
     discover_project_memory,
@@ -13,6 +15,81 @@ from qwenpaw.portability.providers.external_state import (
     discover_qoder_plugins,
     discover_qoder_skills,
 )
+
+
+def test_codex_memory_ignores_internal_pipeline_artifacts(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / ".codex"
+    memories = codex_home / "memories"
+    memories.mkdir(parents=True)
+    (memories / "MEMORY.md").write_text("curated", encoding="utf-8")
+    (memories / "raw_memories.md").write_text(
+        "internal phase one data",
+        encoding="utf-8",
+    )
+    (memories / "phase2_workspace_diff.md").write_text(
+        "internal phase two diff",
+        encoding="utf-8",
+    )
+
+    status = codex_memory_status(codex_home)
+    projects = discover_codex_memory(codex_home)
+
+    assert status["state"] == "consolidated_with_internal_residue"
+    assert status["ignored_internal_files"] == [
+        "raw_memories.md",
+        "phase2_workspace_diff.md",
+    ]
+    imported = [
+        item.relative_path.name
+        for project in projects
+        for item in project.files
+    ]
+    assert imported == ["MEMORY.md"]
+
+
+def test_codex_memory_imports_ad_hoc_notes_before_consolidation(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / ".codex"
+    notes = codex_home / "memories/extensions/ad_hoc/notes"
+    notes.mkdir(parents=True)
+    (notes / "preference.md").write_text(
+        "explain in Chinese",
+        encoding="utf-8",
+    )
+
+    status = codex_memory_status(codex_home)
+    projects = discover_codex_memory(codex_home)
+
+    assert status["state"] == "pending_ad_hoc"
+    assert status["ad_hoc_note_count"] == 1
+    assert [item.source_id for item in projects] == ["codex:ad-hoc"]
+    assert projects[0].files[0].relative_path == Path("preference.md")
+
+
+def test_codex_memory_reports_phase_one_database_without_export(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    database = codex_home / "memories_1.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE stage1_outputs "
+            "(raw_memory TEXT, rollout_summary TEXT)",
+        )
+        connection.execute(
+            "INSERT INTO stage1_outputs VALUES (?, ?)",
+            ("one durable fact", ""),
+        )
+
+    status = codex_memory_status(codex_home)
+
+    assert status["state"] == "phase1_only"
+    assert status["stage1_output_count"] == 1
+    assert not discover_codex_memory(codex_home)
 
 
 def test_codex_memory_preserves_global_and_extension_scope(tmp_path: Path):

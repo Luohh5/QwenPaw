@@ -3,17 +3,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from .base import MigrationProvider
 from .codex import CodexMigrationProvider
+from .locator import canonical_provider_id, resolve_source_location
 from .qoder import QoderMigrationProvider
-
-_ALIASES = {
-    "codex": "codex",
-    "openai-codex": "codex",
-    "qoder": "qoder",
-}
 
 
 def provider_names() -> tuple[str, ...]:
@@ -24,22 +20,26 @@ def provider_names() -> tuple[str, ...]:
 def create_migration_provider(
     source: str,
     workspace: Any,
+    *,
+    source_home: Path | None = None,
 ) -> MigrationProvider:
     """Create one read-only provider or raise a user-actionable error."""
-    provider_id = _ALIASES.get(source.strip().lower())
-    if provider_id == "codex":
-        return CodexMigrationProvider(workspace)
-    if provider_id == "qoder":
-        return QoderMigrationProvider(workspace)
-    supported = ", ".join(provider_names())
-    raise ValueError(
-        f"Unsupported import source {source!r}. Supported providers: "
-        f"{supported}; or pass a QwenPaw backup .zip path.",
+    provider_id = canonical_provider_id(source)
+    location = resolve_source_location(
+        provider_id,
+        source_home=source_home,
     )
+    if provider_id == "codex":
+        return CodexMigrationProvider(workspace, source_location=location)
+    if provider_id == "qoder":
+        return QoderMigrationProvider(workspace, source_location=location)
+    raise AssertionError(f"Unreachable provider id: {provider_id}")
 
 
 __all__ = [
     "MigrationProvider",
+    "canonical_provider_id",
     "create_migration_provider",
     "provider_names",
+    "resolve_source_location",
 ]

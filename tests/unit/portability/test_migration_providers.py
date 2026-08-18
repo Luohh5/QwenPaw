@@ -13,6 +13,7 @@ from qwenpaw.portability.providers import (
     provider_names,
 )
 from qwenpaw.portability.providers.codex import CodexMigrationProvider
+from qwenpaw.portability.providers.qoder import QoderMigrationProvider
 
 
 class _CodexAdapter:
@@ -79,6 +80,15 @@ class _HarnessRuntime:
         return self._adapter
 
 
+class _OfflineCodexAdapter:
+    async def status(self):
+        return SimpleNamespace(
+            installed=False,
+            error="codex executable unavailable",
+            runtime_path="",
+        )
+
+
 def _workspace(tmp_path: Path):
     config = SimpleNamespace(backend="qwenpaw", backend_settings={})
     return SimpleNamespace(
@@ -108,6 +118,58 @@ async def test_codex_provider_reuses_runtime_and_normalizes_inventory(
     }
     assert inventory.mcp_servers[0].metadata["source_runtime_bound"] is False
     assert any("disabled QwenPaw" in item for item in inventory.warnings)
+
+
+@pytest.mark.asyncio
+async def test_codex_provider_detects_portable_assets_without_cli_or_sessions(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "custom-codex-home"
+    skill = codex_home / "skills" / "portable-skill"
+    memory = codex_home / "memories"
+    skill.mkdir(parents=True)
+    memory.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# Portable", encoding="utf-8")
+    (memory / "MEMORY.md").write_text("durable fact", encoding="utf-8")
+    workspace = _workspace(tmp_path)
+    workspace.harness_runtime = _HarnessRuntime(_OfflineCodexAdapter())
+
+    inventory = await CodexMigrationProvider(
+        workspace,
+        rollout_reader=CodexRolloutReader(codex_home),
+    ).inventory(limit=10)
+
+    assert inventory.detected is True
+    assert inventory.sessions == []
+    assert any(item.name == "portable-skill" for item in inventory.skills)
+    assert [item.source_id for item in inventory.memory_projects] == [
+        "codex:global",
+    ]
+    assert inventory.source_location is not None
+    assert inventory.source_location.data_home == str(codex_home.resolve())
+    assert inventory.source_location.data_home_source == "injected"
+
+
+@pytest.mark.asyncio
+async def test_qoder_provider_detects_skill_only_custom_home(
+    tmp_path: Path,
+) -> None:
+    qoder_home = tmp_path / "custom-qoder-home"
+    skill = qoder_home / "skills" / "only-skill"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# Only skill", encoding="utf-8")
+
+    inventory = await QoderMigrationProvider(
+        SimpleNamespace(workspace_dir=tmp_path),
+        qoder_home=qoder_home,
+        qoder_user_data=tmp_path / "missing-user-data",
+    ).inventory(limit=10)
+
+    assert inventory.detected is True
+    assert inventory.sessions == []
+    assert [item.name for item in inventory.skills] == ["only-skill"]
+    assert inventory.source_location is not None
+    assert inventory.source_location.data_home_source == "injected"
 
 
 def test_provider_registry_is_explicit_and_rejects_unknown_sources(

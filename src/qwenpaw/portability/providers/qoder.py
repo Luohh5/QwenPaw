@@ -7,7 +7,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
-from ..models import ProviderInventory, SourceSession
+from ..models import ProviderInventory, SourceLocation, SourceSession
 from .base import ProgressReporter
 from .external_state import (
     discover_qoder_mcp,
@@ -21,6 +21,7 @@ from .qoder_sessions import (
     load_qoder_index,
     read_qoder_transcript,
 )
+from .locator import resolve_source_location
 
 _SESSION_TIMEOUT_SECONDS = 60
 _READ_CONCURRENCY = 4
@@ -44,10 +45,29 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
         *,
         qoder_home: Path | None = None,
         qoder_user_data: Path | None = None,
+        source_location: SourceLocation | None = None,
     ) -> None:
         self._workspace = workspace
-        self._qoder_home = qoder_home or (Path.home() / ".qoder")
-        self._qoder_user_data = qoder_user_data or default_qoder_user_data()
+        if source_location is None:
+            source_location = resolve_source_location(
+                "qoder",
+                source_home=qoder_home,
+            )
+        if qoder_home is not None:
+            source_location.data_home = str(qoder_home.expanduser())
+            source_location.data_home_source = "injected"
+            source_location.data_home_exists = qoder_home.is_dir()
+        if qoder_user_data is not None:
+            source_location.user_data_home = str(qoder_user_data.expanduser())
+            source_location.user_data_home_source = "injected"
+            source_location.user_data_home_exists = qoder_user_data.is_dir()
+        self._source_location = source_location
+        self._qoder_home = Path(source_location.data_home)
+        self._qoder_user_data = (
+            Path(source_location.user_data_home)
+            if source_location.user_data_home
+            else default_qoder_user_data()
+        )
 
     # pylint: disable-next=R0914,R0915,R0912
     async def inventory(
@@ -246,8 +266,12 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
                 or projects.is_dir()
                 or bool(memory_projects)
                 or bool(plugins)
+                or bool(skills)
+                or bool(mcp_servers)
+                or bool(marketplaces)
             ),
-            locator=str(projects),
+            locator=str(self._qoder_home),
+            source_location=self._source_location,
             sessions=sessions,
             ignored_session_ids=ignored_session_ids,
             skills=skills,
