@@ -6,15 +6,17 @@ control enabled; write endpoints route each entry to the owning agent's
 workspace store.  An empty ``agent_id`` on whitelist/blacklist "add" entries
 means "broadcast to all mail-enabled agents".
 """
+
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
+
+from ...utils.io_utils import run_sync_io
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +101,148 @@ class MailACLRemarkBody(BaseModel):
     remark: str
 
 
+def _group_action_entries(
+    entries: List[MailACLEntry],
+    *,
+    broadcast: bool = False,
+) -> List[Tuple[str, Any, List[MailACLEntry]]]:
+    """Resolve stores once and group a request into workspace transactions."""
+    grouped: Dict[Tuple[str, int], Tuple[str, Any, List[MailACLEntry]]] = {}
+    direct_stores: Dict[str, Any] = {}
+    broadcast_targets: Optional[List[Tuple[str, Any]]] = None
+
+    for entry in entries:
+        if broadcast and entry.agent_id == "":
+            if broadcast_targets is None:
+                broadcast_targets = list(_iter_mail_agent_stores())
+            targets = broadcast_targets
+        else:
+            if entry.agent_id not in direct_stores:
+                direct_stores[entry.agent_id] = _get_store_for_agent(
+                    entry.agent_id,
+                )
+            store = direct_stores[entry.agent_id]
+            targets = [] if store is None else [(entry.agent_id, store)]
+
+        for agent_id, store in targets:
+            key = (agent_id, id(store))
+            if key not in grouped:
+                grouped[key] = (agent_id, store, [])
+            grouped[key][2].append(entry)
+    return list(grouped.values())
+
+
+def _list_mail_agents_sync() -> Dict[str, List[str]]:
+    return {"agents": [agent_id for agent_id, _ in _iter_mail_agent_stores()]}
+
+
+def _get_all_acls_sync() -> Dict[str, Dict[str, Any]]:
+    return {
+        agent_id: store.get_acl(agent_id)
+        for agent_id, store in _iter_mail_agent_stores()
+    }
+
+
+def _get_all_pending_sync() -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    for agent_id, store in _iter_mail_agent_stores():
+        result.extend(store.get_acl(agent_id).get("pending", []))
+    result.sort(key=lambda item: item.get("timestamp", 0), reverse=True)
+    return result
+
+
+def _get_pending_count_sync() -> Dict[str, int]:
+    return {
+        "count": sum(
+            len(store.get_acl(agent_id).get("pending", []))
+            for agent_id, store in _iter_mail_agent_stores()
+        ),
+    }
+
+
+def _approve_pending_sync(
+    entries: List[MailACLEntry],
+) -> List[Tuple[MailACLEntry, Optional[Dict[str, Any]]]]:
+    results: List[Tuple[MailACLEntry, Optional[Dict[str, Any]]]] = []
+    for agent_id, store, grouped_entries in _group_action_entries(entries):
+        snapshots = store.approve_many(
+            agent_id,
+            [(entry.address, entry.remark or "") for entry in grouped_entries],
+        )
+        results.extend(zip(grouped_entries, snapshots))
+    return results
+
+
+def _deny_pending_sync(entries: List[MailACLEntry]) -> List[MailACLEntry]:
+    results: List[MailACLEntry] = []
+    for agent_id, store, grouped_entries in _group_action_entries(entries):
+        store.deny_many(
+            agent_id,
+            [(entry.address, entry.remark or "") for entry in grouped_entries],
+        )
+        results.extend(grouped_entries)
+    return results
+
+
+def _dismiss_pending_sync(entries: List[MailACLEntry]) -> List[MailACLEntry]:
+    results: List[MailACLEntry] = []
+    for agent_id, store, grouped_entries in _group_action_entries(entries):
+        store.dismiss_many(
+            agent_id,
+            [entry.address for entry in grouped_entries],
+        )
+        results.extend(grouped_entries)
+    return results
+
+
+def _mutate_list_sync(
+    entries: List[MailACLEntry],
+    action: str,
+    *,
+    broadcast: bool = False,
+) -> int:
+    count = 0
+    for agent_id, store, grouped_entries in _group_action_entries(
+        entries,
+        broadcast=broadcast,
+    ):
+        if action == "whitelist_add":
+            count += store.add_many_to_whitelist(
+                agent_id,
+                [
+                    (
+                        entry.address,
+                        entry.remark or "",
+                        entry.display_name or "",
+                    )
+                    for entry in grouped_entries
+                ],
+            )
+        elif action == "whitelist_remove":
+            count += store.remove_many_from_whitelist(
+                agent_id,
+                [entry.address for entry in grouped_entries],
+            )
+        elif action == "blacklist_add":
+            count += store.add_many_to_blacklist(
+                agent_id,
+                [
+                    (
+                        entry.address,
+                        entry.remark or "",
+                        entry.display_name or "",
+                    )
+                    for entry in grouped_entries
+                ],
+            )
+        elif action == "blacklist_remove":
+            count += store.remove_many_from_blacklist(
+                agent_id,
+                [entry.address for entry in grouped_entries],
+            )
+    return count
+
+
 # ── Endpoints ───────────────────────────────────────────────────────────────
 
 
@@ -108,7 +252,7 @@ class MailACLRemarkBody(BaseModel):
 )
 async def list_mail_agents():
     """Return agent ids that have mailbox access control enabled."""
-    return {"agents": [agent_id for agent_id, _ in _iter_mail_agent_stores()]}
+    return await run_sync_io(_list_mail_agents_sync)
 
 
 @router.get(
@@ -117,10 +261,7 @@ async def list_mail_agents():
 )
 async def get_all_acls():
     """Return mail ACLs aggregated across all mail-enabled agents."""
-    result: Dict[str, Dict[str, Any]] = {}
-    for agent_id, store in _iter_mail_agent_stores():
-        result[agent_id] = store.get_acl(agent_id)
-    return result
+    return await run_sync_io(_get_all_acls_sync)
 
 
 @router.get(
@@ -129,12 +270,7 @@ async def get_all_acls():
 )
 async def get_all_pending():
     """Return pending entries aggregated across all mail-enabled agents."""
-    result: List[Dict[str, Any]] = []
-    for agent_id, store in _iter_mail_agent_stores():
-        acl = store.get_acl(agent_id)
-        result.extend(acl.get("pending", []))
-    result.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
-    return result
+    return await run_sync_io(_get_all_pending_sync)
 
 
 @router.get(
@@ -143,10 +279,7 @@ async def get_all_pending():
 )
 async def get_pending_count():
     """Return the total pending count across all mail-enabled agents."""
-    count = 0
-    for agent_id, store in _iter_mail_agent_stores():
-        count += len(store.get_acl(agent_id).get("pending", []))
-    return {"count": count}
+    return await run_sync_io(_get_pending_count_sync)
 
 
 @router.post(
@@ -157,21 +290,10 @@ async def approve_pending(body: MailACLActionBody, request: Request):
     from ..inbox_store import mark_read_by_acl_sender
 
     _require_valid_addresses(body.entries)
-    count = 0
-    for entry in body.entries:
-        store = _get_store_for_agent(entry.agent_id)
-        if store is None:
-            continue
-        # Snapshot the pending entry (uid/date/subject) before it is
-        # removed by approve_pending, so the blocked email can be
-        # auto-handled after approval.
-        pending_info = store.get_pending_entry(entry.agent_id, entry.address)
-        store.approve_pending(
-            entry.agent_id,
-            entry.address,
-            entry.remark or "",
-        )
-        count += 1
+    # The store atomically removes the user-visible pending row and moves all
+    # of its message UIDs into a separate durable replay outbox.
+    approved = await run_sync_io(_approve_pending_sync, body.entries)
+    for entry, pending_info in approved:
         # Mark the corresponding inbox "pending" notification as read so
         # the unread badge decreases after approval.
         await mark_read_by_acl_sender(entry.address)
@@ -185,7 +307,7 @@ async def approve_pending(body: MailACLActionBody, request: Request):
                 entry.agent_id,
                 exc_info=True,
             )
-    return {"status": "ok", "count": count}
+    return {"status": "ok", "count": len(approved)}
 
 
 async def _trigger_wake_after_approve(
@@ -193,31 +315,23 @@ async def _trigger_wake_after_approve(
     entry: MailACLEntry,
     pending_info: Optional[Dict[str, Any]],
 ) -> None:
-    """Wake the agent to handle the blocked email after sender approval.
+    """Ask the agent's monitor to drain its durable approval outbox."""
 
-    Skips silently when the pending entry has no uid (legacy data) or
-    the agent workspace is unavailable.
-    """
-    from ..mail.monitor import wake_agent_for_mail
-
-    if not pending_info or not pending_info.get("uid", 0):
-        return
+    if not pending_info:
+        return None
+    if request is None:
+        return None
     manager = getattr(request.app.state, "multi_agent_manager", None)
     if manager is None:
-        return
+        return None
     workspace = await manager.get_agent(entry.agent_id)
     if workspace is None:
-        return
-    asyncio.create_task(
-        wake_agent_for_mail(
-            workspace,
-            entry.agent_id,
-            uid=pending_info["uid"],
-            sender=pending_info.get("display_name") or entry.address,
-            subject=pending_info.get("subject", ""),
-            date=pending_info.get("date", ""),
-        ),
-    )
+        return None
+    monitor = getattr(workspace, "mail_monitor", None)
+    if monitor is None:
+        return None
+    monitor.schedule_approved_replay()
+    return None
 
 
 @router.post(
@@ -228,19 +342,10 @@ async def deny_pending(body: MailACLActionBody):
     from ..inbox_store import mark_read_by_acl_sender
 
     _require_valid_addresses(body.entries)
-    count = 0
-    for entry in body.entries:
-        store = _get_store_for_agent(entry.agent_id)
-        if store is None:
-            continue
-        store.deny_pending(
-            entry.agent_id,
-            entry.address,
-            entry.remark or "",
-        )
-        count += 1
+    denied = await run_sync_io(_deny_pending_sync, body.entries)
+    for entry in denied:
         await mark_read_by_acl_sender(entry.address)
-    return {"status": "ok", "count": count}
+    return {"status": "ok", "count": len(denied)}
 
 
 @router.post(
@@ -250,15 +355,10 @@ async def deny_pending(body: MailACLActionBody):
 async def dismiss_pending(body: MailACLActionBody):
     from ..inbox_store import mark_read_by_acl_sender
 
-    count = 0
-    for entry in body.entries:
-        store = _get_store_for_agent(entry.agent_id)
-        if store is None:
-            continue
-        store.dismiss_pending(entry.agent_id, entry.address)
-        count += 1
+    dismissed = await run_sync_io(_dismiss_pending_sync, body.entries)
+    for entry in dismissed:
         await mark_read_by_acl_sender(entry.address)
-    return {"status": "ok", "count": count}
+    return {"status": "ok", "count": len(dismissed)}
 
 
 @router.post(
@@ -266,11 +366,16 @@ async def dismiss_pending(body: MailACLActionBody):
     summary="Update remark on a pending entry",
 )
 async def update_pending_remark(body: MailACLRemarkBody):
-    store = _get_store_for_agent(body.agent_id)
-    found = store is not None and store.update_pending_remark(
-        body.agent_id,
-        body.address,
-        body.remark,
+    def _update() -> bool:
+        store = _get_store_for_agent(body.agent_id)
+        return store is not None and store.update_pending_remark(
+            body.agent_id,
+            body.address,
+            body.remark,
+        )
+
+    found = await run_sync_io(
+        _update,
     )
     if not found:
         raise HTTPException(
@@ -289,29 +394,12 @@ async def update_pending_remark(body: MailACLRemarkBody):
 )
 async def add_to_whitelist(body: MailACLActionBody):
     _require_valid_addresses(body.entries)
-    count = 0
-    for entry in body.entries:
-        if entry.agent_id == "":
-            # Broadcast: apply to all mail-enabled agents.
-            for agent_id, store in _iter_mail_agent_stores():
-                store.add_to_whitelist(
-                    agent_id,
-                    entry.address,
-                    remark=entry.remark or "",
-                    display_name=entry.display_name or "",
-                )
-                count += 1
-            continue
-        store = _get_store_for_agent(entry.agent_id)
-        if store is None:
-            continue
-        store.add_to_whitelist(
-            entry.agent_id,
-            entry.address,
-            remark=entry.remark or "",
-            display_name=entry.display_name or "",
-        )
-        count += 1
+    count = await run_sync_io(
+        _mutate_list_sync,
+        body.entries,
+        "whitelist_add",
+        broadcast=True,
+    )
     return {"status": "ok", "count": count}
 
 
@@ -320,13 +408,11 @@ async def add_to_whitelist(body: MailACLActionBody):
     summary="Remove one or more addresses from whitelist",
 )
 async def remove_from_whitelist(body: MailACLActionBody):
-    count = 0
-    for entry in body.entries:
-        store = _get_store_for_agent(entry.agent_id)
-        if store is None:
-            continue
-        store.remove_from_whitelist(entry.agent_id, entry.address)
-        count += 1
+    count = await run_sync_io(
+        _mutate_list_sync,
+        body.entries,
+        "whitelist_remove",
+    )
     return {"status": "ok", "count": count}
 
 
@@ -336,29 +422,12 @@ async def remove_from_whitelist(body: MailACLActionBody):
 )
 async def add_to_blacklist(body: MailACLActionBody):
     _require_valid_addresses(body.entries)
-    count = 0
-    for entry in body.entries:
-        if entry.agent_id == "":
-            # Broadcast: apply to all mail-enabled agents.
-            for agent_id, store in _iter_mail_agent_stores():
-                store.add_to_blacklist(
-                    agent_id,
-                    entry.address,
-                    remark=entry.remark or "",
-                    display_name=entry.display_name or "",
-                )
-                count += 1
-            continue
-        store = _get_store_for_agent(entry.agent_id)
-        if store is None:
-            continue
-        store.add_to_blacklist(
-            entry.agent_id,
-            entry.address,
-            remark=entry.remark or "",
-            display_name=entry.display_name or "",
-        )
-        count += 1
+    count = await run_sync_io(
+        _mutate_list_sync,
+        body.entries,
+        "blacklist_add",
+        broadcast=True,
+    )
     return {"status": "ok", "count": count}
 
 
@@ -367,13 +436,11 @@ async def add_to_blacklist(body: MailACLActionBody):
     summary="Remove one or more addresses from blacklist",
 )
 async def remove_from_blacklist(body: MailACLActionBody):
-    count = 0
-    for entry in body.entries:
-        store = _get_store_for_agent(entry.agent_id)
-        if store is None:
-            continue
-        store.remove_from_blacklist(entry.agent_id, entry.address)
-        count += 1
+    count = await run_sync_io(
+        _mutate_list_sync,
+        body.entries,
+        "blacklist_remove",
+    )
     return {"status": "ok", "count": count}
 
 
@@ -382,11 +449,16 @@ async def remove_from_blacklist(body: MailACLActionBody):
     summary="Update remark for an address in whitelist or blacklist",
 )
 async def update_remark(body: MailACLRemarkBody):
-    store = _get_store_for_agent(body.agent_id)
-    found = store is not None and store.update_remark(
-        body.agent_id,
-        body.address,
-        body.remark,
+    def _update() -> bool:
+        store = _get_store_for_agent(body.agent_id)
+        return store is not None and store.update_remark(
+            body.agent_id,
+            body.address,
+            body.remark,
+        )
+
+    found = await run_sync_io(
+        _update,
     )
     if not found:
         raise HTTPException(

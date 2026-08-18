@@ -789,8 +789,9 @@ def _patch_generalize(monkeypatch):
         _tool_name,
         target,
         _source,
-        _agent_id=None,
+        agent_id=None,
     ):
+        del agent_id
         return target
 
     monkeypatch.setattr(

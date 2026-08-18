@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import email as email_lib
+import hashlib
 import html as html_lib
 import imaplib
 import json
@@ -42,10 +44,14 @@ from ...config.config import (
     AgentMailPushRule,
 )
 from ...config.context import deactivate_f1_for_session
-from ...utils.io_utils import write_json_atomic
+from ...utils.io_utils import run_sync_io, write_json_atomic
 from ..channels.schema import DEFAULT_CHANNEL
 from ..inbox_store import append_event as append_inbox_event
 from ..inbox_trace_store import read_session_messages
+from .mail_access_control import (
+    get_mail_access_control_store,
+    validate_acl_address,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +81,25 @@ _PROVIDER_IMAP_HOSTS = {
     "tencent_exmail": "imap.exmail.qq.com",
     "aliyun_qiye": "imap.qiye.aliyun.com",
     "netease_qiye": "imap.qiye.163.com",
+}
+
+# Authentication-Results is only trustworthy when its authserv-id belongs to
+# the mailbox provider that received the message.  The provider may omit the
+# Return-Path header from IMAP results (Sina does so consistently and QQ does
+# so for most messages), so these suffixes provide a safe standards-based
+# fallback instead of trusting the author-controlled From header directly.
+_AUTH_SERVICE_SUFFIXES_BY_IMAP_HOST = {
+    "imap.163.com": ("163.com",),
+    "imap.126.com": ("126.com", "163.com"),
+    "imap.yeah.net": ("yeah.net", "163.com"),
+    "imap.qq.com": ("qq.com",),
+    "imap.sina.com": ("sina.com",),
+    "imap.sina.cn": ("sina.cn", "sina.com"),
+    "imap.aliyun.com": ("aliyun.com",),
+    "imap.gmail.com": ("google.com", "gmail.com"),
+    "imap.exmail.qq.com": ("qq.com",),
+    "imap.qiye.aliyun.com": ("aliyun.com",),
+    "imap.qiye.163.com": ("163.com",),
 }
 
 # NetEase servers reject SELECT with "Unsafe Login" unless the client
@@ -134,6 +159,9 @@ _BODY_FETCH_MAX_BYTES = 64 * 1024
 _BACKOFF_INITIAL_SECONDS = 2.0
 _BACKOFF_MAX_SECONDS = 60.0
 _MAX_IDLE_FAILURES = 3
+# Keep retry metadata bounded even if a mailbox contains many permanently
+# malformed messages. Entries are envelope/error snapshots, not message bodies.
+_MAX_DELIVERY_FAILURES = 100
 _WAKE_TIMEOUT_SECONDS = 600
 _EVENT_SUBMIT_TIMEOUT_SECONDS = 30
 # auto_handled event body: final agent output summary length cap.
@@ -291,6 +319,311 @@ def decode_mime_header(value: Any) -> str:
         return str(make_header(decode_header(value))).strip()
     except Exception:
         return str(value).strip()
+
+
+def _parse_acl_address(value: str) -> str:
+    """Return one normalized mailbox address, or an empty string."""
+    _, address = parseaddr(value or "")
+    address = address.lower().strip()
+    try:
+        validate_acl_address(address)
+    except ValueError:
+        return ""
+    return address
+
+
+def _domain_matches(value: str, expected: str) -> bool:
+    """Return whether two domains are equal or parent/subdomain aligned."""
+    left = value.lower().strip().strip(".")
+    right = expected.lower().strip().strip(".")
+    return bool(
+        left
+        and right
+        and (
+            left == right
+            or left.endswith(f".{right}")
+            or right.endswith(f".{left}")
+        ),
+    )
+
+
+def _result_parameter(value: str, name: str) -> str:
+    """Extract one semicolon-delimited Authentication-Results parameter."""
+    match = re.search(
+        rf"(?:^|[;\s]){re.escape(name)}\s*=\s*([^;]+)",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def _result_address(value: str, *names: str) -> str:
+    """Extract and validate an address from an authentication parameter."""
+    for name in names:
+        raw = re.sub(
+            r"\r?\n[ \t]+",
+            "",
+            _result_parameter(value, name),
+        )
+        address = _parse_acl_address(raw)
+        if address:
+            return address
+        # Some providers wrap smtp.mailfrom in additional descriptive text.
+        match = re.search(r"[^\s<>;]+@[^\s<>;]+", raw)
+        if match:
+            address = _parse_acl_address(match.group(0))
+            if address:
+                return address
+    return ""
+
+
+def _result_domain(value: str, *names: str) -> str:
+    """Extract a domain (or the domain of an address) from a result field."""
+    for name in names:
+        raw = re.sub(
+            r"\r?\n[ \t]+",
+            "",
+            _result_parameter(value, name),
+        ).strip('"<> ')
+        if not raw:
+            continue
+        address = _parse_acl_address(raw)
+        if address:
+            return address.rsplit("@", 1)[1]
+        if "@" in raw:
+            raw = raw.rsplit("@", 1)[1]
+        domain = raw.split()[0].strip('"<>., ')
+        if domain and re.fullmatch(r"[a-zA-Z0-9.-]+", domain):
+            return domain.lower()
+    return ""
+
+
+def _received_by(value: str) -> str:
+    """Extract the receiving MTA from the topmost Received header."""
+    match = re.search(r"\bby\s+([^\s;()]+)", value or "", re.IGNORECASE)
+    return match.group(1).lower().strip(".") if match else ""
+
+
+def _received_transaction_id(value: str) -> str:
+    """Extract the receiving MTA transaction id from a Received header."""
+    match = re.search(
+        r"\bwith\s+\S+\s+id\s+([^\s;]+)",
+        value or "",
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else ""
+
+
+def _trusted_authserv(
+    value: str,
+    trusted_suffixes: tuple[str, ...],
+    received_by: str,
+    allow_exact_authserv: bool,
+) -> bool:
+    """Bind Authentication-Results to the actual receiving MTA."""
+    authserv_id = value.partition(";")[0].strip().split()
+    if not authserv_id or not received_by:
+        return False
+    domain = authserv_id[0].lower().strip(".")
+    if allow_exact_authserv and domain == received_by:
+        return True
+    return any(
+        _domain_matches(domain, suffix)
+        and _domain_matches(received_by, suffix)
+        for suffix in trusted_suffixes
+    )
+
+
+def _authenticated_sender_from_headers(
+    sender: str,
+    authentication_results: list[str],
+    received_spf: list[str],
+    trusted_suffixes: tuple[str, ...],
+    received_by: str,
+    allow_exact_authserv: bool = False,
+) -> str:
+    """Resolve a provider-authenticated sender when Return-Path is absent.
+
+    Prefer aligned DMARC/DKIM identities, then an SPF-authenticated envelope
+    sender. Results from an unrelated authserv-id (including a forged header
+    supplied by the message author) are ignored.
+    """
+    claimed = _parse_acl_address(sender)
+    claimed_domain = claimed.rsplit("@", 1)[1] if claimed else ""
+
+    for result in authentication_results:
+        if not _trusted_authserv(
+            result,
+            trusted_suffixes,
+            received_by,
+            allow_exact_authserv,
+        ):
+            continue
+        if re.search(r"\bdmarc\s*=\s*pass\b", result, re.IGNORECASE):
+            domain = _result_domain(result, "header.from")
+            if claimed and _domain_matches(claimed_domain, domain):
+                return claimed
+        if re.search(r"\bdkim\s*=\s*pass\b", result, re.IGNORECASE):
+            domain = _result_domain(result, "header.d", "header.i")
+            if claimed and _domain_matches(claimed_domain, domain):
+                return claimed
+        if re.search(r"\bspf\s*=\s*pass\b", result, re.IGNORECASE):
+            authenticated = _result_address(
+                result,
+                "smtp.mailfrom",
+                "smtp.mail",
+                "envelope-from",
+            )
+            if authenticated:
+                return authenticated
+
+    for result in received_spf:
+        if not re.match(r"\s*pass(?:\s|\()", result, re.IGNORECASE):
+            continue
+        receiver = _result_domain(result, "receiver")
+        if not any(
+            _domain_matches(receiver, suffix)
+            and _domain_matches(received_by, suffix)
+            for suffix in trusted_suffixes
+        ):
+            continue
+        authenticated = _result_address(result, "envelope-from", "sender")
+        if authenticated:
+            return authenticated
+    return ""
+
+
+def _qq_internal_sender_from_headers(
+    sender: str,
+    message_id: str,
+    x_qq_mid: str,
+    *,
+    imap_host: str,
+    has_authentication_headers: bool,
+) -> str:
+    """Recognize QQ/Foxmail mail delivered through QQ's internal path.
+
+    QQ omits Return-Path and Authentication-Results for authenticated internal
+    deliveries.  Require three independent QQ-owned markers, and never apply
+    this fallback when an explicit (possibly failing) authentication result is
+    present. External spoofed mail therefore stays fail-closed.
+    """
+    if imap_host != "imap.qq.com" or has_authentication_headers:
+        return ""
+    claimed = _parse_acl_address(sender)
+    claimed_domain = claimed.rsplit("@", 1)[1] if claimed else ""
+    message_identity = _parse_acl_address(message_id)
+    message_domain = (
+        message_identity.rsplit("@", 1)[1] if message_identity else ""
+    )
+    qq_mid = (x_qq_mid or "").strip().lower()
+    valid_qq_mid = bool(
+        re.fullmatch(
+            r"(?:xmap[a-z]{2}\d+-\d|xmsmtpt)[a-z0-9]{15,80}",
+            qq_mid,
+        ),
+    )
+    if (
+        claimed_domain in {"qq.com", "foxmail.com"}
+        and message_domain == "qq.com"
+        and valid_qq_mid
+    ):
+        return claimed
+    return ""
+
+
+def _authenticated_sender_from_message(
+    message: Any,
+    sender: str,
+    *,
+    imap_host: str,
+    domain: str,
+    provider: str,
+) -> str:
+    """Resolve the transport-backed sender from one parsed envelope."""
+    authentication_results = [
+        decode_mime_header(value)
+        for value in message.get_all("Authentication-Results", [])
+    ]
+    received_spf = [
+        decode_mime_header(value)
+        for value in message.get_all("Received-SPF", [])
+    ]
+    received_headers = [
+        decode_mime_header(value) for value in message.get_all("Received", [])
+    ]
+    top_received = received_headers[0] if received_headers else ""
+    received_by = _received_by(top_received)
+    trusted_suffixes = _AUTH_SERVICE_SUFFIXES_BY_IMAP_HOST.get(imap_host, ())
+    allow_exact_authserv = False
+
+    if domain in _NETEASE_DOMAINS or provider in _NETEASE_PROVIDERS:
+        transaction_id = _received_transaction_id(top_received)
+        coremail_ids = [
+            decode_mime_header(value)
+            for value in message.get_all("X-CM-TRANSID", [])
+        ]
+        coremail_transaction_id = coremail_ids[-1] if coremail_ids else ""
+        if not transaction_id or transaction_id != coremail_transaction_id:
+            # NetEase uses internal authserv-id values such as ``gzmx16``.
+            # Bind them to Coremail's unpredictable delivery transaction id
+            # instead of trusting a sender-supplied lookalike header.
+            received_by = ""
+            trusted_suffixes = ()
+        elif authentication_results:
+            # Coremail appends its own Authentication-Results after the
+            # original message headers. Ignore any earlier copy that may have
+            # been supplied by the sender.
+            authentication_results = authentication_results[-1:]
+            allow_exact_authserv = True
+    else:
+        # Standards-based receivers prepend their boundary results. Never let
+        # a later sender-supplied pass override the receiver's first result.
+        authentication_results = authentication_results[:1]
+        received_spf = received_spf[:1]
+
+    authenticated_sender = _authenticated_sender_from_headers(
+        sender,
+        authentication_results,
+        received_spf,
+        trusted_suffixes,
+        received_by,
+        allow_exact_authserv,
+    )
+    if not authenticated_sender and not message.get("Return-Path"):
+        authenticated_sender = _qq_internal_sender_from_headers(
+            sender,
+            decode_mime_header(message.get("Message-ID")),
+            decode_mime_header(message.get("X-QQ-mid")),
+            imap_host=imap_host,
+            has_authentication_headers=bool(
+                authentication_results or received_spf,
+            ),
+        )
+    return authenticated_sender
+
+
+def resolve_acl_sender(sender: str, return_path: str) -> tuple[str, bool]:
+    """Resolve the identity used by ACL decisions.
+
+    ``From`` is author-controlled.  When its domain is not aligned with the
+    delivery ``Return-Path``, use the latter as the ACL identity so a forged
+    display address cannot inherit an existing whitelist decision.  Without a
+    valid Return-Path there is no transport-backed identity and callers must
+    fail closed.
+    """
+    claimed = _parse_acl_address(sender)
+    transport = _parse_acl_address(return_path)
+    if not transport:
+        return claimed, False
+    if not claimed:
+        return transport, True
+
+    aligned = _domain_matches(
+        claimed.rsplit("@", 1)[1],
+        transport.rsplit("@", 1)[1],
+    )
+    return (claimed if aligned else transport), True
 
 
 def rule_matches(
@@ -614,7 +947,9 @@ async def wake_agent_for_mail(
     date: str,
     param: str = "",
     mode: str = "",
-) -> None:
+    report_failure: bool = True,
+    retry_on_failure: bool = False,
+) -> bool:
     """Build the wake prompt, stream the agent, and emit an
     ``auto_handled`` inbox event (mirrors run_heartbeat_once).
 
@@ -663,36 +998,64 @@ async def wake_agent_for_mail(
             timeout=_WAKE_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
-        await append_inbox_event(
-            agent_id=agent_id,
-            source_type="mail",
-            source_id=_MAIL_SOURCE_ID,
-            event_type="auto_handled",
-            status="error",
-            severity="error",
-            title=f"Mail auto-handling timed out: {subject}",
-            body=(f"Agent run timed out after " f"{_WAKE_TIMEOUT_SECONDS}s."),
-            payload=payload,
-        )
-        return
+        if report_failure:
+            if retry_on_failure:
+                payload["delivery_status"] = "retryable"
+            await append_inbox_event(
+                agent_id=agent_id,
+                source_type="mail",
+                source_id=_MAIL_SOURCE_ID,
+                event_type="auto_handled",
+                status="error",
+                severity="error",
+                title=(
+                    f"Mail auto-handling delayed: {subject}"
+                    if retry_on_failure
+                    else f"Mail auto-handling timed out: {subject}"
+                ),
+                body=(
+                    f"Agent run timed out after {_WAKE_TIMEOUT_SECONDS}s. "
+                    "The approved email remains queued and will retry "
+                    "automatically."
+                    if retry_on_failure
+                    else (
+                        "Agent run timed out after "
+                        f"{_WAKE_TIMEOUT_SECONDS}s."
+                    )
+                ),
+                payload=payload,
+            )
+        return False
     except Exception as exc:  # pylint: disable=broad-except
         logger.exception(
             "mail monitor agent wake failed (agent %s, uid %s)",
             agent_id,
             uid,
         )
-        await append_inbox_event(
-            agent_id=agent_id,
-            source_type="mail",
-            source_id=_MAIL_SOURCE_ID,
-            event_type="auto_handled",
-            status="error",
-            severity="error",
-            title=f"Mail auto-handling failed: {subject}",
-            body=repr(exc),
-            payload=payload,
-        )
-        return
+        if report_failure:
+            if retry_on_failure:
+                payload["delivery_status"] = "retryable"
+            await append_inbox_event(
+                agent_id=agent_id,
+                source_type="mail",
+                source_id=_MAIL_SOURCE_ID,
+                event_type="auto_handled",
+                status="error",
+                severity="error",
+                title=(
+                    f"Mail auto-handling delayed: {subject}"
+                    if retry_on_failure
+                    else f"Mail auto-handling failed: {subject}"
+                ),
+                body=(
+                    f"{exc!r}\nThe approved email remains queued and will "
+                    "retry automatically."
+                    if retry_on_failure
+                    else repr(exc)
+                ),
+                payload=payload,
+            )
+        return False
     finally:
         # Restore normal approval flow after the wake run: clear any F1
         # exploration mode the agent may have activated for this session.
@@ -722,6 +1085,7 @@ async def wake_agent_for_mail(
         body=body,
         payload=payload,
     )
+    return True
 
 
 class MailMonitorService:
@@ -745,6 +1109,13 @@ class MailMonitorService:
         self.domain = (credential.domain or "").strip().lower()
         self.provider = (credential.provider or "").strip().lower()
         self.host = resolve_imap_host(self.domain, self.provider)
+        mailbox_key = "\0".join(
+            (self.email_address.strip().lower(), (self.host or "").lower()),
+        )
+        self._mailbox_fingerprint = hashlib.sha256(
+            mailbox_key.encode("utf-8"),
+        ).hexdigest()
+        self._stored_mailbox_fingerprint: Optional[str] = None
         self.idle_timeout_seconds = resolve_idle_timeout(
             self.domain,
             self.provider,
@@ -756,12 +1127,26 @@ class MailMonitorService:
         # time. A mismatch means UIDs were renumbered server-side.
         self._stored_uidvalidity: Optional[int] = None
         self._current_uidvalidity: Optional[int] = None
+        # Non-connection processing failures are durable and retried on the
+        # next mailbox check. This lets ``last_uid`` move past a poison message
+        # without silently forgetting that message.
+        self._delivery_failures: dict[int, dict[str, Any]] = {}
         self._stop_event = threading.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._task: Optional[asyncio.Task] = None
-
-        # Mail access control store
-        from .mail_access_control import get_mail_access_control_store
+        # Coroutines submitted by the worker are real Tasks on the main loop;
+        # completion futures let the worker wait without hiding task lifetime.
+        self._submission_tasks: set[asyncio.Task[Any]] = set()
+        self._submission_completions: set[
+            concurrent.futures.Future[Any]
+        ] = set()
+        self._submission_lock = threading.Lock()
+        self._approved_replay_task: Optional[asyncio.Task[None]] = None
+        self._approved_replay_generation = 0
+        # Normal IMAP wakes and approved-message replays both write the main
+        # session.  Serialize them so the two pipelines cannot race session
+        # state or emit interleaved agent runs.
+        self._agent_wake_lock = asyncio.Lock()
 
         self._mail_acl_store = get_mail_access_control_store(
             Path(workspace.workspace_dir),
@@ -796,6 +1181,7 @@ class MailMonitorService:
             asyncio.to_thread(self._worker),
             name=f"mail-monitor-{self.agent_id}",
         )
+        self.schedule_approved_replay()
         logger.info(
             "mail monitor started for agent %s (%s, mode=%s)",
             self.agent_id,
@@ -804,25 +1190,61 @@ class MailMonitorService:
         )
 
     async def stop(self) -> None:
-        """Signal the worker thread to exit and wait briefly."""
+        """Cancel submitted work and wait until the worker actually exits."""
         self._stop_event.set()
         task = self._task
-        self._task = None
-        if task is None:
+        replay_task = self._approved_replay_task
+        if task is None and replay_task is None:
             return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 15
+        # This method runs on the same loop captured by start().  Cancel and
+        # await every bridge-created task before waiting for the worker thread;
+        # their done callbacks release any worker blocked in _submit().
+        submitted = list(self._submission_tasks)
+        for submitted_task in submitted:
+            submitted_task.cancel()
+        if replay_task is not None and not replay_task.done():
+            replay_task.cancel()
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=15)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "mail monitor for agent %s did not stop within 15s",
-                self.agent_id,
-            )
+            tasks_to_cancel = [*submitted]
+            if replay_task is not None:
+                tasks_to_cancel.append(replay_task)
+            if tasks_to_cancel:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *tasks_to_cancel,
+                        return_exceptions=True,
+                    ),
+                    timeout=max(deadline - loop.time(), 0.001),
+                )
+            # Flush a _submit() scheduling callback that may have raced stop().
+            # It sees _stop_event and closes its coroutine without a new task.
+            await asyncio.sleep(0)
+            if task is not None:
+                await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=max(deadline - loop.time(), 0.001),
+                )
+        except asyncio.TimeoutError as exc:
+            # Keep self._task pointing at the live worker: callers must not
+            # mistake a timed-out stop for a completed lifecycle transition.
+            raise RuntimeError(
+                "mail monitor for agent "
+                f"{self.agent_id} did not stop within 15s",
+            ) from exc
         except Exception:  # pylint: disable=broad-except
             logger.debug(
                 "mail monitor task for agent %s ended with error",
                 self.agent_id,
                 exc_info=True,
             )
+        finally:
+            if task is not None and task.done():
+                self._task = None
+                self._loop = None
+            if replay_task is not None and replay_task.done():
+                self._approved_replay_task = None
 
     # -- state persistence ---------------------------------------------
 
@@ -833,28 +1255,122 @@ class MailMonitorService:
             return
         if not isinstance(data, dict):
             return
+        fingerprint = data.get("mailbox_fingerprint")
+        if isinstance(fingerprint, str) and fingerprint:
+            self._stored_mailbox_fingerprint = fingerprint
+            if fingerprint != self._mailbox_fingerprint:
+                logger.info(
+                    "mailbox changed for agent %s; resetting UID baseline",
+                    self.agent_id,
+                )
+                return
         last_uid = data.get("last_uid")
         if isinstance(last_uid, int):
             self._last_uid = last_uid
         uidvalidity = data.get("uidvalidity")
         if isinstance(uidvalidity, int):
             self._stored_uidvalidity = uidvalidity
+        failures = data.get("delivery_failures")
+        if isinstance(failures, list):
+            for raw in failures[-_MAX_DELIVERY_FAILURES:]:
+                if not isinstance(raw, dict):
+                    continue
+                try:
+                    uid = int(raw.get("uid", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if uid > 0:
+                    self._delivery_failures[uid] = dict(raw)
 
-    def _save_state(self) -> None:
+    def _save_state(self) -> bool:
+        payload: dict[str, Any] = {
+            "last_uid": self._last_uid,
+            "uidvalidity": self._current_uidvalidity,
+            "mailbox_fingerprint": self._mailbox_fingerprint,
+        }
+        if self._delivery_failures:
+            payload["delivery_failures"] = [
+                self._delivery_failures[uid]
+                for uid in sorted(self._delivery_failures)
+            ]
         try:
-            write_json_atomic(
-                self.state_path,
-                {
-                    "last_uid": self._last_uid,
-                    "uidvalidity": self._current_uidvalidity,
-                },
-            )
+            write_json_atomic(self.state_path, payload)
+            return True
         except OSError as exc:
             logger.warning(
                 "mail monitor could not persist state to %s: %s",
                 self.state_path,
                 exc,
             )
+            return False
+
+    def _commit_last_uid(self, uid: int) -> None:
+        """Persist the delivery watermark or leave its old value intact."""
+        previous = self._last_uid
+        self._last_uid = uid
+        if self._save_state():
+            return
+        self._last_uid = previous
+        raise OSError(f"could not persist mail monitor watermark {uid}")
+
+    def _reset_uid_baseline(self, uid: int) -> None:
+        """Atomically replace state tied to a stale UID namespace."""
+        previous_uid = self._last_uid
+        previous_failures = self._delivery_failures
+        self._last_uid = uid
+        self._delivery_failures = {}
+        if self._save_state():
+            return
+        self._last_uid = previous_uid
+        self._delivery_failures = previous_failures
+        raise OSError(f"could not persist reset mail UID baseline {uid}")
+
+    def _record_delivery_failure(
+        self,
+        uid: int,
+        envelope: dict[str, str],
+        exc: BaseException,
+        *,
+        advance_watermark: bool,
+    ) -> None:
+        """Durably enqueue a retryable failure before committing its UID."""
+        previous_uid = self._last_uid
+        previous = self._delivery_failures.get(uid)
+        attempts = int((previous or {}).get("attempts", 0)) + 1
+        self._delivery_failures[uid] = {
+            "uid": uid,
+            "sender": envelope.get("sender", ""),
+            "subject": envelope.get("subject", ""),
+            "date": envelope.get("date", ""),
+            "attempts": attempts,
+            "error": repr(exc)[:500],
+            "updated_at": time.time(),
+            "notified": bool((previous or {}).get("notified", False)),
+        }
+        if advance_watermark:
+            self._last_uid = uid
+        if len(self._delivery_failures) > _MAX_DELIVERY_FAILURES:
+            self._last_uid = previous_uid
+            if previous is None:
+                self._delivery_failures.pop(uid, None)
+            else:
+                self._delivery_failures[uid] = previous
+            raise RuntimeError("mail delivery retry queue is full")
+        if self._save_state():
+            return
+        self._last_uid = previous_uid
+        if previous is None:
+            self._delivery_failures.pop(uid, None)
+        else:
+            self._delivery_failures[uid] = previous
+        raise OSError(f"could not persist retry state for mail uid {uid}")
+
+    def _clear_delivery_failure(self, uid: int) -> None:
+        previous = self._delivery_failures.pop(uid, None)
+        if previous is None or self._save_state():
+            return
+        self._delivery_failures[uid] = previous
+        raise OSError(f"could not acknowledge retried mail uid {uid}")
 
     # -- worker thread ---------------------------------------------------
 
@@ -869,11 +1385,27 @@ class MailMonitorService:
             conn = None
             try:
                 conn = self._connect()
+                if not self._supports_idle(conn):
+                    logger.info(
+                        "mail server %s does not advertise IMAP IDLE; "
+                        "polling every %ss for agent %s",
+                        self.host,
+                        self.push.poll_interval_seconds,
+                        self.agent_id,
+                    )
+                    poll_conn = conn
+                    conn = None
+                    self._poll_loop(poll_conn)
+                    return
                 self._check_new_messages(conn)
-                failures = 0
-                backoff = _BACKOFF_INITIAL_SECONDS
                 while not self._stop_event.is_set():
                     got_exists = self._idle_wait(conn)
+                    # Count an IDLE cycle as recovered only after the server
+                    # actually accepted and completed it. Resetting after a
+                    # successful LOGIN made servers that reject IDLE loop
+                    # forever at failure 1 and repeatedly reconnect.
+                    failures = 0
+                    backoff = _BACKOFF_INITIAL_SECONDS
                     if self._stop_event.is_set():
                         break
                     if got_exists:
@@ -902,6 +1434,7 @@ class MailMonitorService:
                 )
                 if failures >= _MAX_IDLE_FAILURES:
                     self._close(conn)
+                    conn = None
                     logger.warning(
                         "mail monitor for agent %s degrading to "
                         "polling every %ss",
@@ -916,11 +1449,27 @@ class MailMonitorService:
                 self._close(conn)
         logger.info("mail monitor stopped for agent %s", self.agent_id)
 
-    def _poll_loop(self) -> None:
+    @staticmethod
+    def _supports_idle(conn: imaplib.IMAP4_SSL) -> bool:
+        """Return whether the server advertised the IMAP IDLE extension."""
+        for capability in getattr(conn, "capabilities", ()):
+            if isinstance(capability, bytes):
+                capability = capability.decode("ascii", "replace")
+            if str(capability).strip().upper() == "IDLE":
+                return True
+        return False
+
+    def _poll_loop(self, conn: Optional[imaplib.IMAP4_SSL] = None) -> None:
         """Fallback: NOOP + UID SEARCH at poll_interval_seconds."""
         interval = max(int(self.push.poll_interval_seconds or 120), 10)
-        conn = None
+        retry_delay_cap = min(float(interval), _BACKOFF_MAX_SECONDS)
+        initial_retry_delay = min(
+            _BACKOFF_INITIAL_SECONDS,
+            retry_delay_cap,
+        )
+        retry_delay = initial_retry_delay
         while not self._stop_event.is_set():
+            delay = float(interval)
             try:
                 if conn is None:
                     conn = self._connect()
@@ -929,14 +1478,28 @@ class MailMonitorService:
             except Exception as exc:  # pylint: disable=broad-except
                 if self._stop_event.is_set():
                     break
+                # imaplib normalizes EOF, broken pipes and server BYE replies
+                # to IMAP4.abort.  Reconnect quickly after those transient
+                # disconnects instead of waiting another full poll interval.
+                # Other failures (authentication, protocol or persistence)
+                # retain the configured cadence to avoid a retry storm.
+                if isinstance(exc, imaplib.IMAP4.abort):
+                    delay = retry_delay
+                    retry_delay = min(retry_delay * 2, retry_delay_cap)
+                else:
+                    retry_delay = initial_retry_delay
                 logger.warning(
-                    "mail monitor poll error for agent %s: %s",
+                    "mail monitor poll error for agent %s; "
+                    "retrying in %gs: %s",
                     self.agent_id,
+                    delay,
                     exc,
                 )
                 self._close(conn)
                 conn = None
-            self._sleep(interval)
+            else:
+                retry_delay = initial_retry_delay
+            self._sleep(delay)
         self._close(conn)
         logger.info("mail monitor stopped for agent %s", self.agent_id)
 
@@ -992,6 +1555,7 @@ class MailMonitorService:
         discarded and the next check behaves like a first run: it only
         re-baselines at the newest message without processing history.
         """
+        legacy_state = self._stored_mailbox_fingerprint is None
         if self._last_uid is not None:
             stored = self._stored_uidvalidity
             current = self._current_uidvalidity
@@ -1004,7 +1568,17 @@ class MailMonitorService:
                     current,
                 )
                 self._last_uid = None
+                # Retry UIDs belong to the old UID namespace and must never be
+                # applied to the rebuilt mailbox.
+                self._delivery_failures.clear()
         self._stored_uidvalidity = self._current_uidvalidity
+        self._stored_mailbox_fingerprint = self._mailbox_fingerprint
+        if (
+            legacy_state
+            and self._last_uid is not None
+            and not self._save_state()
+        ):
+            raise OSError("could not persist mail monitor mailbox identity")
 
     @staticmethod
     def _close(conn: Optional[imaplib.IMAP4_SSL]) -> None:
@@ -1095,11 +1669,13 @@ class MailMonitorService:
         conn: imaplib.IMAP4_SSL,
         uid: int,
     ) -> dict[str, str]:
-        """FETCH From/Subject/Date headers for one UID."""
+        """FETCH sender identity and display headers for one UID."""
         typ, data = conn.uid(
             "FETCH",
             str(uid),
-            "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])",
+            "(BODY.PEEK[HEADER.FIELDS (FROM RETURN-PATH "
+            "AUTHENTICATION-RESULTS RECEIVED-SPF RECEIVED X-CM-TRANSID "
+            "MESSAGE-ID X-QQ-MID SUBJECT DATE)])",
         )
         if typ != "OK":
             detail = data[0] if data else b""
@@ -1112,8 +1688,18 @@ class MailMonitorService:
                 raw = item[1]
                 break
         message = email_lib.message_from_bytes(raw or b"")
+        sender = decode_mime_header(message.get("From"))
+        authenticated_sender = _authenticated_sender_from_message(
+            message,
+            sender,
+            imap_host=self.host or "",
+            domain=self.domain,
+            provider=self.provider,
+        )
         return {
-            "sender": decode_mime_header(message.get("From")),
+            "sender": sender,
+            "return_path": decode_mime_header(message.get("Return-Path")),
+            "authenticated_sender": authenticated_sender,
             "subject": decode_mime_header(message.get("Subject")),
             "date": decode_mime_header(message.get("Date")),
         }
@@ -1155,17 +1741,49 @@ class MailMonitorService:
         """Detect new UIDs above last_uid and run the pipeline on each."""
         uids = self._search_uids(conn)
         if not uids:
+            if self._delivery_failures:
+                self._retry_delivery_failures(conn, set())
+                if self._delivery_failures:
+                    return
+            if self._last_uid not in (None, 0):
+                logger.warning(
+                    "mail monitor watermark %s is ahead of an empty "
+                    "mailbox for agent %s; resetting UID baseline",
+                    self._last_uid,
+                    self.agent_id,
+                )
+                self._reset_uid_baseline(0)
+            elif self._last_uid is None:
+                # Establish an empty-mailbox baseline so the first future
+                # message is processed instead of mistaken for history.
+                self._commit_last_uid(0)
             return
         if self._last_uid is None:
             # First run: baseline at the newest message and skip
             # historical mail instead of flooding the pipeline.
-            self._last_uid = max(uids)
-            self._save_state()
+            self._commit_last_uid(max(uids))
             return
+        newest_uid = max(uids)
+        if self._last_uid > newest_uid:
+            # This also repairs legacy state written before mailbox identity
+            # was persisted.  Some providers share UIDVALIDITY values, so an
+            # old mailbox's high watermark can otherwise hide every message
+            # after switching to a mailbox whose UID range starts lower.
+            logger.warning(
+                "mail monitor watermark %s is ahead of mailbox maximum %s "
+                "for agent %s; resetting UID baseline",
+                self._last_uid,
+                newest_uid,
+                self.agent_id,
+            )
+            self._reset_uid_baseline(newest_uid)
+            return
+        self._retry_delivery_failures(conn, set(uids))
         new_uids = sorted(uid for uid in uids if uid > self._last_uid)
         for uid in new_uids:
             if self._stop_event.is_set():
                 return
+            envelope: dict[str, str] = {}
             try:
                 envelope = self._fetch_envelope(conn, uid)
                 self._process_new_email(conn, uid, envelope)
@@ -1175,14 +1793,122 @@ class MailMonitorService:
                 OSError,
             ):
                 raise
-            except Exception:  # pylint: disable=broad-except
+            except Exception as exc:  # pylint: disable=broad-except
                 logger.exception(
                     "mail monitor failed to process uid %s for agent %s",
                     uid,
                     self.agent_id,
                 )
-            self._last_uid = uid
-            self._save_state()
+                # Persist both the retry record and the advanced discovery
+                # watermark in one atomic monitor-state replacement. If that
+                # write fails, _record_delivery_failure raises and the worker
+                # reconnects without committing this UID in memory.
+                self._record_delivery_failure(
+                    uid,
+                    envelope,
+                    exc,
+                    advance_watermark=True,
+                )
+                self._submit_delivery_failure_event(uid)
+                continue
+            self._commit_last_uid(uid)
+
+    def _retry_delivery_failures(
+        self,
+        conn: imaplib.IMAP4_SSL,
+        available_uids: set[int],
+    ) -> None:
+        """Retry durable failures without blocking newer mailbox UIDs."""
+        for uid in sorted(list(self._delivery_failures)):
+            if self._stop_event.is_set():
+                return
+            if uid not in available_uids:
+                if self._submit_missing_retry_event(uid):
+                    self._clear_delivery_failure(uid)
+                continue
+            envelope: dict[str, str] = {}
+            try:
+                envelope = self._fetch_envelope(conn, uid)
+                self._process_new_email(conn, uid, envelope)
+            except (
+                imaplib.IMAP4.abort,
+                ConnectionError,
+                OSError,
+            ):
+                raise
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception(
+                    "mail monitor retry failed for uid %s (agent %s)",
+                    uid,
+                    self.agent_id,
+                )
+                self._record_delivery_failure(
+                    uid,
+                    envelope,
+                    exc,
+                    advance_watermark=False,
+                )
+                self._submit_delivery_failure_event(uid)
+                continue
+            self._clear_delivery_failure(uid)
+
+    def _submit_delivery_failure_event(self, uid: int) -> bool:
+        failure = self._delivery_failures.get(uid)
+        if failure is None:
+            return False
+        if failure.get("notified"):
+            return True
+        submitted = self._submit_event(
+            event_type="delivery_failed",
+            status="error",
+            severity="error",
+            title=f"Mail handling queued for retry: {failure.get('subject')}",
+            body=(
+                f"UID {uid} could not be processed and will be retried. "
+                f"Error: {failure.get('error', '')}"
+            ),
+            payload={
+                "uid": uid,
+                "folder": "INBOX",
+                "from": failure.get("sender", ""),
+                "subject": failure.get("subject", ""),
+                "date": failure.get("date", ""),
+                "delivery_status": "retryable",
+                "attempts": failure.get("attempts", 1),
+            },
+        )
+        if submitted:
+            failure["notified"] = True
+            if not self._save_state():
+                # The retry record itself was already durable before event
+                # submission. A marker write failure can at worst duplicate
+                # this visible error event on the next check.
+                failure["notified"] = False
+        return submitted
+
+    def _submit_missing_retry_event(self, uid: int) -> bool:
+        failure = self._delivery_failures.get(uid)
+        if failure is None:
+            return False
+        return self._submit_event(
+            event_type="delivery_failed",
+            status="error",
+            severity="error",
+            title=f"Mail handling failed: {failure.get('subject')}",
+            body=(
+                f"UID {uid} is no longer present in INBOX and cannot be "
+                "retried automatically."
+            ),
+            payload={
+                "uid": uid,
+                "folder": "INBOX",
+                "from": failure.get("sender", ""),
+                "subject": failure.get("subject", ""),
+                "date": failure.get("date", ""),
+                "delivery_status": "failed",
+                "attempts": failure.get("attempts", 1),
+            },
+        )
 
     # -- per-message pipeline ---------------------------------------------
 
@@ -1192,7 +1918,7 @@ class MailMonitorService:
         uid: int,
         envelope: dict[str, str],
     ) -> None:
-        # pylint: disable=too-many-branches
+        # pylint: disable=too-many-branches,too-many-statements
         sender = envelope.get("sender", "")
         subject = envelope.get("subject", "")
         date = envelope.get("date", "")
@@ -1204,67 +1930,89 @@ class MailMonitorService:
 
         # -- ACL gate (before rules engine) --
         if self.push.access_control_enabled:
-            _, sender_email = parseaddr(sender)
-            sender_email = (sender_email or sender).lower().strip()
-            if sender_email:
-                acl_result = self._mail_acl_store.check_sender(
+            sender_email, transport_backed = resolve_acl_sender(
+                sender,
+                envelope.get("return_path", "")
+                or envelope.get("authenticated_sender", ""),
+            )
+            # Header-only identities are trivially forgeable.  They still enter
+            # the approval queue, but each message gets an isolated identity so
+            # neither a whitelist entry nor a restart can approve future mail
+            # that has no transport evidence.
+            if not transport_backed:
+                sender_email = f"unverified-{uid}@invalid.local"
+            acl_result = (
+                self._mail_acl_store.check_sender(
                     self.agent_id,
                     sender_email,
                 )
-                if acl_result == "deny":
-                    # Silently mark as read and skip
-                    try:
-                        conn.uid("STORE", str(uid), "+FLAGS", r"(\Seen)")
-                    except Exception:
-                        pass
-                    logger.debug(
-                        "mail ACL denied sender %s for agent %s (uid %s)",
-                        sender_email,
-                        self.agent_id,
-                        uid,
-                    )
-                    return
-                if acl_result == "unknown":
-                    # New unknown sender -> add to pending, emit event, skip
-                    self._mail_acl_store.add_pending(
-                        agent_id=self.agent_id,
-                        sender_address=sender_email,
-                        display_name=sender,
-                        subject=subject,
-                        body_preview=body_preview,
-                        uid=uid,
-                        date=date,
-                    )
-                    self._submit_event(
-                        event_type="new_email",
-                        status="success",
-                        severity="warning",
-                        title=f"[待审批] {subject or '(no subject)'}",
-                        body=f"From: {sender}\n(发件人待审批，邮件暂不处理)",
-                        payload={
-                            "uid": uid,
-                            "folder": "INBOX",
-                            "from": sender,
-                            "subject": subject,
-                            "date": date,
-                            "body_preview": body_preview,
-                            "acl_status": "pending",
-                        },
-                    )
-                    return
-                if acl_result == "pending":
-                    # Sender awaiting approval: skip silently (no re-notify,
-                    # no mark-read so the mail can be revisited once the
-                    # sender is approved).
-                    logger.debug(
-                        "mail ACL sender %s still pending for agent %s "
-                        "(uid %s); skipped",
-                        sender_email,
-                        self.agent_id,
-                        uid,
-                    )
-                    return
-                # "allow" -> continue normal flow
+                if transport_backed
+                else "unknown"
+            )
+            if acl_result == "deny":
+                # Silently mark as read and skip
+                try:
+                    conn.uid("STORE", str(uid), "+FLAGS", r"(\Seen)")
+                except Exception:
+                    pass
+                logger.debug(
+                    "mail ACL denied sender %s for agent %s (uid %s)",
+                    sender_email,
+                    self.agent_id,
+                    uid,
+                )
+                return
+            if acl_result == "unknown":
+                # New unknown sender -> add to pending, emit event, skip
+                self._mail_acl_store.add_pending(
+                    agent_id=self.agent_id,
+                    sender_address=sender_email,
+                    display_name=sender,
+                    subject=subject,
+                    body_preview=body_preview,
+                    uid=uid,
+                    date=date,
+                )
+                self._submit_event(
+                    event_type="new_email",
+                    status="success",
+                    severity="warning",
+                    title=f"[待审批] {subject or '(no subject)'}",
+                    body=f"From: {sender}\n(发件人待审批，邮件暂不处理)",
+                    payload={
+                        "uid": uid,
+                        "folder": "INBOX",
+                        "from": sender,
+                        "subject": subject,
+                        "date": date,
+                        "body_preview": body_preview,
+                        "acl_status": "pending",
+                    },
+                )
+                return
+            if acl_result == "pending":
+                # Sender awaiting approval: retain this UID under the
+                # existing sender-level approval row.  ``last_uid`` still
+                # advances, so the durable pending message list is the
+                # only reliable replay source after approval/restart.
+                self._mail_acl_store.add_pending(
+                    agent_id=self.agent_id,
+                    sender_address=sender_email,
+                    display_name=sender,
+                    subject=subject,
+                    body_preview=body_preview,
+                    uid=uid,
+                    date=date,
+                )
+                logger.debug(
+                    "mail ACL sender %s still pending for agent %s "
+                    "(uid %s); skipped",
+                    sender_email,
+                    self.agent_id,
+                    uid,
+                )
+                return
+            # "allow" -> continue normal flow
 
         # Step 1: deterministic rule actions.
         matched = match_rules(
@@ -1274,6 +2022,7 @@ class MailMonitorService:
             body_preview,
         )
         applied_actions: list[str] = []
+        failed_actions: list[str] = []
         wake_param = ""
         for rule in matched:
             try:
@@ -1282,7 +2031,7 @@ class MailMonitorService:
                 elif rule.action == "move":
                     self._move_message(conn, uid, rule.param.strip())
                 elif rule.action == "notify":
-                    self._submit_event(
+                    if not self._submit_event(
                         event_type="new_email",
                         status="success",
                         severity="warning",
@@ -1300,7 +2049,10 @@ class MailMonitorService:
                             "rule_action": "notify",
                             "body_preview": body_preview,
                         },
-                    )
+                    ):
+                        raise RuntimeError(
+                            "could not persist rule notification event",
+                        )
                 elif rule.action == "wake_agent":
                     if rule.param:
                         wake_param = rule.param
@@ -1318,13 +2070,14 @@ class MailMonitorService:
                     self.agent_id,
                     uid,
                 )
+                failed_actions.append(rule.action)
 
         # Step 3 (before the potentially slow wake-up): every new mail
         # produces one unconditional new_email inbox event.
-        self._submit_event(
+        event_persisted = self._submit_event(
             event_type="new_email",
-            status="success",
-            severity="info",
+            status="error" if failed_actions else "success",
+            severity="warning" if failed_actions else "info",
             title=f"New email: {subject or '(no subject)'}",
             body=f"From: {sender}\nDate: {date}",
             payload={
@@ -1334,20 +2087,44 @@ class MailMonitorService:
                 "subject": subject,
                 "date": date,
                 "matched_actions": applied_actions,
+                "failed_actions": failed_actions,
                 "mode": self.push.mode,
                 "body_preview": body_preview,
             },
         )
+        if not event_persisted:
+            raise RuntimeError(
+                f"could not persist inbox event for mail uid {uid}",
+            )
 
         # Step 2: mode-dependent agent wake-up.
         if should_wake_agent(self.push.mode, matched):
-            self._run_wake(
+            wake_result = self._run_wake(
                 uid=uid,
                 sender=sender,
                 subject=subject,
                 date=date,
                 param=wake_param,
             )
+            if wake_result is None:
+                # The unconditional new_email event above is already durable,
+                # so do not retry a possibly-partial agent run. Record a
+                # separate observable bridge failure when possible.
+                self._submit_event(
+                    event_type="auto_handled",
+                    status="error",
+                    severity="error",
+                    title=f"Mail auto-handling could not start: {subject}",
+                    body="The agent wake bridge stopped before completion.",
+                    payload={
+                        "uid": uid,
+                        "folder": "INBOX",
+                        "from": sender,
+                        "subject": subject,
+                        "date": date,
+                        "mode": self.push.mode,
+                    },
+                )
 
     def _ensure_folder(
         self,
@@ -1408,20 +2185,78 @@ class MailMonitorService:
 
     # -- event loop bridging ------------------------------------------------
 
-    def _submit(self, coro: Any, timeout: float) -> None:
-        """Run *coro* on the main event loop from the worker thread."""
+    def _submit(self, coro: Any, timeout: float) -> tuple[bool, Any]:
+        """Run *coro* on the main loop with explicit cancellation tracking."""
+        # pylint: disable=too-many-statements
         loop = self._loop
-        if loop is None or loop.is_closed():
+        if loop is None or loop.is_closed() or self._stop_event.is_set():
             coro.close()
-            return
-        future = asyncio.run_coroutine_threadsafe(coro, loop)
+            return False, None
+
+        completion: concurrent.futures.Future[
+            Any
+        ] = concurrent.futures.Future()
+        scheduled: list[Optional[asyncio.Task[Any]]] = [None]
+
+        def _task_done(task: asyncio.Task[Any]) -> None:
+            self._submission_tasks.discard(task)
+            if completion.done():
+                return
+            if task.cancelled():
+                completion.cancel()
+                return
+            exception = task.exception()
+            if exception is not None:
+                completion.set_exception(exception)
+            else:
+                completion.set_result(task.result())
+
+        def _schedule() -> None:
+            if self._stop_event.is_set() or loop.is_closed():
+                coro.close()
+                completion.cancel()
+                return
+            task = loop.create_task(coro)
+            scheduled[0] = task
+            self._submission_tasks.add(task)
+            task.add_done_callback(_task_done)
+
+        def _cancel_scheduled() -> None:
+            task = scheduled[0]
+            if task is not None and not task.done():
+                task.cancel()
+
+        with self._submission_lock:
+            self._submission_completions.add(completion)
+        loop.call_soon_threadsafe(_schedule)
+        deadline = time.monotonic() + timeout
+        cancel_requested = False
         try:
-            future.result(timeout=timeout)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 and not cancel_requested:
+                    cancel_requested = True
+                    loop.call_soon_threadsafe(_cancel_scheduled)
+                if self._stop_event.is_set() and not cancel_requested:
+                    cancel_requested = True
+                    loop.call_soon_threadsafe(_cancel_scheduled)
+                try:
+                    return True, completion.result(timeout=0.1)
+                except concurrent.futures.TimeoutError:
+                    continue
+                except concurrent.futures.CancelledError:
+                    if self._stop_event.is_set() or cancel_requested:
+                        return False, None
+                    raise
         except Exception:  # pylint: disable=broad-except
             logger.exception(
                 "mail monitor async submission failed for agent %s",
                 self.agent_id,
             )
+            return False, None
+        finally:
+            with self._submission_lock:
+                self._submission_completions.discard(completion)
 
     def _submit_event(
         self,
@@ -1431,8 +2266,8 @@ class MailMonitorService:
         title: str,
         body: str,
         **kwargs: Any,
-    ) -> None:
-        self._submit(
+    ) -> bool:
+        submitted, _result = self._submit(
             append_inbox_event(
                 agent_id=self.agent_id,
                 source_type="mail",
@@ -1445,6 +2280,7 @@ class MailMonitorService:
             ),
             timeout=_EVENT_SUBMIT_TIMEOUT_SECONDS,
         )
+        return submitted
 
     def _run_wake(
         self,
@@ -1454,8 +2290,8 @@ class MailMonitorService:
         subject: str,
         date: str,
         param: str,
-    ) -> None:
-        self._submit(
+    ) -> Optional[bool]:
+        submitted, result = self._submit(
             self._wake_agent(
                 uid=uid,
                 sender=sender,
@@ -1465,6 +2301,127 @@ class MailMonitorService:
             ),
             timeout=_WAKE_TIMEOUT_SECONDS + 30,
         )
+        if not submitted:
+            return None
+        return result is not False
+
+    def schedule_approved_replay(self) -> bool:
+        """Schedule one idempotent drain of the durable approval outbox.
+
+        This method is called on the workspace event loop by both ``start``
+        (crash/restart recovery) and the approval API.  A generation counter
+        closes the race where a new approval arrives just as an existing drain
+        is about to finish, without ever running two drains concurrently.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed() or self._stop_event.is_set():
+            return False
+        self._approved_replay_generation += 1
+        task = self._approved_replay_task
+        if task is None or task.done():
+            self._approved_replay_task = asyncio.create_task(
+                self._drain_approved_replay(),
+                name=f"mail-approved-replay-{self.agent_id}",
+            )
+        return True
+
+    async def _replay_approved_message(
+        self,
+        entry: dict[str, Any],
+        message: Any,
+        attempts: dict[tuple[str, int], int],
+    ) -> bool:
+        """Handle one outbox message; return whether it still needs retry."""
+        if self._stop_event.is_set() or not isinstance(message, dict):
+            return False
+        try:
+            uid = int(message.get("uid", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        if not uid:
+            return False
+
+        sender_address = str(entry.get("sender_address", ""))
+        identity = (sender_address, uid)
+        try:
+            succeeded = await self._wake_agent(
+                uid=uid,
+                sender=(
+                    message.get("display_name")
+                    or entry.get("display_name")
+                    or sender_address
+                ),
+                subject=str(message.get("subject", "")),
+                date=str(message.get("date", "")),
+                param="",
+                report_failure=not attempts.get(identity),
+                retry_on_failure=True,
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.exception(
+                "approved mail replay failed unexpectedly (agent %s, uid %s)",
+                self.agent_id,
+                uid,
+            )
+            # The normal failure path already emitted its one visible retry
+            # event.  An unexpected exception may have happened before that,
+            # so keep the next attempt eligible to report it.
+            return True
+        if not succeeded:
+            attempts[identity] = attempts.get(identity, 0) + 1
+            return True
+
+        attempts.pop(identity, None)
+        await run_sync_io(
+            self._mail_acl_store.ack_approved_replay_messages,
+            self.agent_id,
+            sender_address,
+            [uid],
+        )
+        return False
+
+    async def _drain_approved_replay(self) -> None:
+        """Retry approved UIDs with backoff and ack only successes."""
+        attempts: dict[tuple[str, int], int] = {}
+        retry_delay = _BACKOFF_INITIAL_SECONDS
+        try:
+            while not self._stop_event.is_set():
+                generation = self._approved_replay_generation
+                retry_pending = False
+                entries = await run_sync_io(
+                    self._mail_acl_store.get_approved_replay,
+                    self.agent_id,
+                )
+                for entry in entries:
+                    raw_messages = entry.get("messages", [])
+                    messages = (
+                        raw_messages if isinstance(raw_messages, list) else []
+                    )
+                    for message in messages:
+                        retry_pending = (
+                            await self._replay_approved_message(
+                                entry,
+                                message,
+                                attempts,
+                            )
+                            or retry_pending
+                        )
+                if retry_pending:
+                    if generation != self._approved_replay_generation:
+                        retry_delay = _BACKOFF_INITIAL_SECONDS
+                        continue
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(
+                        retry_delay * 2,
+                        _BACKOFF_MAX_SECONDS,
+                    )
+                    continue
+                if generation == self._approved_replay_generation:
+                    break
+                retry_delay = _BACKOFF_INITIAL_SECONDS
+        finally:
+            if self._approved_replay_task is asyncio.current_task():
+                self._approved_replay_task = None
 
     async def _wake_agent(
         self,
@@ -1474,15 +2431,20 @@ class MailMonitorService:
         subject: str,
         date: str,
         param: str,
-    ) -> None:
+        report_failure: bool = True,
+        retry_on_failure: bool = False,
+    ) -> bool:
         """Run the agent on the new email (mirrors run_heartbeat_once)."""
-        await wake_agent_for_mail(
-            self.workspace,
-            self.agent_id,
-            uid=uid,
-            sender=sender,
-            subject=subject,
-            date=date,
-            param=param,
-            mode=self.push.mode,
-        )
+        async with self._agent_wake_lock:
+            return await wake_agent_for_mail(
+                self.workspace,
+                self.agent_id,
+                uid=uid,
+                sender=sender,
+                subject=subject,
+                date=date,
+                param=param,
+                mode=self.push.mode,
+                report_failure=report_failure,
+                retry_on_failure=retry_on_failure,
+            )

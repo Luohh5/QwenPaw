@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """Unit tests for MailAccessControlStore persistence and ACL semantics."""
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -155,12 +157,44 @@ def test_corrupted_file_does_not_crash_and_reloads_after_repair(tmp_path):
 
 def test_pending_deduplicates(tmp_path):
     store = _store(tmp_path)
-    store.add_pending(AGENT, "new@example.com", subject="first")
-    store.add_pending(AGENT, "new@example.com", subject="second")
+    store.add_pending(AGENT, "new@example.com", subject="first", uid=101)
+    store.add_pending(AGENT, "new@example.com", subject="second", uid=102)
     pending = store.get_acl(AGENT)["pending"]
     assert len(pending) == 1
     assert pending[0]["subject"] == "first"
+    assert [message["uid"] for message in pending[0]["messages"]] == [101, 102]
     assert store.get_pending_count() == 1
+
+    # The sender row and all blocked UIDs survive a process-style reload.
+    reloaded = MailAccessControlStore(
+        tmp_path / "mail_access_control.json",
+    )
+    reloaded_pending = reloaded.get_pending_entry(AGENT, "new@example.com")
+    assert reloaded_pending is not None
+    assert [message["uid"] for message in reloaded_pending["messages"]] == [
+        101,
+        102,
+    ]
+
+
+def test_pending_duplicate_uid_is_not_recorded_twice(tmp_path):
+    store = _store(tmp_path)
+    store.add_pending(AGENT, "new@example.com", subject="first", uid=101)
+    store.add_pending(AGENT, "new@example.com", subject="retry", uid=101)
+    pending = store.get_acl(AGENT)["pending"]
+    assert [message["uid"] for message in pending[0]["messages"]] == [101]
+
+
+def test_pending_write_failure_raises_and_rolls_back_memory(tmp_path):
+    store = _store(tmp_path)
+    with patch(
+        "qwenpaw.app.mail.mail_access_control.write_json_atomic",
+        side_effect=OSError("disk full"),
+    ):
+        with pytest.raises(RuntimeError, match="Could not persist"):
+            store.add_pending(AGENT, "new@example.com", uid=101)
+
+    assert store.get_pending_entry(AGENT, "new@example.com") is None
 
 
 def test_pending_max_limit_evicts_oldest(tmp_path):
@@ -184,6 +218,84 @@ def test_approve_pending_moves_to_whitelist(tmp_path):
     assert acl["pending"] == []
     assert acl["whitelist"]["new@example.com"]["remark"] == "ok"
     assert acl["whitelist"]["new@example.com"]["display_name"] == "New Guy"
+
+
+def test_approval_replay_outbox_acks_only_successful_uids(tmp_path):
+    store = _store(tmp_path)
+    store.add_pending(AGENT, "new@example.com", subject="first", uid=101)
+    store.add_pending(AGENT, "new@example.com", subject="second", uid=102)
+
+    snapshots = store.approve_many(
+        AGENT,
+        [("new@example.com", "")],
+    )
+    assert snapshots[0] is not None
+    assert store.check_sender(AGENT, "new@example.com") == "allow"
+    assert store.get_pending_entry(AGENT, "new@example.com") is None
+    assert [
+        message["uid"]
+        for message in store.get_approved_replay(AGENT)[0]["messages"]
+    ] == [101, 102]
+    # A stale/double click has no pending snapshot to move and cannot append
+    # duplicate UIDs to the replay outbox.
+    assert store.approve_many(AGENT, [("new@example.com", "")]) == [None]
+    assert (
+        store.ack_approved_replay_messages(
+            AGENT,
+            "new@example.com",
+            [101],
+        )
+        == 1
+    )
+
+    reloaded = MailAccessControlStore(
+        tmp_path / "mail_access_control.json",
+    )
+    assert reloaded.get_pending_entry(AGENT, "new@example.com") is None
+    replay = reloaded.get_approved_replay(AGENT)
+    assert [message["uid"] for message in replay[0]["messages"]] == [102]
+    assert (
+        reloaded.ack_approved_replay_messages(
+            AGENT,
+            "new@example.com",
+            [102],
+        )
+        == 1
+    )
+    assert reloaded.get_pending_entry(AGENT, "new@example.com") is None
+    assert reloaded.get_approved_replay(AGENT) == []
+
+
+def test_old_approved_pending_state_migrates_to_hidden_replay(tmp_path):
+    path = tmp_path / "mail_access_control.json"
+    path.write_text(
+        json.dumps(
+            {
+                AGENT: {
+                    "whitelist": {"new@example.com": {}},
+                    "blacklist": {},
+                    "pending": [
+                        {
+                            "sender_address": "new@example.com",
+                            "agent_id": AGENT,
+                            "uid": 101,
+                            "subject": "first",
+                        },
+                    ],
+                },
+            },
+        ),
+        encoding="utf-8",
+    )
+
+    store = MailAccessControlStore(path)
+
+    assert store.get_pending_entry(AGENT, "new@example.com") is None
+    assert store.get_pending_count() == 0
+    assert [
+        message["uid"]
+        for message in store.get_approved_replay(AGENT)[0]["messages"]
+    ] == [101]
 
 
 def test_deny_pending_moves_to_blacklist(tmp_path):

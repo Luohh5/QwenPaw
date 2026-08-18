@@ -2,8 +2,8 @@
 
 .PHONY: test test-unit test-contract test-integration test-channel test-channel-contract coverage-full clean gen-browser-manual install-dev install-mail-mcp
 
-# Python path (override with: make PYTHON=python3.12 <target>)
-PYTHON ?= $(shell command -v python3 2>/dev/null || command -v python)
+# Cross-platform default (override with: make PYTHON=python3.12 <target>)
+PYTHON ?= python
 PYTEST := $(PYTHON) -m pytest
 
 # Default: run all tests

@@ -477,6 +477,7 @@ class Workspace:
                 stop_method="stop",
                 priority=45,
                 concurrent_init=False,
+                require_clean_stop=True,
             ),
         )
 

@@ -49,22 +49,22 @@
 - **C1 Notification Reminder**
   - Matching Criteria: Meeting invitations, interview notices, deadline reminders, and similar time-sensitive notifications
   - Prerequisite Toolchain: Use `get_message` to extract the time and location; use `get_current_time` to determine the appropriate reminder time
-  - Final Action: Create an event in the computer’s calendar **FIRST** if it's accessable. Otherwise, use the `cron` skill to create a reminder with `--schedule-type scheduled --type text`
+  - Final Action: If a Computer Use tool or skill is available, attempt to create an event in the computer’s calendar. Otherwise, use the `cron` skill to create a reminder with `--schedule-type scheduled --type text`
   - Source: v0.2.0 seed
 - **C2 Schedule Planning**
   - Matching Criteria: Job applications or résumé submissions, availability inquiries, and other tasks that require arranging time independently
   - Prerequisite Toolchain: Use `get_message` to verify the details, then use an appropriate tool or `cron` to retrieve the current calendar and identify a suitable available time
-  - Final Action: Create an event in the computer’s calendar **FIRST** if it's accessable. Otherwise, create a `cron` reminder
+  - Final Action: If a Computer Use tool or skill is available, attempt to create an event in the computer’s calendar. Otherwise, create a `cron` reminder
   - Source: v0.2.0 seed
 - **C3 Travel Itinerary and Reminder**
   - Matching Criteria: Booking confirmations or changes for flights, hotels, trains, and other travel arrangements
   - Prerequisite Toolchain: Use `get_message` to extract the itinerary details
-  - Final Action: Create an event in the computer’s calendar **FIRST** if it's accessable. otherwise, use `cron` to create or update a pre-departure reminder
+  - Final Action: Use `write_file` to create or update the itinerary. If a Computer Use tool or skill is available, attempt to create an event in the computer’s calendar; otherwise, use `cron` to create or update a pre-departure reminder
   - Source: v0.2.0 seed
 - **C4 Shipment Tracking**
   - Matching Criteria: E-commerce orders, shipping notifications, and logistics updates
   - Prerequisite Toolchain: Use `get_message` to extract the carrier and tracking number, or the e-commerce order number. In a browser, sign in to the relevant official website with the email account and look up the shipment or order status
-  - Final Action: Create an event in the computer’s calendar **FIRST** if it's accessable. Otherwise, use `cron` to create a `--type agent` task that checks the shipment status daily, notifies the user when the shipment arrives, and then deletes the cron task
+  - Final Action: If a Computer Use tool or skill is available, attempt to create an event in the computer’s calendar. Otherwise, use `cron` to create a `--type agent` task that checks the shipment status daily, notifies the user when the shipment arrives, and then deletes the cron task
   - Source: v0.2.0 seed
 
 ## D Outbound Communications (Output: Sent Email)

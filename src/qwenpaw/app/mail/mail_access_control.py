@@ -15,7 +15,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ...constant import WORKING_DIR
 from ...utils.io_utils import write_json_atomic
@@ -47,6 +47,7 @@ class MailPendingEntry:
         "remark",
         "uid",
         "date",
+        "messages",
     )
 
     def __init__(
@@ -60,6 +61,7 @@ class MailPendingEntry:
         remark: str = "",
         uid: int = 0,
         date: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
     ):
         self.sender_address = sender_address
         self.agent_id = agent_id
@@ -70,6 +72,82 @@ class MailPendingEntry:
         self.remark = remark
         self.uid = uid
         self.date = date
+        self.messages: List[Dict[str, Any]] = []
+        if messages:
+            for message in messages:
+                if isinstance(message, dict):
+                    self._append_message_dict(message)
+        if not self.messages:
+            # Backward compatibility: legacy entries stored only one message
+            # in the sender-level fields.
+            self.append_message(
+                display_name=display_name,
+                subject=subject,
+                body_preview=body_preview,
+                uid=uid,
+                date=date,
+                timestamp=timestamp,
+            )
+
+    def _append_message_dict(self, message: Dict[str, Any]) -> bool:
+        try:
+            uid = int(message.get("uid", 0) or 0)
+        except (TypeError, ValueError):
+            uid = 0
+        try:
+            timestamp = float(message.get("timestamp", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            timestamp = 0.0
+        return self.append_message(
+            display_name=str(message.get("display_name", "")),
+            subject=str(message.get("subject", "")),
+            body_preview=str(message.get("body_preview", "")),
+            uid=uid,
+            date=str(message.get("date", "")),
+            timestamp=timestamp,
+        )
+
+    def append_message(
+        self,
+        *,
+        display_name: str = "",
+        subject: str = "",
+        body_preview: str = "",
+        uid: int = 0,
+        date: str = "",
+        timestamp: float = 0.0,
+    ) -> bool:
+        """Record one blocked message, deduplicated by mailbox UID."""
+        if uid and any(message.get("uid") == uid for message in self.messages):
+            return False
+        if not uid:
+            identity = (subject, date, body_preview)
+            if any(
+                (
+                    message.get("subject", ""),
+                    message.get("date", ""),
+                    message.get("body_preview", ""),
+                )
+                == identity
+                for message in self.messages
+            ):
+                return False
+        self.messages.append(
+            {
+                "display_name": display_name[:200],
+                "subject": subject[:200],
+                "body_preview": body_preview[:500],
+                "timestamp": timestamp or time.time(),
+                "uid": uid,
+                "date": date,
+            },
+        )
+        return True
+
+    def merge_from(self, other: MailPendingEntry) -> None:
+        """Merge another sender entry without duplicating mailbox UIDs."""
+        for message in other.messages:
+            self._append_message_dict(message)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -82,6 +160,7 @@ class MailPendingEntry:
             "remark": self.remark,
             "uid": self.uid,
             "date": self.date,
+            "messages": [dict(message) for message in self.messages],
         }
 
     @classmethod
@@ -96,6 +175,7 @@ class MailPendingEntry:
             remark=data.get("remark", ""),
             uid=data.get("uid", 0),
             date=data.get("date", ""),
+            messages=data.get("messages"),
         )
 
 
@@ -129,16 +209,23 @@ class AgentMailACL:
         whitelist: Optional[Dict[str, MailUserInfo]] = None,
         blacklist: Optional[Dict[str, MailUserInfo]] = None,
         pending: Optional[List[MailPendingEntry]] = None,
+        approved_replay: Optional[List[MailPendingEntry]] = None,
     ):
         self.whitelist: Dict[str, MailUserInfo] = whitelist or {}
         self.blacklist: Dict[str, MailUserInfo] = blacklist or {}
         self.pending: List[MailPendingEntry] = pending or []
+        # Approved messages awaiting agent handling are deliberately separate
+        # from the user-visible approval queue.  Keeping them in ``pending``
+        # made an accepted row reappear until the asynchronous wake completed
+        # and allowed repeated clicks to dispatch the same UID again.
+        self.approved_replay: List[MailPendingEntry] = approved_replay or []
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "whitelist": {k: v.to_dict() for k, v in self.whitelist.items()},
             "blacklist": {k: v.to_dict() for k, v in self.blacklist.items()},
             "pending": [p.to_dict() for p in self.pending],
+            "approved_replay": [p.to_dict() for p in self.approved_replay],
         }
 
     @classmethod
@@ -152,17 +239,49 @@ class AgentMailACL:
         pending = [
             MailPendingEntry.from_dict(p) for p in data.get("pending", [])
         ]
-        return cls(whitelist=whitelist, blacklist=blacklist, pending=pending)
+        approved_replay = [
+            MailPendingEntry.from_dict(p)
+            for p in data.get("approved_replay", [])
+        ]
+
+        # Migrate files written by the old approval flow.  It deliberately
+        # retained an approved sender in ``pending`` until wake success, which
+        # is exactly the state that made the UI row impossible to dismiss.
+        visible_pending: List[MailPendingEntry] = []
+        for entry in pending:
+            if entry.sender_address in whitelist:
+                if not any(message.get("uid") for message in entry.messages):
+                    continue
+                existing = next(
+                    (
+                        item
+                        for item in approved_replay
+                        if item.sender_address == entry.sender_address
+                    ),
+                    None,
+                )
+                if existing is None:
+                    approved_replay.append(entry)
+                else:
+                    existing.merge_from(entry)
+            else:
+                visible_pending.append(entry)
+        return cls(
+            whitelist=whitelist,
+            blacklist=blacklist,
+            pending=visible_pending,
+            approved_replay=approved_replay,
+        )
 
 
-class MailAccessControlStore:
+class MailAccessControlStore:  # pylint: disable=too-many-public-methods
     """Thread-safe persistent store for per-agent mail access control lists."""
 
     _MAX_PENDING = 500
 
     def __init__(self, path: Optional[Path] = None):
         self._path = path or WORKING_DIR / MAIL_ACCESS_CONTROL_FILE
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._data: Dict[str, AgentMailACL] = {}
         self._last_mtime: float = 0.0
         # Domain wildcard caches
@@ -210,11 +329,24 @@ class MailAccessControlStore:
             write_json_atomic(self._path, payload)
             self._last_mtime = self._path.stat().st_mtime
             self._rebuild_domain_sets()
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "Failed to save mail access control data to %s",
                 self._path,
             )
+            # Roll back the mutable in-memory snapshot as well. Otherwise a
+            # retry in the same process could observe an unsaved ``pending``
+            # entry, treat it as durable, and advance the mailbox watermark.
+            self._data = {}
+            self._domain_whitelist = {}
+            self._domain_blacklist = {}
+            self._last_mtime = 0.0
+            self._load()
+            # Callers such as the IMAP monitor must not advance their UID
+            # watermark when an approval/deny state only exists in memory.
+            raise RuntimeError(
+                f"Could not persist mail access control data to {self._path}",
+            ) from exc
 
     def _acl(self, agent_id: str) -> AgentMailACL:
         if agent_id not in self._data:
@@ -260,32 +392,29 @@ class MailAccessControlStore:
 
             sender_lower = sender_email.lower().strip()
 
-            # 1. Check pending
-            for entry in acl.pending:
-                if entry.sender_address == sender_lower:
-                    return "pending"
-
-            # 2. Exact whitelist match
+            # Explicit allow/deny decisions take precedence.  Approval keeps
+            # blocked UIDs in a separate durable replay outbox, while new mail
+            # from that sender is allowed immediately after the decision.
             if sender_lower in acl.whitelist:
                 return "allow"
 
-            # 3. Exact blacklist match
             if sender_lower in acl.blacklist:
                 return "deny"
 
-            # 4. Domain whitelist
             domain = self._extract_domain(sender_lower)
             if domain:
                 wset = self._domain_whitelist.get(agent_id)
                 if wset and domain in wset:
                     return "allow"
 
-                # 5. Domain blacklist
                 bset = self._domain_blacklist.get(agent_id)
                 if bset and domain in bset:
                     return "deny"
 
-            # 6. Unknown
+            for entry in acl.pending:
+                if entry.sender_address == sender_lower:
+                    return "pending"
+
             return "unknown"
 
     @staticmethod
@@ -315,27 +444,59 @@ class MailAccessControlStore:
         remark: str = "",
         display_name: str = "",
     ) -> None:
-        address = address.lower().strip()
-        self._validate_wildcard(address)
+        self.add_many_to_whitelist(
+            agent_id,
+            [(address, remark, display_name)],
+        )
+
+    def add_many_to_whitelist(
+        self,
+        agent_id: str,
+        entries: List[Tuple[str, str, str]],
+    ) -> int:
+        """Apply a whitelist batch with one lock and one durable write."""
+        normalized = []
+        for address, remark, display_name in entries:
+            address = address.lower().strip()
+            self._validate_wildcard(address)
+            normalized.append((address, remark, display_name))
+        if not normalized:
+            return 0
         with self._lock:
+            self._reload_if_stale()
             acl = self._acl(agent_id)
-            existing = acl.whitelist.get(address)
-            acl.whitelist[address] = MailUserInfo(
-                remark=remark or (existing.remark if existing else ""),
-                display_name=display_name
-                or (existing.display_name if existing else ""),
-            )
-            acl.blacklist.pop(address, None)
-            acl.pending = [
-                p for p in acl.pending if p.sender_address != address
-            ]
+            for address, remark, display_name in normalized:
+                existing = acl.whitelist.get(address)
+                acl.whitelist[address] = MailUserInfo(
+                    remark=remark or (existing.remark if existing else ""),
+                    display_name=display_name
+                    or (existing.display_name if existing else ""),
+                )
+                acl.blacklist.pop(address, None)
+                acl.pending = [
+                    p for p in acl.pending if p.sender_address != address
+                ]
             self._save()
+        return len(normalized)
 
     def remove_from_whitelist(self, agent_id: str, address: str) -> None:
-        address = address.lower().strip()
+        self.remove_many_from_whitelist(agent_id, [address])
+
+    def remove_many_from_whitelist(
+        self,
+        agent_id: str,
+        addresses: List[str],
+    ) -> int:
+        normalized = [address.lower().strip() for address in addresses]
+        if not normalized:
+            return 0
         with self._lock:
-            self._acl(agent_id).whitelist.pop(address, None)
+            self._reload_if_stale()
+            acl = self._acl(agent_id)
+            for address in normalized:
+                acl.whitelist.pop(address, None)
             self._save()
+        return len(normalized)
 
     # ── Blacklist ───────────────────────────────────────────────────────
 
@@ -346,27 +507,64 @@ class MailAccessControlStore:
         remark: str = "",
         display_name: str = "",
     ) -> None:
-        address = address.lower().strip()
-        self._validate_wildcard(address)
+        self.add_many_to_blacklist(
+            agent_id,
+            [(address, remark, display_name)],
+        )
+
+    def add_many_to_blacklist(
+        self,
+        agent_id: str,
+        entries: List[Tuple[str, str, str]],
+    ) -> int:
+        """Apply a blacklist batch with one lock and one durable write."""
+        normalized = []
+        for address, remark, display_name in entries:
+            address = address.lower().strip()
+            self._validate_wildcard(address)
+            normalized.append((address, remark, display_name))
+        if not normalized:
+            return 0
         with self._lock:
+            self._reload_if_stale()
             acl = self._acl(agent_id)
-            existing = acl.blacklist.get(address)
-            acl.blacklist[address] = MailUserInfo(
-                remark=remark or (existing.remark if existing else ""),
-                display_name=display_name
-                or (existing.display_name if existing else ""),
-            )
-            acl.whitelist.pop(address, None)
-            acl.pending = [
-                p for p in acl.pending if p.sender_address != address
-            ]
+            for address, remark, display_name in normalized:
+                existing = acl.blacklist.get(address)
+                acl.blacklist[address] = MailUserInfo(
+                    remark=remark or (existing.remark if existing else ""),
+                    display_name=display_name
+                    or (existing.display_name if existing else ""),
+                )
+                acl.whitelist.pop(address, None)
+                acl.pending = [
+                    p for p in acl.pending if p.sender_address != address
+                ]
+                acl.approved_replay = [
+                    p
+                    for p in acl.approved_replay
+                    if p.sender_address != address
+                ]
             self._save()
+        return len(normalized)
 
     def remove_from_blacklist(self, agent_id: str, address: str) -> None:
-        address = address.lower().strip()
+        self.remove_many_from_blacklist(agent_id, [address])
+
+    def remove_many_from_blacklist(
+        self,
+        agent_id: str,
+        addresses: List[str],
+    ) -> int:
+        normalized = [address.lower().strip() for address in addresses]
+        if not normalized:
+            return 0
         with self._lock:
-            self._acl(agent_id).blacklist.pop(address, None)
+            self._reload_if_stale()
+            acl = self._acl(agent_id)
+            for address in normalized:
+                acl.blacklist.pop(address, None)
             self._save()
+        return len(normalized)
 
     # ── Pending ─────────────────────────────────────────────────────────
 
@@ -382,10 +580,21 @@ class MailAccessControlStore:
     ) -> None:
         sender_address = sender_address.lower().strip()
         with self._lock:
+            self._reload_if_stale()
             acl = self._acl(agent_id)
-            # Deduplicate
+            # Keep one approval row per sender, but retain every blocked
+            # message inside that row.  The monitor watermark may advance past
+            # these UIDs, so this durable list is the replay source on approve.
             for existing in acl.pending:
                 if existing.sender_address == sender_address:
+                    if existing.append_message(
+                        display_name=display_name,
+                        subject=subject,
+                        body_preview=body_preview,
+                        uid=uid,
+                        date=date,
+                    ):
+                        self._save()
                     return
             # Enforce max pending limit
             if len(acl.pending) >= self._MAX_PENDING:
@@ -440,27 +649,128 @@ class MailAccessControlStore:
         remark: str = "",
     ) -> bool:
         """Move a pending sender to the whitelist."""
-        sender_address = sender_address.lower().strip()
+        self.approve_many(agent_id, [(sender_address, remark)])
+        return True
+
+    def approve_many(
+        self,
+        agent_id: str,
+        entries: List[Tuple[str, str]],
+    ) -> List[Optional[Dict[str, Any]]]:
+        """Atomically approve senders and enqueue every blocked message.
+
+        The returned snapshots contain only entries newly moved by this call.
+        A repeated approval therefore cannot enqueue or dispatch the same UIDs
+        again.  Replay durability is independent of the visible pending list.
+        """
+        normalized = [
+            (sender_address.lower().strip(), remark)
+            for sender_address, remark in entries
+        ]
+        if not normalized:
+            return []
+        snapshots: List[Optional[Dict[str, Any]]] = []
         with self._lock:
+            self._reload_if_stale()
             acl = self._acl(agent_id)
-            effective_remark = remark
-            display_name = ""
-            for entry in acl.pending:
-                if entry.sender_address == sender_address:
+            for sender_address, remark in normalized:
+                effective_remark = remark
+                display_name = ""
+                pending_entry = next(
+                    (
+                        item
+                        for item in acl.pending
+                        if item.sender_address == sender_address
+                    ),
+                    None,
+                )
+                snapshots.append(
+                    pending_entry.to_dict() if pending_entry else None,
+                )
+                if pending_entry is not None:
                     if not effective_remark:
-                        effective_remark = entry.remark
-                    display_name = entry.display_name
-                    break
-            acl.pending = [
-                p for p in acl.pending if p.sender_address != sender_address
-            ]
-            acl.whitelist[sender_address] = MailUserInfo(
-                remark=effective_remark,
-                display_name=display_name,
-            )
-            acl.blacklist.pop(sender_address, None)
+                        effective_remark = pending_entry.remark
+                    display_name = pending_entry.display_name
+                    if any(
+                        message.get("uid")
+                        for message in pending_entry.messages
+                    ):
+                        existing_replay = next(
+                            (
+                                item
+                                for item in acl.approved_replay
+                                if item.sender_address == sender_address
+                            ),
+                            None,
+                        )
+                        if existing_replay is None:
+                            acl.approved_replay.append(pending_entry)
+                        else:
+                            existing_replay.merge_from(pending_entry)
+                acl.pending = [
+                    item
+                    for item in acl.pending
+                    if item.sender_address != sender_address
+                ]
+                acl.whitelist[sender_address] = MailUserInfo(
+                    remark=effective_remark,
+                    display_name=display_name,
+                )
+                acl.blacklist.pop(sender_address, None)
             self._save()
-            return True
+        return snapshots
+
+    def get_approved_replay(
+        self,
+        agent_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Return a snapshot of approved messages awaiting agent handling."""
+        with self._lock:
+            self._reload_if_stale()
+            return [
+                entry.to_dict()
+                for entry in self._acl(agent_id).approved_replay
+            ]
+
+    def ack_approved_replay_messages(
+        self,
+        agent_id: str,
+        sender_address: str,
+        uids: List[int],
+    ) -> int:
+        """Remove successfully replayed UIDs, preserving any failed ones."""
+        sender_address = sender_address.lower().strip()
+        acknowledged = {int(uid) for uid in uids if uid}
+        if not acknowledged:
+            return 0
+        removed = 0
+        with self._lock:
+            self._reload_if_stale()
+            acl = self._acl(agent_id)
+            for replay_entry in list(acl.approved_replay):
+                if replay_entry.sender_address != sender_address:
+                    continue
+                before = len(replay_entry.messages)
+                replay_entry.messages = [
+                    message
+                    for message in replay_entry.messages
+                    if message.get("uid") not in acknowledged
+                ]
+                removed = before - len(replay_entry.messages)
+                if not replay_entry.messages:
+                    acl.approved_replay.remove(replay_entry)
+                else:
+                    first = replay_entry.messages[0]
+                    replay_entry.display_name = first.get("display_name", "")
+                    replay_entry.subject = first.get("subject", "")
+                    replay_entry.body_preview = first.get("body_preview", "")
+                    replay_entry.timestamp = first.get("timestamp", 0.0)
+                    replay_entry.uid = first.get("uid", 0)
+                    replay_entry.date = first.get("date", "")
+                break
+            if removed:
+                self._save()
+        return removed
 
     def deny_pending(
         self,
@@ -469,41 +779,79 @@ class MailAccessControlStore:
         remark: str = "",
     ) -> bool:
         """Move a pending sender to the blacklist."""
-        sender_address = sender_address.lower().strip()
+        self.deny_many(agent_id, [(sender_address, remark)])
+        return True
+
+    def deny_many(
+        self,
+        agent_id: str,
+        entries: List[Tuple[str, str]],
+    ) -> int:
+        """Deny pending senders with one lock and one durable write."""
+        normalized = [
+            (sender_address.lower().strip(), remark)
+            for sender_address, remark in entries
+        ]
+        if not normalized:
+            return 0
         with self._lock:
+            self._reload_if_stale()
             acl = self._acl(agent_id)
-            effective_remark = remark
-            display_name = ""
-            for entry in acl.pending:
-                if entry.sender_address == sender_address:
+            for sender_address, remark in normalized:
+                effective_remark = remark
+                display_name = ""
+                pending_entry = next(
+                    (
+                        item
+                        for item in acl.pending
+                        if item.sender_address == sender_address
+                    ),
+                    None,
+                )
+                if pending_entry is not None:
                     if not effective_remark:
-                        effective_remark = entry.remark
-                    display_name = entry.display_name
-                    break
-            acl.pending = [
-                p for p in acl.pending if p.sender_address != sender_address
-            ]
-            acl.blacklist[sender_address] = MailUserInfo(
-                remark=effective_remark,
-                display_name=display_name,
-            )
-            acl.whitelist.pop(sender_address, None)
+                        effective_remark = pending_entry.remark
+                    display_name = pending_entry.display_name
+                acl.pending = [
+                    item
+                    for item in acl.pending
+                    if item.sender_address != sender_address
+                ]
+                acl.approved_replay = [
+                    item
+                    for item in acl.approved_replay
+                    if item.sender_address != sender_address
+                ]
+                acl.blacklist[sender_address] = MailUserInfo(
+                    remark=effective_remark,
+                    display_name=display_name,
+                )
+                acl.whitelist.pop(sender_address, None)
             self._save()
-            return True
+        return len(normalized)
 
     def dismiss_pending(self, agent_id: str, sender_address: str) -> bool:
         """Remove from pending without adding to any list."""
-        sender_address = sender_address.lower().strip()
+        return bool(self.dismiss_many(agent_id, [sender_address]))
+
+    def dismiss_many(self, agent_id: str, sender_addresses: List[str]) -> int:
+        """Dismiss pending senders with one lock and one durable write."""
+        normalized = [address.lower().strip() for address in sender_addresses]
+        if not normalized:
+            return 0
         with self._lock:
+            self._reload_if_stale()
             acl = self._acl(agent_id)
             before = len(acl.pending)
             acl.pending = [
-                p for p in acl.pending if p.sender_address != sender_address
+                item
+                for item in acl.pending
+                if item.sender_address not in set(normalized)
             ]
-            if len(acl.pending) < before:
+            removed = before - len(acl.pending)
+            if removed:
                 self._save()
-                return True
-            return False
+            return removed
 
     def update_pending_remark(
         self,
@@ -514,6 +862,7 @@ class MailAccessControlStore:
         """Update the remark on a pending entry."""
         sender_address = sender_address.lower().strip()
         with self._lock:
+            self._reload_if_stale()
             acl = self._acl(agent_id)
             for entry in acl.pending:
                 if entry.sender_address == sender_address:
@@ -531,6 +880,7 @@ class MailAccessControlStore:
         """Update the remark for an address in whitelist or blacklist."""
         address = address.lower().strip()
         with self._lock:
+            self._reload_if_stale()
             acl = self._acl(agent_id)
             if address in acl.whitelist:
                 acl.whitelist[address].remark = remark

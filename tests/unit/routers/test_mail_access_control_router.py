@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """Unit tests for the mail access control API router."""
+
 # pylint: disable=redefined-outer-name,unused-argument
 from __future__ import annotations
 
 import asyncio
+import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -77,6 +80,103 @@ def test_approve_is_idempotent(store):
     assert acl["pending"] == []
 
 
+def test_approve_hides_pending_and_schedules_all_uids_once(store):
+    store.add_pending(
+        AGENT,
+        "new@example.com",
+        subject="first",
+        uid=101,
+    )
+    store.add_pending(
+        AGENT,
+        "new@example.com",
+        subject="second",
+        uid=102,
+    )
+
+    class _Monitor:
+        def __init__(self):
+            self.schedules = 0
+
+        def schedule_approved_replay(self):
+            self.schedules += 1
+            return True
+
+    monitor = _Monitor()
+    workspace = SimpleNamespace(mail_monitor=monitor)
+
+    class _Manager:
+        async def get_agent(self, _agent_id):
+            return workspace
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(multi_agent_manager=_Manager()),
+        ),
+    )
+
+    async def _run():
+        with patch(
+            "qwenpaw.app.inbox_store.mark_read_by_acl_sender",
+            new=lambda _address: asyncio.sleep(0, result=0),
+        ):
+            first = await approve_pending(
+                _entries("new@example.com"),
+                request=request,
+            )
+            # Simulate the stale UI issuing the same action before its next
+            # refresh.  There is no pending snapshot left to schedule again.
+            second = await approve_pending(
+                _entries("new@example.com"),
+                request=request,
+            )
+            return first, second
+
+    first, second = asyncio.run(_run())
+    assert first == {"status": "ok", "count": 1}
+    assert second == {"status": "ok", "count": 1}
+    assert monitor.schedules == 1
+    assert store.get_acl(AGENT)["pending"] == []
+    replay = store.get_approved_replay(AGENT)
+    assert [message["uid"] for message in replay[0]["messages"]] == [101, 102]
+
+
+def test_failed_approval_replay_remains_durable(store):
+    store.add_pending(AGENT, "new@example.com", subject="first", uid=101)
+
+    class _Manager:
+        async def get_agent(self, _agent_id):
+            # No running monitor (for example an agent currently unavailable)
+            # must not put the approved row back in the visible pending list.
+            return SimpleNamespace(mail_monitor=None)
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(multi_agent_manager=_Manager()),
+        ),
+    )
+
+    async def _run():
+        with patch(
+            "qwenpaw.app.inbox_store.mark_read_by_acl_sender",
+            new=lambda _address: asyncio.sleep(0, result=0),
+        ):
+            result = await approve_pending(
+                _entries("new@example.com"),
+                request=request,
+            )
+            return result
+
+    assert asyncio.run(_run()) == {"status": "ok", "count": 1}
+    acl = store.get_acl(AGENT)
+    assert "new@example.com" in acl["whitelist"]
+    assert acl["pending"] == []
+    assert [
+        message["uid"]
+        for message in store.get_approved_replay(AGENT)[0]["messages"]
+    ] == [101]
+
+
 def test_approve_unknown_agent_is_skipped(store):
     result = asyncio.run(
         approve_pending(
@@ -123,6 +223,38 @@ def test_whitelist_add_and_remove(store):
     )
     assert result == {"status": "ok", "count": 1}
     assert "alice@example.com" not in store.get_acl(AGENT)["whitelist"]
+
+
+def test_same_workspace_batch_writes_once(store):
+    body = _entries("alice@example.com", "bob@example.com")
+    # pylint: disable-next=protected-access
+    with patch.object(store, "_save", wraps=store._save) as save:
+        result = asyncio.run(add_to_whitelist(body))
+    assert result == {"status": "ok", "count": 2}
+    assert save.call_count == 1
+
+
+def test_sync_acl_io_does_not_block_event_loop(store):
+    def _slow_get_store(_agent_id):
+        time.sleep(0.1)
+        return store
+
+    async def _run():
+        ticks = 0
+        with patch(
+            "qwenpaw.app.routers.mail_access_control._get_store_for_agent",
+            new=_slow_get_store,
+        ):
+            operation = asyncio.create_task(
+                add_to_whitelist(_entries("alice@example.com")),
+            )
+            while not operation.done():
+                ticks += 1
+                await asyncio.sleep(0.005)
+            await operation
+        return ticks
+
+    assert asyncio.run(_run()) >= 2
 
 
 def test_blacklist_add_and_remove(store):

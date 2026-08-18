@@ -32,15 +32,38 @@ import os
 import re
 import statistics
 import tempfile
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
+from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar, cast
 
 from .errors import MailError
 
 SYSTEM_LABELS = frozenset({"inbox", "sent", "spam", "trash"})
 
 STATE_DIR_ENV = "QWENPAWMAIL_STATE_DIR"
+
+_PROCESS_LOCK_FILE = ".thread_store.lock"
+_LOCK_REGION_SIZE = 1
+
+_Method = TypeVar("_Method", bound=Callable[..., Any])
+
+
+def _synchronized(method: _Method) -> _Method:
+    """Hold one store's re-entrant lock for a complete public operation."""
+
+    @wraps(method)
+    def wrapper(self: "ThreadStore", *args: Any, **kwargs: Any) -> Any:
+        # pylint: disable=protected-access
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return cast(_Method, wrapper)
+
 
 #: First-sync window: newest 500 messages within the last 90 days.
 FIRST_SYNC_DAYS = 90
@@ -190,6 +213,7 @@ class ThreadStore:
     + custom labels (labels.json)."""
 
     def __init__(self, state_dir: Path) -> None:
+        self._lock = threading.RLock()
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._threads_path = self.state_dir / "threads.json"
@@ -245,12 +269,86 @@ class ThreadStore:
                 pass
             raise
 
+    def _reload_unlocked(self) -> None:
+        """Refresh both in-memory snapshots while the caller owns the lock."""
+        self._data = self._load(self._threads_path) or {
+            "version": 1,
+            "folders": {},
+            "threads": {},
+            "msg_index": {},
+        }
+        self._labels = self._load(self._labels_path) or {}
+
+    @contextmanager
+    def process_transaction(self) -> Iterator[None]:
+        """Serialize and refresh a complete transaction across processes.
+
+        QwenPaw's build-before-swap driver reload briefly runs the old and new
+        stdio MCP processes together.  The OS lock prevents those processes
+        from committing stale JSON snapshots over one another.  The in-process
+        re-entrant lock also keeps direct worker-thread callers serialized.
+        """
+        with self._lock:
+            lock_path = self.state_dir / _PROCESS_LOCK_FILE
+            with open(lock_path, "a+b") as lock_file:
+                self._acquire_process_lock(lock_file)
+                try:
+                    self._reload_unlocked()
+                    yield
+                finally:
+                    self._release_process_lock(lock_file)
+
+    @staticmethod
+    def _acquire_process_lock(lock_file: Any) -> None:
+        if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+            import msvcrt
+
+            if os.fstat(lock_file.fileno()).st_size == 0:
+                lock_file.seek(0)
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(
+                        lock_file.fileno(),
+                        msvcrt.LK_NBLCK,
+                        _LOCK_REGION_SIZE,
+                    )
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            return
+
+        import fcntl
+
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+    @staticmethod
+    def _release_process_lock(lock_file: Any) -> None:
+        if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+            import msvcrt
+
+            lock_file.seek(0)
+            msvcrt.locking(
+                lock_file.fileno(),
+                msvcrt.LK_UNLCK,
+                _LOCK_REGION_SIZE,
+            )
+            return
+
+        import fcntl
+
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    @_synchronized
     def save(self) -> None:
         self._atomic_write(self._threads_path, self._data)
         self._atomic_write(self._labels_path, self._labels)
 
     # -- thread building -----------------------------------------------------
 
+    @_synchronized
     def add_message(
         self,
         envelope: dict[str, Any],
@@ -332,6 +430,7 @@ class ThreadStore:
 
     # -- incremental sync ------------------------------------------------
 
+    @_synchronized
     def sync(
         self,
         client: Any,
@@ -439,14 +538,17 @@ class ThreadStore:
             key=lambda m: m.get("timestamp") or 0.0,
         )
 
+    @_synchronized
     def system_labels_for(self, thread: dict[str, Any]) -> list[str]:
         return sorted(
             {m.get("system_label", "inbox") for m in thread["messages"]},
         )
 
+    @_synchronized
     def custom_labels_for(self, thread_id: str) -> list[str]:
         return list(self._labels.get(thread_id, []))
 
+    @_synchronized
     def thread_summary(self, thread_id: str) -> dict[str, Any]:
         thread = self._data["threads"][thread_id]
         msgs = self._thread_sorted_messages(thread)
@@ -473,6 +575,7 @@ class ThreadStore:
             "unread_count": sum(1 for m in msgs if not m.get("seen")),
         }
 
+    @_synchronized
     def list_threads(
         self,
         labels: list[str] | None = None,
@@ -523,6 +626,7 @@ class ThreadStore:
             s.pop("latest_timestamp", None)
         return {"threads": page, "total": total}
 
+    @_synchronized
     def get_thread(self, thread_id: str) -> dict[str, Any]:
         thread = self._data["threads"].get(thread_id)
         if thread is None:
@@ -540,10 +644,12 @@ class ThreadStore:
             ],
         }
 
+    @_synchronized
     def thread_for_message_id(self, message_id: str) -> str | None:
         tid = self._data["msg_index"].get(message_id)
         return tid if tid in self._data["threads"] else None
 
+    @_synchronized
     def thread_for_uid(self, folder: str, uid: str) -> str | None:
         for tid, thread in self._data["threads"].items():
             for m in thread["messages"]:
@@ -551,6 +657,7 @@ class ThreadStore:
                     return tid
         return None
 
+    @_synchronized
     def timestamp_for_message_id(self, message_id: str) -> float | None:
         tid = self.thread_for_message_id(message_id)
         if tid is None:
@@ -560,6 +667,7 @@ class ThreadStore:
                 return m.get("timestamp")
         return None
 
+    @_synchronized
     def thread_messages(self, thread_id: str) -> list[dict[str, Any]]:
         thread = self._data["threads"].get(thread_id)
         if thread is None:
@@ -567,10 +675,13 @@ class ThreadStore:
                 f"Thread {thread_id!r} not found. Use list_threads to see "
                 "available thread ids.",
             )
-        return self._thread_sorted_messages(thread)
+        return [
+            dict(message) for message in self._thread_sorted_messages(thread)
+        ]
 
     # -- labels ---------------------------------------------------------------
 
+    @_synchronized
     def update_labels(
         self,
         thread_id: str,
@@ -607,6 +718,7 @@ class ThreadStore:
 
     # -- deletion ----------------------------------------------------------
 
+    @_synchronized
     def remove_thread(self, thread_id: str) -> None:
         self._data["threads"].pop(thread_id, None)
         self._labels.pop(thread_id, None)
@@ -621,6 +733,7 @@ class ThreadStore:
 
     # -- stats helpers -------------------------------------------------------
 
+    @_synchronized
     def pending_reply_count(self) -> int:
         """Threads whose latest message is inbound and unread or flagged."""
         count = 0

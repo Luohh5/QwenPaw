@@ -190,6 +190,39 @@ def create_server(
         assert store is not None
         return store
 
+    # Every thread-management tool performs a multi-step transaction
+    # (mailbox sync/search plus one or more ThreadStore operations).  Serialize
+    # that whole boundary for this mailbox; ThreadStore also owns a re-entrant
+    # lock so direct callers cannot race its in-memory JSON snapshots.
+    _store_operation_lock = asyncio.Lock()
+
+    async def _run_store_operation(
+        operation: Callable[[], Any],
+        *,
+        persistent_transaction: bool = False,
+    ) -> Any:
+        async with _store_operation_lock:
+
+            def _sync() -> Any:
+                if not persistent_transaction:
+                    return operation()
+                store = _get_store()
+                with store.process_transaction():
+                    return operation()
+
+            task = asyncio.create_task(asyncio.to_thread(_sync))
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Cancelling to_thread does not stop its worker.  Keep the
+                # serialization boundary held until the transaction really
+                # exits, then propagate cancellation to the MCP caller.
+                try:
+                    await task
+                except BaseException:
+                    pass
+                raise
+
     mcp = FastMCP(
         name="qwenpawmail-mcp",
         instructions=(
@@ -584,41 +617,55 @@ def create_server(
             smtp_host: Optional SMTP server address
                 (required for non-built-in domains).
         """
-        env = {"QWENPAWMAIL_EMAIL": email, "QWENPAWMAIL_AUTH_CODE": auth_code}
-        if imap_host:
-            env["QWENPAWMAIL_IMAP_HOST"] = imap_host
-        if smtp_host:
-            env["QWENPAWMAIL_SMTP_HOST"] = smtp_host
-        cfg = load_config(env=env)
-        _config_holder[0] = cfg
-        _client_holder[0] = None
-        _config_source[0] = "runtime"
-        # Rebuild ThreadStore with the new email namespace
-        state_dir = resolve_state_dir(cfg.email)
-        _store_holder[0] = ThreadStore.for_email(state_dir, cfg.email)
-        return {
-            "configured": True,
-            "email": cfg.email,
-            "imap_host": cfg.imap_host,
-            "imap_port": cfg.imap_port,
-            "smtp_host": cfg.smtp_host,
-            "smtp_port": cfg.smtp_port,
-            "next_action": "建议调用 check_auth 验证凭据能否成功登录 IMAP/SMTP",
-        }
+
+        def _sync() -> dict:
+            env = {
+                "QWENPAWMAIL_EMAIL": email,
+                "QWENPAWMAIL_AUTH_CODE": auth_code,
+            }
+            if imap_host:
+                env["QWENPAWMAIL_IMAP_HOST"] = imap_host
+            if smtp_host:
+                env["QWENPAWMAIL_SMTP_HOST"] = smtp_host
+            cfg = load_config(env=env)
+            _config_holder[0] = cfg
+            _client_holder[0] = None
+            _config_source[0] = "runtime"
+            # Rebuild ThreadStore with the new email namespace while no
+            # thread-management operation can still hold the previous store.
+            state_dir = resolve_state_dir(cfg.email)
+            _store_holder[0] = ThreadStore.for_email(state_dir, cfg.email)
+            return {
+                "configured": True,
+                "email": cfg.email,
+                "imap_host": cfg.imap_host,
+                "imap_port": cfg.imap_port,
+                "smtp_host": cfg.smtp_host,
+                "smtp_port": cfg.smtp_port,
+                "next_action": "建议调用 check_auth 验证凭据能否成功登录 IMAP/SMTP",
+            }
+
+        return await _run_store_operation(_sync)
 
     @mcp.tool(annotations=_ann("Clear Credentials", idempotent=True))
     @_tool_errors
     async def clear_credentials() -> dict:
         """Clear runtime credentials. Mail tools will fall back to environment
         variables (if set), or set_credentials must be called again."""
-        _config_holder[0] = None
-        _client_holder[0] = None
-        _config_source[0] = "none"
-        _store_holder[0] = None
-        return {
-            "cleared": True,
-            "note": "凭据已清除。下次调用邮件工具时将回退到环境变量（如已设置），" "或需重新调用 set_credentials。",
-        }
+
+        def _sync() -> dict:
+            _config_holder[0] = None
+            _client_holder[0] = None
+            _config_source[0] = "none"
+            _store_holder[0] = None
+            return {
+                "cleared": True,
+                "note": (
+                    "凭据已清除。下次调用邮件工具时将回退到环境变量" "（如已设置），或需重新调用 set_credentials。"
+                ),
+            }
+
+        return await _run_store_operation(_sync)
 
     # -- thread management & statistics tools ---------------------------------
 
@@ -678,7 +725,10 @@ def create_server(
                 offset=coerce_int(offset, 0, lo=0, hi=10000),
             )
 
-        return await asyncio.to_thread(_sync)
+        return await _run_store_operation(
+            _sync,
+            persistent_transaction=True,
+        )
 
     @mcp.tool(
         annotations=_ann("Search Threads", read_only=True, idempotent=True),
@@ -749,7 +799,10 @@ def create_server(
                 "total": len(summaries),
             }
 
-        return await asyncio.to_thread(_sync)
+        return await _run_store_operation(
+            _sync,
+            persistent_transaction=True,
+        )
 
     @mcp.tool(annotations=_ann("Get Thread", read_only=True, idempotent=True))
     @_tool_errors
@@ -772,7 +825,10 @@ def create_server(
             )
             return result
 
-        return await asyncio.to_thread(_sync)
+        return await _run_store_operation(
+            _sync,
+            persistent_transaction=True,
+        )
 
     @mcp.tool(annotations=_ann("Update Thread", idempotent=True))
     @_tool_errors
@@ -807,7 +863,10 @@ def create_server(
                 "labels": store.thread_summary(thread_id)["labels"],
             }
 
-        return await asyncio.to_thread(_sync)
+        return await _run_store_operation(
+            _sync,
+            persistent_transaction=True,
+        )
 
     @mcp.tool(annotations=_ann("Delete Thread", destructive=True))
     @_tool_errors
@@ -873,7 +932,10 @@ def create_server(
                 result["errors"] = errors
             return result
 
-        return await asyncio.to_thread(_sync)
+        return await _run_store_operation(
+            _sync,
+            persistent_transaction=True,
+        )
 
     @mcp.tool(
         annotations=_ann("Get Mailbox Stats", read_only=True, idempotent=True),
@@ -918,6 +980,9 @@ def create_server(
                 truncated=truncated,
             )
 
-        return await asyncio.to_thread(_sync)
+        return await _run_store_operation(
+            _sync,
+            persistent_transaction=True,
+        )
 
     return mcp

@@ -48,7 +48,7 @@ from ...harnesses.registry import ProviderCatalogItem, get_provider
 from ..agent_startup import AgentStartupStatus
 from ..multi_agent_manager import MultiAgentManager
 from ...constant import WORKING_DIR
-from ...utils.io_utils import run_sync_io
+from ...utils.io_utils import run_sync_io, write_text_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -566,6 +566,89 @@ def _generate_unique_id(existing_ids: set[str]) -> str:
     )
 
 
+async def _require_qwenpawmail_driver_card(
+    workspace_dir: Path,
+    mail: AgentMailConfig,
+    operation: str,
+) -> None:
+    """Generate a usable card before an agent create/copy is committed."""
+    try:
+        synced = await run_sync_io(
+            _sync_qwenpawmail_driver_card,
+            workspace_dir,
+            mail,
+            "qwenpaw",
+            force_rewrite=True,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning(
+            "Failed to prepare qwenpawmail driver during agent %s: %s",
+            operation,
+            exc,
+        )
+        synced = False
+    if not synced:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Agent {operation} was not committed because the "
+                "qwenpawmail driver card could not be generated. Check "
+                "workspace permissions and retry."
+            ),
+        )
+
+
+async def _rollback_qwenpawmail_update(
+    agent_id: str,
+    previous_config: AgentProfileConfig,
+    previous_workspace: Path,
+    rejected_workspace: Path,
+) -> tuple[bool, bool]:
+    """Restore the config/card pair after a failed driver publication."""
+    config_restored = True
+    driver_restored = True
+    try:
+        await run_sync_io(save_agent_config, agent_id, previous_config)
+    except Exception:  # pylint: disable=broad-except
+        config_restored = False
+        logger.exception(
+            "Failed to roll back agent config after driver sync failure "
+            "for %s",
+            agent_id,
+        )
+
+    if config_restored:
+        try:
+            driver_restored = await run_sync_io(
+                _sync_qwenpawmail_driver_card,
+                previous_workspace,
+                previous_config.mail,
+                previous_config.backend or "qwenpaw",
+                force_rewrite=previous_config.mail is not None,
+            )
+        except Exception:  # pylint: disable=broad-except
+            driver_restored = False
+            logger.exception(
+                "Failed to restore qwenpawmail driver for agent %s",
+                agent_id,
+            )
+
+    if rejected_workspace != previous_workspace:
+        try:
+            await run_sync_io(
+                _sync_qwenpawmail_driver_card,
+                rejected_workspace,
+                None,
+                "qwenpaw",
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.exception(
+                "Failed to clean qwenpawmail card from rejected workspace %s",
+                rejected_workspace,
+            )
+    return config_restored, driver_restored
+
+
 @router.post(
     "",
     response_model=AgentProfileRef,
@@ -667,7 +750,11 @@ async def create_agent(
     )
 
     if request.mail is not None:
-        _generate_qwenpawmail_driver_card(workspace_dir, request.mail)
+        await _require_qwenpawmail_driver_card(
+            workspace_dir,
+            request.mail,
+            "creation",
+        )
         _ensure_contacts_file(workspace_dir, language)
         _ensure_mail_triage_file(workspace_dir, language)
 
@@ -811,7 +898,11 @@ async def copy_agent(
     )
 
     if agent_config.mail is not None:
-        _generate_qwenpawmail_driver_card(workspace_dir, agent_config.mail)
+        await _require_qwenpawmail_driver_card(
+            workspace_dir,
+            agent_config.mail,
+            "copy",
+        )
         _ensure_contacts_file(workspace_dir, language)
         _ensure_mail_triage_file(workspace_dir, language)
 
@@ -927,27 +1018,62 @@ async def update_agent(
     await update_agent_config_async(agentId, apply_update)
 
     updated_config = await run_sync_io(load_agent_config, agentId)
-    if updated_config.mail is not None:
-        workspace_dir = Path(
-            updated_config.workspace_dir
+    workspace_dir = Path(
+        updated_config.workspace_dir
+        or config.agents.profiles[agentId].workspace_dir,
+    ).expanduser()
+    # Keep the generated credential-bearing DriverCard in lockstep with the
+    # *persisted* final configuration.  In particular, an explicit mail=null
+    # or a backend switch must revoke the old MCP capability before reload.
+    try:
+        driver_card_synced = await run_sync_io(
+            _sync_qwenpawmail_driver_card,
+            workspace_dir,
+            updated_config.mail,
+            updated_config.backend,
+            force_rewrite=agent_config.mail is not None,
+        )
+    except Exception:  # pylint: disable=broad-except
+        logger.warning(
+            "Failed to synchronize qwenpawmail driver for agent %s",
+            agentId,
+            exc_info=True,
+        )
+        driver_card_synced = False
+
+    if not driver_card_synced:
+        # The runtime has not been reloaded yet, so restoring the previous
+        # config keeps its live state coherent. The failed sync already
+        # revokes a card containing superseded credentials; regenerate the
+        # previous card only after the old config is durable again.
+        old_workspace_dir = Path(
+            existing_config_snap.workspace_dir
             or config.agents.profiles[agentId].workspace_dir,
         ).expanduser()
-        driver_card = workspace_dir / "drivers" / "mcp" / "qwenpawmail.yaml"
-        if agent_config.mail is not None:
-            # The update explicitly carries mail credentials: regenerate the
-            # driver card unconditionally so endpoint.env always matches the
-            # latest credentials (the MCP subprocess loads them at startup).
-            await run_sync_io(
-                _generate_qwenpawmail_driver_card,
-                workspace_dir,
-                updated_config.mail,
-            )
-        elif not driver_card.exists():
-            await run_sync_io(
-                _generate_qwenpawmail_driver_card,
-                workspace_dir,
-                updated_config.mail,
-            )
+        (
+            rollback_configured,
+            rollback_driver,
+        ) = await _rollback_qwenpawmail_update(
+            agentId,
+            existing_config_snap,
+            old_workspace_dir,
+            workspace_dir,
+        )
+
+        rollback_detail = (
+            "The previous mail configuration was restored."
+            if rollback_configured and rollback_driver
+            else "Rollback was incomplete; the driver was left disabled."
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "The qwenpawmail driver card could not be synchronized. "
+                f"{rollback_detail} Check workspace permissions and retry."
+            ),
+        )
+
+    if updated_config.mail is not None and updated_config.backend == "qwenpaw":
         await run_sync_io(
             _ensure_contacts_file,
             workspace_dir,
@@ -1638,14 +1764,16 @@ def _build_qwenpawmail_env(
 def _generate_qwenpawmail_driver_card(
     workspace_dir: Path,
     mail: AgentMailConfig | None = None,
-) -> None:
+) -> bool:
     """Write the qwenpawmail MCP driver card into the agent workspace.
 
     When usable personal-mailbox credentials are available, they are
     injected into endpoint.env so the MCP stdio subprocess can load them
     at startup (surviving process restarts).
 
-    Failures are logged as warnings and never block agent creation.
+    Failures are logged and reported through the boolean return value. Agent
+    create/copy/update callers must not commit a mail configuration when this
+    function returns ``False``.
     """
     try:
         (workspace_dir / "mail_state").mkdir(parents=True, exist_ok=True)
@@ -1677,14 +1805,48 @@ def _generate_qwenpawmail_driver_card(
         driver_dir = workspace_dir / "drivers" / "mcp"
         driver_dir.mkdir(parents=True, exist_ok=True)
         driver_card = driver_dir / "qwenpawmail.yaml"
-        with open(driver_card, "w", encoding="utf-8") as file:
-            file.write(card_text)
+        # The card may contain plaintext mailbox credentials.  Publish a
+        # complete replacement atomically and keep it owner-only even when an
+        # older installation created the file with broader permissions.
+        if driver_card.exists():
+            driver_card.chmod(0o600)
+        write_text_atomic(driver_card, card_text, new_file_mode=0o600)
+        driver_card.chmod(0o600)
+        return True
     except Exception as e:
         logger.warning(
             "Failed to generate qwenpawmail driver card for %s: %s",
             workspace_dir,
             e,
         )
+        return False
+
+
+def _sync_qwenpawmail_driver_card(
+    workspace_dir: Path,
+    mail: AgentMailConfig | None,
+    backend: str,
+    *,
+    force_rewrite: bool = False,
+) -> bool:
+    """Synchronize the generated qwenpawmail card with final agent state.
+
+    Only the exact generated card is removed.  User-managed DriverCards and
+    the mailbox state directory are intentionally left untouched.
+    """
+    driver_card = workspace_dir / "drivers" / "mcp" / "qwenpawmail.yaml"
+    if backend != "qwenpaw" or mail is None:
+        driver_card.unlink(missing_ok=True)
+        return True
+    if (force_rewrite or not driver_card.exists()) and not (
+        _generate_qwenpawmail_driver_card(workspace_dir, mail)
+    ):
+        # Never leave an enabled card containing superseded credentials when
+        # the replacement failed.  The persisted config remains authoritative
+        # and a retry can regenerate the card safely.
+        driver_card.unlink(missing_ok=True)
+        return False
+    return True
 
 
 def _ensure_workspace_md_file(

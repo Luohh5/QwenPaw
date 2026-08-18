@@ -11,7 +11,6 @@ import {
   Typography,
   Empty,
   Spin,
-  AutoComplete,
 } from "antd";
 import { CheckOutlined } from "@ant-design/icons";
 import { useTranslation } from "react-i18next";
@@ -24,11 +23,15 @@ import { providerApi } from "@/api/modules/provider";
 import { providerIcon } from "../../Models/components/providerIcon";
 import styles from "../index.module.less";
 import { AgentBackendFields } from "./AgentBackendFields";
-import { MAIL_DOMAIN_WHITELIST } from "./mailDomains";
+import {
+  MAIL_DOMAIN_PICKER_DOMAINS,
+  MAIL_DOMAIN_WHITELIST,
+  MAIL_ENTERPRISE_SERVICE_DOMAINS,
+} from "./mailDomains";
 
 const { Text } = Typography;
 
-const MAIL_DOMAIN_OPTIONS = MAIL_DOMAIN_WHITELIST.map((domain) => ({
+const MAIL_DOMAIN_OPTIONS = MAIL_DOMAIN_PICKER_DOMAINS.map((domain) => ({
   value: domain,
   label: domain,
 }));
@@ -43,12 +46,6 @@ const MAIL_AUTH_CODE_DOMAINS = [
   "sina.com",
   "sina.cn",
   "gmail.com",
-];
-
-const MAIL_ENTERPRISE_DOMAINS = [
-  "exmail.qq.com",
-  "qiye.aliyun.com",
-  "qiye.163.com",
 ];
 
 const MAIL_PROVIDER_OPTIONS: Array<{ value: string; labelKey: string }> = [
@@ -132,7 +129,7 @@ export function AgentModal({
   const mailCredentialHintKey = useMemo(() => {
     if (
       isCustomMailDomain ||
-      MAIL_ENTERPRISE_DOMAINS.includes(mailDomain ?? "")
+      MAIL_ENTERPRISE_SERVICE_DOMAINS.includes(mailDomain ?? "")
     ) {
       return "agent.mailCredentialHintEnterprise";
     }
@@ -418,12 +415,9 @@ export function AgentModal({
                 },
               ]}
             >
-              <AutoComplete
+              <Select
                 options={MAIL_DOMAIN_OPTIONS}
                 placeholder={t("agent.mailDomainPlaceholder")}
-                // Always show the full whitelist (only 12 items); filtering by
-                // the pre-filled value would hide most options on open.
-                filterOption={false}
               />
             </Form.Item>
             {isCustomMailDomain && (
@@ -487,12 +481,9 @@ export function AgentModal({
                 },
               ]}
             >
-              <AutoComplete
+              <Select
                 options={MAIL_DOMAIN_OPTIONS}
                 placeholder={t("agent.mailDomainPlaceholder")}
-                // Always show the full whitelist (only 12 items); filtering by
-                // the pre-filled value would hide most options on open.
-                filterOption={false}
               />
             </Form.Item>
             {isCustomMailDomain && (

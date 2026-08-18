@@ -1,17 +1,20 @@
 # -*- coding: utf-8 -*-
 # pylint: disable=redefined-outer-name,protected-access
 """Unit tests for the mail push monitor (rule matching, mode branches)."""
+
 from __future__ import annotations
 
 import asyncio
 import email as email_lib
 import imaplib
 import json
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from qwenpaw.app.mail.mail_access_control import MailAccessControlStore
 from qwenpaw.config.config import (
     AgentMailConfig,
     AgentMailCredential,
@@ -29,8 +32,8 @@ from qwenpaw.app.mail.monitor import (
     resolve_imap_host,
     rule_matches,
     should_wake_agent,
+    wake_agent_for_mail,
 )
-
 
 # ── test doubles ─────────────────────────────────────────────────────
 
@@ -63,6 +66,7 @@ class FakeImapConn:
         self.body_bytes: bytes | None = None
         self.header_bytes = (
             b"From: alice@example.com\r\n"
+            b"Return-Path: <alice@example.com>\r\n"
             b"Subject: hello\r\n"
             b"Date: Tue, 28 Jul 2026 10:00:00 +0800\r\n\r\n"
         )
@@ -332,6 +336,231 @@ def test_resolve_imap_host_by_provider():
     assert resolve_imap_host("163.com", "") == "imap.163.com"
 
 
+def test_supports_idle_normalizes_capability_types(tmp_path):
+    service, _workspace = _service(tmp_path)
+    conn = type(
+        "CapabilityConn",
+        (),
+        {"capabilities": (b"IMAP4REV1", "idle")},
+    )()
+    assert service._supports_idle(conn)
+
+    conn.capabilities = ("ID", "IMAP4REV1")
+    assert not service._supports_idle(conn)
+
+
+def test_worker_sina_without_idle_uses_existing_connection_for_polling(
+    tmp_path,
+):
+    service, _workspace = _service(tmp_path)
+    conn = type("SinaConn", (), {"capabilities": ("ID", "IMAP4REV1")})()
+    polled: list[object] = []
+
+    service._connect = lambda: conn
+
+    def _poll_loop(initial_conn=None):
+        polled.append(initial_conn)
+        service._stop_event.set()
+
+    service._poll_loop = _poll_loop
+    service._idle_wait = lambda _conn: pytest.fail("IDLE must not be sent")
+    service._worker()
+
+    assert polled == [conn]
+
+
+def test_worker_repeated_idle_rejection_reaches_polling_fallback(tmp_path):
+    service, _workspace = _service(tmp_path)
+    connections: list[object] = []
+    polled: list[object | None] = []
+
+    def _connect():
+        conn = type("IdleConn", (), {"capabilities": ("IDLE",)})()
+        connections.append(conn)
+        return conn
+
+    service._connect = _connect
+    service._check_new_messages = lambda _conn: None
+    service._idle_wait = lambda _conn: (_ for _ in ()).throw(
+        imaplib.IMAP4.error("IDLE rejected"),
+    )
+    service._sleep = lambda _seconds: None
+    service._close = lambda _conn: None
+
+    def _poll_loop(initial_conn=None):
+        polled.append(initial_conn)
+        service._stop_event.set()
+
+    service._poll_loop = _poll_loop
+    service._worker()
+
+    assert len(connections) == 3
+    assert polled == [None]
+
+
+def test_poll_loop_eof_reconnects_after_short_backoff(tmp_path):
+    service, _workspace = _service(tmp_path)
+    service.push.poll_interval_seconds = 120
+    events: list[tuple[str, object]] = []
+
+    class _PollConn:
+        def __init__(self, name: str, *, abort: bool = False) -> None:
+            self.name = name
+            self.abort = abort
+
+        def noop(self):
+            events.append(("noop", self.name))
+            if self.abort:
+                raise imaplib.IMAP4.abort("socket error: EOF")
+
+    stale = _PollConn("stale", abort=True)
+    fresh = _PollConn("fresh")
+
+    def _connect():
+        events.append(("connect", fresh.name))
+        return fresh
+
+    def _sleep(seconds):
+        events.append(("sleep", seconds))
+        if seconds == 120:
+            service._stop_event.set()
+
+    service._connect = _connect
+    service._check_new_messages = lambda conn: events.append(
+        ("check", conn.name),
+    )
+    service._close = lambda conn: events.append(
+        ("close", None if conn is None else conn.name),
+    )
+    service._sleep = _sleep
+
+    service._poll_loop(stale)
+
+    assert events == [
+        ("noop", "stale"),
+        ("close", "stale"),
+        ("sleep", 2.0),
+        ("connect", "fresh"),
+        ("noop", "fresh"),
+        ("check", "fresh"),
+        ("sleep", 120.0),
+        ("close", "fresh"),
+    ]
+
+
+def test_poll_loop_disconnect_backoff_resets_after_success(tmp_path):
+    service, _workspace = _service(tmp_path)
+    service.push.poll_interval_seconds = 120
+    sleeps: list[float] = []
+    checked: list[str] = []
+
+    class _ScriptedConn:
+        def __init__(self, name: str, outcomes: list[bool]) -> None:
+            self.name = name
+            self.outcomes = outcomes
+
+        def noop(self):
+            if self.outcomes.pop(0):
+                raise imaplib.IMAP4.abort("socket disconnected")
+
+    connections = iter(
+        [
+            _ScriptedConn("first", [True]),
+            _ScriptedConn("second", [True]),
+            _ScriptedConn("third", [True]),
+            _ScriptedConn("fourth", [True]),
+            _ScriptedConn("recovered", [False, True]),
+            _ScriptedConn("final", [False]),
+        ],
+    )
+    interval_sleeps = 0
+
+    def _sleep(seconds):
+        nonlocal interval_sleeps
+        sleeps.append(seconds)
+        if seconds == 120:
+            interval_sleeps += 1
+            if interval_sleeps == 2:
+                service._stop_event.set()
+
+    service._connect = lambda: next(connections)
+    service._check_new_messages = lambda conn: checked.append(conn.name)
+    service._close = lambda _conn: None
+    service._sleep = _sleep
+
+    with (
+        patch("qwenpaw.app.mail.monitor._BACKOFF_INITIAL_SECONDS", 2.0),
+        patch("qwenpaw.app.mail.monitor._BACKOFF_MAX_SECONDS", 8.0),
+    ):
+        service._poll_loop()
+
+    assert sleeps == [2.0, 4.0, 8.0, 8.0, 120.0, 2.0, 120.0]
+    assert checked == ["recovered", "final"]
+
+
+def test_poll_loop_protocol_error_keeps_configured_interval(tmp_path):
+    service, _workspace = _service(tmp_path)
+    service.push.poll_interval_seconds = 120
+    sleeps: list[float] = []
+
+    class _RejectedConn:
+        @staticmethod
+        def noop():
+            raise imaplib.IMAP4.error("NO invalid credentials")
+
+    def _sleep(seconds):
+        sleeps.append(seconds)
+        service._stop_event.set()
+
+    service._close = lambda _conn: None
+    service._sleep = _sleep
+    service._poll_loop(_RejectedConn())
+
+    assert sleeps == [120.0]
+
+
+def test_poll_loop_reconnect_backoff_is_stop_interruptible(tmp_path):
+    service, _workspace = _service(tmp_path)
+    entered_sleep = threading.Event()
+    attempts = 0
+    errors: list[BaseException] = []
+    real_sleep = service._sleep
+
+    def _connect():
+        nonlocal attempts
+        attempts += 1
+        raise imaplib.IMAP4.abort("socket disconnected")
+
+    def _sleep(seconds):
+        entered_sleep.set()
+        real_sleep(seconds)
+
+    def _run():
+        try:
+            service._poll_loop()
+        except BaseException as exc:  # pragma: no cover - diagnostic capture
+            errors.append(exc)
+
+    service._connect = _connect
+    service._close = lambda _conn: None
+    service._sleep = _sleep
+
+    with (
+        patch("qwenpaw.app.mail.monitor._BACKOFF_INITIAL_SECONDS", 60.0),
+        patch("qwenpaw.app.mail.monitor._BACKOFF_MAX_SECONDS", 60.0),
+    ):
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        sleeping = entered_sleep.wait(timeout=1)
+        service._stop_event.set()
+        thread.join(timeout=1)
+
+    assert sleeping
+    assert not thread.is_alive()
+    assert attempts == 1
+    assert not errors
+
+
 def test_resolve_idle_timeout_by_domain():
     # QQ family servers do not reliably push EXISTS while idling, so
     # the IDLE timeout doubles as the polling cadence -> 2 minutes.
@@ -518,6 +747,33 @@ async def test_rules_then_agent_wakes_when_no_rule_matches(
     assert recorder.events[1]["status"] == "success"
 
 
+async def test_approved_wake_failure_is_visible_as_retryable(
+    tmp_path,
+    recorder,
+):
+    workspace = FakeWorkspace(tmp_path)
+
+    async def _failed_query(_req):
+        yield {"type": "started"}
+        raise RuntimeError("temporary failure")
+
+    workspace.stream_query = _failed_query
+    result = await wake_agent_for_mail(
+        workspace,
+        "test-agent",
+        uid=101,
+        sender="alice@example.com",
+        subject="retry me",
+        date="today",
+        retry_on_failure=True,
+    )
+
+    assert result is False
+    assert recorder.events[-1]["status"] == "error"
+    assert recorder.events[-1]["payload"]["delivery_status"] == "retryable"
+    assert "retry automatically" in recorder.events[-1]["body"]
+
+
 async def test_rules_then_agent_no_wake_when_rule_handles(
     tmp_path,
     recorder,
@@ -609,6 +865,769 @@ async def test_check_new_messages_processes_new_uids(tmp_path, recorder):
     assert state["last_uid"] == 5
 
 
+async def test_processing_failure_is_durable_and_does_not_block_newer_uids(
+    tmp_path,
+    recorder,
+):
+    service, _ = _service(tmp_path, mode="rules_only")
+    service._last_uid = 100
+    service._loop = asyncio.get_running_loop()
+    conn = FakeImapConn(uids=b"100 101 102")
+    processed: list[int] = []
+
+    def _fail_first_uid(_conn, uid, _envelope):
+        if uid == 101:
+            raise ValueError("malformed message")
+        processed.append(uid)
+
+    service._process_new_email = _fail_first_uid
+    await asyncio.to_thread(service._check_new_messages, conn)
+
+    assert processed == [102]
+    assert service._last_uid == 102
+    assert service._delivery_failures[101]["attempts"] == 1
+    state = json.loads(
+        (tmp_path / "mail_state" / "monitor.json").read_text("utf-8"),
+    )
+    assert state["last_uid"] == 102
+    assert state["delivery_failures"][0]["uid"] == 101
+    assert recorder.events[-1]["event_type"] == "delivery_failed"
+    assert recorder.events[-1]["payload"]["delivery_status"] == "retryable"
+
+    restarted, _ = _service(tmp_path, mode="rules_only")
+    restarted._loop = asyncio.get_running_loop()
+    restarted._load_state()
+    retried: list[int] = []
+    restarted._process_new_email = (
+        lambda _conn, uid, _envelope: retried.append(uid)
+    )
+    await asyncio.to_thread(restarted._check_new_messages, conn)
+
+    assert retried == [101]
+    assert restarted._last_uid == 102
+    assert restarted._delivery_failures == {}
+    recovered_state = json.loads(
+        (tmp_path / "mail_state" / "monitor.json").read_text("utf-8"),
+    )
+    assert "delivery_failures" not in recovered_state
+
+
+async def test_failed_retry_state_write_does_not_advance_watermark(tmp_path):
+    service, _ = _service(tmp_path, mode="rules_only")
+    service._last_uid = 100
+    service._loop = asyncio.get_running_loop()
+    conn = FakeImapConn(uids=b"100 101")
+
+    def _fail(_conn, _uid, _envelope):
+        raise ValueError("malformed message")
+
+    service._process_new_email = _fail
+    with patch.object(service, "_save_state", return_value=False):
+        with pytest.raises(OSError, match="retry state"):
+            await asyncio.to_thread(service._check_new_messages, conn)
+
+    assert service._last_uid == 100
+    assert service._delivery_failures == {}
+
+
+async def test_inbox_persistence_failure_enters_delivery_retry_queue(tmp_path):
+    service, _ = _service(tmp_path, mode="rules_only")
+    service._last_uid = 100
+    service._loop = asyncio.get_running_loop()
+    conn = FakeImapConn(uids=b"100 101")
+    service._submit_event = lambda **_kwargs: False
+
+    await asyncio.to_thread(service._check_new_messages, conn)
+
+    assert service._last_uid == 101
+    assert service._delivery_failures[101]["attempts"] == 1
+
+
+async def test_retry_uid_missing_from_inbox_becomes_visible_terminal_failure(
+    tmp_path,
+    recorder,
+):
+    service, _ = _service(tmp_path, mode="rules_only")
+    service._last_uid = 101
+    service._delivery_failures[101] = {
+        "uid": 101,
+        "sender": "alice@example.com",
+        "subject": "moved message",
+        "date": "now",
+        "attempts": 1,
+        "error": "ValueError('bad')",
+        "updated_at": 1.0,
+    }
+    service._loop = asyncio.get_running_loop()
+
+    await asyncio.to_thread(
+        service._check_new_messages,
+        FakeImapConn(uids=b""),
+    )
+
+    assert service._delivery_failures == {}
+    assert recorder.events[-1]["event_type"] == "delivery_failed"
+    assert recorder.events[-1]["payload"]["delivery_status"] == "failed"
+
+
+async def test_pending_sender_retains_all_uids_and_restart_does_not_repeat(
+    tmp_path,
+    recorder,
+):
+    service, _ = _service(tmp_path, mode="rules_only")
+    service.push.access_control_enabled = True
+    service._last_uid = 100
+    conn = FakeImapConn(uids=b"100 101 102")
+    service._loop = asyncio.get_running_loop()
+
+    await asyncio.to_thread(service._check_new_messages, conn)
+
+    pending = service._mail_acl_store.get_pending_entry(
+        "test-agent",
+        "alice@example.com",
+    )
+    assert pending is not None
+    assert [message["uid"] for message in pending["messages"]] == [101, 102]
+    assert service._last_uid == 102
+    # One UI approval row/event per sender, even though both UIDs are durable.
+    assert len(recorder.events) == 1
+
+    restarted, _ = _service(tmp_path, mode="rules_only")
+    restarted.push.access_control_enabled = True
+    restarted._loop = asyncio.get_running_loop()
+    restarted._load_state()
+    await asyncio.to_thread(restarted._check_new_messages, conn)
+    assert restarted._last_uid == 102
+    assert len(recorder.events) == 1
+
+
+async def test_acl_missing_from_fails_closed(tmp_path, recorder):
+    service, _ = _service(tmp_path, mode="rules_only")
+    service.push.access_control_enabled = True
+    service._last_uid = 100
+    service._loop = asyncio.get_running_loop()
+    conn = FakeImapConn(uids=b"100 101")
+    conn.header_bytes = (
+        b"Subject: no sender\r\n"
+        b"Date: Tue, 28 Jul 2026 10:00:00 +0800\r\n\r\n"
+    )
+
+    await asyncio.to_thread(service._check_new_messages, conn)
+
+    pending = service._mail_acl_store.get_pending_entry(
+        "test-agent",
+        "unverified-101@invalid.local",
+    )
+    assert pending is not None
+    assert [message["uid"] for message in pending["messages"]] == [101]
+    assert recorder.events[-1]["payload"]["acl_status"] == "pending"
+
+
+async def test_acl_header_only_sender_cannot_reuse_whitelist(
+    tmp_path,
+    recorder,
+):
+    service, _ = _service(tmp_path, mode="rules_only")
+    service.push.access_control_enabled = True
+    service._last_uid = 100
+    service._loop = asyncio.get_running_loop()
+    service._mail_acl_store.add_to_whitelist(
+        "test-agent",
+        "trusted@example.com",
+    )
+    conn = FakeImapConn(uids=b"100 101")
+    conn.header_bytes = (
+        b"From: trusted@example.com\r\n"
+        b"Subject: forged\r\n"
+        b"Date: Tue, 28 Jul 2026 10:00:00 +0800\r\n\r\n"
+    )
+
+    await asyncio.to_thread(service._check_new_messages, conn)
+
+    pending = service._mail_acl_store.get_pending_entry(
+        "test-agent",
+        "unverified-101@invalid.local",
+    )
+    assert pending is not None
+    assert (
+        service._mail_acl_store.get_pending_entry(
+            "test-agent",
+            "trusted@example.com",
+        )
+        is None
+    )
+    assert recorder.events[-1]["payload"]["acl_status"] == "pending"
+
+    reloaded = MailAccessControlStore(tmp_path / "mail_access_control.json")
+    assert (
+        reloaded.get_pending_entry(
+            "test-agent",
+            "unverified-101@invalid.local",
+        )
+        is not None
+    )
+    assert reloaded.get_approved_replay("test-agent") == []
+
+
+async def test_acl_uses_trusted_authentication_result_without_return_path(
+    tmp_path,
+    recorder,
+):
+    service, _ = _service(tmp_path, mode="rules_only")
+    service.domain = "sina.com"
+    service.host = "imap.sina.com"
+    service.push.access_control_enabled = True
+    service._last_uid = 100
+    service._loop = asyncio.get_running_loop()
+    service._mail_acl_store.add_to_whitelist(
+        "test-agent",
+        "alice@example.com",
+    )
+    conn = FakeImapConn(uids=b"100 101")
+    conn.header_bytes = (
+        b"From: Alice <alice@example.com>\r\n"
+        b"Received: from sender.example by sina.com with SMTP id abc123;\r\n"
+        b"Authentication-Results: sina.com; spf=pass "
+        b"smtp.mailfrom=alice@example.com\r\n"
+        b"Subject: authenticated\r\n"
+        b"Date: Tue, 28 Jul 2026 10:00:00 +0800\r\n\r\n"
+    )
+
+    await asyncio.to_thread(service._check_new_messages, conn)
+
+    assert (
+        service._mail_acl_store.get_pending_entry(
+            "test-agent",
+            "alice@example.com",
+        )
+        is None
+    )
+    assert recorder.events[-1]["payload"].get("acl_status") is None
+
+
+async def test_acl_trusted_auth_result_exposes_spf_sender_not_forged_from(
+    tmp_path,
+    recorder,
+):
+    service, _ = _service(tmp_path, mode="rules_only")
+    service.domain = "sina.com"
+    service.host = "imap.sina.com"
+    service.push.access_control_enabled = True
+    service._last_uid = 100
+    service._loop = asyncio.get_running_loop()
+    service._mail_acl_store.add_to_whitelist(
+        "test-agent",
+        "trusted@example.com",
+    )
+    conn = FakeImapConn(uids=b"100 101")
+    conn.header_bytes = (
+        b"From: trusted@example.com\r\n"
+        b"Received: from sender.example by sina.com with SMTP id abc123;\r\n"
+        b"Authentication-Results: sina.com; spf=pass "
+        b"smtp.mailfrom=attacker@evil.example\r\n"
+        b"Subject: forged\r\n"
+        b"Date: Tue, 28 Jul 2026 10:00:00 +0800\r\n\r\n"
+    )
+
+    await asyncio.to_thread(service._check_new_messages, conn)
+
+    assert (
+        service._mail_acl_store.get_pending_entry(
+            "test-agent",
+            "attacker@evil.example",
+        )
+        is not None
+    )
+    assert recorder.events[-1]["payload"]["acl_status"] == "pending"
+
+
+async def test_acl_receiver_failure_cannot_be_overridden_by_later_pass(
+    tmp_path,
+    recorder,
+):
+    service, _ = _service(tmp_path, mode="rules_only")
+    service.domain = "sina.com"
+    service.host = "imap.sina.com"
+    service.push.access_control_enabled = True
+    service._last_uid = 100
+    service._loop = asyncio.get_running_loop()
+    service._mail_acl_store.add_to_whitelist(
+        "test-agent",
+        "trusted@example.com",
+    )
+    conn = FakeImapConn(uids=b"100 101")
+    conn.header_bytes = (
+        b"Received: from attacker.example by sina.com with SMTP id abc123;\r\n"
+        b"Authentication-Results: sina.com; spf=fail "
+        b"smtp.mailfrom=attacker@evil.example\r\n"
+        b"From: trusted@example.com\r\n"
+        b"Authentication-Results: sina.com; spf=pass "
+        b"smtp.mailfrom=trusted@example.com\r\n"
+        b"Subject: forged later result\r\n"
+        b"Date: Tue, 18 Aug 2026 11:31:10 +0800\r\n\r\n"
+    )
+
+    await asyncio.to_thread(service._check_new_messages, conn)
+
+    assert (
+        service._mail_acl_store.get_pending_entry(
+            "test-agent",
+            "unverified-101@invalid.local",
+        )
+        is not None
+    )
+    assert recorder.events[-1]["payload"]["acl_status"] == "pending"
+
+
+async def test_acl_real_netease_header_uses_real_pending_sender(
+    tmp_path,
+    recorder,
+):
+    """Replay the header shape fetched from a real 163 mailbox."""
+    service, _ = _service(tmp_path, mode="rules_only")
+    service.push.access_control_enabled = True
+    service._last_uid = 100
+    service._loop = asyncio.get_running_loop()
+    conn = FakeImapConn(uids=b"100 101")
+    conn.header_bytes = (
+        b"Received: from xmbgsz.mail.qq.com (unknown [192.0.2.1]) "
+        b"by gzga-mx-mtada-g0-8 (Coremail) with SMTP id "
+        b"coremail-transaction.123S4; Tue, 18 Aug 2026 11:31:10 +0800\r\n"
+        b"Authentication-Results: gzga-mx-mtada-g0-8; "
+        b"spf=pass smtp.mail=attacker@evil.example\r\n"
+        b"From: Alice <alice-test@foxmail.com>\r\n"
+        b"Authentication-Results: gzga-mx-mtada-g0-8; "
+        b"spf=pass smtp.mail=alice-\r\n\ttest@foxmail.com; "
+        b"dkim=none\r\n"
+        b"X-CM-TRANSID: coremail-transaction.123S4\r\n"
+        b"Subject: authenticated by Coremail\r\n"
+        b"Date: Tue, 18 Aug 2026 11:31:10 +0800\r\n\r\n"
+    )
+
+    await asyncio.to_thread(service._check_new_messages, conn)
+
+    pending = service._mail_acl_store.get_pending_entry(
+        "test-agent",
+        "alice-test@foxmail.com",
+    )
+    assert pending is not None
+    assert pending["messages"][0]["uid"] == 101
+    assert (
+        service._mail_acl_store.get_pending_entry(
+            "test-agent",
+            "unverified-101@invalid.local",
+        )
+        is None
+    )
+    assert recorder.events[-1]["payload"]["acl_status"] == "pending"
+
+
+async def test_acl_rejects_forged_netease_auth_without_transaction_proof(
+    tmp_path,
+    recorder,
+):
+    service, _ = _service(tmp_path, mode="rules_only")
+    service.push.access_control_enabled = True
+    service._last_uid = 100
+    service._loop = asyncio.get_running_loop()
+    service._mail_acl_store.add_to_whitelist(
+        "test-agent",
+        "trusted@example.com",
+    )
+    conn = FakeImapConn(uids=b"100 101")
+    conn.header_bytes = (
+        b"Received: from attacker.example by gzmx2 (Coremail) "
+        b"with SMTP id real-transaction; Tue, 18 Aug 2026 11:31:10 +0800\r\n"
+        b"Received: from forged.example by gzmx1 (Coremail) "
+        b"with SMTP id forged-transaction; Tue, 18 Aug 2026 11:30:00 +0800\r\n"
+        b"From: trusted@example.com\r\n"
+        b"Authentication-Results: gzmx1; spf=pass "
+        b"smtp.mail=trusted@example.com\r\n"
+        b"X-CM-TRANSID: real-transaction\r\n"
+        b"Subject: forged provider result\r\n"
+        b"Date: Tue, 18 Aug 2026 11:31:10 +0800\r\n\r\n"
+    )
+
+    await asyncio.to_thread(service._check_new_messages, conn)
+
+    assert (
+        service._mail_acl_store.get_pending_entry(
+            "test-agent",
+            "unverified-101@invalid.local",
+        )
+        is not None
+    )
+    assert recorder.events[-1]["payload"]["acl_status"] == "pending"
+
+
+async def test_acl_ignores_authentication_result_from_untrusted_authserv(
+    tmp_path,
+    recorder,
+):
+    service, _ = _service(tmp_path, mode="rules_only")
+    service.push.access_control_enabled = True
+    service._last_uid = 100
+    service._loop = asyncio.get_running_loop()
+    service._mail_acl_store.add_to_whitelist(
+        "test-agent",
+        "trusted@example.com",
+    )
+    conn = FakeImapConn(uids=b"100 101")
+    conn.header_bytes = (
+        b"From: trusted@example.com\r\n"
+        b"Authentication-Results: attacker.example; spf=pass "
+        b"smtp.mailfrom=trusted@example.com\r\n"
+        b"Subject: forged auth result\r\n"
+        b"Date: Tue, 28 Jul 2026 10:00:00 +0800\r\n\r\n"
+    )
+
+    await asyncio.to_thread(service._check_new_messages, conn)
+
+    assert (
+        service._mail_acl_store.get_pending_entry(
+            "test-agent",
+            "unverified-101@invalid.local",
+        )
+        is not None
+    )
+    assert recorder.events[-1]["payload"]["acl_status"] == "pending"
+
+
+async def test_acl_recognizes_qq_internal_delivery_without_standard_auth(
+    tmp_path,
+    recorder,
+):
+    service, _ = _service(tmp_path, mode="rules_only")
+    service.host = "imap.qq.com"
+    service.push.access_control_enabled = True
+    service._last_uid = 100
+    service._loop = asyncio.get_running_loop()
+    service._mail_acl_store.add_to_whitelist(
+        "test-agent",
+        "trusted@qq.com",
+    )
+    conn = FakeImapConn(uids=b"100 101")
+    conn.header_bytes = (
+        b"From: trusted@qq.com\r\n"
+        b"Message-ID: <internal-message@qq.com>\r\n"
+        b"X-QQ-mid: xmapza28-1t1787022240t2uu07pjf\r\n"
+        b"Subject: internal\r\n"
+        b"Date: Tue, 28 Jul 2026 10:00:00 +0800\r\n\r\n"
+    )
+
+    await asyncio.to_thread(service._check_new_messages, conn)
+
+    assert (
+        service._mail_acl_store.get_pending_entry(
+            "test-agent",
+            "trusted@qq.com",
+        )
+        is None
+    )
+    assert recorder.events[-1]["payload"].get("acl_status") is None
+
+
+async def test_acl_qq_internal_fallback_rejects_explicit_auth_failure(
+    tmp_path,
+    recorder,
+):
+    service, _ = _service(tmp_path, mode="rules_only")
+    service.host = "imap.qq.com"
+    service.push.access_control_enabled = True
+    service._last_uid = 100
+    service._loop = asyncio.get_running_loop()
+    service._mail_acl_store.add_to_whitelist(
+        "test-agent",
+        "trusted@qq.com",
+    )
+    conn = FakeImapConn(uids=b"100 101")
+    conn.header_bytes = (
+        b"From: trusted@qq.com\r\n"
+        b"Message-ID: <forged@qq.com>\r\n"
+        b"X-QQ-mid: xmsmtpt1786700897t2w5aav70\r\n"
+        b"Authentication-Results: mx.qq.com; spf=fail "
+        b"smtp.mailfrom=attacker@evil.example\r\n"
+        b"Subject: forged\r\n"
+        b"Date: Tue, 28 Jul 2026 10:00:00 +0800\r\n\r\n"
+    )
+
+    await asyncio.to_thread(service._check_new_messages, conn)
+
+    assert (
+        service._mail_acl_store.get_pending_entry(
+            "test-agent",
+            "unverified-101@invalid.local",
+        )
+        is not None
+    )
+    assert recorder.events[-1]["payload"]["acl_status"] == "pending"
+
+
+async def test_acl_spoofed_from_uses_return_path_identity(tmp_path, recorder):
+    service, _ = _service(tmp_path, mode="rules_only")
+    service.push.access_control_enabled = True
+    service._last_uid = 100
+    service._loop = asyncio.get_running_loop()
+    service._mail_acl_store.add_to_whitelist(
+        "test-agent",
+        "trusted@example.com",
+    )
+    conn = FakeImapConn(uids=b"100 101")
+    conn.header_bytes = (
+        b"From: trusted@example.com\r\n"
+        b"Return-Path: <attacker@evil.example>\r\n"
+        b"Subject: forged\r\n"
+        b"Date: Tue, 28 Jul 2026 10:00:00 +0800\r\n\r\n"
+    )
+
+    await asyncio.to_thread(service._check_new_messages, conn)
+
+    pending = service._mail_acl_store.get_pending_entry(
+        "test-agent",
+        "attacker@evil.example",
+    )
+    assert pending is not None
+    assert recorder.events[-1]["payload"]["acl_status"] == "pending"
+
+
+async def test_acl_aligned_sender_keeps_whitelist_behavior(tmp_path, recorder):
+    service, _ = _service(tmp_path, mode="rules_only")
+    service.push.access_control_enabled = True
+    service._last_uid = 100
+    service._loop = asyncio.get_running_loop()
+    service._mail_acl_store.add_to_whitelist(
+        "test-agent",
+        "alice@example.com",
+    )
+    conn = FakeImapConn(uids=b"100 101")
+
+    await asyncio.to_thread(service._check_new_messages, conn)
+
+    assert (
+        service._mail_acl_store.get_pending_entry(
+            "test-agent",
+            "alice@example.com",
+        )
+        is None
+    )
+    assert recorder.events[-1]["payload"].get("acl_status") is None
+
+
+async def test_approved_uids_replay_once_and_restart_does_not_repeat(
+    tmp_path,
+):
+    service, _ = _service(tmp_path, mode="rules_only")
+    store = service._mail_acl_store
+    store.add_pending(
+        "test-agent",
+        "alice@example.com",
+        subject="first",
+        uid=101,
+    )
+    store.add_pending(
+        "test-agent",
+        "alice@example.com",
+        subject="second",
+        uid=102,
+    )
+    store.approve_many("test-agent", [("alice@example.com", "")])
+    assert store.get_pending_entry("test-agent", "alice@example.com") is None
+
+    handled: list[int] = []
+
+    async def _successful_wake(_workspace, _agent_id, **kwargs):
+        handled.append(kwargs["uid"])
+        return True
+
+    def _idle_worker():
+        service._stop_event.wait()
+
+    service._worker = _idle_worker
+    with patch(
+        "qwenpaw.app.mail.monitor.wake_agent_for_mail",
+        new=_successful_wake,
+    ):
+        await service.start()
+        for _ in range(50):
+            if not store.get_approved_replay("test-agent"):
+                break
+            await asyncio.sleep(0.01)
+        await service.stop()
+
+    assert handled == [101, 102]
+    assert store.get_approved_replay("test-agent") == []
+
+    # A new monitor instance drains persisted work on start.  Since both UIDs
+    # were already durably acknowledged, neither is handled a second time.
+    restarted, _ = _service(tmp_path, mode="rules_only")
+
+    def _restarted_idle_worker():
+        restarted._stop_event.wait()
+
+    restarted._worker = _restarted_idle_worker
+    with patch(
+        "qwenpaw.app.mail.monitor.wake_agent_for_mail",
+        new=_successful_wake,
+    ):
+        await restarted.start()
+        await asyncio.sleep(0.05)
+        await restarted.stop()
+
+    assert handled == [101, 102]
+
+
+async def test_failed_approved_replay_retries_until_success(tmp_path):
+    service, _ = _service(tmp_path, mode="rules_only")
+    store = service._mail_acl_store
+    store.add_pending(
+        "test-agent",
+        "alice@example.com",
+        subject="first",
+        uid=101,
+    )
+    store.approve_many("test-agent", [("alice@example.com", "")])
+    service._loop = asyncio.get_running_loop()
+
+    attempts: list[int] = []
+    reports: list[bool] = []
+    retry_flags: list[bool] = []
+
+    async def _eventual_wake(**kwargs):
+        attempts.append(kwargs["uid"])
+        reports.append(kwargs["report_failure"])
+        retry_flags.append(kwargs["retry_on_failure"])
+        return len(attempts) > 1
+
+    service._wake_agent = _eventual_wake
+    with patch(
+        "qwenpaw.app.mail.monitor._BACKOFF_INITIAL_SECONDS",
+        0.01,
+    ):
+        assert service.schedule_approved_replay()
+        replay_task = service._approved_replay_task
+        assert replay_task is not None
+        await asyncio.wait_for(replay_task, timeout=1)
+
+    assert store.get_pending_entry("test-agent", "alice@example.com") is None
+    assert attempts == [101, 101]
+    assert reports == [True, False]
+    assert retry_flags == [True, True]
+    assert store.get_approved_replay("test-agent") == []
+
+
+async def test_repeated_replay_schedule_does_not_duplicate_active_uid(
+    tmp_path,
+):
+    service, _ = _service(tmp_path, mode="rules_only")
+    store = service._mail_acl_store
+    store.add_pending(
+        "test-agent",
+        "alice@example.com",
+        subject="first",
+        uid=101,
+    )
+    store.approve_many("test-agent", [("alice@example.com", "")])
+    service._loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    handled: list[int] = []
+
+    async def _blocked_wake(**kwargs):
+        handled.append(kwargs["uid"])
+        started.set()
+        await release.wait()
+        return True
+
+    service._wake_agent = _blocked_wake
+    assert service.schedule_approved_replay()
+    await started.wait()
+    assert service.schedule_approved_replay()
+    assert service.schedule_approved_replay()
+    release.set()
+    replay_task = service._approved_replay_task
+    assert replay_task is not None
+    await replay_task
+
+    assert handled == [101]
+    assert store.get_approved_replay("test-agent") == []
+
+
+async def test_stop_cancels_active_approved_replay_and_keeps_uid(tmp_path):
+    service, _ = _service(tmp_path, mode="rules_only")
+    store = service._mail_acl_store
+    store.add_pending(
+        "test-agent",
+        "alice@example.com",
+        subject="first",
+        uid=101,
+    )
+    store.approve_many("test-agent", [("alice@example.com", "")])
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def _never_wake(**_kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    def _idle_worker():
+        service._stop_event.wait()
+
+    service._wake_agent = _never_wake
+    service._worker = _idle_worker
+    await service.start()
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await asyncio.wait_for(service.stop(), timeout=2)
+
+    assert cancelled.is_set()
+    assert service._approved_replay_task is None
+    assert service._task is None
+    replay = store.get_approved_replay("test-agent")
+    assert [message["uid"] for message in replay[0]["messages"]] == [101]
+
+
+async def test_stop_cancels_never_returning_wake_and_joins_worker(tmp_path):
+    service, _ = _service(tmp_path, mode="agent_all")
+    wake_started = asyncio.Event()
+    wake_cancelled = asyncio.Event()
+    worker_exited = threading.Event()
+
+    async def _never_wake(**_kwargs):
+        wake_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            wake_cancelled.set()
+
+    def _worker_once():
+        try:
+            service._run_wake(
+                uid=101,
+                sender="alice@example.com",
+                subject="hello",
+                date="now",
+                param="",
+            )
+        finally:
+            worker_exited.set()
+
+    service._wake_agent = _never_wake
+    service._worker = _worker_once
+    await service.start()
+    await asyncio.wait_for(wake_started.wait(), timeout=1)
+
+    await asyncio.wait_for(service.stop(), timeout=2)
+
+    assert wake_cancelled.is_set()
+    assert worker_exited.is_set()
+    assert service._task is None
+    assert service._submission_tasks == set()
+    assert service._submission_completions == set()
+
+
 def test_state_round_trip(tmp_path):
     service, _ = _service(tmp_path)
     service._last_uid = 42
@@ -626,11 +1645,134 @@ def test_state_round_trip_with_uidvalidity(tmp_path):
     state = json.loads(
         (tmp_path / "mail_state" / "monitor.json").read_text("utf-8"),
     )
-    assert state == {"last_uid": 42, "uidvalidity": 1234}
+    assert state == {
+        "last_uid": 42,
+        "uidvalidity": 1234,
+        "mailbox_fingerprint": service._mailbox_fingerprint,
+    }
     fresh, _ = _service(tmp_path)
     fresh._load_state()
     assert fresh._last_uid == 42
     assert fresh._stored_uidvalidity == 1234
+
+
+def test_mailbox_switch_resets_watermark_even_when_uidvalidity_matches(
+    tmp_path,
+):
+    service, _ = _service(tmp_path)
+    service._last_uid = 1_785_463_863
+    service._current_uidvalidity = 1
+    assert service._save_state()
+
+    sina_config = _mail_config()
+    sina_config.credential.name = "other-account"
+    sina_config.credential.domain = "sina.com"
+    switched = MailMonitorService(
+        agent_id="test-agent",
+        workspace=FakeWorkspace(tmp_path),
+        mail_config=sina_config,
+    )
+    switched._load_state()
+
+    assert switched._last_uid is None
+    assert switched._delivery_failures == {}
+    switched._current_uidvalidity = 1
+    switched._reconcile_uidvalidity()
+
+    processed: list[int] = []
+    switched._process_new_email = (
+        lambda _conn, uid, _envelope: processed.append(uid)
+    )
+    conn = FakeImapConn(uids=b"67")
+    switched._check_new_messages(conn)
+    assert switched._last_uid == 67
+    assert not processed
+
+    conn.search_result = b"67 68"
+    switched._check_new_messages(conn)
+    assert processed == [68]
+
+
+def test_legacy_mailbox_switch_repairs_watermark_above_new_mailbox(tmp_path):
+    state_dir = tmp_path / "mail_state"
+    state_dir.mkdir()
+    (state_dir / "monitor.json").write_text(
+        json.dumps(
+            {
+                "last_uid": 1_785_463_863,
+                "uidvalidity": 1,
+            },
+        ),
+        encoding="utf-8",
+    )
+
+    sina_config = _mail_config()
+    sina_config.credential.name = "other-account"
+    sina_config.credential.domain = "sina.com"
+    switched = MailMonitorService(
+        agent_id="test-agent",
+        workspace=FakeWorkspace(tmp_path),
+        mail_config=sina_config,
+    )
+    switched._load_state()
+    switched._current_uidvalidity = 1
+    switched._reconcile_uidvalidity()
+
+    processed: list[int] = []
+    switched._process_new_email = (
+        lambda _conn, uid, _envelope: processed.append(uid)
+    )
+    conn = FakeImapConn(uids=b"67")
+    switched._check_new_messages(conn)
+    assert switched._last_uid == 67
+    assert not processed
+
+    conn.search_result = b"67 68"
+    switched._check_new_messages(conn)
+    assert processed == [68]
+
+
+def test_mailbox_credential_rotation_keeps_watermark(tmp_path):
+    service, _ = _service(tmp_path)
+    service._last_uid = 42
+    service._current_uidvalidity = 1
+    assert service._save_state()
+
+    rotated_config = _mail_config()
+    rotated_config.credential.auth_code = "b" * 16
+    rotated = MailMonitorService(
+        agent_id="test-agent",
+        workspace=FakeWorkspace(tmp_path),
+        mail_config=rotated_config,
+    )
+    rotated._load_state()
+
+    assert rotated._last_uid == 42
+
+
+def test_empty_mailbox_persists_zero_baseline(tmp_path):
+    service, _ = _service(tmp_path)
+    service._current_uidvalidity = 1
+
+    service._check_new_messages(FakeImapConn(uids=b""))
+
+    assert service._last_uid == 0
+    state = json.loads(
+        (tmp_path / "mail_state" / "monitor.json").read_text("utf-8"),
+    )
+    assert state["last_uid"] == 0
+    assert state["mailbox_fingerprint"] == service._mailbox_fingerprint
+
+
+def test_empty_mailbox_repairs_stale_watermark(tmp_path):
+    service, _ = _service(tmp_path)
+    service._last_uid = 42
+    service._current_uidvalidity = 1
+
+    service._check_new_messages(FakeImapConn(uids=b""))
+
+    assert service._last_uid == 0
+    assert service._delivery_failures == {}
 
 
 # ── UIDVALIDITY reconciliation ───────────────────────────────────
@@ -704,7 +1846,11 @@ async def test_uidvalidity_reset_rebaselines_without_processing(
     state = json.loads(
         (state_dir / "monitor.json").read_text("utf-8"),
     )
-    assert state == {"last_uid": 3, "uidvalidity": 5678}
+    assert state == {
+        "last_uid": 3,
+        "uidvalidity": 5678,
+        "mailbox_fingerprint": service._mailbox_fingerprint,
+    }
 
 
 # ── IMAP response typ defence ────────────────────────────────────
@@ -731,6 +1877,23 @@ def test_fetch_envelope_raises_on_bad_typ(tmp_path):
     conn.fetch_typ = "NO"
     with pytest.raises(imaplib.IMAP4.error, match="UID FETCH"):
         service._fetch_envelope(conn, 5)
+
+
+def test_fetch_envelope_requests_transport_sender(tmp_path):
+    service, _ = _service(tmp_path)
+    conn = FakeImapConn()
+
+    envelope = service._fetch_envelope(conn, 5)
+
+    assert envelope["return_path"] == "<alice@example.com>"
+    fetch = next(call for call in conn.calls if call[0] == "FETCH")
+    assert "RETURN-PATH" in fetch[2]
+    assert "AUTHENTICATION-RESULTS" in fetch[2]
+    assert "RECEIVED-SPF" in fetch[2]
+    assert "RECEIVED" in fetch[2]
+    assert "X-CM-TRANSID" in fetch[2]
+    assert "MESSAGE-ID" in fetch[2]
+    assert "X-QQ-MID" in fetch[2]
 
 
 # ── wake prompt ───────────────────────────────────────────────────────

@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """Unit tests for _validate_mail_config push-rule validation."""
+
 from __future__ import annotations
 
 import asyncio
+import stat
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,13 +14,16 @@ import yaml
 from fastapi import HTTPException
 
 from qwenpaw.app.routers.agents import (
+    CopyAgentRequest,
     CreateAgentRequest,
     _build_copied_agent_config,
     _build_qwenpawmail_env,
     _ensure_mail_triage_file,
     _generate_qwenpawmail_driver_card,
     _resolve_qwenpawmail_command,
+    _sync_qwenpawmail_driver_card,
     _validate_mail_config,
+    copy_agent,
     create_agent,
     update_agent,
 )
@@ -242,6 +247,122 @@ def test_create_agent_rejects_mail_for_third_party_backend():
     assert "qwenpaw backend" in exc_info.value.detail
 
 
+def test_create_mail_agent_driver_failure_is_not_committed(tmp_path):
+    config = SimpleNamespace(
+        agents=SimpleNamespace(
+            profiles={},
+            agent_order=[],
+            language="en",
+        ),
+    )
+    request = CreateAgentRequest(
+        id="mail-create-failure",
+        name="mailbot",
+        workspace_dir=str(tmp_path),
+        mail=_valid_mail(),
+    )
+    with (
+        patch(
+            "qwenpaw.app.routers.agents.load_config",
+            return_value=config,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents._initialize_agent_workspace",
+        ),
+        patch(
+            "qwenpaw.app.routers.agents._sync_qwenpawmail_driver_card",
+            return_value=False,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.save_config",
+        ) as save_root,
+        patch(
+            "qwenpaw.app.routers.agents.save_agent_config",
+        ) as save_agent,
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(create_agent(request=request, http_request=None))
+
+    assert exc_info.value.status_code == 500
+    assert config.agents.profiles == {}
+    save_root.assert_not_called()
+    save_agent.assert_not_called()
+
+
+def test_copy_mail_agent_driver_failure_is_not_committed(
+    tmp_path,
+    monkeypatch,
+):
+    source_workspace = tmp_path / "source"
+    source_workspace.mkdir()
+    config = SimpleNamespace(
+        agents=SimpleNamespace(
+            profiles={
+                "source": SimpleNamespace(
+                    workspace_dir=str(source_workspace),
+                    enabled=True,
+                ),
+            },
+            agent_order=["source"],
+            language="en",
+        ),
+    )
+    source_config = AgentProfileConfig(
+        id="source",
+        name="source",
+        workspace_dir=str(source_workspace),
+        backend="qwenpaw",
+        mail=_valid_mail(),
+    )
+    monkeypatch.setattr(
+        "qwenpaw.app.routers.agents.WORKING_DIR",
+        tmp_path,
+    )
+    with (
+        patch(
+            "qwenpaw.app.routers.agents.load_config",
+            return_value=config,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.load_agent_config",
+            return_value=source_config,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents._generate_unique_id",
+            return_value="copy-failure",
+        ),
+        patch(
+            "qwenpaw.app.routers.agents._initialize_agent_workspace",
+        ),
+        patch(
+            "qwenpaw.app.routers.agents._copy_selected_workspace_files",
+        ),
+        patch(
+            "qwenpaw.app.routers.agents._sync_qwenpawmail_driver_card",
+            return_value=False,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.save_config",
+        ) as save_root,
+        patch(
+            "qwenpaw.app.routers.agents.save_agent_config",
+        ) as save_agent,
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(
+                copy_agent(
+                    agentId="source",
+                    request=CopyAgentRequest(name="copy"),
+                    http_request=None,
+                ),
+            )
+
+    assert exc_info.value.status_code == 500
+    assert set(config.agents.profiles) == {"source"}
+    save_root.assert_not_called()
+    save_agent.assert_not_called()
+
+
 def _fake_global_config(agent_id: str) -> SimpleNamespace:
     return SimpleNamespace(
         agents=SimpleNamespace(
@@ -254,12 +375,15 @@ def test_update_agent_rejects_mail_when_existing_backend_third_party():
     # Request does not set backend explicitly: the effective backend
     # must fall back to the existing third-party config.
     body = AgentProfileConfig(id="a1", name="bot", mail=_valid_mail())
-    with patch(
-        "qwenpaw.app.routers.agents.load_config",
-        return_value=_fake_global_config("a1"),
-    ), patch(
-        "qwenpaw.app.routers.agents.load_agent_config",
-        return_value=SimpleNamespace(backend="claude_code"),
+    with (
+        patch(
+            "qwenpaw.app.routers.agents.load_config",
+            return_value=_fake_global_config("a1"),
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.load_agent_config",
+            return_value=SimpleNamespace(backend="claude_code"),
+        ),
     ):
         with pytest.raises(HTTPException) as exc_info:
             asyncio.run(
@@ -276,12 +400,15 @@ def test_update_agent_rejects_mail_with_explicit_third_party_backend():
         backend="claude_code",
         mail=_valid_mail(),
     )
-    with patch(
-        "qwenpaw.app.routers.agents.load_config",
-        return_value=_fake_global_config("a1"),
-    ), patch(
-        "qwenpaw.app.routers.agents.load_agent_config",
-        return_value=SimpleNamespace(backend="qwenpaw"),
+    with (
+        patch(
+            "qwenpaw.app.routers.agents.load_config",
+            return_value=_fake_global_config("a1"),
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.load_agent_config",
+            return_value=SimpleNamespace(backend="qwenpaw"),
+        ),
     ):
         with pytest.raises(HTTPException) as exc_info:
             asyncio.run(
@@ -309,15 +436,19 @@ def test_update_agent_lock_recheck_rejects_stale_backend_snapshot():
         )
         apply_update(stale)
 
-    with patch(
-        "qwenpaw.app.routers.agents.load_config",
-        return_value=_fake_global_config("a1"),
-    ), patch(
-        "qwenpaw.app.routers.agents.load_agent_config",
-        return_value=SimpleNamespace(backend="qwenpaw"),
-    ), patch(
-        "qwenpaw.app.routers.agents.update_agent_config_async",
-        new=_fake_update_locked,
+    with (
+        patch(
+            "qwenpaw.app.routers.agents.load_config",
+            return_value=_fake_global_config("a1"),
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.load_agent_config",
+            return_value=SimpleNamespace(backend="qwenpaw"),
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.update_agent_config_async",
+            new=_fake_update_locked,
+        ),
     ):
         with pytest.raises(HTTPException) as exc_info:
             asyncio.run(
@@ -363,6 +494,253 @@ def test_driver_card_uses_resolved_command(tmp_path, monkeypatch):
     # The old personal-machine interpreter path must never leak in.
     card_text = card_path.read_text(encoding="utf-8")
     assert "/Users/luohh/Documents/mcp" not in card_text
+    assert stat.S_IMODE(card_path.stat().st_mode) == 0o600
+
+
+def _run_mail_revocation_update(tmp_path, body: AgentProfileConfig):
+    persisted = [
+        AgentProfileConfig(
+            id="a1",
+            name="bot",
+            workspace_dir=str(tmp_path),
+            backend="qwenpaw",
+            mail=_valid_mail(),
+        ),
+    ]
+    _generate_qwenpawmail_driver_card(tmp_path, persisted[0].mail)
+
+    async def _fake_update(_agent_id, apply_update):
+        updated = persisted[0].model_copy(deep=True)
+        apply_update(updated)
+        persisted[0] = updated
+        return updated
+
+    def _fake_load(_agent_id):
+        return persisted[0]
+
+    global_config = _fake_global_config("a1")
+    global_config.agents.profiles["a1"].workspace_dir = str(tmp_path)
+    global_config.agents.language = "en"
+    with (
+        patch(
+            "qwenpaw.app.routers.agents.load_config",
+            return_value=global_config,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.load_agent_config",
+            side_effect=_fake_load,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.update_agent_config_async",
+            new=_fake_update,
+        ),
+        patch("qwenpaw.app.routers.agents.schedule_agent_reload"),
+    ):
+        asyncio.run(
+            update_agent(agentId="a1", agent_config=body, request=None),
+        )
+    return persisted[0]
+
+
+def test_update_personal_mail_to_none_revokes_driver_card(tmp_path):
+    updated = _run_mail_revocation_update(
+        tmp_path,
+        AgentProfileConfig(id="a1", name="bot", mail=None),
+    )
+    card_path = tmp_path / "drivers" / "mcp" / "qwenpawmail.yaml"
+    assert updated.mail is None
+    assert not card_path.exists()
+    # Driver discovery has no card to reload.
+    from qwenpaw.drivers.storage import list_card_paths
+
+    assert list_card_paths(tmp_path / "drivers") == []
+    # Repeated close is idempotent.
+    _sync_qwenpawmail_driver_card(tmp_path, None, "qwenpaw")
+    assert not card_path.exists()
+
+
+def test_update_qwenpaw_to_third_party_revokes_driver_card(tmp_path):
+    updated = _run_mail_revocation_update(
+        tmp_path,
+        AgentProfileConfig(
+            id="a1",
+            name="bot",
+            backend="claude_code",
+            mail=None,
+        ),
+    )
+    assert updated.backend == "claude_code"
+    assert updated.mail is None
+    assert not (tmp_path / "drivers" / "mcp" / "qwenpawmail.yaml").exists()
+
+
+def test_failed_driver_rewrite_revokes_stale_credentials(tmp_path):
+    card_path = tmp_path / "drivers" / "mcp" / "qwenpawmail.yaml"
+    card_path.parent.mkdir(parents=True)
+    card_path.write_text("old plaintext credentials", encoding="utf-8")
+    with patch(
+        "qwenpaw.app.routers.agents._generate_qwenpawmail_driver_card",
+        return_value=False,
+    ):
+        assert not _sync_qwenpawmail_driver_card(
+            tmp_path,
+            _valid_mail(),
+            "qwenpaw",
+            force_rewrite=True,
+        )
+    assert not card_path.exists()
+
+
+def test_update_driver_failure_restores_previous_config(tmp_path):
+    previous_mail = _valid_mail()
+    updated_mail = _valid_mail()
+    updated_mail.credential.auth_code = "b" * 16
+    persisted = [
+        AgentProfileConfig(
+            id="a1",
+            name="bot",
+            workspace_dir=str(tmp_path),
+            backend="qwenpaw",
+            mail=previous_mail,
+        ),
+    ]
+
+    async def _fake_update(_agent_id, apply_update):
+        candidate = persisted[0].model_copy(deep=True)
+        apply_update(candidate)
+        persisted[0] = candidate
+        return candidate
+
+    def _fake_load(_agent_id):
+        return persisted[0]
+
+    def _fake_save(_agent_id, config):
+        persisted[0] = config.model_copy(deep=True)
+
+    global_config = _fake_global_config("a1")
+    global_config.agents.profiles["a1"].workspace_dir = str(tmp_path)
+    global_config.agents.language = "en"
+    body = AgentProfileConfig(id="a1", name="bot", mail=updated_mail)
+
+    with (
+        patch(
+            "qwenpaw.app.routers.agents.load_config",
+            return_value=global_config,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.load_agent_config",
+            side_effect=_fake_load,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.update_agent_config_async",
+            new=_fake_update,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.save_agent_config",
+            side_effect=_fake_save,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents._sync_qwenpawmail_driver_card",
+            side_effect=[False, True],
+        ) as sync_driver,
+        patch(
+            "qwenpaw.app.routers.agents.schedule_agent_reload",
+        ) as reload_agent,
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(
+                update_agent(
+                    agentId="a1",
+                    agent_config=body,
+                    request=None,
+                ),
+            )
+
+    assert exc_info.value.status_code == 500
+    assert "previous mail configuration was restored" in exc_info.value.detail
+    assert persisted[0].mail is not None
+    assert persisted[0].mail.credential.auth_code == "a" * 16
+    assert sync_driver.call_count == 2
+    reload_agent.assert_not_called()
+
+
+def test_update_failed_new_card_rebuilds_old_credentials(tmp_path):
+    previous_mail = _valid_mail()
+    updated_mail = _valid_mail()
+    updated_mail.credential.auth_code = "b" * 16
+    persisted = [
+        AgentProfileConfig(
+            id="a1",
+            name="bot",
+            workspace_dir=str(tmp_path),
+            backend="qwenpaw",
+            mail=previous_mail,
+        ),
+    ]
+    assert _generate_qwenpawmail_driver_card(tmp_path, previous_mail)
+
+    async def _fake_update(_agent_id, apply_update):
+        candidate = persisted[0].model_copy(deep=True)
+        apply_update(candidate)
+        persisted[0] = candidate
+        return candidate
+
+    def _fake_load(_agent_id):
+        return persisted[0]
+
+    def _fake_save(_agent_id, config):
+        persisted[0] = config.model_copy(deep=True)
+
+    def _fail_only_new_credentials(workspace_dir, mail):
+        if mail.credential.auth_code == "b" * 16:
+            return False
+        return _generate_qwenpawmail_driver_card(workspace_dir, mail)
+
+    global_config = _fake_global_config("a1")
+    global_config.agents.profiles["a1"].workspace_dir = str(tmp_path)
+    global_config.agents.language = "en"
+    body = AgentProfileConfig(id="a1", name="bot", mail=updated_mail)
+
+    with (
+        patch(
+            "qwenpaw.app.routers.agents.load_config",
+            return_value=global_config,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.load_agent_config",
+            side_effect=_fake_load,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.update_agent_config_async",
+            new=_fake_update,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.save_agent_config",
+            side_effect=_fake_save,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents._generate_qwenpawmail_driver_card",
+            side_effect=_fail_only_new_credentials,
+        ),
+        patch(
+            "qwenpaw.app.routers.agents.schedule_agent_reload",
+        ) as reload_agent,
+    ):
+        with pytest.raises(HTTPException):
+            asyncio.run(
+                update_agent(
+                    agentId="a1",
+                    agent_config=body,
+                    request=None,
+                ),
+            )
+
+    card_path = tmp_path / "drivers" / "mcp" / "qwenpawmail.yaml"
+    card = yaml.safe_load(card_path.read_text("utf-8"))
+    assert persisted[0].mail is not None
+    assert persisted[0].mail.credential.auth_code == "a" * 16
+    assert card["endpoint"]["env"]["QWENPAWMAIL_AUTH_CODE"] == "a" * 16
+    reload_agent.assert_not_called()
 
 
 def test_copied_agent_drops_mail_for_third_party_backend(tmp_path):
