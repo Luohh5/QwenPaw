@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import time
 from contextlib import AsyncExitStack
 from datetime import timedelta
 from typing import Any, Literal
@@ -27,6 +29,7 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.exceptions import McpError
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +58,9 @@ _TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
     ConnectionResetError,
     BrokenPipeError,
 )
+_TRANSPORT_MCP_MESSAGES = frozenset(
+    {"session terminated", "connection closed"},
+)
 
 
 # How long ``list_tools`` waits for an in-flight reconnect before raising.
@@ -73,7 +79,18 @@ def _is_transport_error(exc: BaseException) -> bool:
     reconnect rather than treat the failure as permanent.  See
     ``_TRANSPORT_ERRORS`` for the full list of recognised exception types.
     """
-    return isinstance(exc, _TRANSPORT_ERRORS)
+    if isinstance(exc, _TRANSPORT_ERRORS):
+        return True
+
+    if isinstance(exc, McpError):
+        error = getattr(exc, "error", None)
+        message = str(getattr(error, "message", exc)).strip().casefold()
+        return message in _TRANSPORT_MCP_MESSAGES
+
+    sub_excs = getattr(exc, "exceptions", None)
+    if sub_excs:
+        return any(_is_transport_error(item) for item in sub_excs)
+    return False
 
 
 def _is_401_error(exc: BaseException) -> bool:
@@ -120,6 +137,15 @@ class _MCPClientMixin:
     _ready_event: asyncio.Event
     _lifecycle_task: asyncio.Task | None
 
+    # Exponential backoff & circuit breaker state
+    _reconnect_delay: float
+    _consecutive_failures: int
+    _circuit_open: bool
+    _circuit_open_since: float
+    _max_reconnect_delay: float
+    _circuit_breaker_threshold: int
+    _circuit_half_open_after: float
+
     # ------------------------------------------------------------------
     # Transport hook (implemented by each concrete subclass)
     # ------------------------------------------------------------------
@@ -143,6 +169,7 @@ class _MCPClientMixin:
     # ------------------------------------------------------------------
 
     async def _run_lifecycle(self) -> None:  # noqa: C901
+        # pylint: disable=too-many-statements
         """Run MCP client lifecycle in a dedicated task.
 
         This ensures ``__aenter__`` and ``__aexit__`` are called in the
@@ -164,6 +191,10 @@ class _MCPClientMixin:
 
                     self.is_connected = True
                     self._ready_event.set()
+                    # Reset backoff & circuit breaker on success
+                    self._reconnect_delay = 1.0
+                    self._consecutive_failures = 0
+                    self._circuit_open = False
                     logger.info(f"MCP client connected: {self.name}")
 
                     await self._wait_for_reload_or_stop()
@@ -200,15 +231,67 @@ class _MCPClientMixin:
                     self._stop_event.set()
                     self._ready_event.set()
                     return
+                self._consecutive_failures += 1
                 logger.error(
-                    f"Error in MCP client lifecycle for {self.name}: {e}",
+                    f"Error in MCP client lifecycle for {self.name} "
+                    f"(failure {self._consecutive_failures}/"
+                    f"{self._circuit_breaker_threshold}): {e}",
                     exc_info=True,
                 )
                 self.session = None
                 self.is_connected = False
                 self._cached_tools = None
                 self._ready_event.clear()
-                await asyncio.sleep(1)
+
+                # Circuit breaker: stop retrying after too many failures
+                if (
+                    self._consecutive_failures
+                    >= self._circuit_breaker_threshold
+                ):
+                    self._circuit_open = True
+                    self._circuit_open_since = time.monotonic()
+                    logger.error(
+                        "MCP client '%s': circuit breaker OPEN after %d "
+                        "consecutive failures. Automatic reconnect "
+                        "suspended. Will probe after %.0fs.",
+                        self.name,
+                        self._consecutive_failures,
+                        self._circuit_half_open_after,
+                    )
+                    # Wait for half-open probe interval or stop signal
+                    try:
+                        await asyncio.wait_for(
+                            self._stop_event.wait(),
+                            timeout=self._circuit_half_open_after,
+                        )
+                    except asyncio.TimeoutError:
+                        # Half-open: allow one probe attempt
+                        logger.info(
+                            "MCP client '%s': circuit half-open, "
+                            "attempting probe reconnect.",
+                            self.name,
+                        )
+                        self._circuit_open = False
+                        self._reconnect_delay = 1.0
+                    continue
+
+                # Exponential backoff with jitter
+                jittered_delay = self._reconnect_delay * (
+                    0.5 + random.random() * 0.5
+                )
+                logger.info(
+                    "MCP client '%s': reconnecting in %.1fs "
+                    "(backoff=%.1fs).",
+                    self.name,
+                    jittered_delay,
+                    self._reconnect_delay,
+                )
+                await asyncio.sleep(jittered_delay)
+                # Increase delay for next attempt (capped)
+                self._reconnect_delay = min(
+                    self._reconnect_delay * 2,
+                    self._max_reconnect_delay,
+                )
 
         logger.info(f"MCP client lifecycle task exited: {self.name}")
 
@@ -245,6 +328,10 @@ class _MCPClientMixin:
         self._stop_event.clear()
         self._oauth_required = False
         self._ready_event.clear()
+        # Reset circuit breaker state for fresh connect attempt
+        self._reconnect_delay = 1.0
+        self._consecutive_failures = 0
+        self._circuit_open = False
         self._lifecycle_task = asyncio.create_task(self._run_lifecycle())
 
         try:
@@ -326,6 +413,12 @@ class _MCPClientMixin:
                 or if the reconnect does not complete within
                 ``_LIST_TOOLS_RECONNECT_WAIT`` seconds.
         """
+        if self._circuit_open:
+            raise RuntimeError(
+                f"MCP client '{self.name}' unavailable (circuit open after "
+                f"{self._consecutive_failures} consecutive failures)",
+            )
+
         if not self.is_connected:
             has_task = self._lifecycle_task is not None and not (
                 self._lifecycle_task.done()
@@ -350,8 +443,34 @@ class _MCPClientMixin:
             try:
                 res = await self.session.list_tools()
             except Exception as exc:
-                self._handle_transport_error(exc)
-                raise
+                if not self._handle_transport_error(exc):
+                    raise
+
+                # Keep known schemas available during reconnection.
+                if self._cached_tools is not None:
+                    logger.warning(
+                        "MCP client '%s' session failed during list_tools; "
+                        "serving cached schemas while reconnecting.",
+                        self.name,
+                    )
+                    return self._cached_tools
+
+                # Cold discovery waits for reconnection and retries once.
+                try:
+                    await asyncio.wait_for(
+                        self._ready_event.wait(),
+                        timeout=_LIST_TOOLS_RECONNECT_WAIT,
+                    )
+                except asyncio.TimeoutError:
+                    raise exc from None
+
+                if not self.is_connected or self.session is None:
+                    raise exc from None
+                try:
+                    res = await self.session.list_tools()
+                except Exception as retry_exc:
+                    self._handle_transport_error(retry_exc)
+                    raise
             self._cached_tools = res.tools
             return res.tools
 
@@ -500,7 +619,7 @@ class _MCPClientMixin:
         await asyncio.gather(task, return_exceptions=True)
         self._clear_lifecycle_state(task)
 
-    def _handle_transport_error(self, exc: BaseException) -> None:
+    def _handle_transport_error(self, exc: BaseException) -> bool:
         """Mark the client as disconnected and schedule a reconnect when *exc*
         indicates a transport/stream failure rather than an MCP-level error.
 
@@ -533,9 +652,12 @@ class _MCPClientMixin:
         ``session`` reference is never reached before the lifecycle task
         replaces it.  Clearing it here would require a lock (the lifecycle
         task also writes ``session``), adding unnecessary complexity.
+
+        Returns:
+            Whether recovery state was applied.
         """
         if not _is_transport_error(exc):
-            return
+            return False
         logger.warning(
             "Transport error on MCP client '%s' (%s: %s); "
             "marking as disconnected and scheduling reconnect.",
@@ -560,6 +682,7 @@ class _MCPClientMixin:
         # session is left as-is; see docstring above.
         if not self._stop_event.is_set():
             self._reload_event.set()
+        return True
 
     async def _wait_for_reload_or_stop(self) -> None:
         """Wait for lifecycle control events without polling."""
@@ -585,6 +708,12 @@ class _MCPClientMixin:
         Raises:
             RuntimeError: If not connected or session not initialized
         """
+        if self._circuit_open:
+            raise RuntimeError(
+                f"MCP client '{self.name}' unavailable (circuit open after "
+                f"{self._consecutive_failures} consecutive failures)",
+            )
+
         if not self.is_connected:
             raise RuntimeError(
                 f"MCP client '{self.name}' is not connected. "
@@ -671,6 +800,15 @@ class StdIOStatefulClient(_MCPClientMixin):
         self._ready_event = asyncio.Event()
         self._stop_event = asyncio.Event()
         self._oauth_required = False
+
+        # Exponential backoff & circuit breaker
+        self._reconnect_delay: float = 1.0
+        self._consecutive_failures: int = 0
+        self._circuit_open: bool = False
+        self._circuit_open_since: float = 0.0
+        self._max_reconnect_delay: float = 60.0
+        self._circuit_breaker_threshold: int = 5
+        self._circuit_half_open_after: float = 300.0
 
         # Session state
         self.session: ClientSession | None = None
@@ -759,6 +897,15 @@ class HttpStatefulClient(_MCPClientMixin):
         self._ready_event = asyncio.Event()
         self._stop_event = asyncio.Event()
         self._oauth_required = False
+
+        # Exponential backoff & circuit breaker
+        self._reconnect_delay: float = 1.0
+        self._consecutive_failures: int = 0
+        self._circuit_open: bool = False
+        self._circuit_open_since: float = 0.0
+        self._max_reconnect_delay: float = 60.0
+        self._circuit_breaker_threshold: int = 5
+        self._circuit_half_open_after: float = 300.0
 
         # Session state
         self.session: ClientSession | None = None
