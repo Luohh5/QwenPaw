@@ -40,7 +40,8 @@ from qwenpaw.drivers.credentials.bindings import (
     resolve_credentials,
 )
 from qwenpaw.drivers.credentials.providers import build_provider
-from qwenpaw.drivers.storage import load_card
+from qwenpaw.drivers.contracts import DriverPolicy, PolicyRule, PolicyTarget
+from qwenpaw.drivers.storage import dump_card, load_card
 
 
 def _valid_mail(push: AgentMailPushConfig | None = None) -> AgentMailConfig:
@@ -498,6 +499,7 @@ def test_driver_card_uses_resolved_command(tmp_path, monkeypatch):
         "kind": "static",
         "ref": AGENT_MAIL_CREDENTIAL_REF,
     }
+    assert card["policy"] == {"default_effect": "ask", "rules": []}
     credential_text = (tmp_path / "credentials.yaml").read_text("utf-8")
     assert "a" * 16 not in credential_text
     assert "ENC:" in credential_text
@@ -546,6 +548,57 @@ credentials: {}
     rewritten = card_path.read_text("utf-8")
     assert "a" * 16 not in rewritten
     assert AGENT_MAIL_CREDENTIAL_REF in rewritten
+
+
+def test_sync_preserves_policy_enabled_and_tool_whitelist(tmp_path):
+    original_mail = _valid_mail()
+    assert _generate_qwenpawmail_driver_card(tmp_path, original_mail)
+    card_path = tmp_path / "drivers" / "mcp" / "qwenpawmail.yaml"
+    card = load_card(card_path)
+    expected_policy = DriverPolicy(
+        default_effect="allow",
+        rules=[
+            PolicyRule(
+                effect="deny",
+                target=PolicyTarget(kind="tool", name="delete_message"),
+            ),
+        ],
+    )
+    card.policy = expected_policy
+    card.enabled = False
+    card.config["tools"] = ["list_messages", "get_message"]
+    dump_card(card, card_path)
+
+    # Backend restart synchronization must retain user-controlled card state.
+    assert _sync_qwenpawmail_driver_card(
+        tmp_path,
+        original_mail,
+        "qwenpaw",
+    )
+    restarted = load_card(card_path)
+    assert restarted.policy == expected_policy
+    assert restarted.enabled is False
+    assert restarted.config["tools"] == ["list_messages", "get_message"]
+
+    # Editing the mailbox must update credentials without resetting that state.
+    updated_mail = _valid_mail()
+    updated_mail.credential.name = "updated"
+    updated_mail.credential.auth_code = "b" * 16
+    assert _sync_qwenpawmail_driver_card(
+        tmp_path,
+        updated_mail,
+        "qwenpaw",
+        force_rewrite=True,
+    )
+    updated = load_card(card_path)
+    assert updated.endpoint["env"]["QWENPAWMAIL_EMAIL"] == "updated@163.com"
+    assert updated.policy == expected_policy
+    assert updated.enabled is False
+    assert updated.config["tools"] == ["list_messages", "get_message"]
+    credential = AsyncCredentialStore(
+        tmp_path / "credentials.yaml",
+    ).get_sync(AGENT_MAIL_CREDENTIAL_REF)
+    assert credential.secrets["auth_code"] == "b" * 16
 
 
 def _run_mail_revocation_update(tmp_path, body: AgentProfileConfig):

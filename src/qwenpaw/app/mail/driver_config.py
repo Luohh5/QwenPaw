@@ -18,8 +18,9 @@ from ...config.config import (
     AgentMailConfig,
     save_agent_mail_credentials,
 )
-from ...drivers.contracts import CredentialRef, DriverCard
-from ...drivers.storage import dump_card
+from ...drivers.contracts import CredentialRef, DriverCard, DriverPolicy
+from ...drivers.errors import DriverCardError
+from ...drivers.storage import dump_card, load_card
 from ...utils.logging import sanitize_log_value
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,21 @@ def resolve_qwenpawmail_command() -> str:
     except (ImportError, ValueError):
         pass
     return "python"
+
+
+def _load_managed_qwenpawmail_card(path: Path) -> DriverCard | None:
+    """Load an existing managed card whose user policy must be retained."""
+    if not is_managed_qwenpawmail_card(path):
+        return None
+    try:
+        return load_card(path)
+    except DriverCardError as exc:
+        logger.warning(
+            "Failed to preserve invalid qwenpawmail DriverCard %s: %s",
+            sanitize_log_value(path),
+            sanitize_log_value(exc),
+        )
+        return None
 
 
 def build_qwenpawmail_env(
@@ -105,6 +121,8 @@ def generate_qwenpawmail_driver_card(
 ) -> bool:
     """Persist mail secrets and publish a secret-free qwenpawmail card."""
     try:
+        card_path = workspace_dir / "drivers" / "mcp" / "qwenpawmail.yaml"
+        existing = _load_managed_qwenpawmail_card(card_path)
         (workspace_dir / "mail_state").mkdir(parents=True, exist_ok=True)
         save_agent_mail_credentials(workspace_dir, mail)
         env = build_qwenpawmail_env(mail, workspace_dir)
@@ -133,17 +151,27 @@ def generate_qwenpawmail_driver_card(
                 if has_runtime_mail_credential
                 else {}
             ),
-            config={
-                "display_name": "qwenpawmail",
-                "description": "",
-                "tools": None,
-                "managed_by": "agent_mail",
-            },
+            config=(
+                {
+                    **existing.config,
+                    "managed_by": "agent_mail",
+                }
+                if existing is not None
+                else {
+                    "display_name": "qwenpawmail",
+                    "description": "",
+                    "tools": None,
+                    "managed_by": "agent_mail",
+                }
+            ),
+            enabled=existing.enabled if existing is not None else True,
+            policy=(
+                existing.policy
+                if existing is not None
+                else DriverPolicy(default_effect="ask", rules=[])
+            ),
         )
-        dump_card(
-            card,
-            workspace_dir / "drivers" / "mcp" / "qwenpawmail.yaml",
-        )
+        dump_card(card, card_path)
         return True
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning(
