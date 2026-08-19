@@ -78,3 +78,45 @@ describe.each(["personal", "dedicated"] as const)(
     });
   },
 );
+
+describe("AgentModal dedicated mailbox credential", () => {
+  it("shows one optional provider credential and no registration secrets", async () => {
+    render(<Harness mailMode="dedicated" />);
+
+    const credential = await screen.findByLabelText(
+      "agent.mailAuthCodeOptional",
+    );
+    expect(credential).not.toHaveAttribute("aria-required", "true");
+    expect(
+      screen.queryByLabelText("agent.mailPassword"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("agent.mailPhone")).not.toBeInTheDocument();
+  });
+
+  it("requires the final mailbox name after a credential is entered", async () => {
+    const user = userEvent.setup();
+    render(<Harness mailMode="dedicated" />);
+
+    await user.type(
+      await screen.findByLabelText("agent.mailAuthCodeOptional"),
+      "abcdefghijklmnop",
+    );
+
+    expect(screen.getByLabelText("agent.mailNameDedicated")).toHaveAttribute(
+      "aria-required",
+      "true",
+    );
+  });
+
+  it("uses the provider password label for Aliyun Mail", async () => {
+    const user = userEvent.setup();
+    render(<Harness mailMode="dedicated" />);
+
+    await user.click(await screen.findByLabelText("agent.mailDomain"));
+    await user.click(await screen.findByText("aliyun.com"));
+
+    expect(
+      await screen.findByLabelText("agent.mailCredentialOptional"),
+    ).toBeInTheDocument();
+  });
+});

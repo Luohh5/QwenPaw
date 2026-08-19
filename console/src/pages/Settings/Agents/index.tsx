@@ -260,12 +260,7 @@ export default function AgentsPage() {
                 )
                   ? ""
                   : mail_credential?.provider || "",
-                auth_code:
-                  mail_mode === "personal"
-                    ? mail_credential?.auth_code || ""
-                    : "",
-                password: mail_credential?.password || "",
-                phone_number: mail_credential?.phone_number || "",
+                auth_code: mail_credential?.auth_code || "",
               },
               ...(push ? { push } : {}),
             }

@@ -1027,6 +1027,71 @@ def test_personal_mail_without_name_rejected():
     assert "credential name" in exc_info.value.detail
 
 
+def test_dedicated_mailbox_allows_registration_without_secrets():
+    """Registration starts without persisting password or phone details."""
+    mail = AgentMailConfig(
+        is_new_account=True,
+        credential=AgentMailCredential(
+            name="",
+            domain="163.com",
+            auth_code="",
+        ),
+    )
+
+    _validate_mail_config(mail)
+
+    assert mail.is_new_account is True
+    assert mail.credential.auth_code == ""
+
+
+def test_dedicated_mailbox_credential_completes_provisioning(tmp_path):
+    """The optional credential turns a registered mailbox into a live one."""
+    mail = AgentMailConfig(
+        is_new_account=True,
+        credential=AgentMailCredential(
+            name="registered",
+            domain="163.com",
+            auth_code="a" * 16,
+            password="legacy-password",
+            phone_number="13800000000",
+        ),
+    )
+
+    _validate_mail_config(mail)
+
+    assert mail.is_new_account is False
+    assert mail.credential.password == ""
+    assert mail.credential.phone_number == ""
+    env = _build_qwenpawmail_env(mail, tmp_path)
+    assert env["QWENPAWMAIL_EMAIL"] == "registered@163.com"
+    assert env["QWENPAWMAIL_AUTH_CODE"]["field"] == "auth_code"
+    assert _generate_qwenpawmail_driver_card(tmp_path, mail)
+    card = load_card(tmp_path / "drivers" / "mcp" / "qwenpawmail.yaml")
+    assert card.endpoint["env"]["QWENPAWMAIL_EMAIL"] == "registered@163.com"
+    stored = AsyncCredentialStore(
+        tmp_path / "credentials.yaml",
+    ).get_sync(AGENT_MAIL_CREDENTIAL_REF)
+    assert stored.public["is_new_account"] is False
+    assert stored.secrets == {"auth_code": "a" * 16}
+
+
+def test_dedicated_mailbox_rejects_invalid_optional_auth_code():
+    mail = AgentMailConfig(
+        is_new_account=True,
+        credential=AgentMailCredential(
+            name="registered",
+            domain="gmail.com",
+            auth_code="too-short",
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_mail_config(mail)
+
+    assert exc_info.value.status_code == 400
+    assert "exactly 16 characters" in exc_info.value.detail
+
+
 # ── MAIL_TRIAGE.md seed distribution ──────────────────────────────
 
 

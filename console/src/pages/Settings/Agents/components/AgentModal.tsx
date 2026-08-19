@@ -110,6 +110,10 @@ export function AgentModal({
   const mailMode = Form.useWatch("mail_mode", form);
   const mailPushMode = Form.useWatch(["mail_push", "mode"], form);
   const mailDomain = Form.useWatch(["mail_credential", "domain"], form);
+  const mailCredential = Form.useWatch(
+    ["mail_credential", "auth_code"],
+    form,
+  );
   const selectedBackend = Form.useWatch("backend", form) ?? "qwenpaw";
 
   const isCustomMailDomain =
@@ -465,7 +469,13 @@ export function AgentModal({
           <>
             <Form.Item
               name={["mail_credential", "name"]}
-              label={t("agent.mailNameOptional")}
+              label={t("agent.mailNameDedicated")}
+              rules={[
+                {
+                  required: !!mailCredential,
+                  message: t("agent.mailNameRequired"),
+                },
+              ]}
             >
               <Input />
             </Form.Item>
@@ -504,28 +514,22 @@ export function AgentModal({
               </Form.Item>
             )}
             <Form.Item
-              name={["mail_credential", "password"]}
-              label={t("agent.mailPassword")}
+              name={["mail_credential", "auth_code"]}
+              label={
+                isAuthCodeDomain
+                  ? t("agent.mailAuthCodeOptional")
+                  : t("agent.mailCredentialOptional")
+              }
+              extra={t("agent.mailDedicatedCredentialHint", {
+                credentialHint: t(mailCredentialHintKey),
+              })}
               rules={[
-                {
-                  required: !editingAgent,
-                  message: t("agent.mailPasswordRequired"),
-                },
+                ...(isAuthCodeDomain
+                  ? [{ len: 16, message: t("agent.mailAuthCodeLength") }]
+                  : []),
               ]}
             >
-              <Input.Password />
-            </Form.Item>
-            <Form.Item
-              name={["mail_credential", "phone_number"]}
-              label={t("agent.mailPhone")}
-              rules={[
-                {
-                  required: !editingAgent,
-                  message: t("agent.mailPhoneRequired"),
-                },
-              ]}
-            >
-              <Input />
+              <Input.Password placeholder={t(mailCredentialHintKey)} />
             </Form.Item>
           </>
         )}

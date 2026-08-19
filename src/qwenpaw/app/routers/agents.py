@@ -1892,38 +1892,38 @@ def _validate_mail_config(mail: AgentMailConfig) -> None:
                 )
 
     if mail.is_new_account:
-        if not credential.password or not credential.phone_number:
+        # Registration secrets are entered directly on the provider page and
+        # are no longer part of QwenPaw's dedicated-mailbox form.  A blank
+        # auth_code means registration is still pending; supplying the final
+        # provider credential completes provisioning in the same UI.
+        credential.password = ""
+        credential.phone_number = ""
+        if not credential.auth_code:
+            return
+        mail.is_new_account = False
+
+    if domain in _AUTH_CODE_16_CHAR_DOMAINS:
+        if len(credential.auth_code) != 16:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "password and phone_number are required "
-                    "for a dedicated new mailbox"
+                    "auth_code must be exactly 16 characters "
+                    "(authorization code or app-specific password)"
                 ),
             )
-        credential.auth_code = ""
-    else:
-        if domain in _AUTH_CODE_16_CHAR_DOMAINS:
-            if len(credential.auth_code) != 16:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "auth_code must be exactly 16 characters "
-                        "(authorization code or app-specific password)"
-                    ),
-                )
-        elif not credential.auth_code:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "auth_code (login password or client-specific "
-                    "password) is required"
-                ),
-            )
-        if not credential.name:
-            raise HTTPException(
-                status_code=400,
-                detail="credential name (mailbox username) is required",
-            )
+    elif not credential.auth_code:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "auth_code (login password or client-specific "
+                "password) is required"
+            ),
+        )
+    if not credential.name:
+        raise HTTPException(
+            status_code=400,
+            detail="credential name (mailbox username) is required",
+        )
 
 
 def _ensure_workspace_md_file(

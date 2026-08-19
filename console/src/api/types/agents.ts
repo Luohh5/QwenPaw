@@ -48,8 +48,6 @@ export interface AgentMailCredential {
   provider?: string;
   // Write-only: GET /agents/{id} intentionally omits mailbox secrets.
   auth_code?: string;
-  password?: string;
-  phone_number?: string;
 }
 
 export interface AgentMailPushRule {

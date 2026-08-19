@@ -1937,19 +1937,22 @@ class AgentMailCredential(BaseModel):
     )
     auth_code: str = Field(
         default="",
-        description="16-char authorization code (personal mailbox only)",
+        description=(
+            "Provider credential: authorization code, app password, or "
+            "mailbox login password"
+        ),
         exclude=True,
         repr=False,
     )
     password: str = Field(
         default="",
-        description="Mailbox password",
+        description="Legacy registration field retained for migration only",
         exclude=True,
         repr=False,
     )
     phone_number: str = Field(
         default="",
-        description="Phone number bound to the mailbox",
+        description="Legacy registration field retained for migration only",
         exclude=True,
         repr=False,
     )
@@ -1997,7 +2000,10 @@ class AgentMailConfig(BaseModel):
 
     is_new_account: bool = Field(
         default=False,
-        description="True = dedicated new mailbox, False = personal mailbox",
+        description=(
+            "True = dedicated mailbox registration pending; supplying the "
+            "mail credential completes registration and changes it to False"
+        ),
     )
     credential: AgentMailCredential = Field(
         default_factory=AgentMailCredential,
