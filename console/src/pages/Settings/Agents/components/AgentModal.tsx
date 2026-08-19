@@ -110,10 +110,7 @@ export function AgentModal({
   const mailMode = Form.useWatch("mail_mode", form);
   const mailPushMode = Form.useWatch(["mail_push", "mode"], form);
   const mailDomain = Form.useWatch(["mail_credential", "domain"], form);
-  const mailCredential = Form.useWatch(
-    ["mail_credential", "auth_code"],
-    form,
-  );
+  const mailCredential = Form.useWatch(["mail_credential", "auth_code"], form);
   const selectedBackend = Form.useWatch("backend", form) ?? "qwenpaw";
 
   const isCustomMailDomain =
