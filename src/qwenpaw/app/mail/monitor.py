@@ -2001,6 +2001,7 @@ class MailMonitorService:
                         "date": date,
                         "body_preview": body_preview,
                         "acl_status": "pending",
+                        "acl_sender_address": sender_email.lower().strip(),
                     },
                 )
                 return

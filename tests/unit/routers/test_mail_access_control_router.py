@@ -118,7 +118,7 @@ def test_approve_hides_pending_and_schedules_all_uids_once(store):
     async def _run():
         with patch(
             "qwenpaw.app.inbox_store.mark_read_by_acl_sender",
-            new=lambda _address: asyncio.sleep(0, result=0),
+            new=lambda _agent_id, _address: asyncio.sleep(0, result=0),
         ):
             first = await approve_pending(
                 _entries("new@example.com"),
@@ -159,7 +159,7 @@ def test_failed_approval_replay_remains_durable(store):
     async def _run():
         with patch(
             "qwenpaw.app.inbox_store.mark_read_by_acl_sender",
-            new=lambda _address: asyncio.sleep(0, result=0),
+            new=lambda _agent_id, _address: asyncio.sleep(0, result=0),
         ):
             result = await approve_pending(
                 _entries("new@example.com"),

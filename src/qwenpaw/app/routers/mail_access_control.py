@@ -296,7 +296,7 @@ async def approve_pending(body: MailACLActionBody, request: Request):
     for entry, pending_info in approved:
         # Mark the corresponding inbox "pending" notification as read so
         # the unread badge decreases after approval.
-        await mark_read_by_acl_sender(entry.address)
+        await mark_read_by_acl_sender(entry.agent_id, entry.address)
         try:
             await _trigger_wake_after_approve(request, entry, pending_info)
         except Exception:  # pylint: disable=broad-except
@@ -344,7 +344,7 @@ async def deny_pending(body: MailACLActionBody):
     _require_valid_addresses(body.entries)
     denied = await run_sync_io(_deny_pending_sync, body.entries)
     for entry in denied:
-        await mark_read_by_acl_sender(entry.address)
+        await mark_read_by_acl_sender(entry.agent_id, entry.address)
     return {"status": "ok", "count": len(denied)}
 
 
@@ -357,7 +357,7 @@ async def dismiss_pending(body: MailACLActionBody):
 
     dismissed = await run_sync_io(_dismiss_pending_sync, body.entries)
     for entry in dismissed:
-        await mark_read_by_acl_sender(entry.address)
+        await mark_read_by_acl_sender(entry.agent_id, entry.address)
     return {"status": "ok", "count": len(dismissed)}
 
 

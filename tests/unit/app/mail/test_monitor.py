@@ -1259,6 +1259,10 @@ async def test_pending_sender_retains_all_uids_and_restart_does_not_repeat(
     assert service._last_uid == 102
     # One UI approval row/event per sender, even though both UIDs are durable.
     assert len(recorder.events) == 1
+    assert (
+        recorder.events[0]["payload"]["acl_sender_address"]
+        == "alice@example.com"
+    )
 
     restarted, _ = _service(tmp_path, mode="rules_only")
     restarted.push.access_control_enabled = True
