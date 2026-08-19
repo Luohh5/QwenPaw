@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from qwenpawmail_mcp.providers import ENTERPRISE_PROVIDERS
 
 from ...config.config import (
     AGENT_MAIL_CREDENTIAL_REF,
@@ -24,27 +25,8 @@ from ...utils.logging import sanitize_log_value
 logger = logging.getLogger(__name__)
 
 
-# NOTE: NetEase enterprise SMTP SSL uses port 994, not 465.
-ENTERPRISE_MAIL_PROVIDERS: dict[str, dict[str, object]] = {
-    "tencent_exmail": {
-        "imap_host": "imap.exmail.qq.com",
-        "imap_port": 993,
-        "smtp_host": "smtp.exmail.qq.com",
-        "smtp_port": 465,
-    },
-    "aliyun_qiye": {
-        "imap_host": "imap.qiye.aliyun.com",
-        "imap_port": 993,
-        "smtp_host": "smtp.qiye.aliyun.com",
-        "smtp_port": 465,
-    },
-    "netease_qiye": {
-        "imap_host": "imap.qiye.163.com",
-        "imap_port": 993,
-        "smtp_host": "smtp.qiye.163.com",
-        "smtp_port": 994,
-    },
-}
+# Compatibility alias used by the agent router for provider validation.
+ENTERPRISE_MAIL_PROVIDERS = ENTERPRISE_PROVIDERS
 
 
 def is_managed_qwenpawmail_card(path: Path) -> bool:
@@ -105,12 +87,12 @@ def build_qwenpawmail_env(
         },
     }
     provider = (credential.provider or "").strip()
-    hosts = ENTERPRISE_MAIL_PROVIDERS.get(provider)
-    if hosts is not None:
-        env["QWENPAWMAIL_IMAP_HOST"] = str(hosts["imap_host"])
-        env["QWENPAWMAIL_IMAP_PORT"] = str(hosts["imap_port"])
-        env["QWENPAWMAIL_SMTP_HOST"] = str(hosts["smtp_host"])
-        env["QWENPAWMAIL_SMTP_PORT"] = str(hosts["smtp_port"])
+    profile = ENTERPRISE_MAIL_PROVIDERS.get(provider)
+    if profile is not None:
+        env["QWENPAWMAIL_IMAP_HOST"] = profile.imap_host
+        env["QWENPAWMAIL_IMAP_PORT"] = str(profile.imap_port)
+        env["QWENPAWMAIL_SMTP_HOST"] = profile.smtp_host
+        env["QWENPAWMAIL_SMTP_PORT"] = str(profile.smtp_port)
     if workspace_dir is not None:
         env["QWENPAWMAIL_STATE_DIR"] = str(workspace_dir / "mail_state")
         env["QWENPAWMAIL_WORKSPACE_DIR"] = str(workspace_dir)

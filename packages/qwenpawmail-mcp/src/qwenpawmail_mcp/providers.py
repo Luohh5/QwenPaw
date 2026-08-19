@@ -196,6 +196,14 @@ PROVIDERS: dict[str, Provider] = {
     ),
 }
 
+# Explicit provider keys accepted for custom-domain enterprise mailboxes.
+# Endpoint and capability data remain owned by the domain registry above.
+ENTERPRISE_PROVIDERS: dict[str, Provider] = {
+    "tencent_exmail": PROVIDERS["exmail.qq.com"],
+    "aliyun_qiye": PROVIDERS["qiye.aliyun.com"],
+    "netease_qiye": PROVIDERS["qiye.163.com"],
+}
+
 
 def provider_for_email(email: str) -> Provider | None:
     """Return the Provider matching the email domain, or None if unknown."""

@@ -43,6 +43,8 @@ from qwenpawmail_mcp.imap_ops import (
     move_message as move_message_on_connection,
 )
 from qwenpawmail_mcp.providers import (
+    ENTERPRISE_PROVIDERS,
+    PROVIDERS,
     ProviderCapabilities,
     provider_for_email,
     provider_for_imap_host,
@@ -66,32 +68,6 @@ from .mail_access_control import (
 logger = logging.getLogger(__name__)
 
 _MAIL_SOURCE_ID = "_mail_monitor"
-
-# Domain -> IMAP host routing (inline table, same family as the
-# qwenpawmail-mcp server).  Unknown domains skip monitoring entirely.
-_IMAP_HOSTS = {
-    "163.com": "imap.163.com",
-    "126.com": "imap.126.com",
-    "yeah.net": "imap.yeah.net",
-    "qq.com": "imap.qq.com",
-    "foxmail.com": "imap.qq.com",
-    "sina.com": "imap.sina.com",
-    "sina.cn": "imap.sina.cn",
-    "aliyun.com": "imap.aliyun.com",
-    "gmail.com": "imap.gmail.com",
-    "exmail.qq.com": "imap.exmail.qq.com",
-    "qiye.aliyun.com": "imap.qiye.aliyun.com",
-    "qiye.163.com": "imap.qiye.163.com",
-}
-
-# Enterprise mail provider -> IMAP host (custom-domain mailboxes,
-# same providers as agents.py _ENTERPRISE_MAIL_PROVIDERS).  All
-# providers use IMAP over SSL on port 993, so no port table needed.
-_PROVIDER_IMAP_HOSTS = {
-    "tencent_exmail": "imap.exmail.qq.com",
-    "aliyun_qiye": "imap.qiye.aliyun.com",
-    "netease_qiye": "imap.qiye.163.com",
-}
 
 # Authentication-Results is only trustworthy when its authserv-id belongs to
 # the mailbox provider that received the message.  The provider may omit the
@@ -691,8 +667,10 @@ def resolve_imap_host(domain: str, provider: str = "") -> Optional[str]:
     """
     provider_key = (provider or "").strip().lower()
     if provider_key:
-        return _PROVIDER_IMAP_HOSTS.get(provider_key)
-    return _IMAP_HOSTS.get((domain or "").strip().lower())
+        profile = ENTERPRISE_PROVIDERS.get(provider_key)
+    else:
+        profile = PROVIDERS.get((domain or "").strip().lower())
+    return profile.imap_host if profile is not None else None
 
 
 def _truncate_text(text: str, limit: int) -> str:

@@ -13,12 +13,7 @@ import {
   Modal,
   Input,
 } from "antd";
-import {
-  CheckOutlined,
-  CloseOutlined,
-  DeleteOutlined,
-  PlusOutlined,
-} from "@ant-design/icons";
+import { Check, Plus, Trash2, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useAppMessage } from "../../../hooks/useAppMessage";
 import {
@@ -425,7 +420,7 @@ export function MailAccessControlDrawer({
             <Button
               type="text"
               size="small"
-              icon={<CheckOutlined />}
+              icon={<Check size={14} />}
               loading={isLoading}
               onClick={() => handlePendingAction(record, "approve")}
               style={{ color: "#52c41a", padding: "0 4px" }}
@@ -435,7 +430,7 @@ export function MailAccessControlDrawer({
             <Button
               type="text"
               size="small"
-              icon={<CloseOutlined />}
+              icon={<X size={14} />}
               danger
               loading={isLoading}
               onClick={() => handlePendingAction(record, "deny")}
@@ -446,7 +441,7 @@ export function MailAccessControlDrawer({
             <Button
               type="text"
               size="small"
-              icon={<DeleteOutlined />}
+              icon={<Trash2 size={14} />}
               loading={isLoading}
               onClick={() => handlePendingAction(record, "dismiss")}
               style={{ padding: "0 4px" }}
@@ -512,7 +507,7 @@ export function MailAccessControlDrawer({
           title={t("inbox.confirmRemove")}
           onConfirm={() => handleRemoveFromList(record)}
         >
-          <Button type="text" danger size="small" icon={<DeleteOutlined />} />
+          <Button type="text" danger size="small" icon={<Trash2 size={14} />} />
         </Popconfirm>
       ),
     },
@@ -563,7 +558,7 @@ export function MailAccessControlDrawer({
             <Button
               type="primary"
               size="small"
-              icon={<CheckOutlined />}
+              icon={<Check size={14} />}
               loading={batchLoading}
             >
               {t("inbox.batchApprove")}
@@ -573,11 +568,7 @@ export function MailAccessControlDrawer({
             title={t("inbox.confirmDeny")}
             onConfirm={() => handleBatchPendingAction("deny")}
           >
-            <Button
-              size="small"
-              icon={<CloseOutlined />}
-              loading={batchLoading}
-            >
+            <Button size="small" icon={<X size={14} />} loading={batchLoading}>
               {t("inbox.batchDeny")}
             </Button>
           </Popconfirm>
@@ -588,7 +579,7 @@ export function MailAccessControlDrawer({
             <Button
               danger
               size="small"
-              icon={<DeleteOutlined />}
+              icon={<Trash2 size={14} />}
               loading={batchLoading}
             >
               {t("inbox.batchDismiss")}
@@ -652,7 +643,7 @@ export function MailAccessControlDrawer({
             />
             <Button
               type="primary"
-              icon={<PlusOutlined />}
+              icon={<Plus size={14} />}
               onClick={() => setAddModalOpen(true)}
             >
               {t("inbox.addSender")}
@@ -670,7 +661,7 @@ export function MailAccessControlDrawer({
             <Button
               danger
               size="small"
-              icon={<DeleteOutlined />}
+              icon={<Trash2 size={14} />}
               loading={listBatchLoading}
             >
               {t("inbox.batchRemove")}
