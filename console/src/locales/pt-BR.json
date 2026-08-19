@@ -438,7 +438,9 @@
       "safety": "Segurança",
       "commit": "Commit"
     },
-    "summary": { "total": "pontos" },
+    "summary": {
+      "total": "pontos"
+    },
     "snapshotDialog": {
       "title": "Criar snapshot",
       "session": "Sessão",
@@ -2659,6 +2661,10 @@
     "requiresConfig": "Requer configuração",
     "configSaved": "Configuração salva",
     "configSaveError": "Falha ao salvar configuração",
+    "webSearchProviderLabel": "Provedor",
+    "webSearchApiKeyLabel": "Chave de API (opcional)",
+    "webSearchQuotaHintBefore": "Grátis: 100 chamadas/dia. Registre-se em ",
+    "webSearchQuotaHintAfter": " para 1.000/dia.",
     "active": "ativo(s)",
     "available": "Disponível",
     "noEnabled": "Nenhuma ferramenta ativada",
@@ -2736,9 +2742,14 @@
       "gotIt": "Entendi"
     },
     "simpleMode": "Modo simples",
-    "fullMode": "Modo completo"
+    "fullMode": "Modo completo",
+    "toggleAgentNavigation": "Expandir ou recolher a navegação do agente"
   },
   "chat": {
+    "groups": {
+      "cronShort": "Agendado",
+      "subagentShort": "Subagente"
+    },
     "fileReference": {
       "codeSnippet": "Trecho de código · {{count}} linhas"
     },

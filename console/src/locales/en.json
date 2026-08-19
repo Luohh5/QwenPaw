@@ -258,7 +258,8 @@
       "gotIt": "Got it"
     },
     "simpleMode": "Simple Mode",
-    "fullMode": "Full Mode"
+    "fullMode": "Full Mode",
+    "toggleAgentNavigation": "Expand or collapse agent navigation"
   },
   "debug": {
     "title": "Debug",
@@ -647,7 +648,9 @@
       "safety": "Safety",
       "commit": "Commit"
     },
-    "summary": { "total": "checkpoints" },
+    "summary": {
+      "total": "checkpoints"
+    },
     "snapshotDialog": {
       "title": "Create snapshot",
       "session": "Session",
@@ -3092,6 +3095,10 @@
     "requiresConfig": "Requires configuration",
     "configSaved": "Configuration saved",
     "configSaveError": "Failed to save configuration",
+    "webSearchProviderLabel": "Provider",
+    "webSearchApiKeyLabel": "API Key (optional)",
+    "webSearchQuotaHintBefore": "Free: 100 calls/day. Register at ",
+    "webSearchQuotaHintAfter": " for 1,000/day.",
     "active": "active",
     "available": "Available",
     "noEnabled": "No tools enabled",
@@ -3237,6 +3244,8 @@
       "rename": "Rename",
       "pin": "Pin",
       "unpin": "Unpin",
+      "pinFailed": "Failed to update conversation pin",
+      "moveToGroup": "Move to group",
       "delete": "Delete"
     },
     "queue": {
@@ -3263,6 +3272,31 @@
       "week": "Within 7 days",
       "month": "Within 30 days",
       "older": "Earlier"
+    },
+    "groups": {
+      "create": "New group",
+      "namePlaceholder": "Group name",
+      "uncategorized": "Uncategorized",
+      "cron": "Scheduled task conversations",
+      "cronShort": "Cron",
+      "cronHint": "Separate conversations created by scheduled tasks; collapsed by default and fixed near the bottom",
+      "subagents": "Conversations with subagents",
+      "subagentShort": "Subagent",
+      "subagentsHint": "Separate conversations created for child-agent tasks; collapsed by default and fixed at the bottom",
+      "pin": "Pin group",
+      "unpin": "Unpin group",
+      "pinned": "Pinned group",
+      "fixedLast": "System group fixed at the bottom",
+      "dragSessionHint": "Press and hold a conversation, then drag it to a group",
+      "moveSuccess": "Moved to “{{name}}”",
+      "moveFailed": "Could not move the conversation. Try again.",
+      "rename": "Rename",
+      "moveUp": "Move up",
+      "moveDown": "Move down",
+      "delete": "Delete group",
+      "manage": "Manage group",
+      "deleteTitle": "Delete this group?",
+      "deleteHint": "Conversations will return to their built-in group."
     },
     "sessionPanel": {
       "searchConversations": "Search conversations…",

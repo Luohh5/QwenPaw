@@ -212,6 +212,7 @@ class MatrixChannel(BaseChannel):
         access_control_dm: bool = False,
         access_control_group: bool = False,
         enabled: bool = True,
+        share_session_in_group: bool = True,
         **_kwargs: Any,
     ) -> None:
         super().__init__(
@@ -232,6 +233,7 @@ class MatrixChannel(BaseChannel):
         self.device_id: str = device_id
         self.encryption: bool = encryption
         self.enabled: bool = enabled
+        self.share_session_in_group: bool = share_session_in_group
         # Channel-level mute
         self.dm_disabled: bool = dm_disabled
         self.group_disabled: bool = group_disabled
@@ -329,6 +331,9 @@ class MatrixChannel(BaseChannel):
             access_control_dm=bool(raw.get("access_control_dm", False)),
             access_control_group=bool(raw.get("access_control_group", False)),
             enabled=raw.get("enabled", True),
+            share_session_in_group=bool(
+                raw.get("share_session_in_group", True),
+            ),
         )
 
     @classmethod
@@ -2896,13 +2901,13 @@ class MatrixChannel(BaseChannel):
         if not content:
             content = [TextContent(type=ContentType.TEXT, text="")]
 
-        # Use room_id as the AgentRequest user_id so that all participants
-        # in the same room share one session (QwenPaw keys session state on
-        # both session_id AND user_id).  The real sender is preserved in
-        # meta["sender_id"] for reply mentions.
         req = self.build_agent_request_from_user_content(
             channel_id=CHANNEL_KEY,
-            sender_id=room_id,
+            sender_id=(
+                sender_id
+                if meta.get("is_group") and not self.share_session_in_group
+                else room_id
+            ),
             session_id=session_id,
             content_parts=content,
             channel_meta=meta,
@@ -2929,7 +2934,14 @@ class MatrixChannel(BaseChannel):
 
     def get_to_handle_from_request(self, request: Any) -> str:
         meta = getattr(request, "channel_meta", {}) or {}
-        return meta.get("room_id", getattr(request, "user_id", ""))
+        room_id = meta.get("room_id")
+        if room_id:
+            return room_id
+        # Recover the room from session_id when metadata is unavailable.
+        session_id = getattr(request, "session_id", "") or ""
+        if session_id.startswith("matrix:"):
+            return session_id[len("matrix:") :]
+        return getattr(request, "user_id", "")
 
     # ------------------------------------------------------------------
     # Mention helper — MSC3952 m.mentions from body text scan

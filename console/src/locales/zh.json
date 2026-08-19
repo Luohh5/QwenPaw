@@ -258,7 +258,8 @@
       "gotIt": "我知道了"
     },
     "simpleMode": "精简模式",
-    "fullMode": "完整模式"
+    "fullMode": "完整模式",
+    "toggleAgentNavigation": "展开或收起智能体导航"
   },
   "debug": {
     "title": "调试",
@@ -429,7 +430,9 @@
       "safety": "安全快照",
       "commit": "提交"
     },
-    "summary": { "total": "个检查点" },
+    "summary": {
+      "total": "个检查点"
+    },
     "snapshotDialog": {
       "title": "创建快照",
       "session": "会话",
@@ -2950,6 +2953,10 @@
     "requiresConfig": "需要配置",
     "configSaved": "配置已保存",
     "configSaveError": "配置保存失败",
+    "webSearchProviderLabel": "搜索服务商",
+    "webSearchApiKeyLabel": "API 密钥（可选）",
+    "webSearchQuotaHintBefore": "未注册每日限 100 次，前往 ",
+    "webSearchQuotaHintAfter": " 注册可享每日 1000 次免费额度。",
     "active": "个已激活",
     "available": "可用",
     "noEnabled": "暂无已启用的工具",
@@ -3094,6 +3101,8 @@
       "rename": "重命名",
       "pin": "置顶",
       "unpin": "取消置顶",
+      "pinFailed": "更新会话置顶状态失败",
+      "moveToGroup": "移动到分组",
       "delete": "删除"
     },
     "queue": {
@@ -3120,6 +3129,31 @@
       "week": "7天内",
       "month": "30天内",
       "older": "更早"
+    },
+    "groups": {
+      "create": "新建分组",
+      "namePlaceholder": "分组名称",
+      "uncategorized": "未分组",
+      "cron": "定时任务对话",
+      "cronShort": "定时任务",
+      "cronHint": "由定时任务运行时创建的独立对话，默认收起并固定在列表底部",
+      "subagents": "与子智能体的对话",
+      "subagentShort": "子智能体",
+      "subagentsHint": "由子智能体执行任务时创建的独立对话，默认收起并固定在列表底部",
+      "pin": "置顶分组",
+      "unpin": "取消置顶分组",
+      "pinned": "已置顶分组",
+      "fixedLast": "系统分组，固定在列表底部",
+      "dragSessionHint": "长按会话并拖到目标分组",
+      "moveSuccess": "已移动到“{{name}}”",
+      "moveFailed": "移动会话失败，请重试",
+      "rename": "重命名",
+      "moveUp": "上移",
+      "moveDown": "下移",
+      "delete": "删除分组",
+      "manage": "管理分组",
+      "deleteTitle": "删除这个分组？",
+      "deleteHint": "组内会话将返回各自的系统分组。"
     },
     "sessionPanel": {
       "searchConversations": "搜索对话…",

@@ -224,7 +224,8 @@
       "gotIt": "Mengerti"
     },
     "simpleMode": "Mode sederhana",
-    "fullMode": "Mode lengkap"
+    "fullMode": "Mode lengkap",
+    "toggleAgentNavigation": "Buka atau tutup navigasi agen"
   },
   "login": {
     "title": "Masuk ke QwenPaw",
@@ -246,6 +247,10 @@
     "unauthorized": "Tidak berwenang, silakan masuk"
   },
   "chat": {
+    "groups": {
+      "cronShort": "Terjadwal",
+      "subagentShort": "Subagen"
+    },
     "fileReference": {
       "codeSnippet": "Cuplikan kode · {{count}} baris"
     },
@@ -801,6 +806,8 @@
     "dmDisabledTooltip": "Saat diaktifkan, bot akan sepenuhnya mengabaikan semua pesan langsung",
     "groupDisabled": "Nonaktifkan Grup",
     "groupDisabledTooltip": "Saat diaktifkan, bot akan sepenuhnya mengabaikan semua pesan grup",
+    "shareSessionInGroup": "Bagikan Konteks dalam Grup",
+    "shareSessionInGroupTooltip": "Saat diaktifkan, semua anggota grup berbagi konteks percakapan yang sama. Saat dinonaktifkan, setiap anggota memiliki konteks independen.",
     "manageAccessControl": "Kontrol Akses",
     "pendingApprovals": "Menunggu Persetujuan",
     "whitelist": "Daftar Putih",
@@ -881,6 +888,10 @@
     "requiresConfig": "Perlu konfigurasi",
     "configSaved": "Konfigurasi tersimpan",
     "configSaveError": "Gagal menyimpan konfigurasi",
+    "webSearchProviderLabel": "Penyedia",
+    "webSearchApiKeyLabel": "Kunci API (opsional)",
+    "webSearchQuotaHintBefore": "Gratis 100 panggilan/hari. Daftar di ",
+    "webSearchQuotaHintAfter": " untuk 1.000/hari.",
     "active": "aktif",
     "available": "Tersedia",
     "noEnabled": "Tidak ada alat yang diaktifkan",
@@ -960,7 +971,9 @@
       "safety": "Pengaman",
       "commit": "Commit"
     },
-    "summary": { "total": "checkpoint" },
+    "summary": {
+      "total": "checkpoint"
+    },
     "snapshotDialog": {
       "title": "Buat snapshot",
       "session": "Sesi",

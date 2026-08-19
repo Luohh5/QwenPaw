@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import logging
 import re
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import (
     Any,
@@ -24,11 +26,13 @@ from pydantic import (
     BaseModel,
     Field,
     ConfigDict,
+    PrivateAttr,
     field_validator,
     model_validator,
 )
 import shortuuid
 from qwenpaw.exceptions import (
+    AgentConfigConflictError,
     ConfigurationException,
 )
 
@@ -58,6 +62,74 @@ logger = logging.getLogger(__name__)
 # lifetime.  The migration reminder is useful once, but repeating it for
 # every request obscures real warnings.
 _legacy_scroll_tool_cap_warned = False
+
+
+@dataclass(frozen=True)
+class _AgentConfigFingerprint:
+    """Metadata used to invalidate one cached agent configuration."""
+
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+
+
+@dataclass(frozen=True)
+class _AgentConfigCacheEntry:
+    """Cached agent configuration and its persisted file version."""
+
+    config: Any
+    fingerprint: _AgentConfigFingerprint
+
+
+def _agent_config_fingerprint(path: Path) -> _AgentConfigFingerprint:
+    """Return a cross-platform fingerprint for an agent config file."""
+    stat_result = path.stat()
+    return _AgentConfigFingerprint(
+        device=stat_result.st_dev,
+        inode=stat_result.st_ino,
+        size=stat_result.st_size,
+        mtime_ns=stat_result.st_mtime_ns,
+    )
+
+
+def _read_agent_config_snapshot(
+    path: Path,
+    retries: int = 3,
+) -> tuple[bytes, _AgentConfigFingerprint]:
+    """Read one stable snapshot across concurrent atomic replacements."""
+    for _attempt in range(retries):
+        before = _agent_config_fingerprint(path)
+        content = path.read_bytes()
+        after = _agent_config_fingerprint(path)
+        if before == after:
+            return content, after
+    raise OSError(f"Agent config changed repeatedly while reading {path}")
+
+
+def _json_payload_digest(payload: Any) -> bytes:
+    """Return the digest produced by the default atomic JSON serializer."""
+    content = json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=False,
+    ).encode("utf-8")
+    return hashlib.sha256(content).digest()
+
+
+def _assert_agent_config_unchanged(
+    path: Path,
+    expected_digest: bytes,
+    agent_id: str,
+) -> None:
+    """Reject a write when its source snapshot is no longer current."""
+    try:
+        current_content, _fingerprint = _read_agent_config_snapshot(path)
+    except FileNotFoundError as exc:
+        raise AgentConfigConflictError(agent_id) from exc
+    if hashlib.sha256(current_content).digest() != expected_digest:
+        raise AgentConfigConflictError(agent_id)
 
 
 # ============================================================================
@@ -427,6 +499,8 @@ class MatrixConfig(BaseChannelConfig):
     # When True, apply m.mentions + optional pill on outbound messages.
     outbound_structured_mentions: bool = True
     streaming_enabled: bool = False
+    # Keep the legacy room-wide session unless isolation is requested.
+    share_session_in_group: bool = True
 
 
 class VoiceChannelConfig(BaseChannelConfig):
@@ -2034,6 +2108,16 @@ class AgentProfileConfig(BaseModel):
     Each agent has its own configuration file with all settings.
     """
 
+    _source_digest: bytes | None = PrivateAttr(default=None)
+
+    def source_digest(self) -> bytes | None:
+        """Return the content version captured when this model was loaded."""
+        return self._source_digest
+
+    def record_source_digest(self, digest: bytes) -> None:
+        """Record the content version represented by this model."""
+        self._source_digest = digest
+
     id: str = Field(..., description="Unique agent ID")
     name: str = Field(..., description="Human-readable agent name")
     description: str = Field(default="", description="Agent description")
@@ -2345,17 +2429,20 @@ class MCPConfig(BaseModel):
     """MCP clients configuration.
 
     Uses a dict to allow dynamic client definitions.
-    Default tavily_search client is created and auto-enabled if API key exists.
+    Default anysearch client is provided but disabled by default; enable it
+    in the Console to use AnySearch through MCP. Access follows the default
+    ask policy (no blanket allow).
     """
 
     clients: Dict[str, MCPClientConfig] = Field(
         default_factory=lambda: {
-            "tavily_search": MCPClientConfig(
-                name="tavily_mcp",
+            "anysearch": MCPClientConfig(
+                name="anysearch_mcp",
                 enabled=False,
-                command="npx",
-                args=["-y", "tavily-mcp@latest"],
-                env={"TAVILY_API_KEY": ""},
+                transport="streamable_http",
+                url="https://api.anysearch.com/mcp",
+                headers={"Authorization": "Bearer ${ANYSEARCH_API_KEY}"},
+                description="AnySearch web search via MCP",
             ),
         },
     )
@@ -3051,22 +3138,30 @@ def _migrate_access_control_fields(  # pylint: disable=too-many-branches
             migrated = True
         # allow_from → access_control.json whitelist
         allow_from = ch_cfg.get("allow_from")
-        if allow_from and isinstance(allow_from, list):
-            try:
-                from ..app.channels.access_control import (
-                    get_access_control_store,
-                )
+        if isinstance(allow_from, list):
+            migration_succeeded = True
+            if allow_from:
+                try:
+                    from ..app.channels.access_control import (
+                        get_access_control_store,
+                    )
 
-                store = get_access_control_store(workspace_dir)
-                store.import_allow_from(ch_key, set(allow_from))
-            except Exception:
-                pass
-            del ch_cfg["allow_from"]
-            migrated = True
+                    store = get_access_control_store(workspace_dir)
+                    store.import_allow_from(ch_key, set(allow_from))
+                except Exception:
+                    migration_succeeded = False
+                    logger.exception(
+                        f"Failed to migrate access control for channel "
+                        f"{ch_key}",
+                    )
+            if migration_succeeded:
+                del ch_cfg["allow_from"]
+                migrated = True
         # group_allow_from (matrix legacy) → whitelist
         grp_allow = ch_cfg.get("group_allow_from")
-        if grp_allow is not None:
-            if isinstance(grp_allow, list) and grp_allow:
+        if isinstance(grp_allow, list):
+            migration_succeeded = True
+            if grp_allow:
                 try:
                     from ..app.channels.access_control import (
                         get_access_control_store,
@@ -3075,9 +3170,14 @@ def _migrate_access_control_fields(  # pylint: disable=too-many-branches
                     store = get_access_control_store(workspace_dir)
                     store.import_allow_from(ch_key, set(grp_allow))
                 except Exception:
-                    pass
-            del ch_cfg["group_allow_from"]
-            migrated = True
+                    migration_succeeded = False
+                    logger.exception(
+                        f"Failed to migrate group access control for channel "
+                        f"{ch_key}",
+                    )
+            if migration_succeeded:
+                del ch_cfg["group_allow_from"]
+                migrated = True
     return migrated
 
 
@@ -3175,10 +3275,10 @@ def migrate_agent_mail_credentials(
 def load_agent_config(  # pylint: disable=too-many-branches,too-many-statements
     agent_id: str,
 ) -> AgentProfileConfig:
-    """Load agent's complete configuration from workspace/agent.json with
-    mtime-based caching.
+    """Load an agent configuration with fingerprint-based caching.
 
-    Uses file modification time to avoid unnecessary disk reads.
+    The fingerprint detects same-mtime atomic replacements. Each loaded model
+    also records a content digest used to reject stale saves.
 
     Args:
         agent_id: Agent ID to load
@@ -3191,6 +3291,7 @@ def load_agent_config(  # pylint: disable=too-many-branches,too-many-statements
     """
     from .utils import (
         load_config,
+        _migrate_last_dispatch_state,
         _agent_config_cache,
         _agent_config_lock,
     )
@@ -3213,47 +3314,77 @@ def load_agent_config(  # pylint: disable=too-many-branches,too-many-statements
         save_agent_config(agent_id, fallback_config)
         return fallback_config
 
-    # Check mtime to see if we can use cached config
     try:
-        current_mtime = agent_config_path.stat().st_mtime
-    except OSError:
-        fallback_config = build_fallback_agent_profile_config(agent_id, config)
-        save_agent_config(agent_id, fallback_config)
-        return fallback_config
+        current_fingerprint = _agent_config_fingerprint(agent_config_path)
+    except OSError as exc:
+        raise ConfigurationException(
+            config_key="agent",
+            message=f"Agent '{agent_id}' config is temporarily unavailable",
+        ) from exc
 
     with _agent_config_lock:
-        # Return cached config if mtime hasn't changed
-        if agent_id in _agent_config_cache:
-            cached_config, cached_mtime = _agent_config_cache[agent_id]
-            if cached_mtime == current_mtime:
-                return cached_config.model_copy(deep=True)
+        cached_entry = _agent_config_cache.get(agent_id)
+        if (
+            isinstance(cached_entry, _AgentConfigCacheEntry)
+            and cached_entry.fingerprint == current_fingerprint
+        ):
+            return cached_entry.config.model_copy(deep=True)
 
-        # Need to reload config from disk
         try:
-            with open(agent_config_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except UnicodeDecodeError as e:
+            raw_content, current_fingerprint = _read_agent_config_snapshot(
+                agent_config_path,
+            )
+            content_digest = hashlib.sha256(raw_content).digest()
+            data = json.loads(raw_content)
+        except UnicodeDecodeError as exc:
             raise ConfigurationException(
                 config_key="agent",
                 message=(
                     f"Agent '{agent_id}' configuration file is corrupted "
                     f"(invalid UTF-8 encoding). Path: {agent_config_path}. "
-                    f"Please repair or delete it. Error: {e}"
+                    f"Please repair or delete it. Error: {exc}"
                 ),
-            ) from e
-        except json.JSONDecodeError as e:
+            ) from exc
+        except json.JSONDecodeError as exc:
             raise ConfigurationException(
                 config_key="agent",
                 message=(
                     f"Agent '{agent_id}' configuration file contains "
-                    f"invalid JSON. Path: {agent_config_path}. Error: {e}"
+                    f"invalid JSON. Path: {agent_config_path}. Error: {exc}"
                 ),
-            ) from e
+            ) from exc
 
+        try:
+            _assert_agent_config_unchanged(
+                agent_config_path,
+                content_digest,
+                agent_id,
+            )
+        except AgentConfigConflictError:
+            _agent_config_cache.pop(agent_id, None)
+            raise
+        last_dispatch_migrated = False
+        last_dispatch_migration_failed = False
+        migration_write_failed = False
         mail_credentials_migrated = migrate_agent_mail_credentials(
             data,
             workspace_dir,
         )
+        if "last_dispatch" in data:
+            try:
+                _migrate_last_dispatch_state(
+                    workspace_dir,
+                    data["last_dispatch"],
+                )
+            except Exception:
+                last_dispatch_migration_failed = True
+                logger.exception(
+                    f"Failed to migrate last dispatch state for agent "
+                    f"{agent_id}",
+                )
+            else:
+                data.pop("last_dispatch")
+                last_dispatch_migrated = True
         project_dir_migrated = migrate_project_directory_config(data)
 
         # Match the existing migration behavior: migrate this workspace only
@@ -3275,14 +3406,21 @@ def load_agent_config(  # pylint: disable=too-many-branches,too-many-statements
             display_migrated = False
             access_control_migrated = False
 
-        if (
-            project_dir_migrated
-            or mail_credentials_migrated
-            or weixin_migrated
-            or display_migrated
-            or access_control_migrated
-        ):
+        migrations_applied = (
+            project_dir_migrated,
+            mail_credentials_migrated,
+            weixin_migrated,
+            display_migrated,
+            access_control_migrated,
+            last_dispatch_migrated,
+        )
+        if any(migrations_applied):
             try:
+                _assert_agent_config_unchanged(
+                    agent_config_path,
+                    content_digest,
+                    agent_id,
+                )
                 if not mail_credentials_migrated and (
                     project_dir_migrated or weixin_migrated or display_migrated
                 ):
@@ -3301,12 +3439,22 @@ def load_agent_config(  # pylint: disable=too-many-branches,too-many-statements
                     )
                     _shutil.copy2(agent_config_path, backup_path)
                 write_json_atomic(agent_config_path, data)
+                content_digest = _json_payload_digest(data)
                 try:
-                    current_mtime = agent_config_path.stat().st_mtime
+                    current_fingerprint = _agent_config_fingerprint(
+                        agent_config_path,
+                    )
                 except OSError:
                     pass
+            except AgentConfigConflictError:
+                _agent_config_cache.pop(agent_id, None)
+                raise
             except OSError:
-                pass
+                migration_write_failed = True
+                logger.exception(
+                    f"Failed to persist agent config migration for "
+                    f"{agent_id}",
+                )
 
         # Normalize legacy ~/.copaw-bound paths to current WORKING_DIR.
         # This keeps QWENPAW_WORKING_DIR effective even if existing agent.json
@@ -3330,17 +3478,20 @@ def load_agent_config(  # pylint: disable=too-many-branches,too-many-statements
 
         agent_config = AgentProfileConfig(**data)
         hydrate_agent_mail_credentials(workspace_dir, agent_config.mail)
+        agent_config.record_source_digest(content_digest)
 
-        # Cache the config with its mtime
-        _agent_config_cache[agent_id] = (
-            agent_config.model_copy(deep=True),
-            current_mtime,
-        )
+        if migration_write_failed or last_dispatch_migration_failed:
+            _agent_config_cache.pop(agent_id, None)
+        else:
+            _agent_config_cache[agent_id] = _AgentConfigCacheEntry(
+                config=agent_config.model_copy(deep=True),
+                fingerprint=current_fingerprint,
+            )
 
         return agent_config.model_copy(deep=True)
 
 
-def save_agent_config(
+def save_agent_config(  # pylint: disable=too-many-branches,too-many-statements
     agent_id: str,
     agent_config: AgentProfileConfig,
 ) -> None:
@@ -3367,53 +3518,76 @@ def save_agent_config(
             message=f"Agent '{agent_id}' not found in config",
         )
 
+    agent_ref = config.agents.profiles[agent_id]
+    workspace_dir = Path(agent_ref.workspace_dir).expanduser()
+    agent_config_path = workspace_dir / "agent.json"
     candidate = agent_config.model_copy(deep=True)
     with _agent_config_lock:
-        agent_ref = config.agents.profiles[agent_id]
-        workspace_dir = Path(agent_ref.workspace_dir).expanduser()
-        agent_config_path = workspace_dir / "agent.json"
         from ..drivers.errors import CredentialNotFoundError
 
-        cached_entry = _agent_config_cache.get(agent_id)
-        had_mail = bool(
-            cached_entry is not None and cached_entry[0].mail is not None,
-        )
-        if (
-            not had_mail
-            and cached_entry is None
-            and agent_config_path.is_file()
-        ):
-            try:
-                persisted = json.loads(
-                    agent_config_path.read_text(encoding="utf-8"),
-                )
-                had_mail = isinstance(persisted, dict) and (
-                    persisted.get("mail") is not None
-                )
-            except (OSError, json.JSONDecodeError):
-                pass
-
-        manage_mail_credential = candidate.mail is not None or had_mail
         credential_store = None
         previous_mail_credential = None
-        if manage_mail_credential:
-            credential_store = _agent_mail_credential_store(workspace_dir)
-            try:
-                previous_mail_credential = credential_store.get_sync(
-                    AGENT_MAIL_CREDENTIAL_REF,
-                )
-            except CredentialNotFoundError:
-                previous_mail_credential = None
-            save_agent_mail_credentials(workspace_dir, candidate.mail)
+        mail_credential_updated = False
         try:
-            write_json_atomic(
-                agent_config_path,
-                candidate.model_dump(exclude_none=True),
+            source_digest = candidate.source_digest()
+            if source_digest is not None:
+                _assert_agent_config_unchanged(
+                    agent_config_path,
+                    source_digest,
+                    agent_id,
+                )
+
+            cached_entry = _agent_config_cache.get(agent_id)
+            had_mail = bool(
+                isinstance(cached_entry, _AgentConfigCacheEntry)
+                and cached_entry.config.mail is not None,
             )
+            if (
+                not had_mail
+                and not isinstance(cached_entry, _AgentConfigCacheEntry)
+                and agent_config_path.is_file()
+            ):
+                try:
+                    persisted = json.loads(
+                        agent_config_path.read_text(encoding="utf-8"),
+                    )
+                    had_mail = isinstance(persisted, dict) and (
+                        persisted.get("mail") is not None
+                    )
+                except (OSError, json.JSONDecodeError):
+                    pass
+
+            if candidate.mail is not None or had_mail:
+                credential_store = _agent_mail_credential_store(workspace_dir)
+                try:
+                    previous_mail_credential = credential_store.get_sync(
+                        AGENT_MAIL_CREDENTIAL_REF,
+                    )
+                except CredentialNotFoundError:
+                    previous_mail_credential = None
+                save_agent_mail_credentials(workspace_dir, candidate.mail)
+                mail_credential_updated = True
+
+            payload = candidate.model_dump(exclude_none=True)
+            saved_digest = _json_payload_digest(payload)
+            write_json_atomic(agent_config_path, payload)
+            candidate.record_source_digest(saved_digest)
+            agent_config.record_source_digest(saved_digest)
+            try:
+                saved_fingerprint = _agent_config_fingerprint(
+                    agent_config_path,
+                )
+            except OSError:
+                _agent_config_cache.pop(agent_id, None)
+            else:
+                _agent_config_cache[agent_id] = _AgentConfigCacheEntry(
+                    config=candidate.model_copy(deep=True),
+                    fingerprint=saved_fingerprint,
+                )
         except Exception:
             # Keep the public agent config and its referenced credential on the
-            # same logical version when the atomic JSON publication fails.
-            if credential_store is not None:
+            # same logical version when JSON publication fails.
+            if credential_store is not None and mail_credential_updated:
                 try:
                     if previous_mail_credential is None:
                         credential_store.delete_sync(
@@ -3427,16 +3601,8 @@ def save_agent_config(
                         "write failure for %s",
                         sanitize_log_value(agent_id),
                     )
-            raise
-        try:
-            current_mtime = agent_config_path.stat().st_mtime
-        except OSError:
             _agent_config_cache.pop(agent_id, None)
-        else:
-            _agent_config_cache[agent_id] = (
-                candidate.model_copy(deep=True),
-                current_mtime,
-            )
+            raise
 
 
 def mutate_agent_config(

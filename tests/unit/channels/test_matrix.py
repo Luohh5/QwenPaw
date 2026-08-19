@@ -170,6 +170,7 @@ class TestMatrixChannelInit:
             dm_disabled=True,
             group_disabled=False,
             access_control_dm=True,
+            share_session_in_group=True,
             on_reply_sent=Mock(),
             display_config=ChannelDisplayConfig(
                 show_tool_details=False,
@@ -181,6 +182,7 @@ class TestMatrixChannelInit:
 
         assert channel.dm_disabled is True
         assert channel.group_disabled is False
+        assert channel.share_session_in_group is True
         assert channel._display_config.show_tool_details is False
         assert channel._display_config.show_tool_calls is False
         assert channel._display_config.show_tool_results is False
@@ -302,6 +304,33 @@ class TestMatrixChannelFromConfig:
         channel = MatrixChannel.from_env(process=mock_process)
         assert isinstance(channel, MatrixChannel)
 
+    def test_from_config_share_session_in_group_default(
+        self,
+        mock_process,
+        matrix_config,
+    ):
+        """Group sessions are shared by default for compatibility."""
+        channel = MatrixChannel.from_config(
+            process=mock_process,
+            config=matrix_config,
+        )
+
+        assert channel.share_session_in_group is True
+
+    def test_from_config_share_session_in_group_false(
+        self,
+        mock_process,
+        matrix_config,
+    ):
+        """Group session isolation can be enabled through config."""
+        matrix_config.share_session_in_group = False
+        channel = MatrixChannel.from_config(
+            process=mock_process,
+            config=matrix_config,
+        )
+
+        assert channel.share_session_in_group is False
+
 
 class TestMatrixChannelMXC:
     """Test MXC to HTTP URL conversion."""
@@ -416,9 +445,74 @@ class TestMatrixChannelBuildRequest:
 
         assert isinstance(request, AgentRequest)
         assert request.channel == "matrix"
-        # user_id is intentionally set to room_id for session keying
         assert request.user_id == "!room:example.com"
         assert request.session_id == "matrix:!room:example.com"
+
+    def test_build_agent_request_group_shared_by_default(
+        self,
+        matrix_channel,
+    ):
+        """Group members share the legacy room-wide session by default."""
+        payload = {
+            "sender_id": "@user:example.com",
+            "content_parts": [
+                TextContent(type=ContentType.TEXT, text="Hello bot"),
+            ],
+            "meta": {
+                "room_id": "!room:example.com",
+                "is_group": True,
+            },
+        }
+
+        request = matrix_channel.build_agent_request_from_native(payload)
+
+        assert request.user_id == "!room:example.com"
+        assert request.session_id == "matrix:!room:example.com"
+
+    def test_build_agent_request_group_isolated_when_disabled(
+        self,
+        matrix_channel,
+    ):
+        """Disabling sharing isolates group members by sender."""
+        matrix_channel.share_session_in_group = False
+        payload = {
+            "sender_id": "@user:example.com",
+            "content_parts": [
+                TextContent(type=ContentType.TEXT, text="Hello bot"),
+            ],
+            "meta": {
+                "room_id": "!room:example.com",
+                "is_group": True,
+            },
+        }
+
+        request = matrix_channel.build_agent_request_from_native(payload)
+
+        assert request.user_id == "@user:example.com"
+        assert request.session_id == "matrix:!room:example.com"
+
+    def test_build_agent_request_dm_keeps_legacy_identity(
+        self,
+        matrix_channel,
+    ):
+        """The group sharing option does not change direct messages."""
+        matrix_channel.share_session_in_group = False
+        payload = {
+            "sender_id": "@user:example.com",
+            "content_parts": [
+                TextContent(type=ContentType.TEXT, text="Hello bot"),
+            ],
+            "meta": {
+                "room_id": "!dm_room:example.com",
+                "is_dm": True,
+                "is_group": False,
+            },
+        }
+
+        request = matrix_channel.build_agent_request_from_native(payload)
+
+        assert request.user_id == "!dm_room:example.com"
+        assert request.session_id == "matrix:!dm_room:example.com"
 
     def test_build_agent_request_with_content_parts(self, matrix_channel):
         """Test building request with existing content_parts."""
@@ -471,6 +565,20 @@ class TestMatrixChannelBuildRequest:
         result = matrix_channel.get_to_handle_from_request(request)
 
         assert result == "@user:example.com"
+
+    def test_get_to_handle_from_request_fallback_to_session_id(
+        self,
+        matrix_channel,
+    ):
+        """Prefer the room encoded in a Matrix session ID."""
+        request = MagicMock(spec=AgentRequest)
+        request.session_id = "matrix:!room:example.com"
+        request.channel_meta = {}
+        request.user_id = "@user:example.com"
+
+        result = matrix_channel.get_to_handle_from_request(request)
+
+        assert result == "!room:example.com"
 
 
 @pytest.mark.asyncio
