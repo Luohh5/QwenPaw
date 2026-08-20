@@ -466,8 +466,29 @@ def test_resolve_qwenpawmail_command_env_override(monkeypatch):
     assert _resolve_qwenpawmail_command() == "/custom/bin/python"
 
 
+def test_resolve_qwenpawmail_command_uses_bundled_sidecar(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.delenv("QWENPAWMAIL_PYTHON", raising=False)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    backend = tmp_path / (
+        "qwenpaw-backend.exe" if sys.platform == "win32" else "qwenpaw-backend"
+    )
+    mail_mcp = backend.with_name(
+        "qwenpawmail-mcp.exe"
+        if sys.platform == "win32"
+        else "qwenpawmail-mcp",
+    )
+    mail_mcp.touch()
+    monkeypatch.setattr(sys, "executable", str(backend))
+
+    assert _resolve_qwenpawmail_command() == str(mail_mcp)
+
+
 def test_resolve_qwenpawmail_command_uses_current_env(monkeypatch):
     monkeypatch.delenv("QWENPAWMAIL_PYTHON", raising=False)
+    monkeypatch.delattr(sys, "frozen", raising=False)
     with patch(
         "importlib.util.find_spec",
         return_value=object(),
@@ -477,6 +498,7 @@ def test_resolve_qwenpawmail_command_uses_current_env(monkeypatch):
 
 def test_resolve_qwenpawmail_command_falls_back_to_path(monkeypatch):
     monkeypatch.delenv("QWENPAWMAIL_PYTHON", raising=False)
+    monkeypatch.delattr(sys, "frozen", raising=False)
     with patch(
         "importlib.util.find_spec",
         return_value=None,

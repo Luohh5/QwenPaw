@@ -169,6 +169,7 @@ Write-Host ""
 $BACKEND_DIR = Join-Path $DIST "pyinstaller\qwenpaw-backend"
 $BACKEND_EXE = Join-Path $BACKEND_DIR "qwenpaw-backend.exe"
 $CLI_EXE = Join-Path $BACKEND_DIR "qwenpaw.exe"
+$MAIL_MCP_EXE = Join-Path $BACKEND_DIR "qwenpawmail-mcp.exe"
 $MODEL_CATALOG = Join-Path $BACKEND_DIR `
     "_internal\qwenpaw\providers\data\model_catalog.json"
 if (-not (Test-Path $BACKEND_DIR)) {
@@ -181,6 +182,11 @@ if (-not (Test-Path $BACKEND_EXE)) {
 }
 if (-not (Test-Path $CLI_EXE)) {
     Write-Host "ERROR: CLI executable not found at $CLI_EXE" -ForegroundColor Red
+    exit 1
+}
+if (-not (Test-Path $MAIL_MCP_EXE)) {
+    Write-Host "ERROR: Mail MCP executable not found at $MAIL_MCP_EXE" `
+        -ForegroundColor Red
     exit 1
 }
 if (-not (Test-Path $MODEL_CATALOG)) {

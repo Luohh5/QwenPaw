@@ -55,6 +55,15 @@ def resolve_qwenpawmail_command() -> str:
     override = os.environ.get("QWENPAWMAIL_PYTHON", "").strip()
     if override:
         return override
+    if getattr(sys, "frozen", False):
+        executable_name = (
+            "qwenpawmail-mcp.exe"
+            if sys.platform == "win32"
+            else "qwenpawmail-mcp"
+        )
+        bundled = Path(sys.executable).with_name(executable_name)
+        if bundled.is_file():
+            return str(bundled)
     try:
         if importlib.util.find_spec("qwenpawmail_mcp") is not None:
             return sys.executable

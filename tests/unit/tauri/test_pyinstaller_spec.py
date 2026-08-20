@@ -60,3 +60,12 @@ def test_desktop_spec_collects_provider_catalog_data():
         "providers/data",
         "qwenpaw/providers/data",
     ) in _data_directories()
+
+
+def test_desktop_spec_bundles_qwenpawmail_mcp_sidecar():
+    source = SPEC_PATH.read_text(encoding="utf-8")
+
+    assert "qwenpawmail_mcp" in _collected_submodule_packages()
+    assert "str(QWENPAWMAIL_SRC)" in source
+    assert 'script_entry("mail_mcp_entry.py")' in source
+    assert 'name="qwenpawmail-mcp"' in source

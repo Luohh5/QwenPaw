@@ -22,6 +22,7 @@ from PyInstaller.utils.hooks import (
 REPO_ROOT = Path(SPECPATH).parent.parent
 
 SRC = REPO_ROOT / "src" / "qwenpaw"
+QWENPAWMAIL_SRC = REPO_ROOT / "packages" / "qwenpawmail-mcp" / "src"
 if sys.platform == "darwin":
     codesign_identity = os.environ.get(
         "PYINSTALLER_CODESIGN_IDENTITY"
@@ -164,8 +165,13 @@ a = Analysis(
     [
         str(SRC / "tauri" / "entry.py"),
         str(SRC / "tauri" / "cli_entry.py"),
+        str(SRC / "tauri" / "mail_mcp_entry.py"),
     ],
-    pathex=[str(REPO_ROOT), str(REPO_ROOT / "src")],
+    pathex=[
+        str(REPO_ROOT),
+        str(REPO_ROOT / "src"),
+        str(QWENPAWMAIL_SRC),
+    ],
     binaries=[*qoder_binaries, *codex_binaries],
     datas=datas,
     hiddenimports=[
@@ -189,6 +195,9 @@ a = Analysis(
         *collect_submodules("qwenpaw.agents.acp"),
         # PawApp SDK modules are imported by installed app plugins at runtime.
         *collect_submodules("qwenpaw.pawapp"),
+        # Mail support lives in a second source root and also ships as its own
+        # stdio sidecar so the frozen backend is never used as an interpreter.
+        *collect_submodules("qwenpawmail_mcp"),
         # ASGI app entry points
         "qwenpaw.app._app",
         "qwenpaw.app.multi_agent_manager",
@@ -268,9 +277,27 @@ cli_exe = EXE(
     exclude_binaries=True,
 )
 
+mail_mcp_exe = EXE(
+    pyz,
+    script_entry("mail_mcp_entry.py"),
+    [],
+    name="qwenpawmail-mcp",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=True,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=codesign_identity,
+    exclude_binaries=True,
+)
+
 coll = COLLECT(
     backend_exe,
     cli_exe,
+    mail_mcp_exe,
     a.binaries,
     a.datas,
     strip=False,

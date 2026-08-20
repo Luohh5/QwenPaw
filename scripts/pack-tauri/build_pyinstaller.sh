@@ -103,6 +103,7 @@ echo ""
 BACKEND_DIR="${DIST}/pyinstaller/qwenpaw-backend"
 BACKEND_EXE="${BACKEND_DIR}/qwenpaw-backend"
 CLI_EXE="${BACKEND_DIR}/qwenpaw"
+MAIL_MCP_EXE="${BACKEND_DIR}/qwenpawmail-mcp"
 MODEL_CATALOG="${BACKEND_DIR}/_internal/qwenpaw/providers/data/model_catalog.json"
 if [ ! -d "${BACKEND_DIR}" ]; then
     echo "ERROR: Backend bundle directory not found at ${BACKEND_DIR}"
@@ -114,6 +115,10 @@ if [ ! -f "${BACKEND_EXE}" ]; then
 fi
 if [ ! -f "${CLI_EXE}" ]; then
     echo "ERROR: CLI executable not found at ${CLI_EXE}"
+    exit 1
+fi
+if [ ! -f "${MAIL_MCP_EXE}" ]; then
+    echo "ERROR: Mail MCP executable not found at ${MAIL_MCP_EXE}"
     exit 1
 fi
 if [ ! -f "${MODEL_CATALOG}" ]; then
@@ -139,6 +144,7 @@ mkdir -p "${DEST}"
 cp -R "${BACKEND_DIR}/." "${DEST}/"
 chmod +x "${DEST}/qwenpaw-backend"
 chmod +x "${DEST}/qwenpaw"
+chmod +x "${DEST}/qwenpawmail-mcp"
 echo "Copied to: ${DEST}"
 echo ""
 
