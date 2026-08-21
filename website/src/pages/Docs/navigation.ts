@@ -22,7 +22,6 @@ export const DOC_GROUPS: DocGroup[] = [
     titleKey: "docs.groupControl",
     children: [
       { slug: "console", titleKey: "docs.console" },
-      { slug: "mailbox", titleKey: "docs.mailbox" },
       { slug: "tui", titleKey: "docs.tui" },
       { slug: "channels", titleKey: "docs.channels" },
       { slug: "commands", titleKey: "docs.commands" },
@@ -34,6 +33,7 @@ export const DOC_GROUPS: DocGroup[] = [
         slug: "memory-evolving-and-proactive",
         titleKey: "docs.memoryEvolvingAndProactive",
       },
+      { slug: "mailbox", titleKey: "docs.mailbox" },
     ],
   },
   {

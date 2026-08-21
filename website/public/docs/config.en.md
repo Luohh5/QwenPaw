@@ -33,6 +33,7 @@ $QWENPAW_WORKING_DIR/                      # Default ~/.qwenpaw
 │   │   ├── MEMORY.md                    # Long-term memory
 │   │   ├── MAIL_TRIAGE.md               # Automatic mail triage rules (created with mail config)
 │   │   ├── CONTACTS.md                  # Mail contacts (created with mail config)
+│   │   ├── credentials.yaml             # Encrypted credential store (including mail credentials)
 │   │   ├── mail_access_control.json     # Mail allow/block/pending senders
 │   │   ├── mail_state/                  # Mail monitor, thread, and label state
 │   │   ├── drivers/mcp/qwenpawmail.yaml # Generated mail MCP driver card
@@ -65,25 +66,27 @@ $QWENPAW_SECRET_DIR/                       # Default ~/.qwenpaw.secret
 
 **Agent Workspace (`~/.qwenpaw/workspaces/{agent_id}/`)**
 
-| File / Directory    | Purpose                                                      |
-| ------------------- | ------------------------------------------------------------ |
-| `agent.json`        | Agent config (channels, heartbeat, tools, skills, MCP, etc.) |
-| `chats.json`        | Conversation history                                         |
-| `jobs.json`         | Cron job list                                                |
-| `token_usage.json`  | Token usage records                                          |
-| `AGENTS.md`         | Persona file (see [Agent Persona](./persona))                |
-| `SOUL.md`           | Persona file (see [Agent Persona](./persona))                |
-| `PROFILE.md`        | Persona file (see [Agent Persona](./persona))                |
-| `BOOTSTRAP.md`      | Initial setup guide (auto-deleted after completion)          |
-| `MEMORY.md`         | Long-term memory (see [Memory](./memory))                    |
-| `MAIL_TRIAGE.md`    | Automatic mail triage and safety rules                       |
-| `CONTACTS.md`       | Known mail contacts and relationship context                 |
-| `mail_state/`       | Mail monitor, thread index, and custom label state           |
-| `skills/`           | Skills available in this workspace                           |
-| `skill.json`        | Skill enabled state, channel routing, and config             |
-| `memory/`           | Daily memory files (see [Memory](./memory))                  |
-| `.browser-profile/` | Browser persistent profile (see [Browser](./browser))        |
-| `browser/`          | Browser user data of the legacy implementation               |
+| File / Directory           | Purpose                                                                       |
+| -------------------------- | ----------------------------------------------------------------------------- |
+| `agent.json`               | Agent config (channels, heartbeat, tools, skills, MCP, etc.)                  |
+| `chats.json`               | Conversation history                                                          |
+| `jobs.json`                | Cron job list                                                                 |
+| `token_usage.json`         | Token usage records                                                           |
+| `AGENTS.md`                | Persona file (see [Agent Persona](./persona))                                 |
+| `SOUL.md`                  | Persona file (see [Agent Persona](./persona))                                 |
+| `PROFILE.md`               | Persona file (see [Agent Persona](./persona))                                 |
+| `BOOTSTRAP.md`             | Initial setup guide (auto-deleted after completion)                           |
+| `MEMORY.md`                | Long-term memory (see [Memory](./memory))                                     |
+| `MAIL_TRIAGE.md`           | Automatic mail triage and safety rules                                        |
+| `CONTACTS.md`              | Known mail contacts and relationship context                                  |
+| `credentials.yaml`         | Encrypted workspace credential store, including mail secrets                  |
+| `mail_access_control.json` | Mail allowlist, blocklist, pending senders, and approved-message replay queue |
+| `mail_state/`              | Mail monitor, thread index, and custom label state                            |
+| `skills/`                  | Skills available in this workspace                                            |
+| `skill.json`               | Skill enabled state, channel routing, and config                              |
+| `memory/`                  | Daily memory files (see [Memory](./memory))                                   |
+| `.browser-profile/`        | Browser persistent profile (see [Browser](./browser))                         |
+| `browser/`                 | Browser user data of the legacy implementation                                |
 
 > **Persona files:** Agent behavior and personality are defined by persona files. Running `qwenpaw init` automatically creates template files based on your chosen language (`zh` / `en` / `ru`). For detailed explanation and management, see [Agent Persona](./persona).
 
@@ -263,9 +266,6 @@ Each agent has an independent `agent.json` in its workspace directory (`~/.qwenp
     "credential": {
       "name": "alex",
       "domain": "163.com",
-      "auth_code": "your-authorization-code",
-      "password": "",
-      "phone_number": "",
       "provider": ""
     },
     "push": {
@@ -366,20 +366,20 @@ Mailbox configuration is available only for the native QwenPaw backend. Prefer
 **Settings → Agent management → Email Management** in the Console so QwenPaw
 also creates the qwenpawmail MCP driver card and workspace files.
 
-| Field                         | Type           | Default     | Description                                                                                                          |
-| ----------------------------- | -------------- | ----------- | -------------------------------------------------------------------------------------------------------------------- |
-| `is_new_account`              | bool           | `false`     | `false` connects an existing account; `true` describes a dedicated agent mailbox awaiting registration               |
-| `credential.name`             | string         | `""`        | Mailbox local part before `@`                                                                                        |
-| `credential.domain`           | string         | `"163.com"` | Mail domain                                                                                                          |
-| `credential.auth_code`        | string         | `""`        | Existing-mailbox credential: authorization code, app password, or login/security password depending on provider      |
-| `credential.password`         | string         | `""`        | Proposed account password for dedicated mailbox registration                                                         |
-| `credential.phone_number`     | string         | `""`        | Phone number for dedicated mailbox registration                                                                      |
-| `credential.provider`         | string         | `""`        | Custom-domain enterprise provider: `tencent_exmail`, `aliyun_qiye`, or `netease_qiye`; leave empty for known domains |
-| `push`                        | object \| null | `null`      | New-mail monitor config; omit or set to `null` to keep the monitor stopped                                           |
-| `push.mode`                   | string         | `"off"`     | `off` or `agent_all`; `rules_only` and `rules_then_agent` are compatibility modes for older configs                  |
-| `push.rules`                  | array          | `[]`        | Deterministic new-mail rules retained for older configs                                                              |
-| `push.poll_interval_seconds`  | int            | `120`       | Polling interval after IMAP IDLE failure; runtime minimum is 10 seconds                                              |
-| `push.access_control_enabled` | bool           | `false`     | Check sender allowlist, blocklist, and pending state before automatic processing                                     |
+| Field                         | Type           | Default     | Description                                                                                                                |
+| ----------------------------- | -------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `is_new_account`              | bool           | `false`     | `false` connects an existing account; `true` describes a dedicated agent mailbox awaiting registration                     |
+| `credential.name`             | string         | `""`        | Mailbox local part before `@`                                                                                              |
+| `credential.domain`           | string         | `"163.com"` | Mail domain                                                                                                                |
+| `credential.auth_code`        | string         | `""`        | Write-only authorization code, app password, or mailbox login password; encrypted and excluded from reads and `agent.json` |
+| `credential.password`         | string         | `""`        | Legacy dedicated-mailbox registration field retained for migration only; the current flow does not store it                |
+| `credential.phone_number`     | string         | `""`        | Legacy dedicated-mailbox registration field retained for migration only; the current flow does not store it                |
+| `credential.provider`         | string         | `""`        | Legacy enterprise custom-domain compatibility field; the current managed UI does not offer enterprise mail setup           |
+| `push`                        | object \| null | `null`      | New-mail monitor config; omit or set to `null` to keep the monitor stopped                                                 |
+| `push.mode`                   | string         | `"off"`     | `off` or `agent_all`; `rules_only` and `rules_then_agent` are compatibility modes for older configs                        |
+| `push.rules`                  | array          | `[]`        | Deterministic new-mail rules retained for older configs                                                                    |
+| `push.poll_interval_seconds`  | int            | `120`       | Polling interval after IMAP IDLE failure; runtime minimum is 10 seconds                                                    |
+| `push.access_control_enabled` | bool           | `false`     | Check sender allowlist, blocklist, and pending state before automatic processing                                           |
 
 Each `push.rules` entry has `field` (`from` / `content` / `keyword`, with
 `subject` as a legacy alias), `contains`, `action` (`mark_read` / `move` /
@@ -387,11 +387,14 @@ Each `push.rules` entry has `field` (`from` / `content` / `keyword`, with
 **Wake the agent for every email**. Existing rule modes continue to load but are
 not the recommended setup path for new configurations.
 
-For an existing mailbox, the address and authentication credential are also
-written into `drivers/mcp/qwenpawmail.yaml`. A pending dedicated account's
-password and phone number remain only in `agent.json`. These are local plaintext
-configuration files: do not commit them or share backups containing them. See
-[Mailbox Management and Automation](./mailbox) for setup, automation, and
+The public mailbox identity and automatic-processing settings are stored in
+`agent.json`. `auth_code`, `password`, and `phone_number` are write-only secrets:
+QwenPaw excludes them from public configuration and encrypts them in the
+workspace's `credentials.yaml`. `drivers/mcp/qwenpawmail.yaml` stores only a
+credential reference, which is resolved when the MCP subprocess starts. Do not
+assume that a missing `auth_code` in the API or `agent.json` means no credential
+is configured, and do not write credentials directly into these public files.
+See [Mailbox Management and Automation](./mailbox) for setup, automation, and
 provider details.
 
 ---

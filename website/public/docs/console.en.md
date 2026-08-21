@@ -104,10 +104,10 @@ baseline; it does not process historical messages. See
 
 **Mail access control:**
 When mailbox access control is enabled, Inbox shows a **Mail access control**
-entry and pending count. Review unknown senders per agent; allow, deny, or
+entry and pending count. Review unknown senders per agent; approve, block, or
 dismiss them; and maintain exact-address or `*@example.com` domain allowlists
-and blocklists. Allowing a pending sender resumes processing of the saved
-original message.
+and blocklists. Approving a pending sender processes every message saved in that
+pending record; failed work remains in a retry queue that survives restarts.
 
 ![todo](https://img.alicdn.com/imgextra/i2/O1CN01iC21Ec20wD8uObwi2_!!6000000006913-2-tps-2886-1878.png)
 
