@@ -8,6 +8,7 @@ from .models import (
     ImportReceipt,
     MigrationPlan,
     ProviderInventory,
+    SourceScheduledTask,
     SourceLocation,
 )
 from .providers import provider_names, resolve_source_location
@@ -17,6 +18,7 @@ __all__ = [
     "ImportReceipt",
     "MigrationPlan",
     "ProviderInventory",
+    "SourceScheduledTask",
     "SourceLocation",
     "export_to_backup",
     "export_trace",

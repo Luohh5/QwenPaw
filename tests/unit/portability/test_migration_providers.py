@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -121,6 +122,55 @@ async def test_codex_provider_reuses_runtime_and_normalizes_inventory(
 
 
 @pytest.mark.asyncio
+async def test_codex_provider_reports_non_root_rollouts_as_ignored(
+    tmp_path: Path,
+) -> None:
+    guardian_id = "01a013a9-e0c1-7853-8ce5-ffbac53bbbf1"
+    rollout = (
+        tmp_path
+        / ".codex/sessions/2026/08/18"
+        / f"rollout-2026-08-18T00-00-00-{guardian_id}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-08-18T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": guardian_id,
+                    "parent_thread_id": "thread-1",
+                    "source": {"subagent": {"other": "guardian"}},
+                    "thread_source": "subagent",
+                },
+            },
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "timestamp": "2026-08-18T00:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "The following is the Codex agent history",
+                },
+            },
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    inventory = await CodexMigrationProvider(
+        _workspace(tmp_path),
+        rollout_reader=CodexRolloutReader(tmp_path / ".codex"),
+    ).inventory(limit=10)
+
+    assert [item.source_id for item in inventory.sessions] == ["thread-1"]
+    assert inventory.ignored_session_ids == [guardian_id]
+    assert any("non-root" in item for item in inventory.warnings)
+
+
+@pytest.mark.asyncio
 async def test_codex_provider_detects_portable_assets_without_cli_or_sessions(
     tmp_path: Path,
 ) -> None:
@@ -170,6 +220,55 @@ async def test_qoder_provider_detects_skill_only_custom_home(
     assert [item.name for item in inventory.skills] == ["only-skill"]
     assert inventory.source_location is not None
     assert inventory.source_location.data_home_source == "injected"
+
+
+@pytest.mark.asyncio
+async def test_qoder_provider_includes_enabled_plugin_mcp(tmp_path: Path):
+    qoder_home = tmp_path / ".qoder"
+    plugins_root = qoder_home / "plugins"
+    plugin = plugins_root / "cache/community/gitlab/1.0.0"
+    plugin.mkdir(parents=True)
+    (plugin / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "GitLab": {
+                        "type": "http",
+                        "url": "https://gitlab.example/mcp",
+                    },
+                },
+            },
+        ),
+        encoding="utf-8",
+    )
+    (plugins_root / "installed_plugins_v2.json").write_text(
+        json.dumps(
+            {
+                "plugins": {
+                    "gitlab@community": [
+                        {
+                            "enabled": True,
+                            "installPath": str(plugin),
+                            "version": "1.0.0",
+                        },
+                    ],
+                },
+            },
+        ),
+        encoding="utf-8",
+    )
+
+    inventory = await QoderMigrationProvider(
+        SimpleNamespace(workspace_dir=tmp_path),
+        qoder_home=qoder_home,
+        qoder_user_data=tmp_path / "missing-user-data",
+    ).inventory(limit=10)
+
+    assert [server.name for server in inventory.mcp_servers] == ["GitLab"]
+    assert inventory.discovered_mcp_count == 1
+    assert inventory.mcp_servers[0].metadata["source_plugin"] == (
+        "gitlab@community"
+    )
 
 
 def test_provider_registry_is_explicit_and_rejects_unknown_sources(

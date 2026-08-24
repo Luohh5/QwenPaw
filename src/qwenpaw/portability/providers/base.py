@@ -3,12 +3,27 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
 from ..models import ProviderInventory
 
 ProgressReporter = Callable[[str], Awaitable[None]]
+logger = logging.getLogger(__name__)
+
+
+async def report_progress(
+    progress: ProgressReporter | None,
+    message: str,
+) -> None:
+    """Treat presentation failures as non-fatal to migration work."""
+    if progress is None:
+        return
+    try:
+        await progress(message)
+    except Exception:  # pylint: disable=broad-except
+        logger.debug("Migration progress reporter failed", exc_info=True)
 
 
 class MigrationProvider(Protocol):
@@ -25,4 +40,4 @@ class MigrationProvider(Protocol):
         """Return a bounded, normalized inventory from the source."""
 
 
-__all__ = ["MigrationProvider", "ProgressReporter"]
+__all__ = ["MigrationProvider", "ProgressReporter", "report_progress"]

@@ -1,0 +1,582 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from pathlib import Path
+
+import pytest
+
+from qwenpaw.portability.providers import qoder_schedules
+from qwenpaw.portability.providers.qoder_schedules import (
+    discover_qoder_scheduled_tasks,
+)
+
+
+def _store_path(user_data: Path, version: int) -> Path:
+    return (
+        user_data
+        / "globalStorage"
+        / "aicoding.aicoding-agent"
+        / "schedule"
+        / f"tasks.v{version}.json"
+    )
+
+
+def _write_store(
+    user_data: Path,
+    *,
+    version: int,
+    tasks: list[object],
+    runs: list[object] | None = None,
+) -> Path:
+    path = _store_path(user_data, version)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, object] = {"version": version, "tasks": tasks}
+    if version == 2:
+        payload["runs"] = runs if runs is not None else []
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _v2_task(
+    task_id: str,
+    *,
+    repeat: dict[str, object] | None = None,
+    lifecycle: str = "active",
+    start_at: str = "2026-08-20T00:00:00Z",
+    timezone: str = "UTC",
+    **overrides: object,
+) -> dict[str, object]:
+    task: dict[str, object] = {
+        "id": task_id,
+        "title": f"Task {task_id}",
+        "prompt": f"Run {task_id}",
+        "lifecycle": lifecycle,
+        "enabled": lifecycle == "active",
+        "schedule": {
+            "startAt": start_at,
+            "timezone": timezone,
+            "repeat": repeat or {"frequency": "none"},
+        },
+        "source": "slash",
+        "createdAt": "2026-08-18T00:00:00Z",
+        "updatedAt": "2026-08-18T00:00:00Z",
+    }
+    task.update(overrides)
+    return task
+
+
+def test_missing_store_returns_empty_inventory(tmp_path: Path) -> None:
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(tmp_path)
+
+    assert not tasks
+    assert not warnings
+    assert discovered == 0
+
+
+def test_v2_maps_active_and_paused_and_filters_terminal_tasks(
+    tmp_path: Path,
+) -> None:
+    user_data = tmp_path / "User"
+    existing_workspace = tmp_path / "project"
+    existing_workspace.mkdir()
+    missing_workspace = tmp_path / "missing-project"
+    active = _v2_task(
+        "daily",
+        repeat={"frequency": "daily", "time": "08:05"},
+        workspacePath=str(existing_workspace),
+        completedAt="2026-08-18T01:00:00Z",
+        model="qoder-model",
+    )
+    paused = _v2_task(
+        "weekly",
+        lifecycle="paused",
+        repeat={
+            "frequency": "weekly",
+            "time": "09:30",
+            "weekdays": [6, 1, 3, 1],
+        },
+        workspacePath=str(missing_workspace),
+    )
+    completed = _v2_task("completed", lifecycle="completed")
+    deleted = _v2_task(
+        "deleted",
+        deletedAt="2026-08-18T02:00:00Z",
+    )
+    _write_store(
+        user_data,
+        version=2,
+        tasks=[active, paused, completed, deleted],
+        runs=[
+            {
+                "id": "run-not-imported",
+                "taskId": "daily",
+                "status": "completed",
+            },
+        ],
+    )
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert discovered == 4
+    assert not warnings
+    assert [task.source_id for task in tasks] == [
+        "qoder:schedule:daily",
+        "qoder:schedule:weekly",
+    ]
+
+    daily, weekly = tasks
+    assert daily.schedule_type == "cron"
+    assert daily.cron == "5 8 * * *"
+    assert daily.enabled is True
+    assert daily.cwd == str(existing_workspace)
+    assert daily.metadata["workspace_status"] == "exists"
+    assert daily.metadata["workspace_exists"] is True
+    assert daily.metadata["target_default_enabled"] is False
+    assert daily.metadata["review_required"] is True
+    assert "model_compatibility_review" in daily.metadata["review_reasons"]
+
+    assert weekly.schedule_type == "cron"
+    assert weekly.cron == "30 9 * * mon,wed,sat"
+    assert weekly.enabled is False
+    assert weekly.metadata["source_lifecycle"] == "paused"
+    assert weekly.metadata["workspace_status"] == "missing"
+    assert weekly.metadata["workspace_exists"] is False
+    assert "source_task_paused" in weekly.metadata["review_reasons"]
+    assert "workspace_path_missing" in weekly.metadata["review_reasons"]
+
+
+def test_v2_maps_once_and_every_hour(tmp_path: Path) -> None:
+    user_data = tmp_path / "User"
+    _write_store(
+        user_data,
+        version=2,
+        tasks=[
+            _v2_task("once"),
+            _v2_task(
+                "hourly",
+                repeat={"frequency": "every-hour", "minute": 17},
+            ),
+        ],
+    )
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert discovered == 2
+    assert not warnings
+    once, hourly = tasks
+    assert once.schedule_type == "once"
+    assert once.run_at == datetime.fromisoformat("2026-08-20T00:00:00+00:00")
+    assert once.cron == ""
+    assert hourly.schedule_type == "cron"
+    assert hourly.cron == "17 * * * *"
+    assert hourly.run_at is None
+
+
+@pytest.mark.parametrize(
+    ("minutes", "start_at", "expected_type", "expected_cron"),
+    [
+        (15, "2026-08-20T00:00:00Z", "cron", "*/15 * * * *"),
+        (20, "2026-08-20T00:05:00Z", "cron", "5,25,45 * * * *"),
+        (120, "2026-08-20T00:00:00Z", "cron", "0 */2 * * *"),
+        (1_440, "2026-08-20T08:30:00Z", "cron", "30 8 * * *"),
+        (7, "2026-08-20T00:00:00Z", "unsupported", ""),
+        (90, "2026-08-20T00:00:00Z", "unsupported", ""),
+        (15, "2026-08-20T00:00:30Z", "unsupported", ""),
+    ],
+)
+def test_interval_only_maps_when_one_cron_is_exact(
+    tmp_path: Path,
+    minutes: int,
+    start_at: str,
+    expected_type: str,
+    expected_cron: str,
+) -> None:
+    user_data = tmp_path / f"User-{minutes}-{start_at[-3:]}"
+    _write_store(
+        user_data,
+        version=2,
+        tasks=[
+            _v2_task(
+                "interval",
+                repeat={"frequency": "interval", "minutes": minutes},
+                start_at=start_at,
+            ),
+        ],
+    )
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert discovered == 1
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task.schedule_type == expected_type
+    assert task.cron == expected_cron
+    if expected_type == "unsupported":
+        assert task.metadata["schedule_review_reason"] == (
+            "interval_not_exactly_representable"
+        )
+        assert warnings and "retained for review" in warnings[0]
+    else:
+        assert not warnings
+        assert task.metadata["schedule_fidelity"] == "exact"
+
+
+def test_corrupt_v2_never_falls_back_to_v1(tmp_path: Path) -> None:
+    user_data = tmp_path / "User"
+    v2_path = _store_path(user_data, 2)
+    v2_path.parent.mkdir(parents=True)
+    v2_path.write_text("{broken", encoding="utf-8")
+    _write_store(
+        user_data,
+        version=1,
+        tasks=[
+            {
+                "id": "legacy",
+                "title": "Legacy task",
+                "prompt": "Do legacy work",
+                "fireAt": "2026-08-21T00:00:00Z",
+                "timezone": "UTC",
+                "status": "pending",
+            },
+        ],
+    )
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert not tasks
+    assert discovered == 0
+    assert len(warnings) == 1
+    assert "Qoder v1 was not used" in warnings[0]
+
+
+def test_valid_v2_is_preferred_even_when_it_is_empty(tmp_path: Path) -> None:
+    user_data = tmp_path / "User"
+    _write_store(user_data, version=2, tasks=[])
+    _write_store(
+        user_data,
+        version=1,
+        tasks=[
+            {
+                "id": "legacy",
+                "fireAt": "2026-08-21T00:00:00Z",
+                "timezone": "UTC",
+                "status": "pending",
+            },
+        ],
+    )
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert not tasks
+    assert not warnings
+    assert discovered == 0
+
+
+def test_v1_fallback_maps_pending_one_shot_and_filters_history(
+    tmp_path: Path,
+) -> None:
+    user_data = tmp_path / "User"
+    _write_store(
+        user_data,
+        version=1,
+        tasks=[
+            {
+                "id": "legacy-pending",
+                "title": "Legacy pending",
+                "prompt": "Continue the old task",
+                "fireAt": "2026-08-21T12:34:56Z",
+                "timezone": "UTC",
+                "status": "pending",
+                "workspacePath": str(tmp_path),
+            },
+            {
+                "id": "legacy-failed",
+                "title": "Legacy failed",
+                "prompt": "Do not restore",
+                "fireAt": "2026-08-19T00:00:00Z",
+                "timezone": "UTC",
+                "status": "failed",
+            },
+        ],
+    )
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert discovered == 2
+    assert not warnings
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task.source_id == "qoder:schedule:legacy-pending"
+    assert task.schedule_type == "once"
+    assert task.run_at == datetime.fromisoformat("2026-08-21T12:34:56+00:00")
+    assert task.enabled is True
+    assert task.metadata["source_store_version"] == 1
+    assert task.metadata["legacy_store"] is True
+    assert "legacy_v1_definition" in task.metadata["review_reasons"]
+
+
+def test_remote_workspace_is_preserved_but_not_checked_locally(
+    tmp_path: Path,
+) -> None:
+    user_data = tmp_path / "User"
+    remote_path = "/remote/workspace/that/is/not/local"
+    _write_store(
+        user_data,
+        version=2,
+        tasks=[
+            _v2_task(
+                "remote",
+                workspacePath=remote_path,
+                workspaceType="folder",
+                ownerAuthority="ssh-remote+example",
+                targetRemoteAuthority="ssh-remote+example",
+            ),
+        ],
+    )
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert discovered == 1
+    assert not warnings
+    task = tasks[0]
+    assert task.cwd == remote_path
+    assert task.metadata["workspace_status"] == "remote_unverified"
+    assert task.metadata["workspace_exists"] is None
+    assert task.metadata["source_owner_authority"] == "ssh-remote+example"
+    assert task.metadata["source_target_remote_authority"] == (
+        "ssh-remote+example"
+    )
+    assert "remote_workspace_unverified" in task.metadata["review_reasons"]
+
+
+def test_malformed_schedule_is_retained_as_unsupported(tmp_path: Path) -> None:
+    user_data = tmp_path / "User"
+    task = _v2_task("bad-zone", timezone="Not/A-Timezone")
+    _write_store(user_data, version=2, tasks=[task, "not-a-task"])
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert discovered == 2
+    assert len(tasks) == 1
+    assert tasks[0].schedule_type == "unsupported"
+    assert tasks[0].timezone == "Not/A-Timezone"
+    assert tasks[0].metadata["schedule_review_reason"] == "invalid_timezone"
+    assert len(warnings) == 2
+    assert any("retained for review" in warning for warning in warnings)
+    assert any("index 1" in warning for warning in warnings)
+
+
+def test_v2_without_runs_array_is_treated_as_corrupt(tmp_path: Path) -> None:
+    user_data = tmp_path / "User"
+    path = _store_path(user_data, 2)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"version": 2, "tasks": [_v2_task("task")]}),
+        encoding="utf-8",
+    )
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert not tasks
+    assert discovered == 0
+    assert len(warnings) == 1
+    assert "no valid runs array" in warnings[0]
+    assert "Qoder v1 was not used" in warnings[0]
+
+
+def test_oversized_store_is_rejected_before_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_data = tmp_path / "User"
+    path = _store_path(user_data, 2)
+    path.parent.mkdir(parents=True)
+    monkeypatch.setattr(qoder_schedules, "_MAX_STORE_BYTES", 64)
+    path.write_bytes(b"{" + (b"x" * 128))
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert not tasks
+    assert discovered == 0
+    assert len(warnings) == 1
+    assert "64-byte safety limit" in warnings[0]
+    assert "Qoder v1 was not used" in warnings[0]
+
+
+def test_symbolic_link_store_is_rejected(tmp_path: Path) -> None:
+    user_data = tmp_path / "User"
+    target = tmp_path / "outside-store.json"
+    target.write_text(
+        json.dumps({"version": 2, "tasks": [], "runs": []}),
+        encoding="utf-8",
+    )
+    path = _store_path(user_data, 2)
+    path.parent.mkdir(parents=True)
+    path.symlink_to(target)
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert not tasks
+    assert discovered == 0
+    assert len(warnings) == 1
+    assert "symbolic-link" in warnings[0]
+
+
+def test_store_with_too_many_tasks_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_data = tmp_path / "User"
+    monkeypatch.setattr(qoder_schedules, "_MAX_TASKS", 2)
+    _write_store(
+        user_data,
+        version=2,
+        tasks=[_v2_task(str(index)) for index in range(3)],
+    )
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert not tasks
+    assert discovered == 0
+    assert len(warnings) == 1
+    assert "exceeding the 2-task safety limit" in warnings[0]
+
+
+def test_arbitrary_nested_metadata_is_not_copied(tmp_path: Path) -> None:
+    user_data = tmp_path / "User"
+    leak_marker = "NESTED_VALUE_MUST_NOT_BE_COPIED"
+    oversized_scalar = "x" * 10_000
+    task = _v2_task(
+        "bounded-metadata",
+        schedule={
+            "startAt": "2026-08-20T00:00:00Z",
+            "timezone": "UTC",
+            "repeat": {
+                "frequency": "none",
+                "minutes": 15,
+                "weekdays": [0, 1, 2, 3, 4, 5, 6, 99],
+                "unknown": {"deep": leak_marker},
+            },
+            "unknown": {"deep": leak_marker},
+        },
+        executionTarget={
+            "kind": "newSession",
+            "sessionId": "session-id",
+            "questTaskId": "quest-id",
+            "unknown": {"deep": leak_marker},
+        },
+        metadata={"arbitrary": {"deep": leak_marker}},
+        ownerAuthority=oversized_scalar,
+        sourceRequestId=oversized_scalar,
+    )
+    _write_store(user_data, version=2, tasks=[task])
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert discovered == 1
+    assert not warnings
+    assert len(tasks) == 1
+    metadata = tasks[0].metadata
+    serialized = json.dumps(metadata)
+    assert leak_marker not in serialized
+    assert set(metadata["source_schedule"]) == {
+        "startAt",
+        "timezone",
+        "repeat",
+    }
+    assert set(metadata["source_schedule"]["repeat"]) == {
+        "frequency",
+        "minutes",
+        "weekdays",
+    }
+    assert metadata["source_schedule"]["repeat"]["weekdays"] == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+    ]
+    assert metadata["source_execution_target"] == {
+        "kind": "newSession",
+        "sessionId": "session-id",
+        "questTaskId": "quest-id",
+    }
+    assert len(metadata["source_owner_authority"]) == 256
+    assert len(metadata["source_request_id"]) == 2_048
+
+
+def test_oversized_prompt_is_audited_and_never_made_executable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_data = tmp_path / "User"
+    prompt = "never execute this oversized instruction"
+    monkeypatch.setattr(qoder_schedules, "_MAX_PROMPT_CHARS", 10)
+    monkeypatch.setattr(qoder_schedules, "_MAX_PROMPT_BYTES", 100)
+    _write_store(
+        user_data,
+        version=2,
+        tasks=[_v2_task("oversized-prompt", prompt=prompt)],
+    )
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert discovered == 1
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task.prompt == ""
+    assert task.schedule_type == "unsupported"
+    assert task.metadata["unsupported_reason"] == (
+        "source_prompt_exceeds_limit"
+    )
+    assert task.metadata["schedule_review_reason"] == (
+        "source_prompt_exceeds_limit"
+    )
+    audit = task.metadata["prompt_audit"]
+    assert audit["disposition"] == "omitted"
+    assert audit["original_chars"] == len(prompt)
+    assert audit["original_bytes"] == len(prompt.encode("utf-8"))
+    assert len(audit["sha256"]) == 64
+    assert prompt not in json.dumps(task.metadata)
+    assert warnings and "retained for review" in warnings[0]
+
+
+def test_identity_title_and_cwd_limits_are_enforced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_data = tmp_path / "User"
+    monkeypatch.setattr(qoder_schedules, "_MAX_SOURCE_ID_CHARS", 8)
+    monkeypatch.setattr(qoder_schedules, "_MAX_TITLE_CHARS", 12)
+    monkeypatch.setattr(qoder_schedules, "_MAX_CWD_CHARS", 8)
+    _write_store(
+        user_data,
+        version=2,
+        tasks=[
+            _v2_task("id-that-is-too-long"),
+            _v2_task(
+                "safe-id",
+                title="A title that is much too long",
+                workspacePath="/workspace/that/is/too/long",
+            ),
+        ],
+    )
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert discovered == 2
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert len(task.name) <= 12
+    assert task.cwd == ""
+    assert task.metadata["workspace_status"] == "blocked_unsafe"
+    assert task.metadata["title_audit"]["original_chars"] > 12
+    assert task.metadata["cwd_audit"]["disposition"] == "omitted"
+    assert "source_title_normalized" in task.metadata["review_reasons"]
+    assert "source_cwd_blocked" in task.metadata["review_reasons"]
+    assert len(warnings) == 1
+    assert "unsafe or oversized id" in warnings[0]

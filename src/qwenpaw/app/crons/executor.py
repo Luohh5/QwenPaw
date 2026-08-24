@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import re
 import uuid
 from typing import Any, Dict
 
@@ -17,6 +19,56 @@ from ...security.tool_guard.execution_level import ToolExecutionLevel
 from ...schemas import RunStatus
 
 logger = logging.getLogger(__name__)
+
+_SESSION_COMPONENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_SESSION_COMPONENT_MAX_LENGTH = 32
+_TRACE_META_MAX_LENGTH = 256
+
+
+def _safe_session_component(value: str | None, *, fallback: str) -> str:
+    """Return a bounded, filesystem-neutral component for a session id.
+
+    Imported jobs can contain arbitrary source identifiers.  Preserve a
+    readable prefix when possible, and add a digest whenever normalization or
+    truncation is needed so two different source identifiers do not collapse
+    into the same cron session.
+    """
+    raw = (value or "").strip()
+    normalized = _SESSION_COMPONENT_RE.sub("-", raw).strip("._-")
+    if not normalized:
+        normalized = fallback
+    if normalized == raw and len(normalized) <= _SESSION_COMPONENT_MAX_LENGTH:
+        return normalized
+
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+    prefix_length = _SESSION_COMPONENT_MAX_LENGTH - len(digest) - 1
+    prefix = normalized[:prefix_length].rstrip("._-") or fallback
+    return f"{prefix}-{digest}"
+
+
+def _isolated_run_session_id(
+    *,
+    target_session_id: str | None,
+    job_id: str | None,
+    run_id: str,
+) -> str:
+    """Build one bounded and traceable session id per cron execution."""
+    target = _safe_session_component(
+        target_session_id,
+        fallback="session",
+    )
+    job = _safe_session_component(job_id, fallback="job")
+    return f"cron:{target}:job:{job}:run:{run_id}"
+
+
+def _bounded_trace_meta(value: str | None) -> str:
+    """Keep untrusted target identifiers from bloating trace metadata."""
+    raw = value or ""
+    if len(raw) <= _TRACE_META_MAX_LENGTH:
+        return raw
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+    prefix_length = _TRACE_META_MAX_LENGTH - len(digest) - 1
+    return f"{raw[:prefix_length]}-{digest}"
 
 
 class CronExecutor:
@@ -40,6 +92,7 @@ class CronExecutor:
         target_user_id = job.dispatch.target.user_id
         target_session_id = job.dispatch.target.session_id
         target_channel = job.dispatch.channel
+        run_id = str(uuid.uuid4())
         dispatch_meta: Dict[str, Any] = dict(job.dispatch.meta or {})
         if job.task_type == "agent":
             # Agent cron replies still print to the console channel, but
@@ -105,6 +158,7 @@ class CronExecutor:
         )
         request_context["source"] = "cron"
         request_context["cron_job_id"] = job.id or ""
+        request_context["cron_run_id"] = run_id
         request_context["approval_level"] = (
             ToolExecutionLevel.AUTO.value
             if job.runtime.tool_safety
@@ -117,14 +171,15 @@ class CronExecutor:
         if share_session:
             req["session_id"] = target_session_id or f"cron:{job.id}"
         else:
-            # Use job.id (not run_id) so all runs of this job accumulate in the
-            # same dedicated session, giving users a complete history.
-            req["session_id"] = (
-                f"{target_session_id}:cron:{job.id}"
-                if target_session_id
-                else f"cron:{job.id}"
+            # A non-shared cron run is a first-class task: it gets a fresh
+            # session and ChatSpec rather than inheriting earlier run context.
+            req["session_id"] = _isolated_run_session_id(
+                target_session_id=target_session_id,
+                job_id=job.id,
+                run_id=run_id,
             )
             req["session_source"] = "cron"
+        request_context["cron_run_session_id"] = req["session_id"]
 
         # Register a ChatSpec so the session appears in the frontend list.
         chat_manager = getattr(self._workspace, "chat_manager", None)
@@ -154,7 +209,6 @@ class CronExecutor:
         )
         baseline_count = len(baseline_messages)
 
-        run_id = str(uuid.uuid4())
         await create_trace(
             run_id,
             meta={
@@ -162,8 +216,12 @@ class CronExecutor:
                 "job_name": job.name,
                 "task_type": "agent",
                 "dispatch_channel": job.dispatch.channel,
-                "target_user_id": target_user_id,
-                "target_session_id": target_session_id,
+                "target_user_id": _bounded_trace_meta(target_user_id),
+                "target_session_id": _bounded_trace_meta(
+                    target_session_id,
+                ),
+                "run_session_id": req["session_id"],
+                "share_session": share_session,
                 "silent": job.dispatch.silent,
             },
         )
@@ -243,6 +301,7 @@ class CronExecutor:
             return {
                 "task_type": "agent",
                 "run_id": run_id,
+                "session_id": req["session_id"],
                 "delivery_status": delivery_status,
                 "delivery_error": delivery_error,
             }

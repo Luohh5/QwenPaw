@@ -3,568 +3,64 @@
 
 from __future__ import annotations
 
-import hashlib
-import io
-import json
 import logging
-import os
-import re
 import shutil
-import tempfile
-import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from uuid import uuid4
 
 from ..agents.skill_system import SkillService
 from ..app.driver_config_service import DriverConfigService
-from ..app.chats.models import ChatSpec
-from ..app.chats.session import session_relative_paths
 from ..drivers.adapters.mcp_legacy_config import legacy_mcp_client_to_driver
-from ..harnesses.session import HarnessSessionBridge
 from ..plugins.marketplace_registry import ExternalMarketplaceRegistry
-from ..utils import io_utils
 from ..utils.io_utils import (
     get_path_lock,
-    read_json_async,
     run_sync_io,
     unlink_async,
     write_json_atomic_async,
 )
+from .adaptation_loop import run_adaptation_loop
+from .compatibility import mcp_inline_secret_risks
 from .doctor import run_migration_doctor
 from .models import (
     ImportReceipt,
     MigrationDoctorReport,
-    MigrationPlan,
     ProviderInventory,
-    SourceMemoryProject,
-    SourceMCPServer,
-    SourceSession,
-    SourceSkill,
 )
-from .planner import build_migration_plan, inventory_fingerprint
 from .providers import create_migration_provider
-from .providers.base import ProgressReporter
+from .providers.base import ProgressReporter, report_progress as _report
 from .qoder_plugin_adapter import stage_qoder_skill_plugin
+from .scheduled_tasks import build_imported_job, imported_job_source
+from .import_conversations import ConversationState, import_conversations
+from .import_support import (
+    _RegistrySnapshot,
+    _bounded_memory,
+    _bounded_session,
+    _mcp_client_data,
+    _progress_milestone,
+    _remove_session_state,
+    _replace_memory_project,
+    _restore_memory_project,
+    _restore_registry_file,
+    _skill_zip,
+    _snapshot_registry_file,
+)
+from .import_planning import ImportPlanningMixin
 
 logger = logging.getLogger(__name__)
 
-_MAX_SESSIONS = 500
-_MAX_HISTORY_ITEMS = 20_000
-_MAX_SESSION_TEXT_BYTES = 64 * 1024 * 1024
-_MAX_SKILL_FILES = 5000
-_MAX_SKILL_BYTES = 64 * 1024 * 1024
-_MAX_MEMORY_FILES = 5000
-_MAX_MEMORY_BYTES = 64 * 1024 * 1024
-_PLAN_ID_PATTERN = re.compile(r"^plan-[0-9a-f]{32}$")
 
-
-async def _report(
-    progress: ProgressReporter | None,
-    message: str,
-) -> None:
-    """Keep presentation failures from aborting the migration transaction."""
-    if progress is None:
-        return
-    try:
-        await progress(message)
-    except Exception:  # pylint: disable=broad-except
-        logger.debug("Migration progress reporter failed", exc_info=True)
-
-
-def _progress_milestone(index: int, total: int) -> bool:
-    """Report roughly five-percent increments without flooding the chat."""
-    if total <= 20:
-        return True
-    step = max(1, total // 20)
-    return index == 1 or index == total or index % step == 0
-
-
-def _session_key(provider_id: str, source_id: str) -> str:
-    digest = hashlib.sha256(source_id.encode("utf-8")).hexdigest()[:24]
-    return f"import:{provider_id}:{digest}"
-
-
-def _chat_id(provider_id: str, source_id: str) -> str:
-    return str(uuid5(NAMESPACE_URL, f"qwenpaw:{provider_id}:{source_id}"))
-
-
-def _project_directory(
-    session: SourceSession,
-    warnings: list[str],
-) -> str | None:
-    """Return a safe existing source cwd for the QwenPaw session override."""
-    raw = str(session.cwd or "").strip()
-    if not raw:
-        return None
-    path = Path(raw).expanduser()
-    if not path.is_absolute() or not path.is_dir():
-        warnings.append(
-            f"Session {session.source_id} source project directory is no "
-            f"longer available; retained it as provenance only: {raw}",
-        )
-        return None
-    return str(path.resolve())
-
-
-def _mcp_client_data(server: SourceMCPServer) -> Any:
-    """Return the attribute shape consumed by the existing MCP translator."""
-    return SimpleNamespace(
-        name=server.name,
-        description="Imported from external Agent; review before enabling.",
-        enabled=False,
-        transport=server.transport,
-        command=server.command,
-        args=list(server.args),
-        env=dict(server.env),
-        cwd=server.cwd,
-        url=server.url,
-        headers=dict(server.headers),
-        oauth=None,
-    )
-
-
-def _bounded_session(session: SourceSession) -> SourceSession:
-    if len(session.history) > _MAX_HISTORY_ITEMS:
-        raise ValueError(
-            f"Session {session.source_id} exceeds the history item limit.",
-        )
-    size = sum(
-        len(item.model_dump_json().encode("utf-8", errors="replace"))
-        for item in session.history
-    )
-    if size > _MAX_SESSION_TEXT_BYTES:
-        raise ValueError(
-            f"Session {session.source_id} exceeds the 64 MiB text limit.",
-        )
-    return session
-
-
-def _bounded_memory(projects: list[SourceMemoryProject]) -> None:
-    count = 0
-    total = 0
-    for project in projects:
-        for item in project.files:
-            source = item.source_path.expanduser()
-            if source.is_symlink() or not source.is_file():
-                raise ValueError(
-                    f"Memory source is unavailable or symbolic: {source}",
-                )
-            count += 1
-            total += source.stat().st_size
-            if count > _MAX_MEMORY_FILES or total > _MAX_MEMORY_BYTES:
-                raise ValueError(
-                    "External memory exceeds the 5,000 file / 64 MiB "
-                    "migration limit.",
-                )
-
-
-def _safe_memory_key(project: SourceMemoryProject) -> str:
-    label = re.sub(r"[^A-Za-z0-9._-]+", "-", project.project_key).strip(
-        ".-",
-    )
-    label = (label or "project")[:48]
-    digest = hashlib.sha256(project.source_id.encode("utf-8")).hexdigest()[:10]
-    return f"{label}-{digest}"
-
-
-def _memory_import_root(workspace: Any, provider_id: str) -> Path:
-    daily_dir = "memory"
-    manager = getattr(workspace, "memory_manager", None)
-    if manager is not None:
-        try:
-            config = manager.get_memory_config()
-            configured = getattr(config, "daily_dir", "")
-            if isinstance(configured, str) and configured.strip():
-                daily_dir = configured.strip()
-        except Exception:  # pylint: disable=broad-except
-            logger.debug("Could not read configured daily memory dir")
-    relative = Path(daily_dir)
-    if relative.is_absolute() or ".." in relative.parts:
-        raise ValueError(f"Unsafe configured memory directory: {daily_dir}")
-    workspace_root = Path(workspace.workspace_dir).resolve()
-    target = (workspace_root / relative / "imports" / provider_id).resolve()
-    if not target.is_relative_to(workspace_root):
-        raise ValueError("Memory import target escapes the Agent workspace")
-    return target
-
-
-def _snapshot_tree(root: Path) -> dict[Path, bytes] | None:
-    if not root.exists():
-        return None
-    if root.is_symlink() or not root.is_dir():
-        raise ValueError(f"Memory target is not a safe directory: {root}")
-    snapshot: dict[Path, bytes] = {}
-    total = 0
-    for path in sorted(root.rglob("*")):
-        if path.is_symlink():
-            raise ValueError(f"Memory target contains a symbolic link: {path}")
-        if not path.is_file():
-            continue
-        data = path.read_bytes()
-        total += len(data)
-        if total > _MAX_MEMORY_BYTES:
-            raise ValueError("Existing imported memory exceeds 64 MiB")
-        snapshot[path.relative_to(root)] = data
-    return snapshot
-
-
-def _memory_payload(
-    provider_id: str,
-    project: SourceMemoryProject,
-) -> dict[Path, bytes]:
-    payload: dict[Path, bytes] = {}
-    for item in project.files:
-        relative = item.relative_path
-        if (
-            relative.is_absolute()
-            or ".." in relative.parts
-            or relative.suffix.lower() != ".md"
-        ):
-            raise ValueError(
-                f"Unsafe external memory path: {item.relative_path}",
-            )
-        source = item.source_path.expanduser()
-        if source.is_symlink() or not source.is_file():
-            raise ValueError(f"Memory source is unavailable: {source}")
-        payload[relative] = source.read_bytes()
-    scope = {
-        "schema_version": "1",
-        "provider": provider_id,
-        "source_id": project.source_id,
-        "project_key": project.project_key,
-        "cwd": project.cwd,
-        "trust": "source_material_not_instructions",
-    }
-    payload[Path("_scope.json")] = (
-        json.dumps(scope, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-    ).encode("utf-8")
-    return payload
-
-
-def _replace_memory_project(
-    workspace: Any,
-    provider_id: str,
-    project: SourceMemoryProject,
-) -> tuple[Path, dict[Path, bytes] | None, bool]:
-    target = _memory_import_root(workspace, provider_id) / _safe_memory_key(
-        project,
-    )
-    payload = _memory_payload(provider_id, project)
-    previous = _snapshot_tree(target)
-    if previous == payload:
-        return target, previous, False
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temp_root = Path(
-        tempfile.mkdtemp(prefix=f".{target.name}.new-", dir=target.parent),
-    )
-    old_root = target.parent / f".{target.name}.old-{uuid4().hex}"
-    try:
-        for relative, data in payload.items():
-            output = temp_root / relative
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_bytes(data)
-        if target.exists():
-            os.replace(target, old_root)
-        os.replace(temp_root, target)
-        if old_root.exists():
-            shutil.rmtree(old_root)
-    except BaseException:
-        if target.exists() and old_root.exists():
-            shutil.rmtree(target)
-        if old_root.exists():
-            os.replace(old_root, target)
-        raise
-    finally:
-        if temp_root.exists():
-            shutil.rmtree(temp_root)
-        if old_root.exists():
-            shutil.rmtree(old_root)
-    return target, previous, True
-
-
-def _restore_memory_project(
-    target: Path,
-    previous: dict[Path, bytes] | None,
-) -> None:
-    if target.exists():
-        shutil.rmtree(target)
-    if previous is None:
-        return
-    for relative, data in previous.items():
-        output = target / relative
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(data)
-
-
-def _skill_zip(skill: SourceSkill) -> bytes:
-    source_root = skill.directory.expanduser()
-    if source_root.is_symlink():
-        raise ValueError(f"Skill root is a symbolic link: {source_root}")
-    root = source_root.resolve(strict=True)
-    if not root.is_dir() or not (root / "SKILL.md").is_file():
-        raise ValueError(f"Skill source is incomplete: {root}")
-    output = io.BytesIO()
-    count = 0
-    total = 0
-    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-        for entry in sorted(root.rglob("*")):
-            if entry.is_symlink():
-                raise ValueError(f"Skill contains a symbolic link: {entry}")
-            if not entry.is_file():
-                continue
-            resolved = entry.resolve(strict=True)
-            if not resolved.is_relative_to(root):
-                raise ValueError(f"Skill file escapes its root: {entry}")
-            size = entry.stat().st_size
-            count += 1
-            total += size
-            if count > _MAX_SKILL_FILES or total > _MAX_SKILL_BYTES:
-                raise ValueError(
-                    f"Skill {skill.name!r} exceeds migration limits.",
-                )
-            archive.write(entry, f"{root.name}/{entry.relative_to(root)}")
-    return output.getvalue()
-
-
-async def _remove_session_state(
-    workspace: Any,
-    *,
-    session_id: str,
-    user_id: str,
-    channel: str,
-) -> None:
-    save_dir = Path(workspace.session.save_dir)
-    for relative in session_relative_paths(session_id, user_id, channel):
-        await unlink_async(save_dir / relative, missing_ok=True)
-
-
-class ProviderImportService:  # pylint: disable=too-few-public-methods
+class ProviderImportService(ImportPlanningMixin):
     """Trusted writer coordinating provider inventory and QwenPaw stores."""
 
     def __init__(self, workspace: Any) -> None:
         """Bind the importer to one already-started Agent workspace."""
         self._workspace = workspace
 
-    async def import_from(
-        self,
-        source: str,
-        *,
-        source_home: Path | None = None,
-        progress: ProgressReporter | None = None,
-    ) -> ImportReceipt:
-        """Inventory, persist a plan, and commit one provider migration."""
-        started_at = datetime.now(timezone.utc)
-        lock_path = (
-            Path(self._workspace.workspace_dir) / ".qwenpaw" / "imports"
-        )
-        await _report(progress, "正在等待迁移锁，避免重复导入…")
-        async with get_path_lock(lock_path):
-            inventory = await self._inventory(
-                source,
-                source_home=source_home,
-                progress=progress,
-            )
-            plan = await build_migration_plan(
-                self._workspace,
-                inventory,
-                source_home=str(source_home or ""),
-            )
-            await self._write_plan(plan)
-            await _report(
-                progress,
-                "读取完成："
-                f"{len(inventory.sessions)} 个会话、"
-                f"{len(inventory.skills)} 个 Skill、"
-                f"{len(inventory.mcp_servers)} 个 MCP、"
-                f"{len(inventory.memory_projects)} 组 Memory、"
-                f"{len(inventory.plugins)} 个插件；正在写入 QwenPaw…",
-            )
-            return await self._execute_plan(
-                plan,
-                inventory,
-                started_at=started_at,
-                progress=progress,
-            )
-
-    async def _execute_plan(
-        self,
-        plan: MigrationPlan,
-        inventory: ProviderInventory,
-        *,
-        started_at: datetime,
-        progress: ProgressReporter | None,
-    ) -> ImportReceipt:
-        """Mark plan lifecycle around the rollback-capable data write."""
-        plan.state = "applying"
-        await self._write_plan(plan)
-        try:
-            receipt = await self._apply(
-                inventory,
-                started_at=started_at,
-                plan_id=plan.plan_id,
-                progress=progress,
-            )
-        except BaseException:
-            plan.state = "ready"
-            try:
-                await self._write_plan(plan)
-            except Exception:  # pylint: disable=broad-except
-                logger.exception("Failed to restore migration plan state")
-            raise
-        plan.state = "applied"
-        plan.migration_id = receipt.migration_id
-        try:
-            await self._write_plan(plan)
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.exception("Failed to finalize migration plan state")
-            receipt.warnings.append(
-                "迁移已成功，但计划状态回写失败：" f"{type(exc).__name__}: {exc}",
-            )
-        return receipt
-
-    async def inspect(
-        self,
-        source: str,
-        *,
-        source_home: Path | None = None,
-        progress: ProgressReporter | None = None,
-    ) -> ProviderInventory:
-        """Read and normalize a source without changing QwenPaw state."""
-        return await self._inventory(
-            source,
-            source_home=source_home,
-            progress=progress,
-            require_detected=False,
-        )
-
-    async def plan_from(
-        self,
-        source: str,
-        *,
-        source_home: Path | None = None,
-        progress: ProgressReporter | None = None,
-    ) -> MigrationPlan:
-        """Create and persist a dry-run migration plan without importing."""
-        lock_path = (
-            Path(self._workspace.workspace_dir) / ".qwenpaw" / "imports"
-        )
-        await _report(progress, "正在生成迁移预演，不会修改现有数据…")
-        async with get_path_lock(lock_path):
-            inventory = await self._inventory(
-                source,
-                source_home=source_home,
-                progress=progress,
-            )
-            plan = await build_migration_plan(
-                self._workspace,
-                inventory,
-                source_home=str(source_home or ""),
-            )
-            await self._write_plan(plan)
-        await _report(progress, "迁移预演已生成；尚未导入任何内容。")
-        return plan
-
-    async def apply_plan(
-        self,
-        plan_id: str,
-        *,
-        progress: ProgressReporter | None = None,
-    ) -> ImportReceipt:
-        """Revalidate a persisted plan and apply the unchanged source."""
-        if not _PLAN_ID_PATTERN.fullmatch(plan_id):
-            raise ValueError("迁移计划编号格式无效。")
-        lock_path = (
-            Path(self._workspace.workspace_dir) / ".qwenpaw" / "imports"
-        )
-        await _report(progress, "正在重新核对迁移计划和来源数据…")
-        async with get_path_lock(lock_path):
-            plan = await self._read_plan(plan_id)
-            if plan.agent_id != self._workspace.agent_id:
-                raise ValueError("该迁移计划属于另一个智能体，不能在这里执行。")
-            if plan.state != "ready":
-                raise ValueError(
-                    f"该迁移计划当前状态为 {plan.state!r}，不能重复执行。",
-                )
-            source_home = Path(plan.source_home) if plan.source_home else None
-            inventory = await self._inventory(
-                plan.source,
-                source_home=source_home,
-                progress=progress,
-            )
-            if inventory_fingerprint(inventory) != plan.inventory_fingerprint:
-                message = "来源数据在预演后发生了变化。请重新运行 --dry-run，"
-                message += "确认新计划后再执行。"
-                raise ValueError(message)
-            return await self._execute_plan(
-                plan,
-                inventory,
-                started_at=datetime.now(timezone.utc),
-                progress=progress,
-            )
-
-    async def _inventory(
-        self,
-        source: str,
-        *,
-        source_home: Path | None,
-        progress: ProgressReporter | None,
-        require_detected: bool = True,
-    ) -> ProviderInventory:
-        await _report(progress, f"正在检测 {source} 并读取可迁移内容…")
-        # Keep compatibility with tests and integrations that patch the old
-        # two-argument factory while still supporting explicit source roots.
-        if source_home is None:
-            provider = create_migration_provider(source, self._workspace)
-        else:
-            provider = create_migration_provider(
-                source,
-                self._workspace,
-                source_home=source_home,
-            )
-        inventory = await provider.inventory(
-            limit=_MAX_SESSIONS,
-            progress=progress,
-        )
-        if require_detected and not inventory.detected:
-            detail = "; ".join(inventory.warnings) or "未检测到来源数据"
-            raise ValueError(
-                f"未找到 {inventory.provider_name} 的可迁移数据 "
-                f"(source not found)：{detail}",
-            )
-        return inventory
-
-    def _plan_path(self, plan_id: str) -> Path:
-        return (
-            Path(self._workspace.workspace_dir)
-            / ".qwenpaw"
-            / "imports"
-            / "plans"
-            / f"{plan_id}.json"
-        )
-
-    async def _write_plan(self, plan: MigrationPlan) -> None:
-        path = self._plan_path(plan.plan_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        await io_utils.write_json_atomic_async(
-            path,
-            plan.model_dump(mode="json"),
-            sort_keys=True,
-            new_file_mode=0o600,
-        )
-
-    async def _read_plan(self, plan_id: str) -> MigrationPlan:
-        path = self._plan_path(plan_id)
-        try:
-            value = await read_json_async(path)
-            return MigrationPlan.model_validate(value)
-        except FileNotFoundError as exc:
-            raise ValueError(f"找不到迁移计划：{plan_id}") from exc
-        except (OSError, ValueError, TypeError) as exc:
-            raise ValueError(f"迁移计划已损坏或无法读取：{plan_id}") from exc
+    def _create_provider(self, source: str, **kwargs: Any) -> Any:
+        """Keep provider construction local for stable integrations/mocks."""
+        return create_migration_provider(source, self._workspace, **kwargs)
 
     # pylint: disable-next=R0912,R0915,R0914
     async def _apply(
@@ -591,9 +87,10 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
             for chat in existing_chats
         }
 
-        imported_sessions: list[str] = []
-        skipped_sessions: list[str] = []
-        archived_internal_sessions: list[str] = []
+        conversations = ConversationState()
+        imported_sessions = conversations.imported
+        skipped_sessions = conversations.skipped
+        archived_internal_sessions = conversations.archived_internal
         imported_skills: list[str] = []
         skipped_skills: list[str] = []
         imported_mcp_servers: list[str] = []
@@ -602,26 +99,100 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
         skipped_memory_projects: list[str] = []
         restored_marketplaces: list[str] = []
         skipped_marketplaces: list[str] = []
+        prepared_plugins: list[str] = []
         installed_plugins: list[str] = []
         skipped_plugins: list[str] = []
+        imported_scheduled_tasks: list[str] = []
+        skipped_scheduled_tasks: list[str] = []
+        adaptation_status = "not_run"
+        adaptation_manifest = ""
+        adaptation_summary = ""
+        adaptation_counts: dict[str, int] = {}
+        adaptation_asset_zones: dict[str, str] = {}
         plugin_app = None
-        created_chats: list[str] = []
-        created_states: list[tuple[str, str, str]] = []
-        patched_project_dirs: list[tuple[str, str | None]] = []
-        archived_chats: list[str] = []
+        created_chats = conversations.created_chats
+        created_states = conversations.created_states
+        patched_project_dirs = conversations.patched_project_dirs
+        archived_chats = conversations.archived_chats
         created_mcp: list[tuple[str, str]] = []
+        created_scheduled_tasks: list[str] = []
+        replaced_scheduled_tasks: list[Any] = []
         memory_changes: list[tuple[Path, dict[Path, bytes] | None]] = []
         receipt_path: Path | None = None
+        marketplace_registry_snapshot: _RegistrySnapshot | None = None
+        marketplace_registry_touched = False
+        adaptation_root = (
+            Path(self._workspace.workspace_dir)
+            / ".qwenpaw"
+            / "imports"
+            / migration_id
+        )
         skill_service = SkillService(self._workspace.workspace_dir)
         driver_config = DriverConfigService(self._workspace)
 
         try:
+            await import_conversations(
+                self._workspace,
+                inventory,
+                sessions,
+                existing_by_source,
+                warnings,
+                started_at,
+                progress,
+                conversations,
+            )
+
+            try:
+                adaptation = await run_adaptation_loop(
+                    self._workspace,
+                    inventory,
+                    migration_id,
+                    progress,
+                )
+                adaptation_status = adaptation.status
+                adaptation_counts = dict(adaptation.counts)
+                adaptation_asset_zones = dict(adaptation.asset_zones)
+                try:
+                    adaptation_manifest = str(
+                        adaptation.manifest_path.relative_to(
+                            Path(self._workspace.workspace_dir),
+                        ),
+                    )
+                except ValueError:
+                    adaptation_manifest = str(adaptation.manifest_path)
+                try:
+                    adaptation_summary = str(
+                        adaptation.summary_path.relative_to(
+                            Path(self._workspace.workspace_dir),
+                        ),
+                    )
+                except ValueError:
+                    adaptation_summary = str(adaptation.summary_path)
+                warnings.extend(adaptation.warnings)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception("Portability adaptation loop failed")
+                adaptation_status = "failed_safe"
+                warnings.append(
+                    "工具和设置自动兼容 Loop 运行失败；迁移将继续，并保持"
+                    "相关资产禁用："
+                    f"{type(exc).__name__}: {exc}",
+                )
+
             registry_path = getattr(
                 self._workspace,
                 "marketplace_registry_path",
                 None,
             )
             marketplace_registry = ExternalMarketplaceRegistry(registry_path)
+            if inventory.marketplaces:
+                registry_file = marketplace_registry.path
+                marketplace_registry_snapshot = _RegistrySnapshot(
+                    path=registry_file,
+                    content=await run_sync_io(
+                        _snapshot_registry_file,
+                        registry_file,
+                    ),
+                )
             marketplace_total = len(inventory.marketplaces)
             for marketplace_index, marketplace in enumerate(
                 inventory.marketplaces,
@@ -644,6 +215,8 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                     source_type=marketplace.source_type,
                     ref_name=marketplace.ref_name,
                 )
+                if changed:
+                    marketplace_registry_touched = True
                 if credentials_removed:
                     warnings.append(
                         f"Marketplace {marketplace.name!r} contained URL "
@@ -662,7 +235,23 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                 else:
                     skipped_marketplaces.append(marketplace.name)
 
-            if inventory.plugins:
+            installable_plugins = [
+                plugin
+                for plugin in inventory.plugins
+                if (
+                    adaptation_asset_zones.get(f"plugins:{plugin.source_id}")
+                    == "migrate"
+                    or (
+                        adaptation_asset_zones.get(
+                            f"plugins:{plugin.source_id}",
+                        )
+                        == "repair"
+                        and plugin.metadata.get("adapter")
+                        == "qoder_skill_only_v1"
+                    )
+                )
+            ]
+            if installable_plugins:
                 try:
                     # pylint: disable-next=C0415
                     from ..plugins.registry import (
@@ -695,6 +284,30 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                         "portable Skills/MCP are handled separately.",
                     )
                     continue
+                compatibility_zone = adaptation_asset_zones.get(
+                    f"plugins:{plugin.source_id}",
+                    "failed_safe",
+                )
+                if compatibility_zone not in {"migrate", "repair"}:
+                    skipped_plugins.append(plugin.source_id)
+                    warnings.append(
+                        f"Plugin {plugin.source_id!r} was not installed: "
+                        f"compatibility zone is {compatibility_zone!r}. "
+                        "Its Marketplace provenance remains available for "
+                        "manual review.",
+                    )
+                    continue
+                if (
+                    compatibility_zone == "repair"
+                    and plugin.metadata.get("adapter") != "qoder_skill_only_v1"
+                ):
+                    prepared_plugins.append(plugin.source_id)
+                    warnings.append(
+                        f"Plugin {plugin.source_id!r} remains in the repair "
+                        "zone. Its source was preserved but executable code "
+                        "was not loaded.",
+                    )
+                    continue
                 if plugin_app is None:
                     skipped_plugins.append(plugin.source_id)
                     warnings.append(
@@ -715,6 +328,7 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                         staged_plugin = await run_sync_io(
                             stage_qoder_skill_plugin,
                             plugin,
+                            enabled=compatibility_zone == "migrate",
                         )
                         install_source = str(staged_plugin)
                     record = await install_plugin_source(
@@ -725,18 +339,14 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                     )
                     installed_plugins.append(record.manifest.id)
                     if staged_plugin is not None:
-                        binding = bool(
-                            plugin.metadata.get("harness_bound", False),
-                        )
                         warnings.append(
                             f"Adapted local Qoder Skill-only plugin "
                             f"{plugin.source_id!r} into a QwenPaw native "
-                            "wrapper. Its Skills were installed "
+                            "wrapper; its Skills are "
                             + (
-                                "disabled because Qoder-specific paths or "
-                                "runtime contracts require review."
-                                if binding
-                                else "enabled after structural validation."
+                                "enabled."
+                                if compatibility_zone == "migrate"
+                                else "installed disabled for further repair."
                             ),
                         )
                 except Exception as exc:  # pylint: disable=broad-except
@@ -754,10 +364,9 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                         )
             if installed_plugins:
                 warnings.append(
-                    "Compatible plugins were installed and hot-loaded "
-                    "without reloading Agents during the active /import. "
-                    "Their tools remain disabled until reviewed; restart or "
-                    "reload the Agent after this migration if needed.",
+                    "兼容性 Goal 批准的插件已通过 QwenPaw 原生安装流程"
+                    "写入；Qoder Skill-only 插件使用 QwenPaw 生成的安全"
+                    "包装器。需要时请在迁移后重载智能体。",
                 )
 
             memory_total = len(inventory.memory_projects)
@@ -797,12 +406,24 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                         progress,
                         f"正在安全检查并暂存 Skill：" f"{skill_index}/{skill_total}",
                     )
+                compatibility_zone = adaptation_asset_zones.get(
+                    f"skills:{skill.source_id}",
+                    "failed_safe",
+                )
+                if compatibility_zone not in {"migrate", "repair"}:
+                    skipped_skills.append(skill.name)
+                    warnings.append(
+                        f"Skill {skill.name!r} 未写入 QwenPaw：兼容状态为 "
+                        f"{compatibility_zone!r}；源文件仍保留在兼容清单/"
+                        "隔离暂存区，可修复后重试。",
+                    )
+                    continue
                 try:
                     data = await run_sync_io(_skill_zip, skill)
                     result = await run_sync_io(
                         skill_service.import_from_zip,
                         data,
-                        False,
+                        compatibility_zone == "migrate",
                     )
                     names = [str(name) for name in result.get("imported", [])]
                     if names:
@@ -833,6 +454,18 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                         progress,
                         f"正在转换并加密保存 MCP：{mcp_index}/{mcp_total}",
                     )
+                compatibility_zone = adaptation_asset_zones.get(
+                    f"mcp:{server.source_id}",
+                    "failed_safe",
+                )
+                if compatibility_zone not in {"migrate", "repair"}:
+                    skipped_mcp_servers.append(server.name)
+                    warnings.append(
+                        f"MCP {server.name!r} 未写入 DriverCard：兼容状态"
+                        f"为 {compatibility_zone!r}；请根据兼容清单修复"
+                        "后重试。",
+                    )
+                    continue
                 if server.name in existing_driver_names:
                     skipped_mcp_servers.append(server.name)
                     warnings.append(
@@ -851,19 +484,36 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                         f"{server.transport!r} and was skipped.",
                     )
                     continue
+                inline_secret_risks = mcp_inline_secret_risks(
+                    server.command,
+                    server.args,
+                    server.url,
+                    server.env,
+                    server.headers,
+                    server.cwd,
+                )
+                if inline_secret_risks:
+                    skipped_mcp_servers.append(server.name)
+                    warnings.append(
+                        f"MCP {server.name!r} 的命令参数或 URL 可能包含"
+                        "无法安全绑定的明文凭据，已拒绝写入 DriverCard；"
+                        "请改用环境变量/请求头凭据或在 QwenPaw 中重新配置。",
+                    )
+                    continue
                 credential_ref = ""
                 try:
                     card, credential = legacy_mcp_client_to_driver(
                         server.name,
                         _mcp_client_data(server),
+                        force_encrypt_bindings=True,
                     )
-                    card.enabled = False
+                    card.enabled = compatibility_zone == "migrate"
                     card.config = {
                         **dict(card.config),
                         "migration_source": inventory.provider_id,
                         "migration_source_id": server.source_id,
                         "source_enabled": server.enabled,
-                        "requires_review": True,
+                        "requires_review": compatibility_zone == "repair",
                         "auth_status": server.auth_status,
                         "source_runtime_bound": bool(
                             server.metadata.get("source_runtime_bound"),
@@ -875,7 +525,7 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                     try:
                         await driver_config.save_card(
                             card,
-                            reload_driver=False,
+                            reload_driver=compatibility_zone == "migrate",
                         )
                     except BaseException:
                         if credential_ref:
@@ -905,118 +555,177 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                         f"was skipped: {type(exc).__name__}: {exc}",
                     )
 
-            bridge = HarnessSessionBridge(self._workspace.session)
-            ignored_total = len(inventory.ignored_session_ids)
-            if ignored_total:
-                await _report(
-                    progress,
-                    "正在整理此前误导入的内部执行轨迹…",
-                )
-            for source_id in inventory.ignored_session_ids:
-                chat = existing_by_source.get(
-                    (inventory.provider_id, source_id),
-                )
-                if chat is None or chat.archived:
-                    continue
-                archived = await self._workspace.chat_manager.archive_chat(
-                    chat.id,
-                )
-                if archived is not None:
-                    archived_chats.append(chat.id)
-                    archived_internal_sessions.append(source_id)
-            if archived_internal_sessions:
-                warnings.append(
-                    f"Archived {len(archived_internal_sessions)} previously "
-                    "imported Qoder internal Agent/Experts execution traces. "
-                    "They remain recoverable from the archived chat list.",
-                )
-
-            session_total = len(sessions)
-            for session_index, session in enumerate(sessions, start=1):
-                if _progress_milestone(session_index, session_total):
+            cron_manager = getattr(self._workspace, "cron_manager", None)
+            existing_task_jobs: dict[tuple[str, str], Any] = {}
+            if cron_manager is not None:
+                try:
+                    existing_task_jobs = {
+                        key: job
+                        for job in await cron_manager.list_jobs()
+                        if (key := imported_job_source(job)) is not None
+                    }
+                except Exception as exc:  # pylint: disable=broad-except
+                    warnings.append(
+                        "无法读取 QwenPaw 定时任务列表；本次定时任务迁移已"
+                        f"安全跳过：{type(exc).__name__}: {exc}",
+                    )
+                    cron_manager = None
+            task_total = len(inventory.scheduled_tasks)
+            for task_index, task in enumerate(
+                inventory.scheduled_tasks,
+                start=1,
+            ):
+                if _progress_milestone(task_index, task_total):
                     await _report(
                         progress,
-                        f"正在写入会话：{session_index}/{session_total}",
+                        "正在转换定时任务模板（默认禁用）：" f"{task_index}/{task_total}",
                     )
-                source_key = (inventory.provider_id, session.source_id)
-                existing_chat = existing_by_source.get(source_key)
-                project_dir = _project_directory(session, warnings)
-                if existing_chat is not None:
-                    if project_dir:
-                        runtime_context = (
-                            existing_chat.meta.get("runtime_context") or {}
-                        )
-                        current = str(runtime_context.get("project_dir") or "")
-                        if current != project_dir:
-                            patched_project_dirs.append(
-                                (existing_chat.id, current or None),
-                            )
-                            await self._workspace.chat_manager.set_project_dir(
-                                existing_chat.id,
-                                project_dir,
-                            )
-                    skipped_sessions.append(session.source_id)
-                    continue
-                if not session.history:
-                    skipped_sessions.append(session.source_id)
+                compatibility_zone = adaptation_asset_zones.get(
+                    f"scheduled_tasks:{task.source_id}",
+                    "failed_safe",
+                )
+                if compatibility_zone not in {"migrate", "repair"}:
+                    skipped_scheduled_tasks.append(task.source_id)
                     warnings.append(
-                        f"Session {session.source_id} contained no readable "
-                        "conversation history.",
+                        f"定时任务 {task.name!r} 未写入 Cron：兼容状态"
+                        f"为 {compatibility_zone!r}；它只保留在兼容清单"
+                        "中，不会被“立即运行”绕过。",
                     )
                     continue
-                session_id = _session_key(
-                    inventory.provider_id,
-                    session.source_id,
-                )
-                user_id = session_id
-                channel = "console"
-                await bridge.hydrate(
-                    session_id=session_id,
-                    user_id=user_id,
-                    channel=channel,
-                    backend=inventory.provider_id,
-                    history=session.history,
-                )
-                created_states.append((session_id, user_id, channel))
-                portability_meta = {
-                    "schema_version": "1",
-                    "source": inventory.provider_id,
-                    "source_id": session.source_id,
-                    "source_locator": inventory.locator,
-                    "source_cwd": session.cwd,
-                    "imported_at": datetime.now(timezone.utc).isoformat(),
-                    "import_mode": "historical_archive",
-                    "read_only_enforced": False,
-                    "continuation_fidelity": "not_guaranteed",
-                    "historical_tools_are_data": True,
-                    "fidelity": "normalized_lossy",
-                }
-                chat_meta: dict[str, Any] = {
-                    "portability": portability_meta,
-                }
-                if project_dir:
-                    chat_meta["runtime_context"] = {
-                        "project_dir": project_dir,
-                    }
-                updated_at = session.updated_at
-                if updated_at is None:
-                    updated_at = session.created_at
-                if updated_at is None:
-                    updated_at = started_at
-                spec = ChatSpec(
-                    id=_chat_id(inventory.provider_id, session.source_id),
-                    name=session.title,
-                    session_id=session_id,
-                    user_id=user_id,
-                    channel=channel,
-                    created_at=session.created_at or started_at,
-                    updated_at=updated_at,
-                    meta=chat_meta,
-                )
-                await self._workspace.chat_manager.create_chat(spec)
-                existing_by_source[source_key] = spec
-                created_chats.append(spec.id)
-                imported_sessions.append(session.source_id)
+                key = (inventory.provider_id, task.source_id)
+                existing_task = existing_task_jobs.get(key)
+                repairing_invalid_task = False
+                if existing_task is not None:
+                    validator = getattr(
+                        cron_manager,
+                        "validate_job_spec",
+                        None,
+                    )
+                    if not callable(validator):
+                        skipped_scheduled_tasks.append(task.source_id)
+                        continue
+                    try:
+                        validator(existing_task)
+                    except Exception as exc:  # pylint: disable=broad-except
+                        portability = getattr(existing_task, "meta", {}).get(
+                            "portability",
+                            {},
+                        )
+                        review_checker = getattr(
+                            cron_manager,
+                            "requires_portability_review",
+                            None,
+                        )
+                        still_awaiting_review = (
+                            bool(review_checker(existing_task))
+                            if callable(review_checker)
+                            else bool(
+                                isinstance(portability, dict)
+                                and (
+                                    portability.get("requires_review") is True
+                                    or portability.get("safety")
+                                    == "disabled_until_explicit_promotion"
+                                ),
+                            )
+                        )
+                        if not still_awaiting_review:
+                            skipped_scheduled_tasks.append(task.source_id)
+                            warnings.append(
+                                f"已有定时任务 {task.name!r} 无法注册，但"
+                                "它已经过人工处理，本次不会覆盖："
+                                f"{type(exc).__name__}: {exc}",
+                            )
+                            continue
+                        repairing_invalid_task = True
+                        warnings.append(
+                            f"检测到旧版留下的无效定时任务 "
+                            f"{task.name!r}；将用已通过兼容检查的禁用"
+                            "模板修复，不会执行任务。",
+                        )
+                    else:
+                        review_checker = getattr(
+                            cron_manager,
+                            "requires_portability_review",
+                            None,
+                        )
+                        normalizer = getattr(
+                            cron_manager,
+                            "canonicalize_imported_job_for_review",
+                            None,
+                        )
+                        if (
+                            callable(review_checker)
+                            and review_checker(existing_task)
+                            and callable(normalizer)
+                        ):
+                            normalized_existing = normalizer(existing_task)
+                            if normalized_existing != existing_task:
+                                await cron_manager.create_or_replace_job(
+                                    normalized_existing,
+                                )
+                                replaced_scheduled_tasks.append(existing_task)
+                                existing_task_jobs[key] = normalized_existing
+                                warnings.append(
+                                    f"定时任务 {task.name!r} 的旧版迁移审核"
+                                    "门禁已补齐，任务保持禁用。",
+                                )
+                        skipped_scheduled_tasks.append(task.source_id)
+                        continue
+                if cron_manager is None:
+                    skipped_scheduled_tasks.append(task.source_id)
+                    warnings.append(
+                        f"定时任务 {task.name!r} 未写入：目标智能体的 Cron "
+                        "服务尚未初始化。聊天记录和其他资产不受影响。",
+                    )
+                    continue
+                try:
+                    target_session_id = ""
+                    target_user_id = "cron"
+                    source_kind = str(
+                        task.metadata.get("source_kind") or "",
+                    ).lower()
+                    if source_kind == "heartbeat":
+                        target_thread_id = str(
+                            task.metadata.get("target_thread_id") or "",
+                        )
+                        target_chat = existing_by_source.get(
+                            (inventory.provider_id, target_thread_id),
+                        )
+                        if target_chat is None:
+                            raise ValueError(
+                                "Codex heartbeat 的目标会话未迁移，不能安全" + "绑定到其他会话。",
+                            )
+                        target_session_id = target_chat.session_id
+                        target_user_id = target_chat.user_id
+                    job = build_imported_job(
+                        inventory.provider_id,
+                        task,
+                        target_user_id=target_user_id,
+                        target_session_id=target_session_id,
+                        enabled=compatibility_zone == "migrate",
+                    )
+                    if source_kind == "heartbeat":
+                        job.runtime = job.runtime.model_copy(
+                            update={"share_session": True},
+                        )
+                    if repairing_invalid_task:
+                        existing_id = getattr(existing_task, "id", None)
+                        if existing_id:
+                            job = job.model_copy(update={"id": existing_id})
+                    await cron_manager.create_or_replace_job(job)
+                    assert job.id is not None
+                    if repairing_invalid_task:
+                        replaced_scheduled_tasks.append(existing_task)
+                    else:
+                        created_scheduled_tasks.append(job.id)
+                    imported_scheduled_tasks.append(task.source_id)
+                    existing_task_jobs[key] = job
+                except Exception as exc:  # pylint: disable=broad-except
+                    skipped_scheduled_tasks.append(task.source_id)
+                    warnings.append(
+                        f"定时任务 {task.name!r} 已保留在迁移清单中，但未"
+                        f"启用或写入：{type(exc).__name__}: {exc}",
+                    )
 
             completed_at = datetime.now(timezone.utc)
             await _report(progress, "正在生成迁移回执并完成一致性检查…")
@@ -1030,6 +739,7 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                 completed_at=completed_at,
                 imported_sessions=imported_sessions,
                 skipped_sessions=skipped_sessions,
+                ignored_source_sessions=list(inventory.ignored_session_ids),
                 archived_internal_sessions=archived_internal_sessions,
                 imported_skills=imported_skills,
                 skipped_skills=skipped_skills,
@@ -1039,9 +749,19 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                 skipped_memory_projects=skipped_memory_projects,
                 restored_marketplaces=restored_marketplaces,
                 skipped_marketplaces=skipped_marketplaces,
+                prepared_plugins=prepared_plugins,
                 installed_plugins=installed_plugins,
                 skipped_plugins=skipped_plugins,
+                imported_scheduled_tasks=imported_scheduled_tasks,
+                skipped_scheduled_tasks=skipped_scheduled_tasks,
                 discovered_mcp_count=inventory.discovered_mcp_count,
+                discovered_scheduled_task_count=(
+                    inventory.discovered_scheduled_task_count
+                ),
+                adaptation_status=adaptation_status,
+                adaptation_manifest=adaptation_manifest,
+                adaptation_summary=adaptation_summary,
+                adaptation_counts=adaptation_counts,
                 warnings=warnings,
             )
             receipt_dir = Path(self._workspace.workspace_dir) / ".qwenpaw"
@@ -1063,9 +783,10 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                 )
             except Exception as exc:  # pylint: disable=broad-except
                 logger.exception("Migration Doctor failed")
-                receipt.warnings.append(
+                warnings.append(
                     "迁移内容已写入，但自动体检运行失败：" f"{type(exc).__name__}: {exc}",
                 )
+                receipt.warnings = list(warnings)
                 receipt.doctor_report = MigrationDoctorReport(
                     status="fail",
                     summary_zh="迁移已完成，但自动体检未能正常运行，请查看日志。",
@@ -1111,6 +832,34 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                         "Failed to roll back imported MCP %s",
                         card_name,
                     )
+            cron_manager = getattr(self._workspace, "cron_manager", None)
+            if cron_manager is not None:
+                for job_id in reversed(created_scheduled_tasks):
+                    try:
+                        await cron_manager.delete_job(job_id)
+                    except Exception:  # pylint: disable=broad-except
+                        logger.exception(
+                            "Failed to roll back imported scheduled task %s",
+                            job_id,
+                        )
+                for previous_job in reversed(replaced_scheduled_tasks):
+                    try:
+                        restore = getattr(
+                            cron_manager,
+                            "restore_imported_job_snapshot",
+                            None,
+                        )
+                        if callable(restore):
+                            await restore(previous_job)
+                        else:
+                            await cron_manager.create_or_replace_job(
+                                previous_job,
+                            )
+                    except Exception:  # pylint: disable=broad-except
+                        logger.exception(
+                            "Failed to restore replaced scheduled task %s",
+                            getattr(previous_job, "id", ""),
+                        )
             for skill_name in imported_skills:
                 try:
                     await run_sync_io(
@@ -1151,6 +900,32 @@ class ProviderImportService:  # pylint: disable=too-few-public-methods
                     logger.exception(
                         "Failed to roll back imported Memory %s",
                         target,
+                    )
+            if (
+                marketplace_registry_touched
+                and marketplace_registry_snapshot is not None
+            ):
+                registry_file = marketplace_registry_snapshot.path
+                previous_registry = marketplace_registry_snapshot.content
+                try:
+                    async with get_path_lock(registry_file):
+                        await run_sync_io(
+                            _restore_registry_file,
+                            registry_file,
+                            previous_registry,
+                        )
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception(
+                        "Failed to roll back Marketplace registry %s",
+                        registry_file,
+                    )
+            if adaptation_root.is_dir() and not adaptation_root.is_symlink():
+                try:
+                    await run_sync_io(shutil.rmtree, adaptation_root)
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception(
+                        "Failed to roll back compatibility staging %s",
+                        adaptation_root,
                     )
             raise
 

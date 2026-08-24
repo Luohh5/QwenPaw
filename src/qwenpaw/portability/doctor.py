@@ -19,6 +19,14 @@ from .models import (
     MigrationDoctorReport,
     ProviderInventory,
 )
+from .scheduled_tasks import imported_job_source, is_nonlocal_workspace
+from .compatibility import (
+    AssetType,
+    AssetZone,
+    CompatibilityManifest,
+    RunState,
+    load_manifest,
+)
 
 
 def _check(
@@ -142,6 +150,103 @@ def _receipt_check(
     )
 
 
+def _adaptation_check(
+    workspace: Any,
+    receipt: ImportReceipt,
+) -> MigrationDoctorCheck | None:
+    if (
+        receipt.adaptation_status == "not_run"
+        and not receipt.adaptation_manifest
+    ):
+        return None
+    manifest, error = _verified_adaptation_manifest(workspace, receipt)
+    if not receipt.adaptation_manifest:
+        return _check(
+            "compatibility",
+            "warning",
+            "工具和设置兼容清单",
+            "自动兼容流程未生成可验证清单；相关资产仍保持禁用。",
+        )
+    if manifest is None:
+        return _check(
+            "compatibility",
+            "fail",
+            "工具和设置兼容清单",
+            f"兼容清单无法读取或验证：{error}",
+        )
+    counts: dict[str, int] = {}
+    for asset in manifest.assets:
+        counts[asset.zone.value] = counts.get(asset.zone.value, 0) + 1
+    migrate = counts.get("migrate", 0)
+    repair = counts.get("repair", 0)
+    discard = counts.get("discard", 0)
+    staging = counts.get("staging", 0)
+    if manifest.state is RunState.COMPLETED and not repair and not staging:
+        status = "pass"
+    else:
+        status = "warning"
+    return _check(
+        "compatibility",
+        status,
+        "工具和设置兼容清单",
+        f"已检查 {len(manifest.assets)} 项：待迁移 {migrate}，待修复 "
+        f"{repair}，丢弃 {discard}，仍在安全暂存区 {staging}；"
+        f"Goal 状态为 {manifest.state.value}。",
+    )
+
+
+def _verified_adaptation_manifest(
+    workspace: Any,
+    receipt: ImportReceipt,
+) -> tuple[CompatibilityManifest | None, str]:
+    """Load only the manifest which is securely bound to this receipt."""
+    if not receipt.adaptation_manifest:
+        return None, "未生成兼容清单"
+    workspace_root = Path(workspace.workspace_dir).resolve()
+    path = Path(receipt.adaptation_manifest)
+    if not path.is_absolute():
+        path = workspace_root / path
+    try:
+        path = path.resolve(strict=True)
+        if not path.is_relative_to(workspace_root):
+            raise ValueError("清单路径越出智能体工作区")
+        manifest = load_manifest(path)
+    except (OSError, ValueError, TypeError) as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    if (
+        manifest.migration_id != receipt.migration_id
+        or manifest.source != receipt.source
+    ):
+        return None, "迁移编号或来源与回执不一致"
+    return manifest, ""
+
+
+def _job_request_context(job: Any) -> dict[str, Any]:
+    request = getattr(job, "request", None)
+    context = (
+        request.get("request_context")
+        if isinstance(request, dict)
+        else getattr(request, "request_context", None)
+    )
+    return context if isinstance(context, dict) else {}
+
+
+def _job_portability(job: Any) -> dict[str, Any]:
+    meta = getattr(job, "meta", None)
+    if not isinstance(meta, dict):
+        return {}
+    portability = meta.get("portability")
+    return portability if isinstance(portability, dict) else {}
+
+
+def _remote_or_unverified_source(job: Any) -> bool:
+    portability = _job_portability(job)
+    if portability.get("source_cwd_remote_or_unverified") is True:
+        return True
+    metadata = portability.get("source_metadata")
+    return isinstance(metadata, dict) and is_nonlocal_workspace(metadata)
+
+
 async def _session_check(
     workspace: Any,
     inventory: ProviderInventory,
@@ -192,13 +297,14 @@ async def _session_check(
     status = "pass" if readable == len(expected) else "fail"
     detail = f"已导入 {len(expected)} 个会话，其中 {readable} 个可以读取历史。"
     if cwd_expected:
-        detail += f" 需要恢复项目目录的 {cwd_expected} 个会话中，{cwd_ok} 个匹配。"
+        detail += f" 需要恢复项目目录的 {cwd_expected} 个会话中，"
+        detail += f"{cwd_ok} 个匹配。"
         if cwd_ok != cwd_expected and status == "pass":
             status = "warning"
     return _check("sessions", status, "会话完整性", detail)
 
 
-async def run_migration_doctor(
+async def run_migration_doctor(  # pylint: disable=R0912,R0915
     workspace: Any,
     inventory: ProviderInventory,
     receipt: ImportReceipt,
@@ -208,6 +314,9 @@ async def run_migration_doctor(
     session_result = await _session_check(workspace, inventory, receipt)
     if session_result is not None:
         checks.append(session_result)
+    adaptation_result = _adaptation_check(workspace, receipt)
+    if adaptation_result is not None:
+        checks.append(adaptation_result)
 
     if receipt.imported_skills:
         visible = {
@@ -216,14 +325,22 @@ async def run_migration_doctor(
         }
         states = _skill_states(workspace)
         present = sum(name in visible for name in receipt.imported_skills)
-        disabled = sum(
-            name in visible and not states.get(name, False)
+        manifest, _ = _verified_adaptation_manifest(workspace, receipt)
+        zones = {
+            item.name: item.zone
+            for item in (manifest.assets if manifest else [])
+            if item.asset_type is AssetType.SKILL
+        }
+        activation_ok = sum(
+            name in visible
+            and states.get(name, False)
+            is (zones.get(name) is AssetZone.MIGRATE)
             for name in receipt.imported_skills
         )
         status = (
             "pass"
             if present == len(receipt.imported_skills)
-            and disabled == len(receipt.imported_skills)
+            and activation_ok == len(receipt.imported_skills)
             else "fail"
         )
         checks.append(
@@ -232,7 +349,7 @@ async def run_migration_doctor(
                 status,
                 "Skill 安全状态",
                 f"计划导入 {len(receipt.imported_skills)} 个，实际可见 {present} 个；"
-                f"保持禁用 {disabled} 个。",
+                f"启用状态与 Goal 分区一致 {activation_ok} 个。",
             ),
         )
 
@@ -242,19 +359,26 @@ async def run_migration_doctor(
             for card in await DriverConfigService(workspace).list_cards()
         }
         present = sum(name in cards for name in receipt.imported_mcp_servers)
-        disabled = sum(
-            name in cards and not cards[name].enabled
+        manifest, _ = _verified_adaptation_manifest(workspace, receipt)
+        zones = {
+            item.name: item.zone
+            for item in (manifest.assets if manifest else [])
+            if item.asset_type is AssetType.MCP
+        }
+        activation_ok = sum(
+            name in cards
+            and cards[name].enabled is (zones.get(name) is AssetZone.MIGRATE)
             for name in receipt.imported_mcp_servers
         )
         status = (
             "pass"
             if present == len(receipt.imported_mcp_servers)
-            and disabled == len(receipt.imported_mcp_servers)
+            and activation_ok == len(receipt.imported_mcp_servers)
             else "fail"
         )
         detail = (
             f"计划导入 {len(receipt.imported_mcp_servers)} 个，实际保存 {present} 个；"
-            f"保持禁用 {disabled} 个。启用前仍需检查依赖并重新授权。"
+            f"启用状态与 Goal 分区一致 {activation_ok} 个。"
         )
         checks.append(_check("mcp", status, "MCP DriverCard", detail))
 
@@ -310,7 +434,7 @@ async def run_migration_doctor(
         installed = _installed_plugin_ids()
         present = sum(item in installed for item in receipt.installed_plugins)
         status = (
-            "pass" if present == len(receipt.installed_plugins) else "warning"
+            "warning" if present == len(receipt.installed_plugins) else "fail"
         )
         checks.append(
             _check(
@@ -318,9 +442,202 @@ async def run_migration_doctor(
                 status,
                 "插件安装状态",
                 f"原生安装流程返回 {len(receipt.installed_plugins)} 个插件，"
-                f"磁盘清单确认 {present} 个。若当前智能体尚未出现能力，请重载智能体。",
+                f"磁盘清单确认 {present} 个；实际启用状态由兼容性 Goal 的"
+                "migrate/repair 分区决定。",
             ),
         )
+
+    if receipt.prepared_plugins:
+        checks.append(
+            _check(
+                "plugins_prepared",
+                "warning",
+                "插件等待用户确认",
+                f"{len(receipt.prepared_plugins)} 个插件已通过结构检查并保留"
+                "安装来源，但尚未加载任何第三方执行代码；请在插件界面复核"
+                "权限、依赖和来源后再确认安装。",
+            ),
+        )
+
+    if (
+        inventory.scheduled_tasks
+        or receipt.discovered_scheduled_task_count
+        or receipt.imported_scheduled_tasks
+        or receipt.skipped_scheduled_tasks
+    ):
+        cron_manager = getattr(workspace, "cron_manager", None)
+        if cron_manager is None:
+            checks.append(
+                _check(
+                    "scheduled_tasks",
+                    "fail",
+                    "定时任务安全状态",
+                    "迁移回执记录了定时任务，但目标智能体的 Cron 服务不可用。",
+                ),
+            )
+        else:
+            try:
+                jobs = await cron_manager.list_jobs()
+                grouped_by_source: dict[tuple[str, str], list[Any]] = {}
+                for job in jobs:
+                    key = imported_job_source(job)
+                    if key is not None:
+                        grouped_by_source.setdefault(key, []).append(job)
+                expected = {
+                    (inventory.provider_id, source_id)
+                    for source_id in receipt.imported_scheduled_tasks
+                }
+                present = sum(key in grouped_by_source for key in expected)
+                unique = sum(
+                    len(grouped_by_source.get(key, [])) == 1
+                    for key in expected
+                )
+                manifest, _ = _verified_adaptation_manifest(
+                    workspace,
+                    receipt,
+                )
+                schedule_assets = {
+                    asset.source_id: asset
+                    for asset in (manifest.assets if manifest else [])
+                    if asset.asset_type is AssetType.SCHEDULED_TASK
+                }
+
+                def activation_matches(key: tuple[str, str]) -> bool:
+                    jobs_for_key = grouped_by_source.get(key, [])
+                    asset = schedule_assets.get(key[1])
+                    if len(jobs_for_key) != 1 or asset is None:
+                        return False
+                    job = jobs_for_key[0]
+                    pending = (
+                        _job_portability(job).get("requires_review") is True
+                    )
+                    marker = _job_request_context(job).get(
+                        "portability_review_required",
+                    )
+                    if asset.zone is AssetZone.MIGRATE:
+                        return job.enabled and not pending and marker is False
+                    return (
+                        asset.zone is AssetZone.REPAIR
+                        and not job.enabled
+                        and job.runtime.tool_safety
+                        and pending
+                        and marker is True
+                    )
+
+                activation_safe = sum(
+                    activation_matches(key) for key in expected
+                )
+                tasks_by_id = {
+                    task.source_id: task for task in inventory.scheduled_tasks
+                }
+                remote_expected = {
+                    (inventory.provider_id, source_id)
+                    for source_id in receipt.imported_scheduled_tasks
+                    if source_id in tasks_by_id
+                    and is_nonlocal_workspace(tasks_by_id[source_id].metadata)
+                }
+                remote_unmapped = sum(
+                    len(grouped_by_source.get(key, [])) == 1
+                    and _remote_or_unverified_source(grouped_by_source[key][0])
+                    and "project_dir"
+                    not in _job_request_context(grouped_by_source[key][0])
+                    for key in remote_expected
+                )
+
+                imported = receipt.imported_scheduled_tasks
+                skipped = receipt.skipped_scheduled_tasks
+                processed_ids = imported + skipped
+                normalized_count = len(inventory.scheduled_tasks)
+                discovered_count = receipt.discovered_scheduled_task_count
+                duplicate_receipt_ids = len(processed_ids) != len(
+                    set(processed_ids),
+                )
+                processed_matches = len(
+                    processed_ids,
+                ) == normalized_count and set(processed_ids) == set(
+                    tasks_by_id,
+                )
+                discovery_valid = (
+                    discovered_count == 0
+                    or discovered_count >= normalized_count
+                )
+
+                compatibility_classified: int | None = None
+                if manifest is not None:
+                    compatibility_classified = sum(
+                        source_id in schedule_assets
+                        and schedule_assets[source_id].zone
+                        in {AssetZone.MIGRATE, AssetZone.REPAIR}
+                        for source_id in imported
+                    )
+
+                hard_failure = any(
+                    (
+                        present != len(expected),
+                        unique != len(expected),
+                        activation_safe != len(expected),
+                        remote_unmapped != len(remote_expected),
+                        duplicate_receipt_ids,
+                        not processed_matches,
+                        not discovery_valid,
+                        compatibility_classified is not None
+                        and compatibility_classified != len(imported),
+                    ),
+                )
+                raw_rejections = max(discovered_count - normalized_count, 0)
+                legacy_discovery_count = (
+                    discovered_count == 0 and normalized_count > 0
+                )
+                status = "fail" if hard_failure else "pass"
+                if status == "pass" and (
+                    raw_rejections or legacy_discovery_count
+                ):
+                    status = "warning"
+                compatibility_detail = ""
+                if compatibility_classified is not None:
+                    compatibility_detail = (
+                        f" 兼容清单确认已分类 {compatibility_classified}/"
+                        f"{len(imported)} 个。"
+                    )
+                elif imported:
+                    compatibility_detail = " 本次无可用兼容清单，无法复核 READY 状态。"
+                discovery_detail = (
+                    f"来源发现 {discovered_count} 个、规范化 {normalized_count} "
+                    f"个、回执导入 {len(imported)} 个、跳过 {len(skipped)} 个、"
+                    f"落盘 {present} 个。"
+                )
+                if raw_rejections:
+                    discovery_detail += (
+                        f" 另有 {raw_rejections} 个来源记录未进入可迁移"
+                        "定义（例如已结束、已取消、损坏或规则无法"
+                        "等价转换），仅保留在来源扫描告警中。"
+                    )
+                elif legacy_discovery_count:
+                    discovery_detail += " 旧回执未记录来源发现总数。"
+                checks.append(
+                    _check(
+                        "scheduled_tasks",
+                        status,
+                        "定时任务安全状态",
+                        discovery_detail
+                        + f" 唯一落盘 {unique}/{len(expected)} 个，启用或禁用"
+                        f"状态与 Goal 分区一致 {activation_safe}/"
+                        f"{len(expected)} 个；远程或未验证工作区"
+                        f"未绑定本机目录 {remote_unmapped}/"
+                        f"{len(remote_expected)} 个。"
+                        + compatibility_detail
+                        + " 待修复任务仍需人工处理。",
+                    ),
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                checks.append(
+                    _check(
+                        "scheduled_tasks",
+                        "fail",
+                        "定时任务安全状态",
+                        f"无法读取目标任务列表：{type(exc).__name__}: {exc}",
+                    ),
+                )
 
     checks.append(_receipt_check(workspace, receipt))
     if any(item.status == "fail" for item in checks):

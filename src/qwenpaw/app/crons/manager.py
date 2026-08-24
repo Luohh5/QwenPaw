@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Union
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -105,6 +107,19 @@ class CronManager(ManagerBase):
             self._scheduler.start()
             for job in jobs_file.jobs:
                 try:
+                    if self._requires_portability_review(job):
+                        repaired = self.canonicalize_imported_job_for_review(
+                            job,
+                        )
+                        if repaired != job:
+                            job = repaired
+                            await self._repo.upsert_job(job)
+                            logger.warning(
+                                "Repaired and disabled imported cron job "
+                                "pending review: job_id=%s name=%s",
+                                job.id,
+                                job.name,
+                            )
                     await self._register_or_update(job)
                 except Exception as e:  # pylint: disable=broad-except
                     logger.warning(
@@ -214,6 +229,12 @@ class CronManager(ManagerBase):
             self._history[job_id] = await self._repo.get_history(job_id)
         return self._history[job_id]
 
+    def validate_job_spec(self, spec: CronJobSpec) -> None:
+        """Fully validate scheduler registration without changing state."""
+        if spec.id is None:
+            raise ValueError("Job must have an id before registration")
+        self._build_trigger(spec)
+
     # ----- write/control -----
 
     @api_action(
@@ -225,9 +246,8 @@ class CronManager(ManagerBase):
     )
     async def create_or_replace_job(self, spec: CronJobSpec) -> None:
         async with self._lock:
-            await self._repo.upsert_job(spec)
-            if self._started:
-                await self._register_or_update(spec)
+            previous = await self._repo.get_job(spec.id or "")
+            await self._persist_and_register(spec, previous=previous)
 
     @api_action(
         methods={"http", "cli", "slash"},
@@ -260,10 +280,363 @@ class CronManager(ManagerBase):
             job = await self._repo.get_job(job_id)
             if job is None:
                 raise KeyError(f"Job not found: {job_id}")
+            self._assert_review_complete(job)
             enabled_job = job.model_copy(update={"enabled": True})
-            await self._repo.upsert_job(enabled_job)
-            if self._scheduler.get_job(job_id):
-                self._scheduler.resume_job(job_id)
+            await self._persist_and_register(enabled_job, previous=job)
+
+    async def promote_imported_job(
+        self,
+        job_id: str,
+        *,
+        actor: Optional[str] = None,
+    ) -> CronJobSpec:
+        """Clear an imported job's review gate without enabling the job.
+
+        Promotion is deliberately separate from the generic update and resume
+        paths.  It records the review decision, but leaves ``enabled=False``;
+        callers must make a second, explicit decision to resume the job.
+        """
+        async with self._lock:
+            job = await self._repo.get_job(job_id)
+            if job is None:
+                raise KeyError(f"Job not found: {job_id}")
+            if not self._requires_portability_review(job):
+                raise ValueError(f"Job does not require promotion: {job_id}")
+            self._assert_promotion_workspace_is_local(job)
+
+            promoted = self._promoted_job(job, actor=actor)
+            await self._persist_and_register(
+                promoted,
+                previous=job,
+                allow_gate_clear=True,
+            )
+            return promoted
+
+    async def _persist_and_register(  # pylint: disable=too-many-branches
+        self,
+        spec: CronJobSpec,
+        *,
+        previous: Optional[CronJobSpec],
+        allow_gate_clear: bool = False,
+    ) -> None:
+        """Persist and register a job as one logical transaction.
+
+        Repository implementations are expected to save atomically.  This
+        method extends that guarantee across APScheduler: trigger validation
+        happens before persistence, and any later registration failure restores
+        both the previous repository record and scheduler registration.
+        """
+        self.validate_job_spec(spec)
+        assert spec.id is not None
+        if not allow_gate_clear:
+            self._validate_review_gate_update(previous, spec)
+
+        # Validate timezone, cron fields and trigger construction before the
+        # repository is changed.  _register_or_update rebuilds it to keep that
+        # method independently safe for startup callers.
+        job_id = spec.id
+        old_runtime = self._rt.get(job_id)
+        old_state = self._states.get(job_id)
+        await self._repo.upsert_job(spec)
+        try:
+            if self._started:
+                await self._register_or_update(spec)
+        except Exception:
+            try:
+                if previous is None:
+                    await self._repo.delete_job(job_id)
+                else:
+                    await self._repo.upsert_job(previous)
+
+                if self._started:
+                    if previous is None:
+                        if self._scheduler.get_job(job_id):
+                            self._scheduler.remove_job(job_id)
+                    else:
+                        await self._register_or_update(previous)
+
+                if old_runtime is None:
+                    self._rt.pop(job_id, None)
+                else:
+                    self._rt[job_id] = old_runtime
+                if old_state is None:
+                    self._states.pop(job_id, None)
+                else:
+                    self._states[job_id] = old_state
+            except Exception:  # pylint: disable=broad-except
+                logger.exception(
+                    "Failed to roll back cron job transaction: job_id=%s",
+                    job_id,
+                )
+            raise
+
+    @staticmethod
+    def _portability_metadata(job: CronJobSpec) -> Optional[Dict[str, Any]]:
+        candidates = CronManager._portability_metadata_candidates(job)
+        return next(
+            (
+                value
+                for value in candidates
+                if CronManager._has_imported_provenance(value)
+            ),
+            candidates[0] if candidates else None,
+        )
+
+    @staticmethod
+    def _portability_metadata_candidates(
+        job: CronJobSpec,
+    ) -> list[Dict[str, Any]]:
+        candidates: list[Dict[str, Any]] = []
+        for container in (job.meta, job.dispatch.meta):
+            portability = container.get("portability")
+            if isinstance(portability, dict) and portability not in candidates:
+                candidates.append(portability)
+        return candidates
+
+    @staticmethod
+    def _request_review_marker(job: CronJobSpec) -> Any:
+        request_context = (
+            getattr(job.request, "request_context", None)
+            if job.request is not None
+            else None
+        )
+        if not isinstance(request_context, dict):
+            return None
+        return request_context.get("portability_review_required")
+
+    @staticmethod
+    def _has_imported_provenance(portability: Dict[str, Any]) -> bool:
+        return bool(
+            isinstance(portability.get("source"), str)
+            and portability.get("source", "").strip()
+            and isinstance(portability.get("source_id"), str)
+            and portability.get("source_id", "").strip(),
+        )
+
+    @classmethod
+    def _requires_portability_review(cls, job: CronJobSpec) -> bool:
+        candidates = cls._portability_metadata_candidates(job)
+        request_marker = cls._request_review_marker(job)
+        if not candidates:
+            return request_marker is True
+
+        if any(
+            bool(portability.get("requires_review"))
+            or portability.get("safety") == "disabled_until_explicit_promotion"
+            for portability in candidates
+        ):
+            return True
+
+        imported = any(
+            cls._has_imported_provenance(portability)
+            for portability in candidates
+        )
+        if not imported:
+            return request_marker is True
+
+        # Imported provenance is fail-closed.  Older or partially damaged
+        # records often lack the newer review fields; they are pending until
+        # the dedicated promotion path writes a complete, internally
+        # consistent decision to every copy of the metadata.
+        explicitly_promoted = bool(
+            request_marker is False
+            and all(
+                portability.get("requires_review") is False
+                and portability.get("safety") == "reviewed_disabled"
+                and isinstance(portability.get("promoted_at"), str)
+                and portability.get("promoted_at", "").strip()
+                for portability in candidates
+            ),
+        )
+        return not explicitly_promoted
+
+    @classmethod
+    def requires_portability_review(cls, job: CronJobSpec) -> bool:
+        """Public read-only review check used by migration repair logic."""
+        return cls._requires_portability_review(job)
+
+    @classmethod
+    def canonicalize_imported_job_for_review(
+        cls,
+        job: CronJobSpec,
+    ) -> CronJobSpec:
+        """Repair a pending imported job's duplicated review markers."""
+        portability = cls._portability_metadata(job)
+        if portability is None or not cls._has_imported_provenance(
+            portability,
+        ):
+            return job
+        return cls._with_portability_review(job, pending=True)
+
+    async def restore_imported_job_snapshot(self, job: CronJobSpec) -> None:
+        """Restore a quarantined import snapshot without registering it.
+
+        This is intentionally limited to migration provenance and always
+        restores a disabled, review-gated record.  It lets a larger import
+        transaction roll back an invalid legacy Cron definition without
+        asking APScheduler to accept that invalid trigger.
+        """
+        async with self._lock:
+            restored = self.canonicalize_imported_job_for_review(job)
+            portability = self._portability_metadata(restored)
+            if (
+                portability is None
+                or not self._has_imported_provenance(portability)
+                or not self._requires_portability_review(restored)
+            ):
+                raise PermissionError(
+                    "Only review-gated imported cron snapshots may be "
+                    "restored",
+                )
+            if restored.id is None:
+                raise ValueError("Imported cron snapshot must have an id")
+            await self._repo.upsert_job(restored)
+            if self._started and self._scheduler.get_job(restored.id):
+                self._scheduler.remove_job(restored.id)
+            self._rt.pop(restored.id, None)
+            self._states.pop(restored.id, None)
+
+    @classmethod
+    def _assert_review_complete(cls, job: CronJobSpec) -> None:
+        if cls._requires_portability_review(job):
+            raise PermissionError(
+                "Imported cron job requires explicit promotion before "
+                f"execution or enablement: {job.id}",
+            )
+
+    @classmethod
+    def _assert_promotion_workspace_is_local(cls, job: CronJobSpec) -> None:
+        portability = cls._portability_metadata(job) or {}
+        requires_mapping = (
+            portability.get("source_cwd_remote_or_unverified") is True
+            or portability.get("source_cwd_binding")
+            == "omitted_remote_or_unverified"
+        )
+        if not requires_mapping:
+            return
+
+        request_context = (
+            getattr(job.request, "request_context", None)
+            if job.request is not None
+            else None
+        )
+        project_dir = (
+            request_context.get("project_dir")
+            if isinstance(request_context, dict)
+            else None
+        )
+        if not isinstance(project_dir, str) or not project_dir.strip():
+            raise PermissionError(
+                "Remote or unverified imported cron jobs require an explicit "
+                "local project_dir before promotion",
+            )
+        try:
+            local_dir = Path(project_dir).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise PermissionError(
+                "The explicit local project_dir cannot be resolved before "
+                "promotion",
+            ) from exc
+        if not local_dir.is_dir():
+            raise PermissionError(
+                "The explicit local project_dir must be an existing directory "
+                "before promotion",
+            )
+
+    @classmethod
+    def _validate_review_gate_update(
+        cls,
+        previous: Optional[CronJobSpec],
+        replacement: CronJobSpec,
+    ) -> None:
+        if cls._requires_portability_review(replacement):
+            if replacement.enabled:
+                raise PermissionError(
+                    "Imported cron jobs must remain disabled until explicit "
+                    f"promotion: {replacement.id}",
+                )
+            if (
+                previous is not None
+                and cls._requires_portability_review(previous)
+                and cls.canonicalize_imported_job_for_review(replacement)
+                != replacement
+            ):
+                raise PermissionError(
+                    "The portability review gate can only be cleared by "
+                    f"promote_imported_job: {previous.id}",
+                )
+            return
+        if previous is not None and cls._requires_portability_review(previous):
+            raise PermissionError(
+                "The portability review gate can only be cleared by "
+                f"promote_imported_job: {previous.id}",
+            )
+
+    @classmethod
+    def _promoted_job(
+        cls,
+        job: CronJobSpec,
+        *,
+        actor: Optional[str],
+    ) -> CronJobSpec:
+        return cls._with_portability_review(
+            job,
+            pending=False,
+            actor=actor,
+        )
+
+    @classmethod
+    def _with_portability_review(
+        cls,
+        job: CronJobSpec,
+        *,
+        pending: bool,
+        actor: Optional[str] = None,
+    ) -> CronJobSpec:
+        """Write one review state to all duplicated Cron payload fields."""
+        promoted_at = datetime.now(timezone.utc).isoformat()
+        portability = copy.deepcopy(cls._portability_metadata(job) or {})
+        portability["requires_review"] = pending
+        portability["safety"] = (
+            "disabled_until_explicit_promotion"
+            if pending
+            else "reviewed_disabled"
+        )
+        if pending:
+            portability.pop("promoted_at", None)
+            portability.pop("promoted_by", None)
+        else:
+            portability["promoted_at"] = promoted_at
+            if actor:
+                portability["promoted_by"] = actor
+
+        meta = copy.deepcopy(job.meta)
+        meta["portability"] = copy.deepcopy(portability)
+
+        dispatch = job.dispatch.model_copy(deep=True)
+        dispatch_meta = copy.deepcopy(dispatch.meta)
+        dispatch_meta["portability"] = copy.deepcopy(portability)
+        dispatch.meta = dispatch_meta
+
+        request = job.request.model_copy(deep=True) if job.request else None
+        if request is not None:
+            request_context = getattr(request, "request_context", None)
+            updated_context = (
+                copy.deepcopy(request_context)
+                if isinstance(request_context, dict)
+                else {}
+            )
+            updated_context["portability_review_required"] = pending
+            request.request_context = updated_context
+
+        return job.model_copy(
+            update={
+                "enabled": False,
+                "meta": meta,
+                "dispatch": dispatch,
+                "request": request,
+            },
+        )
 
     async def reschedule_heartbeat(self) -> None:
         """Reload heartbeat config and update or remove the heartbeat job.
@@ -402,6 +775,7 @@ class CronManager(ManagerBase):
         job = await self._repo.get_job(job_id)
         if not job:
             raise KeyError(f"Job not found: {job_id}")
+        self._assert_review_complete(job)
         logger.info(
             "cron run_job (async): job_id=%s channel=%s task_type=%s "
             "target_user_id=%s target_session_id=%s",
@@ -557,14 +931,12 @@ class CronManager(ManagerBase):
         assert spec.id is not None, "Job must have an id"
         trigger = self._build_trigger(spec)
 
-        # per-job concurrency semaphore
-        self._rt[spec.id] = _Runtime(
-            sem=asyncio.Semaphore(spec.runtime.max_concurrency),
-        )
-
-        # replace existing
-        if self._scheduler.get_job(spec.id):
-            self._scheduler.remove_job(spec.id)
+        add_job_kwargs: Dict[str, Any] = {}
+        if not spec.enabled or self._requires_portability_review(spec):
+            # Register directly in the paused state.  This avoids a window in
+            # which a disabled imported task could become due between add_job
+            # and a subsequent pause_job call.
+            add_job_kwargs["next_run_time"] = None
 
         self._scheduler.add_job(
             self._scheduled_callback,
@@ -573,10 +945,15 @@ class CronManager(ManagerBase):
             args=[spec.id],
             misfire_grace_time=spec.runtime.misfire_grace_seconds,
             replace_existing=True,
+            **add_job_kwargs,
         )
 
-        if not spec.enabled:
-            self._scheduler.pause_job(spec.id)
+        # Only publish new runtime state after APScheduler accepted the whole
+        # registration.  add_job(replace_existing=True) preserves the old job
+        # if construction/validation fails.
+        self._rt[spec.id] = _Runtime(
+            sem=asyncio.Semaphore(spec.runtime.max_concurrency),
+        )
 
         # update next_run
         aps_job = self._scheduler.get_job(spec.id)
@@ -663,6 +1040,12 @@ class CronManager(ManagerBase):
         job = await self._repo.get_job(job_id)
         if not job:
             return
+        if self._requires_portability_review(job):
+            await self._record_skipped(
+                job,
+                "Imported cron job is awaiting explicit promotion",
+            )
+            return
 
         await self._execute_once(
             job,
@@ -748,6 +1131,7 @@ class CronManager(ManagerBase):
         trigger: Literal["scheduled", "manual"] = "scheduled",
     ) -> None:
         assert job.id is not None, "Job must have an id"
+        self._assert_review_complete(job)
         rt = self._rt.get(job.id)
         if not rt:
             rt = _Runtime(sem=asyncio.Semaphore(job.runtime.max_concurrency))

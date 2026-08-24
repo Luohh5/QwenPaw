@@ -139,8 +139,14 @@ class ScheduleSpec(BaseModel):
 
 
 class DispatchTarget(BaseModel):
-    user_id: str
-    session_id: str
+    user_id: str = Field(
+        max_length=256,
+        description="Bounded user identifier receiving cron output.",
+    )
+    session_id: str = Field(
+        max_length=256,
+        description="Bounded target session; isolated runs derive a safe ID.",
+    )
 
 
 class DispatchSpec(BaseModel):
@@ -165,7 +171,8 @@ class JobRuntimeSpec(BaseModel):
         default=True,
         description=(
             "Whether to share session with target user. "
-            "If False, creates isolated context with unique run ID."
+            "If False, each execution creates a visible cron-sourced chat "
+            "whose isolated session ID contains that execution's run ID."
         ),
     )
     tool_safety: bool = Field(

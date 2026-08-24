@@ -1186,10 +1186,14 @@ class PluginLoader:
         )
 
         # Guard against path-traversal in plugin_id (e.g. "../../etc")
-        if not target_dir.is_relative_to(resolved_install_dir):
+        if (
+            target_dir == resolved_install_dir
+            or not target_dir.is_relative_to(resolved_install_dir)
+        ):
             raise ValueError(
-                f"Plugin id '{plugin_id}' resolves outside the plugin "
-                f"directory ({resolved_install_dir}). Refusing to install.",
+                f"Plugin id '{plugin_id}' does not resolve to a safe child "
+                f"of the plugin directory ({resolved_install_dir}). "
+                "Refusing to install.",
             )
 
         # Copy files when source is not already the target (off the loop).

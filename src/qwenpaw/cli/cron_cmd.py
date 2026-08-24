@@ -30,8 +30,8 @@ def cron_group() -> None:
     """Manage scheduled cron jobs via the HTTP API (/cron).
 
     Use list/get/state to inspect jobs; create/update/delete to
-    add, modify, or remove; pause/resume to toggle execution;
-    run to trigger a one-off run.
+    add, modify, or remove; promote imported jobs after review;
+    pause/resume to toggle execution; run to trigger a one-off run.
     """
 
 
@@ -1036,6 +1036,43 @@ def resume_job(
         r = c.post(f"/cron/jobs/{job_id}/resume", headers=headers)
         if r.status_code == 404:
             raise click.ClickException("Job not found.")
+        r.raise_for_status()
+        print_json(r.json())
+
+
+@cron_group.command("promote")
+@click.argument("job_id", metavar="JOB_ID")
+@click.option(
+    "--base-url",
+    default=None,
+    help="Override the API base URL. Defaults to global --host/--port.",
+)
+@click.option(
+    "--agent-id",
+    default="default",
+    help="Agent ID (defaults to 'default')",
+)
+@click.pass_context
+def promote_imported_job(
+    ctx: click.Context,
+    job_id: str,
+    base_url: Optional[str],
+    agent_id: str,
+) -> None:
+    """Approve one reviewed imported job without enabling or running it."""
+    base_url = _base_url(ctx, base_url)
+    with client(base_url) as c:
+        headers = {"X-Agent-Id": agent_id}
+        r = c.post(f"/cron/jobs/{job_id}/promote", headers=headers)
+        if r.status_code == 404:
+            raise click.ClickException("Job not found.")
+        if r.status_code == 409:
+            detail = "Imported job is not ready for promotion."
+            try:
+                detail = str(r.json().get("detail") or detail)
+            except (TypeError, ValueError):
+                pass
+            raise click.ClickException(detail)
         r.raise_for_status()
         print_json(r.json())
 

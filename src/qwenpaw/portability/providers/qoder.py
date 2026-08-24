@@ -12,6 +12,7 @@ from .base import ProgressReporter
 from .external_state import (
     discover_qoder_mcp,
     discover_qoder_memory,
+    discover_qoder_plugin_mcp,
     discover_qoder_plugins,
     discover_qoder_skills,
 )
@@ -21,6 +22,7 @@ from .qoder_sessions import (
     load_qoder_index,
     read_qoder_transcript,
 )
+from .qoder_schedules import discover_qoder_scheduled_tasks
 from .locator import resolve_source_location
 
 _SESSION_TIMEOUT_SECONDS = 60
@@ -84,6 +86,10 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
             asyncio.to_thread(discover_qoder_mcp, self._qoder_home),
             asyncio.to_thread(discover_qoder_transcripts, self._qoder_home),
             asyncio.to_thread(load_qoder_index, self._qoder_user_data),
+            asyncio.to_thread(
+                discover_qoder_scheduled_tasks,
+                self._qoder_user_data,
+            ),
         )
         (
             memory_projects,
@@ -92,19 +98,36 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
             mcp_state,
             records,
             index_state,
+            scheduled_task_state,
         ) = discovery
         marketplaces, plugins = plugin_state
         mcp_servers, mcp_warnings, discovered_mcp_count = mcp_state
+        (
+            plugin_mcp_servers,
+            plugin_mcp_warnings,
+            plugin_mcp_count,
+        ) = await asyncio.to_thread(discover_qoder_plugin_mcp, plugins)
+        mcp_servers.extend(plugin_mcp_servers)
+        mcp_warnings.extend(plugin_mcp_warnings)
+        discovered_mcp_count += plugin_mcp_count
         qoder_index, index_warnings = index_state
+        (
+            scheduled_tasks,
+            scheduled_task_warnings,
+            discovered_scheduled_task_count,
+        ) = scheduled_task_state
 
         total_records = len(records)
         sessions: list[SourceSession] = []
-        warnings: list[str] = [*index_warnings, *mcp_warnings]
+        warnings: list[str] = [
+            *index_warnings,
+            *mcp_warnings,
+            *scheduled_task_warnings,
+        ]
         warnings.append(
-            "Qoder built-in IDE tools, hooks, Agent definitions, tool "
-            "policies, credentials and runtime state are harness-bound and "
-            "were not copied. Portable custom tools are migrated only when "
-            "represented by a standalone Skill or MCP configuration.",
+            "Qoder built-in IDE runtime, credentials and tool policies are "
+            "not copied. Components of enabled third-party plugins enter "
+            "the compatibility Goal as one plugin asset for Agent review.",
         )
         if progress is not None:
             await progress(
@@ -216,7 +239,10 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
                     "working-directory binding.",
                 )
         if plugins:
-            compatible = sum(bool(item.install_source) for item in plugins)
+            compatible = sum(
+                bool(item.install_source or item.metadata.get("install_path"))
+                for item in plugins
+            )
             adapted_custom = sum(
                 item.metadata.get("adapter") == "qoder_skill_only_v1"
                 for item in plugins
@@ -229,8 +255,9 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
             warnings.append(
                 f"Found {len(plugins)} enabled Qoder plugin(s) across "
                 f"{len(marketplaces)} Marketplace source(s); {compatible} "
-                "expose a QwenPaw-compatible native install source. Qoder "
-                "cache directories are never copied.",
+                "provide a source that can enter compatibility review. "
+                "Local plugin sources are copied into the isolated staging "
+                "area and are never modified in place.",
             )
             if plugin_owned_skills:
                 warnings.append(
@@ -241,21 +268,32 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
                 )
             if adapted_custom:
                 warnings.append(
-                    f"Prepared {adapted_custom} enabled local Qoder "
+                    f"Prepared {adapted_custom} enabled Qoder "
                     "Skill-only plugin(s) for a constrained QwenPaw native "
-                    "wrapper. Harness-bound Skills remain disabled until "
-                    "reviewed.",
+                    "wrapper. Generated-wrapper Skills remain disabled "
+                    "until explicitly reviewed and enabled.",
                 )
         if not skills:
             warnings.append(
                 "No standalone user/project Qoder Skills were found outside "
                 "plugin-owned directories.",
             )
-        if discovered_mcp_count == 0:
+        if plugin_mcp_count:
+            warnings.append(
+                f"Prepared {plugin_mcp_count} MCP server(s) declared by "
+                "enabled Qoder plugins for the normal QwenPaw MCP "
+                "compatibility and DriverCard migration flow.",
+            )
+        elif discovered_mcp_count == 0:
             warnings.append(
                 "Qoder's user-level mcp.json currently contains no MCP "
-                "servers. Plugin-owned or built-in MCP runtimes are not "
-                "copied as standalone servers.",
+                "servers, and no enabled third-party plugin declares one.",
+            )
+        if scheduled_tasks:
+            warnings.append(
+                f"Prepared {len(scheduled_tasks)} Qoder scheduled task(s) "
+                "as disabled QwenPaw Agent jobs. Running/queued state and "
+                "execution history were not resumed or copied.",
             )
         projects = self._qoder_home / "projects"
         return ProviderInventory(
@@ -269,6 +307,7 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
                 or bool(skills)
                 or bool(mcp_servers)
                 or bool(marketplaces)
+                or bool(scheduled_tasks)
             ),
             locator=str(self._qoder_home),
             source_location=self._source_location,
@@ -279,7 +318,9 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
             memory_projects=memory_projects,
             marketplaces=marketplaces,
             plugins=plugins,
+            scheduled_tasks=scheduled_tasks,
             discovered_mcp_count=discovered_mcp_count,
+            discovered_scheduled_task_count=(discovered_scheduled_task_count),
             warnings=warnings,
         )
 

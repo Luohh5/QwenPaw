@@ -54,6 +54,14 @@ def test_create_help_exposes_silent_delivery_flag():
     assert "--silent / --no-silent" in result.output
 
 
+def test_promote_help_explains_review_without_enablement():
+    result = CliRunner().invoke(cron_group, ["promote", "--help"])
+
+    assert result.exit_code == 0
+    assert "without enabling or running" in result.output
+    assert "--agent-id" in result.output
+
+
 # --- _resolve_update_spec regression tests (issue #6176) ---
 
 

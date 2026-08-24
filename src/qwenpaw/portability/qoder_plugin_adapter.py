@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -12,7 +15,10 @@ from typing import Any
 from .models import SourcePlugin
 
 _MAX_PLUGIN_FILES = 5000
+_MAX_PLUGIN_ENTRIES = 6000
 _MAX_PLUGIN_BYTES = 64 * 1024 * 1024
+_MAX_MANIFEST_BYTES = 1024 * 1024
+_PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _QODER_NATIVE_PLUGIN_FEATURES = {
     "agents",
     "canvas",
@@ -47,48 +53,136 @@ def _has_skill_directory(root: Path) -> bool:
     return False
 
 
+def _iter_regular_tree(root: Path):
+    """Yield a bounded tree without following links or buffering all paths."""
+    canonical = root.resolve(strict=True)
+    pending = [canonical]
+    entries = 0
+    files = 0
+    total = 0
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as iterator:
+            for directory_entry in iterator:
+                entries += 1
+                if entries > _MAX_PLUGIN_ENTRIES:
+                    raise ValueError(
+                        "Qoder custom plugin exceeds the 6,000 entry limit",
+                    )
+                path = Path(directory_entry.path)
+                if directory_entry.is_symlink():
+                    raise ValueError(
+                        f"Qoder custom plugin contains a link: {path}",
+                    )
+                resolved = path.resolve(strict=True)
+                if not resolved.is_relative_to(canonical):
+                    raise ValueError(
+                        f"Qoder custom plugin file escaped: {path}",
+                    )
+                if directory_entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+                    continue
+                if not directory_entry.is_file(follow_symlinks=False):
+                    raise ValueError(
+                        "Qoder custom plugin contains a non-regular entry: "
+                        f"{path}",
+                    )
+                before = directory_entry.stat(follow_symlinks=False)
+                files += 1
+                total += before.st_size
+                if files > _MAX_PLUGIN_FILES or total > _MAX_PLUGIN_BYTES:
+                    raise ValueError(
+                        "Qoder custom plugin exceeds the 5,000 file / "
+                        "64 MiB limit",
+                    )
+                yield path, before
+
+
+def _open_verified(path: Path, before: os.stat_result) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode) or (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_size,
+    ) != (before.st_dev, before.st_ino, before.st_size):
+        os.close(descriptor)
+        raise ValueError(f"Qoder custom plugin file changed: {path}")
+    return descriptor
+
+
 def _contains_qoder_bindings(skills_root: Path) -> bool:
-    for path in sorted(skills_root.rglob("*")):
-        if not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
+    for path, before in _iter_regular_tree(skills_root):
+        if before.st_size > 2 * 1024 * 1024:
             continue
+        descriptor = -1
         try:
-            content = path.read_bytes().lower()
+            descriptor = _open_verified(path, before)
+            with os.fdopen(descriptor, "rb") as stream:
+                descriptor = -1
+                content = stream.read(2 * 1024 * 1024 + 1).lower()
         except OSError:
             continue
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
         if any(marker in content for marker in _QODER_BINDING_MARKERS):
             return True
     return False
 
 
-# pylint: disable-next=too-many-return-statements
+# pylint: disable-next=too-many-return-statements,too-many-branches
 def discover_qoder_custom_skill_adapter(
     qoder_home: Path,
     install_path: Path | None,
     manifest: Any,
     record: dict[str, Any],
+    plugin_id: str = "",
 ) -> dict[str, Any] | None:
-    """Describe a safe local Qoder Skill-only plugin translation.
-
-    Qoder's ``custom`` ledger entries are canonical user-owned plugin sources,
-    unlike ``plugins/cache``. The importer repeats these checks immediately
-    before staging so discovery metadata cannot relax the security boundary.
-    """
+    """Describe a bounded Qoder Skill-only plugin translation."""
     if install_path is None or not isinstance(manifest, dict):
         return None
-    # Current Qoder releases omit ``source`` for local-custom records; older
-    # releases wrote ``source: custom``.
-    if str(record.get("source") or "") not in {"", "custom"}:
-        return None
     try:
-        custom_root = (qoder_home / "plugins" / "custom").resolve(strict=True)
         source = install_path.resolve(strict=True)
     except OSError:
         return None
-    if (
-        install_path.is_symlink()
-        or not source.is_dir()
-        or not source.is_relative_to(custom_root)
+    if install_path.is_symlink() or not source.is_dir():
+        return None
+    source_kind = str(record.get("source") or "")
+    plugin_name = marketplace = ""
+    if "@" in plugin_id:
+        plugin_name, marketplace = plugin_id.rsplit("@", 1)
+    custom_root = qoder_home / "plugins" / "custom"
+    if source_kind == "custom" or (
+        source_kind == "" and marketplace in {"", "local-custom"}
     ):
+        try:
+            if not source.is_relative_to(custom_root.resolve(strict=True)):
+                return None
+        except OSError:
+            return None
+        source_kind = "custom"
+    elif source_kind in {"", "marketplace"} and marketplace:
+        source_kind = "marketplace"
+        cache = qoder_home / "plugins" / "cache" / marketplace / plugin_name
+        version = str(record.get("version") or "")
+        candidates = [cache]
+        if version:
+            candidates.insert(0, cache / version)
+        try:
+            if source not in {
+                candidate.resolve(strict=True) for candidate in candidates
+            }:
+                return None
+        except OSError:
+            return None
+        if str(manifest.get("name") or "") != plugin_name:
+            return None
+        manifest_version = str(manifest.get("version") or "")
+        if version and manifest_version and version != manifest_version:
+            return None
+    else:
         return None
     skills_value = manifest.get("skills")
     if not isinstance(skills_value, str) or not skills_value.strip():
@@ -105,38 +199,69 @@ def discover_qoder_custom_skill_adapter(
         return None
     if any(manifest.get(key) for key in _QODER_NATIVE_PLUGIN_FEATURES):
         return None
-    for path in skills_root.rglob("*"):
-        if path.is_symlink():
-            return None
-    harness_bound = _contains_qoder_bindings(skills_root)
+    try:
+        _validate_source_tree(source)
+        harness_bound = _contains_qoder_bindings(skills_root)
+    except (OSError, ValueError):
+        return None
     return {
         "adapter": "qoder_skill_only_v1",
-        "canonical_custom_root": str(custom_root),
+        "canonical_plugin_source": str(source),
+        "qoder_source_kind": source_kind,
         "skills_relative_path": str(skills_root.relative_to(source)),
         "harness_bound": harness_bound,
-        "skills_enabled_by_default": not harness_bound,
+        # Compatibility is not activation authorization.  The generated
+        # QwenPaw wrapper keeps even binding-free source Skills disabled until
+        # the user explicitly reviews them.
+        "skills_enabled_by_default": False,
     }
 
 
-def _validated_custom_source(plugin: SourcePlugin) -> Path:
+def _validated_source(plugin: SourcePlugin) -> Path:
     source = Path(plugin.install_source).expanduser()
-    custom_root_raw = str(plugin.metadata.get("canonical_custom_root") or "")
-    if not custom_root_raw:
-        raise ValueError("Qoder custom plugin provenance is missing")
-    custom_root = Path(custom_root_raw).expanduser().resolve(strict=True)
+    canonical_raw = str(plugin.metadata.get("canonical_plugin_source") or "")
     if source.is_symlink():
         raise ValueError("Qoder custom plugin source is symbolic")
     source = source.resolve(strict=True)
-    if not source.is_dir() or not source.is_relative_to(custom_root):
-        raise ValueError("Qoder custom plugin source escaped plugins/custom")
+    if not source.is_dir():
+        raise ValueError("Qoder plugin source is unavailable")
+    if canonical_raw:
+        valid = source == Path(canonical_raw).expanduser().resolve(strict=True)
+    else:
+        custom_root = str(plugin.metadata.get("canonical_custom_root") or "")
+        if not custom_root:
+            raise ValueError("Qoder plugin provenance is missing")
+        valid = source.is_relative_to(
+            Path(custom_root).expanduser().resolve(strict=True),
+        )
+    if not valid:
+        raise ValueError("Qoder plugin source changed after discovery")
     return source
 
 
 def _read_qoder_manifest(source: Path) -> dict[str, Any]:
     path = source / ".qoder-plugin" / "plugin.json"
-    if path.is_symlink() or not path.is_file():
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise ValueError(
+            "Qoder custom plugin manifest is unavailable",
+        ) from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
         raise ValueError("Qoder custom plugin manifest is unavailable")
-    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if before.st_size > _MAX_MANIFEST_BYTES:
+        raise ValueError("Qoder custom plugin manifest exceeds 1 MiB")
+    descriptor = _open_verified(path, before)
+    try:
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            encoded = stream.read(_MAX_MANIFEST_BYTES + 1)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(encoded) > _MAX_MANIFEST_BYTES:
+        raise ValueError("Qoder custom plugin manifest exceeds 1 MiB")
+    manifest = json.loads(encoded.decode("utf-8"))
     if not isinstance(manifest, dict):
         raise ValueError("Qoder custom plugin manifest is invalid")
     if any(manifest.get(key) for key in _QODER_NATIVE_PLUGIN_FEATURES):
@@ -165,21 +290,59 @@ def _validated_skills_root(
 
 
 def _validate_source_tree(source: Path) -> None:
-    count = 0
-    total = 0
-    for entry in sorted(source.rglob("*")):
-        if entry.is_symlink():
-            raise ValueError(f"Qoder custom plugin contains a link: {entry}")
-        if not entry.is_file():
-            continue
-        if not entry.resolve(strict=True).is_relative_to(source):
-            raise ValueError(f"Qoder custom plugin file escaped: {entry}")
-        count += 1
-        total += entry.stat().st_size
-        if count > _MAX_PLUGIN_FILES or total > _MAX_PLUGIN_BYTES:
-            raise ValueError(
-                "Qoder custom plugin exceeds the 5,000 file / 64 MiB limit",
+    for _path, _before in _iter_regular_tree(source):
+        pass
+
+
+def _copy_skill_tree(source: Path, target: Path) -> None:
+    """Copy only verified regular files into the generated wrapper."""
+    target.mkdir(mode=0o700)
+    canonical = source.resolve(strict=True)
+    for path, before in _iter_regular_tree(canonical):
+        relative = path.relative_to(canonical)
+        output = target / relative
+        output.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        descriptor = _open_verified(path, before)
+        try:
+            with os.fdopen(descriptor, "rb") as source_stream:
+                descriptor = -1
+                with output.open("xb") as target_stream:
+                    shutil.copyfileobj(
+                        source_stream,
+                        target_stream,
+                        length=1024 * 1024,
+                    )
+            os.chmod(
+                output,
+                0o700 if before.st_mode & stat.S_IXUSR else 0o600,
             )
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
+def _copy_optional_readme(source: Path, target: Path) -> None:
+    """Copy one optional README through the same no-follow boundary."""
+    try:
+        before = source.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ValueError("Qoder custom plugin README is not a regular file")
+    descriptor = _open_verified(source, before)
+    try:
+        with os.fdopen(descriptor, "rb") as source_stream:
+            descriptor = -1
+            with target.open("xb") as target_stream:
+                shutil.copyfileobj(
+                    source_stream,
+                    target_stream,
+                    length=1024 * 1024,
+                )
+        os.chmod(target, 0o600)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _plugin_backend(enabled: bool) -> str:
@@ -202,26 +365,49 @@ def _plugin_backend(enabled: bool) -> str:
 def _author(value: Any) -> str:
     if isinstance(value, dict):
         value = value.get("name") or value.get("email") or ""
-    return str(value or "Imported from Qoder")
+    return _bounded_manifest_text(value or "Imported from Qoder", 200)
+
+
+def _bounded_manifest_text(value: Any, limit: int) -> str:
+    """Return bounded display metadata without control characters."""
+    text = str(value or "")
+    return "".join(
+        character
+        for character in text[:limit]
+        if ord(character) >= 32 and ord(character) != 127
+    ).strip()
 
 
 def _qwenpaw_manifest(
     plugin: SourcePlugin,
     manifest: dict[str, Any],
+    enabled: bool,
 ) -> dict[str, Any]:
-    plugin_id = str(manifest.get("name") or plugin.name).strip()
-    if not plugin_id or "/" in plugin_id or "\\" in plugin_id:
+    plugin_id = _bounded_manifest_text(
+        manifest.get("name") or plugin.name,
+        128,
+    )
+    if not _PLUGIN_ID_RE.fullmatch(plugin_id):
         raise ValueError("Qoder custom plugin name is unsafe")
     descriptions = {}
     description_zh = manifest.get("descriptionZh")
     if isinstance(description_zh, str) and description_zh.strip():
-        descriptions["zh-CN"] = description_zh.strip()
+        descriptions["zh-CN"] = _bounded_manifest_text(description_zh, 4096)
     return {
         "id": plugin_id,
-        "name": str(manifest.get("displayName") or plugin_id),
-        "version": str(manifest.get("version") or plugin.version or "0.0.0"),
+        "name": _bounded_manifest_text(
+            manifest.get("displayName") or plugin_id,
+            200,
+        ),
+        "version": _bounded_manifest_text(
+            manifest.get("version") or plugin.version or "0.0.0",
+            100,
+        ),
         "type": "general",
-        "description": str(manifest.get("description") or ""),
+        "description": _bounded_manifest_text(
+            manifest.get("description"),
+            4096,
+        ),
         "description_i18n": descriptions,
         "author": _author(manifest.get("author")),
         "entry": {"backend": "plugin.py"},
@@ -232,15 +418,19 @@ def _qwenpaw_manifest(
                 "source_id": plugin.source_id,
                 "adapter": "qoder_skill_only_v1",
                 "harness_bound": bool(plugin.metadata.get("harness_bound")),
-                "requires_review": True,
+                "requires_review": not enabled,
             },
         },
     }
 
 
-def stage_qoder_skill_plugin(plugin: SourcePlugin) -> Path:
+def stage_qoder_skill_plugin(
+    plugin: SourcePlugin,
+    *,
+    enabled: bool = False,
+) -> Path:
     """Build a review-safe QwenPaw wrapper for a Qoder Skill-only plugin."""
-    source = _validated_custom_source(plugin)
+    source = _validated_source(plugin)
     manifest = _read_qoder_manifest(source)
     skills_root = _validated_skills_root(source, manifest)
     _validate_source_tree(source)
@@ -248,18 +438,18 @@ def stage_qoder_skill_plugin(plugin: SourcePlugin) -> Path:
     target = temp_root / "plugin"
     try:
         target.mkdir()
-        shutil.copytree(skills_root, target / "skills")
-        readme = source / "README.md"
-        if readme.is_file() and not readme.is_symlink():
-            shutil.copy2(readme, target / "README.qoder.md")
-        enabled = bool(plugin.metadata.get("skills_enabled_by_default", False))
+        _copy_skill_tree(skills_root, target / "skills")
+        _copy_optional_readme(
+            source / "README.md",
+            target / "README.qoder.md",
+        )
         (target / "plugin.py").write_text(
             _plugin_backend(enabled),
             encoding="utf-8",
         )
         (target / "plugin.json").write_text(
             json.dumps(
-                _qwenpaw_manifest(plugin, manifest),
+                _qwenpaw_manifest(plugin, manifest, enabled),
                 ensure_ascii=False,
                 indent=2,
             )

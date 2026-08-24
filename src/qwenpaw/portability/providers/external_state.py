@@ -485,13 +485,13 @@ def _credential_placeholders(values: Any) -> dict[str, str]:
 
 
 # pylint: disable-next=too-many-locals
-def discover_qoder_mcp(
-    qoder_home: Path,
+def _qoder_mcp_servers(
+    records: Any,
+    *,
+    source_prefix: str,
+    source_manifest: str,
 ) -> tuple[list[SourceMCPServer], list[str], int]:
-    """Translate Qoder's standard user-level ``mcp.json`` safely."""
-    qoder_home = qoder_home.expanduser()
-    config = _read_json(qoder_home / "mcp.json")
-    records = config.get("mcpServers") if isinstance(config, dict) else None
+    """Normalize one Qoder MCP manifest through the shared MCP pipeline."""
     if not isinstance(records, dict):
         return [], [], 0
     servers: list[SourceMCPServer] = []
@@ -526,7 +526,7 @@ def discover_qoder_mcp(
         runtime_bound = ".qoder/plugins/cache" in command.replace("\\", "/")
         servers.append(
             SourceMCPServer(
-                source_id=f"qoder:mcp:{name}",
+                source_id=f"{source_prefix}:{name}",
                 name=str(name),
                 transport=transport,
                 enabled=bool(
@@ -540,13 +540,61 @@ def discover_qoder_mcp(
                 headers=headers,
                 auth_status="reauthorize" if credentials_removed else "",
                 metadata={
-                    "source_manifest": "qoder_mcp_json",
+                    "source_manifest": source_manifest,
                     "credentials_removed": credentials_removed,
                     "source_runtime_bound": runtime_bound,
                 },
             ),
         )
     return servers, warnings, len(records)
+
+
+def discover_qoder_mcp(
+    qoder_home: Path,
+) -> tuple[list[SourceMCPServer], list[str], int]:
+    """Translate Qoder's standard user-level ``mcp.json`` safely."""
+    config = _read_json(qoder_home.expanduser() / "mcp.json")
+    records = config.get("mcpServers") if isinstance(config, dict) else None
+    return _qoder_mcp_servers(
+        records,
+        source_prefix="qoder:mcp",
+        source_manifest="qoder_mcp_json",
+    )
+
+
+def discover_qoder_plugin_mcp(
+    plugins: list[SourcePlugin],
+) -> tuple[list[SourceMCPServer], list[str], int]:
+    """Discover standard MCP manifests owned by enabled Qoder plugins."""
+    servers: list[SourceMCPServer] = []
+    warnings: list[str] = []
+    discovered = 0
+    seen: set[str] = set()
+    for plugin in plugins:
+        source = str(
+            plugin.metadata.get("install_path") or plugin.install_source or "",
+        )
+        if not source or source.startswith(("http://", "https://")):
+            continue
+        root = Path(source).expanduser()
+        for filename in (".mcp.json", "mcp.json"):
+            config = _read_json(root / filename)
+            records = (
+                config.get("mcpServers") if isinstance(config, dict) else None
+            )
+            found, found_warnings, count = _qoder_mcp_servers(
+                records,
+                source_prefix=f"qoder:plugin-mcp:{plugin.source_id}",
+                source_manifest="qoder_plugin_mcp_json",
+            )
+            for server in found:
+                server.metadata["source_plugin"] = plugin.source_id
+                if server.source_id not in seen:
+                    seen.add(server.source_id)
+                    servers.append(server)
+            warnings.extend(found_warnings)
+            discovered += count
+    return servers, warnings, discovered
 
 
 def _marketplace_source(config: dict[str, Any], base: Path) -> tuple[str, str]:
@@ -792,6 +840,7 @@ def discover_qoder_plugins(
             install_path,
             manifest,
             enabled_records[0],
+            str(plugin_id),
         )
         plugins.append(
             SourcePlugin(
@@ -843,6 +892,7 @@ __all__ = [
     "discover_project_memory",
     "discover_qoder_mcp",
     "discover_qoder_memory",
+    "discover_qoder_plugin_mcp",
     "discover_qoder_plugins",
     "discover_qoder_skills",
 ]

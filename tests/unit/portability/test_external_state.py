@@ -5,6 +5,10 @@ import json
 import sqlite3
 from pathlib import Path
 
+from qwenpaw.portability.models import SourcePlugin
+from qwenpaw.portability.qoder_plugin_adapter import (
+    discover_qoder_custom_skill_adapter,
+)
 from qwenpaw.portability.providers.external_state import (
     codex_memory_status,
     discover_codex_memory,
@@ -12,6 +16,7 @@ from qwenpaw.portability.providers.external_state import (
     discover_project_memory,
     discover_qoder_mcp,
     discover_qoder_memory,
+    discover_qoder_plugin_mcp,
     discover_qoder_plugins,
     discover_qoder_skills,
 )
@@ -205,6 +210,54 @@ def test_qoder_plugin_cache_is_metadata_only(tmp_path: Path):
     assert plugins[0].install_source == ""
 
 
+def test_qoder_marketplace_skill_only_plugin_is_adaptable(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".qoder"
+    plugins_root = home / "plugins"
+    source = plugins_root / "cache/community/cangjie-skills/1.0.0"
+    skill = source / "skills/cangjie/SKILL.md"
+    manifest = source / ".qoder-plugin/plugin.json"
+    skill.parent.mkdir(parents=True)
+    manifest.parent.mkdir()
+    skill.write_text(
+        "---\nname: cangjie\ndescription: Cangjie docs\n---\n",
+        encoding="utf-8",
+    )
+    manifest.write_text(
+        json.dumps(
+            {
+                "name": "cangjie-skills",
+                "version": "1.0.0",
+                "skills": "./skills/",
+            },
+        ),
+        encoding="utf-8",
+    )
+    (plugins_root / "installed_plugins_v2.json").write_text(
+        json.dumps(
+            {
+                "plugins": {
+                    "cangjie-skills@community": [
+                        {
+                            "enabled": True,
+                            "installPath": str(source),
+                            "version": "1.0.0",
+                        },
+                    ],
+                },
+            },
+        ),
+        encoding="utf-8",
+    )
+
+    _marketplaces, plugins = discover_qoder_plugins(home)
+
+    assert plugins[0].install_source == str(source.resolve())
+    assert plugins[0].metadata["adapter"] == "qoder_skill_only_v1"
+    assert plugins[0].metadata["qoder_source_kind"] == "marketplace"
+
+
 def test_qoder_memory_reads_current_account_scoped_layout(tmp_path: Path):
     """Current Qoder memory scopes are not mistaken for project-local v1."""
     home = tmp_path / ".qoder"
@@ -268,6 +321,66 @@ def test_qoder_mcp_is_translated_without_copying_credentials(
     assert servers[1].transport == "sse"
     assert servers[1].headers == {"Authorization": "${AUTHORIZATION}"}
     assert "secret" not in "".join(item.model_dump_json() for item in servers)
+
+
+def test_qoder_plugin_mcp_uses_the_normal_mcp_pipeline(tmp_path: Path):
+    home = tmp_path / ".qoder"
+    plugins_root = home / "plugins"
+    gitlab = plugins_root / "cache/community/gitlab/1.0.0"
+    mongodb = plugins_root / "cache/community/mongodb/1.0.0"
+    gitlab.mkdir(parents=True)
+    mongodb.mkdir(parents=True)
+    (gitlab / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "GitLab": {
+                        "type": "http",
+                        "url": "https://gitlab.example/mcp",
+                        "headers": {"Authorization": "secret"},
+                    },
+                },
+            },
+        ),
+        encoding="utf-8",
+    )
+    (mongodb / "mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "mongodb": {
+                        "command": "npx",
+                        "args": ["-y", "mongodb-mcp-server@1"],
+                    },
+                },
+            },
+        ),
+        encoding="utf-8",
+    )
+    plugins = [
+        SourcePlugin(
+            source_id="gitlab@community",
+            name="gitlab",
+            marketplace="community",
+            metadata={"install_path": str(gitlab)},
+        ),
+        SourcePlugin(
+            source_id="mongodb@community",
+            name="mongodb",
+            marketplace="community",
+            metadata={"install_path": str(mongodb)},
+        ),
+    ]
+
+    servers, warnings, discovered = discover_qoder_plugin_mcp(plugins)
+
+    assert not warnings
+    assert discovered == 2
+    assert [server.name for server in servers] == ["GitLab", "mongodb"]
+    assert servers[0].source_id == ("qoder:plugin-mcp:gitlab@community:GitLab")
+    assert servers[0].headers == {"Authorization": "${AUTHORIZATION}"}
+    assert servers[0].metadata["source_plugin"] == "gitlab@community"
+    assert servers[1].command == "npx"
 
 
 def test_qoder_skills_only_discovers_standalone_sources(tmp_path: Path):
@@ -392,6 +505,31 @@ def test_qoder_local_custom_skill_plugin_is_adaptable_source(
     assert plugins[0].metadata["adapter"] == "qoder_skill_only_v1"
     assert plugins[0].metadata["harness_bound"] is True
     assert plugins[0].metadata["skills_enabled_by_default"] is False
+
+
+def test_qoder_binding_free_skill_plugin_still_requires_activation(
+    tmp_path: Path,
+) -> None:
+    """Structural compatibility never grants third-party activation."""
+    home = tmp_path / ".qoder"
+    source = home / "plugins/custom/plain-skill"
+    skill = source / "skills/plain"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "Use the tools available in the current session.",
+        encoding="utf-8",
+    )
+
+    metadata = discover_qoder_custom_skill_adapter(
+        home,
+        source,
+        {"name": "plain-skill", "skills": "skills"},
+        {"source": "custom"},
+    )
+
+    assert metadata is not None
+    assert metadata["harness_bound"] is False
+    assert metadata["skills_enabled_by_default"] is False
 
 
 def test_qoder_custom_plugin_with_native_extensions_is_not_adapted(

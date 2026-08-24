@@ -9,7 +9,7 @@ import os
 import re
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from ..events import HarnessHistoryItem, HarnessHistoryKind
 
@@ -19,6 +19,56 @@ _UUID_PATTERN = re.compile(
 )
 _MAX_ROLLOUT_BYTES = 128 * 1024 * 1024
 _MAX_LINE_BYTES = 128 * 1024 * 1024
+
+
+def _source_label(value: Any) -> str:
+    """Return a stable label for a serialized Codex source variant."""
+    if isinstance(value, str):
+        return re.sub(r"(?<!^)(?=[A-Z])", "_", value).lower()
+    if not isinstance(value, Mapping):
+        return "unknown"
+    for key, child in value.items():
+        label = _source_label(key)
+        if label == "other" and isinstance(child, str):
+            return _source_label(child)
+        return label
+    return "unknown"
+
+
+def codex_non_root_session_kind(metadata: Mapping[str, Any]) -> str:
+    """Classify Codex internal/child sessions from structural metadata.
+
+    Codex's app-server omits these sessions from its default ``thread/list``
+    response.  The JSONL fallback must apply the same boundary or Guardian,
+    compaction, memory and delegated worker rollouts appear as user chats.
+    Message text is deliberately ignored because a normal conversation may
+    quote an internal prompt while debugging it.
+    """
+    source = metadata.get("source")
+    if isinstance(source, Mapping):
+        for raw_key, value in source.items():
+            key = _source_label(raw_key)
+            if key == "internal":
+                return f"internal:{_source_label(value)}"
+            if key in {"subagent", "sub_agent"}:
+                return f"subagent:{_source_label(value)}"
+    elif isinstance(source, str):
+        label = _source_label(source)
+        if label.startswith(("internal", "subagent", "sub_agent")):
+            return label
+
+    thread_source = metadata.get("thread_source")
+    if thread_source is None:
+        thread_source = metadata.get("threadSource")
+    label = _source_label(thread_source)
+    if label in {
+        "subagent",
+        "sub_agent",
+        "memory_consolidation",
+        "automation",
+    }:
+        return label
+    return ""
 
 
 @dataclass(frozen=True)
@@ -31,6 +81,8 @@ class CodexRolloutRecord:
     title: str = ""
     created_at: str = ""
     updated_at: str = ""
+    non_root_kind: str = ""
+    parent_thread_id: str = ""
     lineage_paths: tuple[Path, ...] = ()
 
     def as_thread(self) -> dict[str, Any]:
@@ -44,6 +96,7 @@ class CodexRolloutRecord:
             "rolloutPath": str(self.path),
             "rolloutLineageLength": len(self.paths),
             "source": "codex-rollout-jsonl",
+            "parentThreadId": self.parent_thread_id or None,
         }
 
     @property
@@ -61,6 +114,8 @@ class _RolloutMetadataState:
     title: str = ""
     created_at: str = ""
     updated_at: str = ""
+    non_root_kind: str = ""
+    parent_thread_id: str = ""
 
     def update(self, entry: dict[str, Any]) -> None:
         """Merge metadata carried by one rollout entry."""
@@ -81,6 +136,14 @@ class _RolloutMetadataState:
             self.cwd = str(payload.get("cwd") or self.cwd)
             self.created_at = str(
                 payload.get("timestamp") or self.created_at,
+            )
+            self.parent_thread_id = str(
+                payload.get("parent_thread_id")
+                or payload.get("parentThreadId")
+                or self.parent_thread_id,
+            )
+            self.non_root_kind = (
+                codex_non_root_session_kind(payload) or self.non_root_kind
             )
         elif entry_type == "turn_context":
             self.cwd = str(payload.get("cwd") or self.cwd)
@@ -105,13 +168,26 @@ class CodexRolloutReader:
         self._records: dict[str, CodexRolloutRecord] | None = None
 
     def list_threads(self, *, limit: int = 500) -> list[dict[str, Any]]:
-        """Return newest bounded rollout metadata records."""
+        """Return newest user-facing root rollout metadata records."""
         records = sorted(
-            self._index().values(),
+            (
+                item
+                for item in self._index().values()
+                if not item.non_root_kind
+            ),
             key=lambda item: (item.updated_at, str(item.path)),
             reverse=True,
         )
         return [item.as_thread() for item in records[: max(0, limit)]]
+
+    def list_non_root_thread_ids(self, *, limit: int = 5000) -> list[str]:
+        """Return bounded child/internal IDs for prior-import cleanup."""
+        records = sorted(
+            (item for item in self._index().values() if item.non_root_kind),
+            key=lambda item: (item.updated_at, str(item.path)),
+            reverse=True,
+        )
+        return [item.thread_id for item in records[: max(0, limit)]]
 
     def has_thread(self, thread_id: str) -> bool:
         """Return whether a local rollout exists for ``thread_id``."""
@@ -210,6 +286,14 @@ class CodexRolloutReader:
                     self._records[record.thread_id] = replace(
                         latest,
                         created_at=earliest_created,
+                        non_root_kind=(
+                            existing.non_root_kind or record.non_root_kind
+                        ),
+                        parent_thread_id=(
+                            latest.parent_thread_id
+                            or existing.parent_thread_id
+                            or record.parent_thread_id
+                        ),
                         lineage_paths=lineage,
                     )
         return self._records
@@ -246,6 +330,8 @@ def _read_rollout_metadata(path: Path) -> CodexRolloutRecord | None:
         title=" ".join(state.title.split()),
         created_at=state.created_at,
         updated_at=state.updated_at or state.created_at,
+        non_root_kind=state.non_root_kind,
+        parent_thread_id=state.parent_thread_id,
     )
 
 
@@ -409,4 +495,8 @@ def _visible_text(payload: dict[str, Any]) -> str:
     return ""
 
 
-__all__ = ["CodexRolloutReader", "CodexRolloutRecord"]
+__all__ = [
+    "CodexRolloutReader",
+    "CodexRolloutRecord",
+    "codex_non_root_session_kind",
+]

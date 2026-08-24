@@ -8,6 +8,7 @@ vi.mock("../../../api", () => ({
     listCronJobs: vi.fn(),
     createCronJob: vi.fn(),
     replaceCronJob: vi.fn(),
+    promoteCronJob: vi.fn(),
     deleteCronJob: vi.fn(),
     triggerCronJob: vi.fn(),
   },
@@ -143,6 +144,102 @@ describe("useCronJobs", () => {
     expect(mockMessage.error).toHaveBeenCalled();
   });
 
+  it("待审核任务编辑时保留审核元数据并仅允许覆盖 project_dir", async () => {
+    const pendingJob = {
+      id: "imported-edit",
+      enabled: false,
+      name: "Imported original",
+      schedule: { type: "cron", cron: "0 9 * * *" },
+      task_type: "agent",
+      request: {
+        input: [{ role: "user", content: "original" }],
+        request_context: {
+          source: "cron",
+          portability_review_required: true,
+          project_dir: "/old/project",
+        },
+      },
+      dispatch: {
+        type: "channel",
+        target: { user_id: "system", session_id: "isolated" },
+        meta: { portability: { source: "qoder" }, audit: "keep" },
+      },
+      meta: {
+        portability: {
+          requires_review: true,
+          safety: "disabled_until_explicit_promotion",
+          source: "qoder",
+        },
+        audit: "keep",
+      },
+    };
+    const formValues = {
+      ...pendingJob,
+      name: "Imported edited",
+      enabled: true,
+      meta: {
+        portability: {
+          requires_review: false,
+          safety: "reviewed_disabled",
+        },
+      },
+      dispatch: {
+        ...pendingJob.dispatch,
+        meta: { audit: "erase" },
+      },
+      request: {
+        input: [{ role: "user", content: "edited" }],
+        request_context: {
+          project_dir: "  /new/local-project  ",
+          source: "tampered",
+          portability_review_required: false,
+        },
+      },
+    };
+    (api.listCronJobs as ReturnType<typeof vi.fn>).mockResolvedValue([
+      pendingJob,
+    ]);
+    (api.replaceCronJob as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_jobId, spec) => spec,
+    );
+
+    const { result } = renderHook(() => useCronJobs());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      expect(
+        await result.current.updateJob(
+          pendingJob.id,
+          formValues as unknown as Parameters<
+            typeof result.current.updateJob
+          >[1],
+        ),
+      ).toBe(true);
+    });
+
+    const submitted = (api.replaceCronJob as ReturnType<typeof vi.fn>).mock
+      .calls[0][1];
+    expect(submitted).toMatchObject({
+      id: pendingJob.id,
+      name: "Imported edited",
+      enabled: false,
+      meta: pendingJob.meta,
+      dispatch: { meta: pendingJob.dispatch.meta },
+      request: {
+        input: formValues.request.input,
+        request_context: {
+          source: "cron",
+          portability_review_required: true,
+          project_dir: "/new/local-project",
+        },
+      },
+    });
+    expect(result.current.jobs[0]).toEqual(submitted);
+    expect(result.current.jobs[0].meta?.portability?.requires_review).toBe(
+      true,
+    );
+  });
+
   // 6. deleteJob 成功：optimistic delete，message.success
   it("deleteJob 成功：乐观删除 job，message.success 被调用", async () => {
     (api.deleteCronJob as ReturnType<typeof vi.fn>).mockResolvedValue(
@@ -243,6 +340,154 @@ describe("useCronJobs", () => {
 
     expect(returnValue).toBe(false);
     expect(mockMessage.error).toHaveBeenCalledWith("Failed to execute");
+  });
+
+  it("待审核任务不能通过普通启用或立即执行绕过审核", async () => {
+    const pendingJob = {
+      id: "imported-1",
+      enabled: false,
+      name: "Imported",
+      meta: {
+        portability: {
+          requires_review: true,
+          safety: "disabled_until_explicit_promotion",
+        },
+      },
+    };
+    (api.listCronJobs as ReturnType<typeof vi.fn>).mockResolvedValue([
+      pendingJob,
+    ]);
+
+    const { result } = renderHook(() => useCronJobs());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      expect(
+        await result.current.toggleEnabled(
+          pendingJob as unknown as Parameters<
+            typeof result.current.toggleEnabled
+          >[0],
+        ),
+      ).toBe(false);
+      expect(await result.current.executeNow(pendingJob.id)).toBe(false);
+    });
+
+    expect(api.replaceCronJob).not.toHaveBeenCalled();
+    expect(api.triggerCronJob).not.toHaveBeenCalled();
+    expect(mockMessage.error).toHaveBeenCalledWith(
+      "cronJobs.importReviewBlocked",
+    );
+  });
+
+  it("promoteImportedJob 成功后用后端结果替换任务且仍保持禁用", async () => {
+    const pendingJob = {
+      id: "imported-1",
+      enabled: false,
+      name: "Imported",
+      meta: {
+        portability: {
+          requires_review: true,
+          safety: "disabled_until_explicit_promotion",
+        },
+      },
+    };
+    const promotedJob = {
+      ...pendingJob,
+      meta: {
+        portability: {
+          requires_review: false,
+          safety: "reviewed_disabled",
+        },
+      },
+    };
+    (api.listCronJobs as ReturnType<typeof vi.fn>).mockResolvedValue([
+      pendingJob,
+    ]);
+    (api.promoteCronJob as ReturnType<typeof vi.fn>).mockResolvedValue(
+      promotedJob,
+    );
+
+    const { result } = renderHook(() => useCronJobs());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      expect(await result.current.promoteImportedJob(pendingJob.id)).toBe(true);
+    });
+
+    expect(api.promoteCronJob).toHaveBeenCalledWith(pendingJob.id);
+    expect(result.current.jobs[0]).toEqual(promotedJob);
+    expect(result.current.jobs[0].enabled).toBe(false);
+    expect(mockMessage.success).toHaveBeenCalledWith(
+      "cronJobs.importReviewSuccess",
+    );
+  });
+
+  it("promoteImportedJob 原样展示后端的本地项目目录错误", async () => {
+    const pendingJob = {
+      id: "remote-imported",
+      enabled: false,
+      name: "Remote imported",
+      meta: { portability: { requires_review: true } },
+    };
+    const backendDetail =
+      "Remote or unverified imported cron jobs require an explicit local project_dir before promotion";
+    (api.listCronJobs as ReturnType<typeof vi.fn>).mockResolvedValue([
+      pendingJob,
+    ]);
+    (api.promoteCronJob as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("promotion failed"),
+    );
+    (parseErrorDetail as ReturnType<typeof vi.fn>).mockReturnValue(
+      backendDetail,
+    );
+
+    const { result } = renderHook(() => useCronJobs());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      expect(await result.current.promoteImportedJob(pendingJob.id)).toBe(
+        false,
+      );
+    });
+
+    expect(mockMessage.error).toHaveBeenCalledWith(backendDetail);
+    expect(result.current.jobs[0]).toEqual(pendingJob);
+  });
+
+  it("远程待审核任务缺少本地目录映射时不调用 promote API", async () => {
+    const pendingJob = {
+      id: "remote-without-mapping",
+      enabled: false,
+      name: "Remote imported",
+      request: {
+        input: [],
+        request_context: { project_dir: "   " },
+      },
+      meta: {
+        portability: {
+          requires_review: true,
+          source_cwd_remote_or_unverified: true,
+        },
+      },
+    };
+    (api.listCronJobs as ReturnType<typeof vi.fn>).mockResolvedValue([
+      pendingJob,
+    ]);
+
+    const { result } = renderHook(() => useCronJobs());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      expect(await result.current.promoteImportedJob(pendingJob.id)).toBe(
+        false,
+      );
+    });
+
+    expect(api.promoteCronJob).not.toHaveBeenCalled();
+    expect(mockMessage.error).toHaveBeenCalledWith(
+      "cronJobs.importReviewProjectDirRequired",
+    );
+    expect(result.current.promotingJobIds.size).toBe(0);
   });
 
   describe("错误信息归一化", () => {

@@ -93,6 +93,27 @@ class SourcePlugin(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class SourceScheduledTask(BaseModel):
+    """One external scheduled task normalized for safe QwenPaw staging.
+
+    ``enabled`` records the state at the source only.  The compatibility Goal
+    decides whether the imported QwenPaw job is enabled or held for repair.
+    ``unsupported`` is a first-class schedule type so that a task definition
+    can be audited without guessing at lossy timing semantics.
+    """
+
+    source_id: str
+    name: str
+    schedule_type: str = "unsupported"
+    cron: str = ""
+    run_at: datetime | None = None
+    timezone: str = "UTC"
+    prompt: str = ""
+    cwd: str = ""
+    enabled: bool = False
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class SourceSession(BaseModel):
     """Provider-neutral external conversation ready for materialization."""
 
@@ -120,7 +141,9 @@ class ProviderInventory(BaseModel):
     memory_projects: list[SourceMemoryProject] = Field(default_factory=list)
     marketplaces: list[SourceMarketplace] = Field(default_factory=list)
     plugins: list[SourcePlugin] = Field(default_factory=list)
+    scheduled_tasks: list[SourceScheduledTask] = Field(default_factory=list)
     discovered_mcp_count: int = 0
+    discovered_scheduled_task_count: int = 0
     warnings: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -186,6 +209,7 @@ class ImportReceipt(BaseModel):
     completed_at: datetime
     imported_sessions: list[str] = Field(default_factory=list)
     skipped_sessions: list[str] = Field(default_factory=list)
+    ignored_source_sessions: list[str] = Field(default_factory=list)
     archived_internal_sessions: list[str] = Field(default_factory=list)
     imported_skills: list[str] = Field(default_factory=list)
     skipped_skills: list[str] = Field(default_factory=list)
@@ -195,9 +219,17 @@ class ImportReceipt(BaseModel):
     skipped_memory_projects: list[str] = Field(default_factory=list)
     restored_marketplaces: list[str] = Field(default_factory=list)
     skipped_marketplaces: list[str] = Field(default_factory=list)
+    prepared_plugins: list[str] = Field(default_factory=list)
     installed_plugins: list[str] = Field(default_factory=list)
     skipped_plugins: list[str] = Field(default_factory=list)
+    imported_scheduled_tasks: list[str] = Field(default_factory=list)
+    skipped_scheduled_tasks: list[str] = Field(default_factory=list)
     discovered_mcp_count: int = 0
+    discovered_scheduled_task_count: int = 0
+    adaptation_status: str = "not_run"
+    adaptation_manifest: str = ""
+    adaptation_summary: str = ""
+    adaptation_counts: dict[str, int] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
     backend_changed: bool = False
     doctor_report: MigrationDoctorReport | None = None
@@ -225,6 +257,7 @@ __all__ = [
     "SourceMemoryFile",
     "SourceMemoryProject",
     "SourcePlugin",
+    "SourceScheduledTask",
     "SourceSession",
     "SourceSkill",
     "SourceMCPServer",

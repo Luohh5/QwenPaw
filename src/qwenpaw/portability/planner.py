@@ -1,37 +1,334 @@
 # -*- coding: utf-8 -*-
-"""Read-only inventory planning and per-asset fidelity classification."""
+"""Read-only source fingerprinting and review-plan construction."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from ..app.driver_config_service import DriverConfigService
-from ..config.utils import get_plugins_dir
 from .models import (
     MigrationAssetPlan,
     MigrationPlan,
     ProviderInventory,
 )
 
-_SUPPORTED_MCP_TRANSPORTS = {"stdio", "streamable_http", "sse"}
+_MAX_FINGERPRINT_ENTRIES = 6_000
+_MAX_FINGERPRINT_FILES = 5_000
+_MAX_FINGERPRINT_BYTES = 64 * 1024 * 1024
+_HASH_CHUNK_BYTES = 1024 * 1024
 
 
-def _hash_file(hasher: Any, path: Path) -> None:
-    hasher.update(str(path).encode("utf-8", errors="replace"))
+@dataclass
+class _FingerprintBudget:
+    entries: int = 0
+    files: int = 0
+    total_bytes: int = 0
+
+    def add_entry(self, path: Path) -> None:
+        self.entries += 1
+        if self.entries > _MAX_FINGERPRINT_ENTRIES:
+            raise ValueError(
+                "Portable source tree exceeds the fingerprint entry limit "
+                f"({_MAX_FINGERPRINT_ENTRIES}): {path}",
+            )
+
+    def add_file(self, path: Path, size: int) -> None:
+        self.files += 1
+        if self.files > _MAX_FINGERPRINT_FILES:
+            raise ValueError(
+                "Portable source tree exceeds the fingerprint file limit "
+                f"({_MAX_FINGERPRINT_FILES}): {path}",
+            )
+        if size < 0 or self.total_bytes + size > _MAX_FINGERPRINT_BYTES:
+            raise ValueError(
+                "Portable source tree exceeds the fingerprint byte limit "
+                f"({_MAX_FINGERPRINT_BYTES}): {path}",
+            )
+        self.total_bytes += size
+
+
+def _fingerprint_error(path: Path, reason: str) -> ValueError:
+    return ValueError(f"Unsafe portable fingerprint source {path}: {reason}")
+
+
+def _absolute_path(path: Path) -> Path:
+    expanded = path.expanduser()
+    if expanded.is_absolute():
+        return Path(os.path.abspath(expanded))
+    return Path(os.path.abspath(Path.cwd() / expanded))
+
+
+def _hash_record(hasher: Any, kind: str, value: str) -> None:
+    encoded_kind = kind.encode("utf-8")
+    encoded_value = value.encode("utf-8", errors="replace")
+    hasher.update(len(encoded_kind).to_bytes(4, "big"))
+    hasher.update(encoded_kind)
+    hasher.update(len(encoded_value).to_bytes(8, "big"))
+    hasher.update(encoded_value)
+
+
+def _lstat(path: Path) -> os.stat_result:
     try:
-        if path.is_symlink() or not path.is_file():
-            hasher.update(b"[unavailable]")
-            return
-        with path.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                hasher.update(chunk)
+        return path.lstat()
     except OSError as exc:
-        hasher.update(f"[error:{type(exc).__name__}]".encode())
+        raise _fingerprint_error(
+            path,
+            f"cannot inspect ({type(exc).__name__})",
+        ) from exc
+
+
+def _resolved_within(path: Path, root: Path) -> Path:
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise _fingerprint_error(
+            path,
+            "path escapes its declared root",
+        ) from exc
+    return resolved
+
+
+def _hash_regular_file(
+    hasher: Any,
+    path: Path,
+    budget: _FingerprintBudget,
+) -> None:
+    before = _lstat(path)
+    if stat.S_ISLNK(before.st_mode):
+        raise _fingerprint_error(path, "symbolic links are not allowed")
+    if not stat.S_ISREG(before.st_mode):
+        raise _fingerprint_error(path, "entry is not a regular file")
+
+    descriptor = -1
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise _fingerprint_error(path, "entry is not a regular file")
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise _fingerprint_error(path, "file changed while being opened")
+        budget.add_file(path, opened.st_size)
+        _hash_record(hasher, "file", str(path))
+        hasher.update(opened.st_size.to_bytes(8, "big"))
+
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            remaining = opened.st_size
+            while remaining:
+                chunk = stream.read(min(_HASH_CHUNK_BYTES, remaining))
+                if not chunk:
+                    raise _fingerprint_error(path, "file shrank while hashing")
+                hasher.update(chunk)
+                remaining -= len(chunk)
+            if stream.read(1):
+                raise _fingerprint_error(path, "file grew while hashing")
+            after = os.fstat(stream.fileno())
+        if (
+            (after.st_dev, after.st_ino, after.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise _fingerprint_error(path, "file changed while hashing")
+    except OSError as exc:
+        raise _fingerprint_error(
+            path,
+            f"cannot read ({type(exc).__name__})",
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _hash_tree(
+    hasher: Any,
+    root: Path,
+    budget: _FingerprintBudget,
+) -> None:
+    root_info = _lstat(root)
+    if stat.S_ISLNK(root_info.st_mode):
+        raise _fingerprint_error(root, "symbolic links are not allowed")
+    if not stat.S_ISDIR(root_info.st_mode):
+        raise _fingerprint_error(root, "skill/plugin root is not a directory")
+    try:
+        resolved_root = root.resolve(strict=True)
+    except OSError as exc:
+        raise _fingerprint_error(root, "cannot resolve source root") from exc
+
+    budget.add_entry(resolved_root)
+    pending = [resolved_root]
+    while pending:
+        path = pending.pop()
+        info = _lstat(path)
+        if stat.S_ISLNK(info.st_mode):
+            _hash_record(hasher, "rejected-symbolic-link", str(path))
+            continue
+        _resolved_within(path, resolved_root)
+        if stat.S_ISREG(info.st_mode):
+            _hash_regular_file(hasher, path, budget)
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            _hash_record(hasher, "rejected-non-regular-entry", str(path))
+            continue
+
+        _hash_record(hasher, "directory", str(path))
+        children: list[Path] = []
+        try:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    child = Path(entry.path)
+                    budget.add_entry(child)
+                    children.append(child)
+        except OSError as exc:
+            raise _fingerprint_error(
+                path,
+                f"cannot scan directory ({type(exc).__name__})",
+            ) from exc
+        children.sort(key=lambda child: child.name)
+        pending.extend(reversed(children))
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _has_parent_in(path: Path, roots: set[Path]) -> bool:
+    parent = path.parent
+    while parent != parent.parent:
+        if parent in roots:
+            return True
+        parent = parent.parent
+    return parent in roots
+
+
+@dataclass(frozen=True)
+class _FingerprintSource:
+    kind: str
+    path: Path
+
+
+def _fingerprint_sources(
+    inventory: ProviderInventory,
+) -> list[_FingerprintSource]:
+    sources: list[_FingerprintSource] = []
+
+    def add(kind: str, value: Path | str) -> None:
+        if len(sources) >= _MAX_FINGERPRINT_ENTRIES:
+            raise ValueError(
+                "Portable inventory exceeds the fingerprint source limit "
+                f"({_MAX_FINGERPRINT_ENTRIES}).",
+            )
+        sources.append(
+            _FingerprintSource(kind=kind, path=_absolute_path(Path(value))),
+        )
+
+    for project in inventory.memory_projects:
+        for item in project.files:
+            relative = item.relative_path
+            if relative.is_absolute() or ".." in relative.parts:
+                raise _fingerprint_error(
+                    item.source_path,
+                    "memory relative path escapes its declared scope",
+                )
+            add("file", item.source_path)
+    for skill in inventory.skills:
+        add("tree", skill.directory)
+    for plugin in inventory.plugins:
+        if plugin.install_source:
+            add("plugin", plugin.install_source)
+    return sources
+
+
+# pylint: disable-next=too-many-return-statements
+def _canonical_source(
+    source: _FingerprintSource,
+) -> tuple[str, Path]:
+    path = source.path
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        if source.kind == "plugin":
+            return "external", path
+        return "rejected-missing", path
+    except OSError as exc:
+        raise _fingerprint_error(
+            path,
+            f"cannot inspect ({type(exc).__name__})",
+        ) from exc
+
+    if stat.S_ISLNK(info.st_mode):
+        return "rejected-symbolic-link", path
+    if source.kind == "tree" and not stat.S_ISDIR(info.st_mode):
+        return "rejected-non-directory", path
+    if source.kind == "file" and not stat.S_ISREG(info.st_mode):
+        return "rejected-non-regular", path
+    if source.kind == "plugin" and not (
+        stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)
+    ):
+        return "rejected-non-regular", path
+    try:
+        canonical = path.resolve(strict=True)
+    except OSError as exc:
+        raise _fingerprint_error(path, "cannot resolve source") from exc
+    return ("tree" if stat.S_ISDIR(info.st_mode) else "file"), canonical
+
+
+def _hash_inventory_sources(
+    hasher: Any,
+    inventory: ProviderInventory,
+) -> None:
+    classified = {
+        _canonical_source(source) for source in _fingerprint_sources(inventory)
+    }
+    roots = sorted(
+        (path for kind, path in classified if kind == "tree"),
+        key=lambda path: path.parts,
+    )
+    selected_roots: list[Path] = []
+    for root in roots:
+        if selected_roots and _is_within(root, selected_roots[-1]):
+            continue
+        selected_roots.append(root)
+
+    root_set = set(selected_roots)
+    files = {
+        path
+        for kind, path in classified
+        if kind == "file" and not _has_parent_in(path, root_set)
+    }
+    markers = {
+        (kind, path)
+        for kind, path in classified
+        if kind not in {"tree", "file"}
+    }
+    work = [("tree", path) for path in selected_roots]
+    work.extend(("file", path) for path in files)
+    work.extend(markers)
+    work.sort(key=lambda item: (str(item[1]), item[0]))
+
+    budget = _FingerprintBudget()
+    for kind, path in work:
+        if kind == "tree":
+            _hash_tree(hasher, path, budget)
+        elif kind == "file":
+            budget.add_entry(path)
+            _hash_regular_file(hasher, path, budget)
+        else:
+            budget.add_entry(path)
+            _hash_record(hasher, kind, str(path))
 
 
 def inventory_fingerprint(inventory: ProviderInventory) -> str:
@@ -39,7 +336,11 @@ def inventory_fingerprint(inventory: ProviderInventory) -> str:
     hasher = hashlib.sha256()
     payload = inventory.model_dump(
         mode="json",
-        exclude={"warnings", "source_location"},
+        exclude={
+            "ignored_session_ids",
+            "source_location",
+            "warnings",
+        },
     )
     hasher.update(
         json.dumps(
@@ -49,46 +350,8 @@ def inventory_fingerprint(inventory: ProviderInventory) -> str:
             separators=(",", ":"),
         ).encode("utf-8"),
     )
-    referenced: set[Path] = set()
-    for project in inventory.memory_projects:
-        referenced.update(item.source_path for item in project.files)
-    for skill in inventory.skills:
-        root = skill.directory.expanduser()
-        if root.is_dir() and not root.is_symlink():
-            try:
-                referenced.update(
-                    path for path in root.rglob("*") if path.is_file()
-                )
-            except OSError:
-                referenced.add(root)
-        else:
-            referenced.add(root)
-    for plugin in inventory.plugins:
-        if not plugin.install_source:
-            continue
-        root = Path(plugin.install_source).expanduser()
-        if root.is_dir() and not root.is_symlink():
-            try:
-                referenced.update(
-                    path for path in root.rglob("*") if path.is_file()
-                )
-            except OSError:
-                referenced.add(root)
-        else:
-            referenced.add(root)
-    for path in sorted(referenced, key=str):
-        _hash_file(hasher, path)
+    _hash_inventory_sources(hasher, inventory)
     return hasher.hexdigest()
-
-
-def _installed_skill_names(workspace: Any) -> set[str]:
-    path = Path(workspace.workspace_dir) / "skill.json"
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return set()
-    skills = value.get("skills") if isinstance(value, dict) else None
-    return set(skills) if isinstance(skills, dict) else set()
 
 
 def _imported_memory_ids(workspace: Any, provider_id: str) -> set[str]:
@@ -107,28 +370,6 @@ def _imported_memory_ids(workspace: Any, provider_id: str) -> set[str]:
         if source_id:
             source_ids.add(str(source_id))
     return source_ids
-
-
-def _installed_plugin_ids() -> set[str]:
-    root = get_plugins_dir()
-    installed: set[str] = set()
-    if not root.is_dir():
-        return installed
-    try:
-        children = list(root.iterdir())
-    except OSError:
-        return installed
-    for child in children:
-        manifest = child / "plugin.json"
-        if child.is_symlink() or not manifest.is_file():
-            continue
-        try:
-            value = json.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            continue
-        if isinstance(value, dict):
-            installed.add(str(value.get("id") or child.name))
-    return installed
 
 
 def _asset(
@@ -171,15 +412,10 @@ async def build_migration_plan(
         )
         for chat in chats
     }
-    existing_skills = _installed_skill_names(workspace)
-    existing_mcp = {
-        card.name for card in await DriverConfigService(workspace).list_cards()
-    }
     existing_memory = _imported_memory_ids(
         workspace,
         inventory.provider_id,
     )
-    installed_plugins = _installed_plugin_ids()
     actions: list[MigrationAssetPlan] = []
 
     for session in inventory.sessions:
@@ -219,50 +455,26 @@ async def build_migration_plan(
             )
 
     for skill in inventory.skills:
-        if skill.name in existing_skills:
-            actions.append(
-                _asset(
-                    "skill",
-                    skill.source_id,
-                    skill.name,
-                    "conflict_keep_target",
-                    "manual_review",
-                    "QwenPaw 已有同名 Skill，将保留现有版本。",
-                ),
-            )
-        else:
-            actions.append(
-                _asset(
-                    "skill",
-                    skill.source_id,
-                    skill.name,
-                    "import_disabled",
-                    "manual_review",
-                    "先经过结构与安全检查并保持禁用，确认命令和工具依赖后再启用。",
-                ),
-            )
+        actions.append(
+            _asset(
+                "skill",
+                skill.source_id,
+                skill.name,
+                "agent_goal_test_and_adapt",
+                "agent_decision",
+                "进入安全暂存区，由 Agent 语义判断，必要时再由兼容性 Goal 修复。",
+            ),
+        )
 
     for server in inventory.mcp_servers:
-        if server.name in existing_mcp:
-            action = "conflict_keep_target"
-            fidelity = "manual_review"
-            reason = "QwenPaw 已有同名 DriverCard，将保留现有配置。"
-        elif server.transport not in _SUPPORTED_MCP_TRANSPORTS:
-            action = "skip"
-            fidelity = "unsupported"
-            reason = f"暂不支持 MCP transport：{server.transport}。"
-        else:
-            action = "import_disabled"
-            fidelity = "converted"
-            reason = "转换成禁用的 DriverCard；凭据和 OAuth 需要重新授权。"
         actions.append(
             _asset(
                 "mcp",
                 server.source_id,
                 server.name,
-                action,
-                fidelity,
-                reason,
+                "agent_goal_test_and_adapt",
+                "agent_decision",
+                "进入安全暂存区，由 Agent 语义判断，必要时再由兼容性 Goal 修复。",
             ),
         )
 
@@ -300,40 +512,38 @@ async def build_migration_plan(
         )
 
     for plugin in inventory.plugins:
-        if not plugin.install_source:
-            action = "skip"
-            fidelity = "unsupported"
-            reason = "没有独立且兼容的安装来源，不会复制其他 Harness 的缓存。"
-        elif plugin.name in installed_plugins:
-            action = "already_present"
-            fidelity = "manual_review"
-            reason = "QwenPaw 已有可能同名的插件，将由原生安装器处理版本冲突。"
-        elif plugin.metadata.get("harness_bound"):
-            action = "native_install_review"
-            fidelity = "manual_review"
-            reason = "可走原生安装流程，但包含来源 Harness 绑定，相关 Skill 默认禁用。"
-        else:
-            action = "native_install"
-            fidelity = "converted"
-            reason = "通过 QwenPaw 原生插件安装和加载流程处理。"
         actions.append(
             _asset(
                 "plugin",
                 plugin.source_id,
                 plugin.name,
-                action,
-                fidelity,
-                reason,
+                "agent_goal_test_and_adapt",
+                "agent_decision",
+                "进入安全暂存区，由 Agent 判断整体可用性，必要时再启动修复 Goal。",
+            ),
+        )
+
+    for task in inventory.scheduled_tasks:
+        actions.append(
+            _asset(
+                "scheduled_task",
+                task.source_id,
+                task.name,
+                "agent_goal_test_and_adapt",
+                "agent_decision",
+                "进入安全暂存区，由 Agent 语义判断，必要时再由修复 Goal 验证。",
             ),
         )
 
     counts = {
         "sessions": len(inventory.sessions),
+        "ignored_source_sessions": len(inventory.ignored_session_ids),
         "skills": len(inventory.skills),
         "mcp_servers": len(inventory.mcp_servers),
         "memory_scopes": len(inventory.memory_projects),
         "marketplaces": len(inventory.marketplaces),
         "plugins": len(inventory.plugins),
+        "scheduled_tasks": len(inventory.scheduled_tasks),
         "actions": len(actions),
         "manual_review": sum(
             item.fidelity == "manual_review" for item in actions

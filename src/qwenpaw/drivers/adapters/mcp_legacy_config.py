@@ -202,8 +202,15 @@ async def _migrate_one_client(
 def legacy_mcp_client_to_driver(
     client_key: str,
     config: Any,
+    *,
+    force_encrypt_bindings: bool = False,
 ) -> tuple[DriverCard, CredentialRecord | None]:
-    """Convert one legacy MCP config object into Driver contracts."""
+    """Convert one legacy MCP config object into Driver contracts.
+
+    ``force_encrypt_bindings`` is used for untrusted third-party imports.  It
+    sends every environment/header value through the encrypted credential
+    store instead of guessing sensitivity from a field name.
+    """
     transport = str(getattr(config, "transport", "stdio") or "stdio")
     oauth = getattr(config, "oauth", None)
     credential_alias = (
@@ -213,14 +220,23 @@ def legacy_mcp_client_to_driver(
     )
     now = time.time()
 
-    env_public, env_secrets = split_mcp_binding(
-        "env",
-        dict(getattr(config, "env", {}) or {}),
-    )
-    header_public, header_secrets = split_mcp_binding(
-        "headers",
-        dict(getattr(config, "headers", {}) or {}),
-    )
+    raw_env = {
+        str(key): str(value)
+        for key, value in dict(getattr(config, "env", {}) or {}).items()
+    }
+    raw_headers = {
+        str(key): str(value)
+        for key, value in dict(getattr(config, "headers", {}) or {}).items()
+    }
+    if force_encrypt_bindings:
+        env_public, env_secrets = {}, raw_env
+        header_public, header_secrets = {}, raw_headers
+    else:
+        env_public, env_secrets = split_mcp_binding("env", raw_env)
+        header_public, header_secrets = split_mcp_binding(
+            "headers",
+            raw_headers,
+        )
     env_plan = plan_env_ref_bindings(env_secrets)
     header_plan = plan_env_ref_bindings(header_secrets)
 

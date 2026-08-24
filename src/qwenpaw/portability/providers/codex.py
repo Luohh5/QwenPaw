@@ -7,7 +7,10 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
-from ...harnesses.codex.rollout_reader import CodexRolloutReader
+from ...harnesses.codex.rollout_reader import (
+    CodexRolloutReader,
+    codex_non_root_session_kind,
+)
 from ..models import (
     ProviderInventory,
     SourceLocation,
@@ -22,6 +25,7 @@ from .external_state import (
     discover_codex_memory,
     discover_codex_plugins,
 )
+from .codex_schedules import discover_codex_scheduled_tasks
 from .locator import resolve_source_location
 
 _DISCOVERY_TIMEOUT_SECONDS = 60
@@ -88,6 +92,9 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             rollout_reader.list_threads,
             limit=limit,
         )
+        ignored_session_ids = await asyncio.to_thread(
+            rollout_reader.list_non_root_thread_ids,
+        )
 
         try:
             status = await asyncio.wait_for(
@@ -115,7 +122,12 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
                 "已连接 Codex，正在检查 Memory、插件、Skill 与 MCP 配置…",
             )
 
-        memory_projects, plugin_state, memory_state = await asyncio.gather(
+        (
+            memory_projects,
+            plugin_state,
+            memory_state,
+            scheduled_task_state,
+        ) = await asyncio.gather(
             asyncio.to_thread(
                 discover_codex_memory,
                 rollout_reader.codex_home,
@@ -128,8 +140,38 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
                 codex_memory_status,
                 rollout_reader.codex_home,
             ),
+            asyncio.to_thread(
+                discover_codex_scheduled_tasks,
+                rollout_reader.codex_home,
+            ),
         )
         marketplaces, plugins = plugin_state
+        (
+            scheduled_tasks,
+            scheduled_task_warnings,
+            discovered_scheduled_task_count,
+            automation_run_thread_ids,
+        ) = scheduled_task_state
+        warnings.extend(scheduled_task_warnings)
+        ignored_session_ids = sorted(
+            set(ignored_session_ids) | set(automation_run_thread_ids),
+        )
+        ignored_source_ids = set(ignored_session_ids)
+        if automation_run_thread_ids:
+            # Refill the bounded root list after DB-only automation IDs are
+            # removed, so internal runs cannot consume the user's session
+            # import quota merely because an older rollout lacks the newer
+            # structured thread_source marker.
+            offline_threads = await asyncio.to_thread(
+                rollout_reader.list_threads,
+                limit=limit + min(len(automation_run_thread_ids), 5000),
+            )
+        offline_threads = [
+            item
+            for item in offline_threads
+            if str(item.get("id") or item.get("threadId") or "")
+            not in ignored_source_ids
+        ][:limit]
 
         skills = await self._discover_skills(
             adapter,
@@ -164,8 +206,11 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             or offline_threads
             or memory_projects
             or skills
+            or mcp_servers
             or plugins
-            or marketplaces,
+            or marketplaces
+            or ignored_session_ids
+            or scheduled_tasks,
         )
         if not detected:
             detail = (
@@ -202,6 +247,26 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
                     "Codex app-server session listing failed; local rollout "
                     f"recovery was used: {_error_detail(exc)}",
                 )
+        visible_online_threads: list[dict[str, Any]] = []
+        for item in online_threads:
+            source_id = str(item.get("id") or item.get("threadId") or "")
+            if (
+                source_id in ignored_session_ids
+                or codex_non_root_session_kind(item)
+            ):
+                if source_id:
+                    ignored_session_ids.append(source_id)
+                continue
+            visible_online_threads.append(item)
+        online_threads = visible_online_threads
+        ignored_session_ids = sorted(set(ignored_session_ids))
+        if ignored_session_ids:
+            warnings.append(
+                f"Ignored {len(ignored_session_ids)} Codex non-root "
+                "internal/subagent/automation session(s). They are "
+                "implementation traces rather than top-level user "
+                "conversations.",
+            )
         raw_threads = _merge_threads(online_threads, offline_threads, limit)
         if len(raw_threads) >= limit:
             warnings.append(
@@ -254,6 +319,12 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
                 "expose a QwenPaw-compatible native install source. "
                 "Installed Codex cache directories are never copied.",
             )
+        if scheduled_tasks:
+            warnings.append(
+                f"Prepared {len(scheduled_tasks)} Codex automation(s) as "
+                "disabled QwenPaw Agent jobs. Automation run conversations "
+                "were excluded from normal chat migration.",
+            )
         warnings.append(
             "Codex built-in tools, sandbox/approval settings, hooks, agents, "
             "and provider runtime state are harness-bound and were not "
@@ -276,12 +347,15 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             locator=locator or str(rollout_reader.codex_home),
             source_location=self._source_location,
             sessions=sessions,
+            ignored_session_ids=ignored_session_ids,
             skills=skills,
             mcp_servers=mcp_servers,
             memory_projects=memory_projects,
             marketplaces=marketplaces,
             plugins=plugins,
+            scheduled_tasks=scheduled_tasks,
             discovered_mcp_count=len(mcp_servers),
+            discovered_scheduled_task_count=(discovered_scheduled_task_count),
             warnings=warnings,
             metadata={"memory": memory_state},
         )

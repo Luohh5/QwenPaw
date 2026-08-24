@@ -25,6 +25,30 @@ if TYPE_CHECKING:
     from ...runtime.tool_registry import ToolRegistry
 
 
+def _is_builtin_self_authorizing_tool(name: str, descriptor: Any) -> bool:
+    """Return whether *descriptor* is the exact built-in migration tool.
+
+    Names and descriptor metadata are public plugin inputs and therefore not
+    an identity boundary.  Comparing both the callable and its decorator-
+    attached descriptor prevents a plugin from unregistering a built-in and
+    registering a same-name function that claims the private-loop opt-in.
+    """
+    from ...agents.tools import migration_compatibility
+
+    if (
+        name not in migration_compatibility.MIGRATION_COMPAT_TOOL_NAMES
+        or descriptor is None
+    ):
+        return False
+    expected = getattr(migration_compatibility, name, None)
+    return bool(
+        expected is not None
+        and descriptor.func is expected
+        and getattr(expected, "_tool_descriptor", None) is descriptor
+        and descriptor.metadata.get("self_authorizing_request_opt_in") is True,
+    )
+
+
 class QwenPawLocalWorkspace(AgentScopeLocalWorkspace):
     """LocalWorkspace whose ``list_tools`` delegates to ToolRegistry."""
 
@@ -77,6 +101,20 @@ class QwenPawLocalWorkspace(AgentScopeLocalWorkspace):
                 return []
             sa_set = set(subagent_whitelist)
             allowed = (allowed & sa_set) if allowed is not None else sa_set
+            # A very small class of disabled-by-default internal tools can
+            # opt into an explicit request whitelist when the tool itself
+            # enforces an in-memory capability.  This does not affect normal
+            # disabled tools, and the capability check still fails closed if
+            # a caller forges only the request_context field.
+            self_authorizing = {
+                name
+                for name in sa_set
+                if _is_builtin_self_authorizing_tool(
+                    name,
+                    self._tool_registry.get(name),
+                )
+            }
+            denied -= self_authorizing
 
         descs = self._tool_registry.filter(
             active_modes=set(active_modes),

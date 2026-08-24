@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import re
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+from qwenpaw.app.crons import executor as executor_module
 from qwenpaw.app.crons.executor import CronExecutor
 from qwenpaw.app.crons.models import DispatchSpec, DispatchTarget
 from qwenpaw.schemas import Event, RunStatus
@@ -17,8 +20,10 @@ class _Workspace:
     def __init__(self, events=None) -> None:
         self.events_consumed = 0
         self.events = events if events is not None else ("first", "second")
+        self.requests = []
 
-    async def stream_query(self, _request):
+    async def stream_query(self, request):
+        self.requests.append(request)
         for event in self.events:
             self.events_consumed += 1
             yield event
@@ -165,3 +170,119 @@ async def test_final_mode_no_completed_message_returns_no_content(monkeypatch):
     assert workspace.events_consumed == 1
     channel_manager.send_event.assert_not_awaited()
     assert result["delivery_status"] == "no_content"
+
+
+@pytest.mark.asyncio
+async def test_non_shared_job_creates_a_distinct_session_for_each_run(
+    monkeypatch,
+):
+    workspace = _Workspace()
+    workspace.chat_manager = AsyncMock()
+    workspace.chat_manager.get_or_create_chat.side_effect = [
+        SimpleNamespace(id="chat-1"),
+        SimpleNamespace(id="chat-2"),
+    ]
+    channel_manager = AsyncMock()
+    job = make_cron_job_spec(
+        job_id="imported/job id",
+        session_id="../unsafe/" + ("x" * 200),
+    )
+    job.runtime.share_session = False
+
+    _patch_trace_storage(monkeypatch)
+
+    executor = CronExecutor(
+        workspace=workspace,
+        channel_manager=channel_manager,
+    )
+    first = await executor.execute(job)
+    second = await executor.execute(job)
+
+    first_session = workspace.requests[0]["session_id"]
+    second_session = workspace.requests[1]["session_id"]
+    assert first["run_id"] != second["run_id"]
+    assert first_session != second_session
+    assert first_session == first["session_id"]
+    assert second_session == second["session_id"]
+    assert first_session.endswith(f":run:{first['run_id']}")
+    assert second_session.endswith(f":run:{second['run_id']}")
+    assert len(first_session) <= 115
+    assert re.fullmatch(r"[A-Za-z0-9:._-]+", first_session)
+    assert workspace.requests[0]["session_source"] == "cron"
+
+    chat_calls = workspace.chat_manager.get_or_create_chat.await_args_list
+    assert [call.kwargs["session_id"] for call in chat_calls] == [
+        first_session,
+        second_session,
+    ]
+    assert all(call.kwargs["source"] == "cron" for call in chat_calls)
+
+
+@pytest.mark.asyncio
+async def test_shared_job_reuses_the_target_session(monkeypatch):
+    workspace = _Workspace()
+    workspace.chat_manager = AsyncMock()
+    workspace.chat_manager.get_or_create_chat.return_value = SimpleNamespace(
+        id="chat-1",
+    )
+    channel_manager = AsyncMock()
+    job = make_cron_job_spec(
+        job_id="shared-job",
+        session_id="console:existing-session",
+    )
+    job.runtime.share_session = True
+
+    _patch_trace_storage(monkeypatch)
+
+    executor = CronExecutor(
+        workspace=workspace,
+        channel_manager=channel_manager,
+    )
+    first = await executor.execute(job)
+    second = await executor.execute(job)
+
+    assert first["run_id"] != second["run_id"]
+    assert [request["session_id"] for request in workspace.requests] == [
+        "console:existing-session",
+        "console:existing-session",
+    ]
+    assert [first["session_id"], second["session_id"]] == [
+        "console:existing-session",
+        "console:existing-session",
+    ]
+    chat_calls = workspace.chat_manager.get_or_create_chat.await_args_list
+    assert all(call.kwargs["source"] == "cron" for call in chat_calls)
+
+
+@pytest.mark.asyncio
+async def test_trace_and_session_delta_use_the_same_run_session(monkeypatch):
+    workspace = _Workspace()
+    channel_manager = AsyncMock()
+    job = make_cron_job_spec(job_id="trace-job")
+    job.runtime.share_session = False
+
+    _patch_trace_storage(monkeypatch)
+
+    result = await CronExecutor(
+        workspace=workspace,
+        channel_manager=channel_manager,
+    ).execute(job)
+
+    run_session_id = workspace.requests[0]["session_id"]
+    assert workspace.requests[0]["request_context"]["cron_run_id"] == (
+        result["run_id"]
+    )
+    assert (
+        workspace.requests[0]["request_context"]["cron_run_session_id"]
+        == run_session_id
+    )
+
+    read_call = executor_module.read_session_messages.await_args
+    append_call = executor_module.append_trace_from_session_delta.await_args
+    create_call = executor_module.create_trace.await_args
+    assert read_call.kwargs["session_id"] == run_session_id
+    assert append_call.kwargs["session_id"] == run_session_id
+    assert append_call.kwargs["run_id"] == result["run_id"]
+    assert create_call.args[0] == result["run_id"]
+    assert create_call.kwargs["meta"]["run_session_id"] == run_session_id
+    assert create_call.kwargs["meta"]["share_session"] is False

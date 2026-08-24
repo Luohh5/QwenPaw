@@ -58,6 +58,19 @@ describe("cronJobApi", () => {
     );
   });
 
+  it("promoteCronJob sends POST to the dedicated review endpoint", async () => {
+    const promoted = { id: "job/special", enabled: false };
+    vi.mocked(request).mockResolvedValue(promoted);
+
+    const result = await cronJobApi.promoteCronJob("job/special");
+
+    expect(request).toHaveBeenCalledWith(
+      `/cron/jobs/${encodeURIComponent("job/special")}/promote`,
+      { method: "POST" },
+    );
+    expect(result).toEqual(promoted);
+  });
+
   it("deleteCronJob sends DELETE with encoded jobId", async () => {
     await cronJobApi.deleteCronJob("job-1");
     expect(request).toHaveBeenCalledWith(
