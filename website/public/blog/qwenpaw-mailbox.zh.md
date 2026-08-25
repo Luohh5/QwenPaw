@@ -1,6 +1,6 @@
 ---
 title: "QwenPaw Mail: 让 Agent 接管你的邮箱"
-date: 2026-08-24
+date: 2026-08-26
 author: QwenPaw Team
 tags: [邮箱管理, 邮件自动化, 风险管控, 智能体应用]
 cover: https://img.alicdn.com/imgextra/i2/O1CN01agWtGNAisLK7K3pQ_!!6000000001277-2-tps-3607-2025.png

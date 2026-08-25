@@ -1,6 +1,6 @@
 ---
 title: "QwenPaw Mail: Let an Agent Take Over Your Mailbox"
-date: 2026-08-24
+date: 2026-08-26
 author: QwenPaw Team
 tags:
   [Mailbox Management, Email Automation, Security & Privacy, Agent Applications]
