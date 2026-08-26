@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from .compatibility import AssetType, PluginComponent
-from .safe_files import TreeLimits, walk_tree
 
 ADAPTATION_TEXT_SUFFIXES = {
     "",
@@ -42,27 +41,18 @@ _IGNORED_PARTS = {
     "vendor",
 }
 _MANIFEST_DIRS = {".qoder-plugin", ".claude-plugin", ".codex-plugin"}
-_DISCOVERY_LIMITS = TreeLimits(
-    entries=6_000,
-    files=5_000,
-    bytes=64 * 1024 * 1024,
-)
 
 
 def _text_files(root: Path) -> list[str]:
     return sorted(
-        entry.relative.as_posix()
-        for entry in walk_tree(
-            root,
-            limits=_DISCOVERY_LIMITS,
-            unsafe="yield",
-            excluded_dirs=frozenset(_IGNORED_PARTS),
-        )
-        if entry.is_file
-        and entry.path.name != ".DS_Store"
-        and not entry.path.name.startswith("._")
-        and entry.path.suffix.lower() in ADAPTATION_TEXT_SUFFIXES
-        and not set(entry.relative.parts[:-1]) & _IGNORED_PARTS
+        str(path.relative_to(root))
+        for path in root.rglob("*")
+        if path.is_file()
+        and not path.is_symlink()
+        and path.name != ".DS_Store"
+        and not path.name.startswith("._")
+        and path.suffix.lower() in ADAPTATION_TEXT_SUFFIXES
+        and not set(path.relative_to(root).parts[:-1]) & _IGNORED_PARTS
     )
 
 

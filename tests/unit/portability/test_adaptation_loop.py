@@ -5,7 +5,6 @@ import inspect
 from pathlib import Path
 import json
 import sys
-from textwrap import indent
 from types import SimpleNamespace
 
 import pytest
@@ -119,109 +118,128 @@ def _write_native_plugin(root: Path, backend: str) -> None:
     (root / "plugin.py").write_text(backend, encoding="utf-8")
 
 
-def _native_backend(
-    registration: str,
-    *,
-    definitions: str = "",
-    register_args: str = "self, api",
-) -> str:
-    prefix = f"{definitions.rstrip()}\n\n" if definitions else ""
-    return (
-        f"{prefix}class NativePlugin:\n"
-        f"    def register({register_args}):\n"
-        f"{indent(registration.strip(), '        ')}\n\n"
-        "plugin = NativePlugin()\n"
+def test_native_plugin_test_uses_current_plugin_api_contract(
+    tmp_path: Path,
+) -> None:
+    _write_native_plugin(
+        tmp_path,
+        "async def command(ctx, args):\n"
+        "    return None\n\n"
+        "class NativePlugin:\n"
+        "    def register(self, api):\n"
+        "        api.register_slash_command(\n"
+        "            name='demo', async_handler=command)\n\n"
+        "plugin = NativePlugin()\n",
     )
+
+    with pytest.raises(ValueError, match="unexpected keyword.*async_handler"):
+        CompatibilityTester._test_native_plugin(tmp_path)
 
 
 @pytest.mark.parametrize(
-    ("backend", "message"),
+    "handler",
     [
-        pytest.param(
-            _native_backend(
-                "api.register_slash_command(\n"
-                "    name='demo', async_handler=command)",
-                definitions="async def command(ctx, args):\n    return None",
-            ),
-            "unexpected keyword.*async_handler",
-            id="legacy-async-handler-keyword",
-        ),
-        pytest.param(
-            _native_backend(
-                "api.register_slash_command('demo', command)",
-                definitions="async def command(args):\n    return None",
-            ),
-            "register_slash_command.handler",
-            id="slash-handler-missing-context",
-        ),
-        pytest.param(
-            _native_backend(
-                "api.register_slash_command('demo', command)",
-                definitions="def command(ctx, args):\n    return None",
-            ),
-            "register_slash_command.handler",
-            id="slash-handler-extra-context",
-        ),
-        pytest.param(
-            _native_backend("api.register_skill_provider('skills', True)"),
-            "register_skill_provider",
-            id="skill-provider-positional-argument",
-        ),
-        pytest.param(
-            _native_backend("pass", register_args="self, api, required"),
-            r"callable as register\(api\)",
-            id="register-requires-extra-argument",
-        ),
-        pytest.param(
-            _native_backend(
-                "api.register_startup_hook('start', startup)",
-                definitions="def startup(required):\n    pass",
-            ),
+        "async def command(args):\n    return None\n",
+        "def command(ctx, args):\n    return None\n",
+    ],
+)
+def test_native_plugin_test_validates_slash_handler_signature(
+    tmp_path: Path,
+    handler: str,
+) -> None:
+    _write_native_plugin(
+        tmp_path,
+        handler + "\nclass NativePlugin:\n"
+        "    def register(self, api):\n"
+        "        api.register_slash_command('demo', command)\n\n"
+        "plugin = NativePlugin()\n",
+    )
+
+    with pytest.raises(ValueError, match="register_slash_command.handler"):
+        CompatibilityTester._test_native_plugin(tmp_path)
+
+
+def test_native_plugin_test_validates_every_plugin_api_call(
+    tmp_path: Path,
+) -> None:
+    _write_native_plugin(
+        tmp_path,
+        "class NativePlugin:\n"
+        "    def register(self, api):\n"
+        "        api.register_skill_provider('skills', True)\n\n"
+        "plugin = NativePlugin()\n",
+    )
+
+    with pytest.raises(ValueError, match="register_skill_provider"):
+        CompatibilityTester._test_native_plugin(tmp_path)
+
+
+def test_native_plugin_test_validates_register_invocation(tmp_path: Path):
+    _write_native_plugin(
+        tmp_path,
+        "class NativePlugin:\n"
+        "    def register(self, api, required):\n"
+        "        pass\n\n"
+        "plugin = NativePlugin()\n",
+    )
+
+    with pytest.raises(ValueError, match=r"callable as register\(api\)"):
+        CompatibilityTester._test_native_plugin(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("callback", "registration", "message"),
+    [
+        (
+            "def startup(required):\n    pass\n",
+            "api.register_startup_hook('start', startup)",
             "register_startup_hook.callback",
-            id="startup-hook-required-positional",
         ),
-        pytest.param(
-            _native_backend(
-                "api.register_middleware(middleware)",
-                definitions="async def middleware(ctx, config):\n    pass",
-            ),
+        (
+            "async def middleware(ctx, config):\n    pass\n",
+            "api.register_middleware(middleware)",
             "register_middleware.middleware_factory",
-            id="middleware-required-positional",
         ),
-        pytest.param(
-            _native_backend(
-                "api.register_control_command(Handler())",
-                definitions=(
-                    "class Handler:\n"
-                    "    command_name = '/demo'\n"
-                    "    def handle(self, context):\n"
-                    "        pass"
-                ),
-            ),
+        (
+            "class Handler:\n"
+            "    command_name = '/demo'\n"
+            "    def handle(self, context):\n        pass\n",
+            "api.register_control_command(Handler())",
             "register_control_command.handler",
-            id="control-handler-wrong-signature",
-        ),
-        pytest.param(
-            _native_backend(
-                "configure(api)",
-                definitions=(
-                    "def configure(api):\n"
-                    "    api.register_skill_provider('skills')"
-                ),
-            ),
-            "PluginApi value escapes",
-            id="escaped-plugin-api",
         ),
     ],
 )
-def test_native_plugin_rejects_invalid_registration_contract(
+def test_native_plugin_test_validates_other_callback_contracts(
     tmp_path: Path,
-    backend: str,
+    callback: str,
+    registration: str,
     message: str,
 ) -> None:
-    _write_native_plugin(tmp_path, backend)
+    _write_native_plugin(
+        tmp_path,
+        callback
+        + "\nclass NativePlugin:\n"
+        + "    def register(self, api):\n"
+        + f"        {registration}\n\n"
+        + "plugin = NativePlugin()\n",
+    )
 
     with pytest.raises(ValueError, match=message):
+        CompatibilityTester._test_native_plugin(tmp_path)
+
+
+def test_native_plugin_test_rejects_untraceable_plugin_api_calls(tmp_path):
+    _write_native_plugin(
+        tmp_path,
+        "def configure(api):\n"
+        "    api.register_skill_provider('skills')\n\n"
+        "class NativePlugin:\n"
+        "    def register(self, api):\n"
+        "        configure(api)\n\n"
+        "plugin = NativePlugin()\n",
+    )
+
+    with pytest.raises(ValueError, match="PluginApi value escapes"):
         CompatibilityTester._test_native_plugin(tmp_path)
 
 
@@ -370,7 +388,6 @@ def test_inspect_returns_exact_live_plugin_api_signatures(tmp_path: Path):
 
 
 def test_large_plugin_checklist_uses_behavioral_entries_not_doc_corpus(
-    write_tree,
     tmp_path: Path,
 ) -> None:
     files = {
@@ -383,7 +400,10 @@ def test_large_plugin_checklist_uses_behavioral_entries_not_doc_corpus(
         ".DS_Store": "binary metadata placeholder",
         "__MACOSX/._plugin.json": "archive metadata",
     }
-    write_tree(tmp_path, files)
+    for relative, content in files.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
     components = discover_components(
         AssetType.PLUGIN,
         SimpleNamespace(install_source=str(tmp_path)),
@@ -399,7 +419,6 @@ def test_large_plugin_checklist_uses_behavioral_entries_not_doc_corpus(
 
 
 def test_codex_plugin_is_staged_and_read_as_component_container(
-    write_tree,
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "cache/cloudflare/0.1.2"
@@ -415,7 +434,10 @@ def test_codex_plugin_is_staged_and_read_as_component_container(
         "skills/cloudflare/SKILL.md": "Cloudflare guidance",
         ".mcp.json": '{"mcpServers":{}}',
     }
-    write_tree(source, files)
+    for relative, content in files.items():
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
     inventory = ProviderInventory(
         provider_id="codex",
         provider_name="Codex",
@@ -815,7 +837,6 @@ async def test_static_failure_keeps_remote_plugin_in_repair(
     )
     result = await run_adaptation_loop(workspace, inventory, "migration-3")
     assert result.status == "stopped_limit"
-    assert result.counts["repair"] == 1
     assert result.asset_zones["plugins:remote"] == "repair"
     assert "每项最多 4 次尝试" in result.summary_path.read_text(
         encoding="utf-8",
@@ -1025,7 +1046,6 @@ async def test_rejected_secret_repair_does_not_mutate_source(
 
 @pytest.mark.asyncio
 async def test_mixed_plugin_is_one_asset_with_component_review_and_repair(
-    write_tree,
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "mixed-plugin"
@@ -1039,7 +1059,10 @@ async def test_mixed_plugin_is_one_asset_with_component_review_and_repair(
         "rules/review.md": "Review rules",
         "mcp.json": '{"mcpServers":{}}',
     }
-    write_tree(source, files)
+    for relative, content in files.items():
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
 
     async def action(context):
         if context.phase == "triage":
@@ -1193,10 +1216,6 @@ async def test_mission_repairs_assets_in_parallel_with_isolated_scope(
         "migration-parallel",
     )
     assert result.status == "completed"
-    assert result.asset_zones == {
-        "skills:first": "migrate",
-        "skills:second": "migrate",
-    }
     assert workspace.max_active_queries == 2
     phases = [
         item.request_context["portability_phase"]

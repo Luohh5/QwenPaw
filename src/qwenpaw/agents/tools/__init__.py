@@ -62,6 +62,7 @@ from .make_skill_tools import materialize_skill  # noqa: E402
 from .migration_compatibility import (  # noqa: E402
     migration_compat_classify,
     migration_compat_inspect,
+    migration_compat_list,
     migration_compat_read_file,
     migration_compat_test,
     migration_compat_update,

@@ -55,7 +55,7 @@ def test_four_zone_workflow_requires_current_passing_test(
 
     store.record_test("demo", passed=True, summary="native loader passed")
     manifest = store.classify("demo", AssetZone.MIGRATE, "works")
-    assert store.complete() == (True, "四区清单已收敛")
+    assert manifest.goal_complete
     assert manifest.by_zone(AssetZone.MIGRATE)[0].revision == 1
 
 
@@ -69,8 +69,8 @@ def test_semantic_triage_can_discard_without_static_test(
         skills=[_skill(tmp_path)],
     )
     store.record_inspection("demo")
-    store.classify("demo", AssetZone.DISCARD, "QwenPaw has it")
-    assert store.complete() == (True, "四区清单已收敛")
+    manifest = store.classify("demo", AssetZone.DISCARD, "QwenPaw has it")
+    assert manifest.goal_complete
     with pytest.raises(RuntimeError, match="repair zone"):
         store.record_test("demo", passed=True, summary="irrelevant")
 
@@ -84,10 +84,10 @@ def test_hard_stop_preserves_unreviewed_staging_items(
         source="codex",
         skills=[_skill(tmp_path)],
     )
-    manifest = store.finish(stopped=True, reason="workflow limit")
+    manifest = store.finish(stopped=True, reason="goal limit")
     assert manifest.state is RunState.STOPPED_LIMIT
     assert manifest.assets[0].zone is AssetZone.STAGING
-    assert manifest.stop_reason == "workflow limit"
+    assert manifest.stop_reason == "goal limit"
 
 
 def test_exhausted_staging_asset_is_not_reclassified_as_repair(
@@ -103,8 +103,7 @@ def test_exhausted_staging_asset_is_not_reclassified_as_repair(
         store.consume("demo")
     asset = load_manifest(store.path).assets[0]
     assert asset.zone is AssetZone.STAGING
-    assert asset.budget_exhausted
-    assert store.complete() == (False, "安全暂存区仍有 1 项，待修复区仍有 0 项")
+    assert load_manifest(store.path).next_asset is None
 
 
 def test_asset_budget_reserves_final_classification_call(
@@ -179,12 +178,6 @@ def test_manifest_and_summary_are_owner_only_and_secret_free(
         (["--database-url", "postgresql://u:p@example/db"], ""),
         ([], "https://hooks.slack.com/services/T/B/secret"),
         (["X-Custom-Auth: secret-value"], ""),
-    ],
-    ids=[
-        "attached-password-flag",
-        "database-url",
-        "webhook-path",
-        "custom-auth-header",
     ],
 )
 def test_inline_mcp_credentials_fail_closed(args, url) -> None:

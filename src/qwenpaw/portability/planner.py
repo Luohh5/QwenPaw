@@ -18,19 +18,40 @@ from .models import (
     MigrationPlan,
     ProviderInventory,
 )
-from .safe_files import (
-    TreeBudget,
-    TreeLimitError,
-    TreeLimits,
-    open_regular_file,
-    regular_file_info,
-    walk_tree,
-)
 
 _MAX_FINGERPRINT_ENTRIES = 6_000
 _MAX_FINGERPRINT_FILES = 5_000
 _MAX_FINGERPRINT_BYTES = 64 * 1024 * 1024
 _HASH_CHUNK_BYTES = 1024 * 1024
+
+
+@dataclass
+class _FingerprintBudget:
+    entries: int = 0
+    files: int = 0
+    total_bytes: int = 0
+
+    def add_entry(self, path: Path) -> None:
+        self.entries += 1
+        if self.entries > _MAX_FINGERPRINT_ENTRIES:
+            raise ValueError(
+                "Portable source tree exceeds the fingerprint entry limit "
+                f"({_MAX_FINGERPRINT_ENTRIES}): {path}",
+            )
+
+    def add_file(self, path: Path, size: int) -> None:
+        self.files += 1
+        if self.files > _MAX_FINGERPRINT_FILES:
+            raise ValueError(
+                "Portable source tree exceeds the fingerprint file limit "
+                f"({_MAX_FINGERPRINT_FILES}): {path}",
+            )
+        if size < 0 or self.total_bytes + size > _MAX_FINGERPRINT_BYTES:
+            raise ValueError(
+                "Portable source tree exceeds the fingerprint byte limit "
+                f"({_MAX_FINGERPRINT_BYTES}): {path}",
+            )
+        self.total_bytes += size
 
 
 def _fingerprint_error(path: Path, reason: str) -> ValueError:
@@ -53,15 +74,54 @@ def _hash_record(hasher: Any, kind: str, value: str) -> None:
     hasher.update(encoded_value)
 
 
+def _lstat(path: Path) -> os.stat_result:
+    try:
+        return path.lstat()
+    except OSError as exc:
+        raise _fingerprint_error(
+            path,
+            f"cannot inspect ({type(exc).__name__})",
+        ) from exc
+
+
+def _resolved_within(path: Path, root: Path) -> Path:
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise _fingerprint_error(
+            path,
+            "path escapes its declared root",
+        ) from exc
+    return resolved
+
+
 def _hash_regular_file(
     hasher: Any,
     path: Path,
-    before: os.stat_result,
+    budget: _FingerprintBudget,
 ) -> None:
+    before = _lstat(path)
+    if stat.S_ISLNK(before.st_mode):
+        raise _fingerprint_error(path, "symbolic links are not allowed")
+    if not stat.S_ISREG(before.st_mode):
+        raise _fingerprint_error(path, "entry is not a regular file")
+
+    descriptor = -1
     try:
-        with open_regular_file(path, expected=before) as (stream, opened):
-            _hash_record(hasher, "file", str(path))
-            hasher.update(opened.st_size.to_bytes(8, "big"))
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise _fingerprint_error(path, "entry is not a regular file")
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise _fingerprint_error(path, "file changed while being opened")
+        budget.add_file(path, opened.st_size)
+        _hash_record(hasher, "file", str(path))
+        hasher.update(opened.st_size.to_bytes(8, "big"))
+
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
             remaining = opened.st_size
             while remaining:
                 chunk = stream.read(min(_HASH_CHUNK_BYTES, remaining))
@@ -71,44 +131,70 @@ def _hash_regular_file(
                 remaining -= len(chunk)
             if stream.read(1):
                 raise _fingerprint_error(path, "file grew while hashing")
-    except (OSError, ValueError) as exc:
+            after = os.fstat(stream.fileno())
+        if (
+            (after.st_dev, after.st_ino, after.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise _fingerprint_error(path, "file changed while hashing")
+    except OSError as exc:
         raise _fingerprint_error(
             path,
             f"cannot read ({type(exc).__name__})",
         ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _hash_tree(
     hasher: Any,
     root: Path,
-    budget: TreeBudget,
-    limits: TreeLimits,
+    budget: _FingerprintBudget,
 ) -> None:
+    root_info = _lstat(root)
+    if stat.S_ISLNK(root_info.st_mode):
+        raise _fingerprint_error(root, "symbolic links are not allowed")
+    if not stat.S_ISDIR(root_info.st_mode):
+        raise _fingerprint_error(root, "skill/plugin root is not a directory")
     try:
-        for entry in walk_tree(
-            root,
-            limits=limits,
-            budget=budget,
-            include_root=True,
-            unsafe="yield",
-        ):
-            if stat.S_ISLNK(entry.info.st_mode):
-                kind = "rejected-symbolic-link"
-            elif entry.is_file:
-                _hash_regular_file(hasher, entry.path, entry.info)
-                continue
-            elif entry.is_dir:
-                kind = "directory"
-            else:
-                kind = "rejected-non-regular-entry"
-            _hash_record(hasher, kind, str(entry.path))
-    except TreeLimitError:
-        raise
-    except (OSError, ValueError) as exc:
-        raise _fingerprint_error(
-            root,
-            f"cannot walk source tree ({type(exc).__name__})",
-        ) from exc
+        resolved_root = root.resolve(strict=True)
+    except OSError as exc:
+        raise _fingerprint_error(root, "cannot resolve source root") from exc
+
+    budget.add_entry(resolved_root)
+    pending = [resolved_root]
+    while pending:
+        path = pending.pop()
+        info = _lstat(path)
+        if stat.S_ISLNK(info.st_mode):
+            _hash_record(hasher, "rejected-symbolic-link", str(path))
+            continue
+        _resolved_within(path, resolved_root)
+        if stat.S_ISREG(info.st_mode):
+            _hash_regular_file(hasher, path, budget)
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            _hash_record(hasher, "rejected-non-regular-entry", str(path))
+            continue
+
+        _hash_record(hasher, "directory", str(path))
+        children: list[Path] = []
+        try:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    child = Path(entry.path)
+                    budget.add_entry(child)
+                    children.append(child)
+        except OSError as exc:
+            raise _fingerprint_error(
+                path,
+                f"cannot scan directory ({type(exc).__name__})",
+            ) from exc
+        children.sort(key=lambda child: child.name)
+        pending.extend(reversed(children))
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -233,28 +319,16 @@ def _hash_inventory_sources(
     work.extend(markers)
     work.sort(key=lambda item: (str(item[1]), item[0]))
 
-    limits = TreeLimits(
-        entries=_MAX_FINGERPRINT_ENTRIES,
-        files=_MAX_FINGERPRINT_FILES,
-        bytes=_MAX_FINGERPRINT_BYTES,
-    )
-    budget = TreeBudget()
-    try:
-        for kind, path in work:
-            if kind == "tree":
-                _hash_tree(hasher, path, budget, limits)
-            elif kind == "file":
-                info = regular_file_info(path)
-                budget.add(path, info, limits)
-                _hash_regular_file(hasher, path, info)
-            else:
-                budget.add_entry(path, limits)
-                _hash_record(hasher, kind, str(path))
-    except TreeLimitError as exc:
-        raise ValueError(
-            "Portable source tree exceeds the fingerprint "
-            f"{exc.kind} limit ({exc.limit}): {exc.path}",
-        ) from exc
+    budget = _FingerprintBudget()
+    for kind, path in work:
+        if kind == "tree":
+            _hash_tree(hasher, path, budget)
+        elif kind == "file":
+            budget.add_entry(path)
+            _hash_regular_file(hasher, path, budget)
+        else:
+            budget.add_entry(path)
+            _hash_record(hasher, kind, str(path))
 
 
 def inventory_fingerprint(inventory: ProviderInventory) -> str:
@@ -305,6 +379,8 @@ def _asset(
     action: str,
     fidelity: str,
     reason_zh: str,
+    *,
+    default_enabled: bool = False,
 ) -> MigrationAssetPlan:
     return MigrationAssetPlan(
         asset_type=asset_type,
@@ -312,6 +388,7 @@ def _asset(
         name=name,
         action=action,
         fidelity=fidelity,
+        default_enabled=default_enabled,
         reason_zh=reason_zh,
     )
 
@@ -383,9 +460,9 @@ async def build_migration_plan(
                 "skill",
                 skill.source_id,
                 skill.name,
-                "agent_test_and_adapt",
+                "agent_goal_test_and_adapt",
                 "agent_decision",
-                "进入安全暂存区，由 Agent 语义判断，必要时再由 Mission 修复。",
+                "进入安全暂存区，由 Agent 语义判断，必要时再由兼容性 Goal 修复。",
             ),
         )
 
@@ -395,9 +472,9 @@ async def build_migration_plan(
                 "mcp",
                 server.source_id,
                 server.name,
-                "agent_test_and_adapt",
+                "agent_goal_test_and_adapt",
                 "agent_decision",
-                "进入安全暂存区，由 Agent 语义判断，必要时再由 Mission 修复。",
+                "进入安全暂存区，由 Agent 语义判断，必要时再由兼容性 Goal 修复。",
             ),
         )
 
@@ -440,9 +517,9 @@ async def build_migration_plan(
                 "plugin",
                 plugin.source_id,
                 plugin.name,
-                "agent_test_and_adapt",
+                "agent_goal_test_and_adapt",
                 "agent_decision",
-                "进入安全暂存区，由 Agent 判断整体可用性，必要时再启动修复 Mission。",
+                "进入安全暂存区，由 Agent 判断整体可用性，必要时再启动修复 Goal。",
             ),
         )
 
@@ -452,9 +529,9 @@ async def build_migration_plan(
                 "scheduled_task",
                 task.source_id,
                 task.name,
-                "agent_test_and_adapt",
+                "agent_goal_test_and_adapt",
                 "agent_decision",
-                "进入安全暂存区，由 Agent 语义判断，必要时再由 Mission 修复和验证。",
+                "进入安全暂存区，由 Agent 语义判断，必要时再由修复 Goal 验证。",
             ),
         )
 

@@ -388,7 +388,7 @@ class ProviderImportService(ImportPlanningMixin):
                         )
             if installed_plugins:
                 warnings.append(
-                    "兼容流程批准的插件已通过 QwenPaw 原生安装流程"
+                    "兼容性 Goal 批准的插件已通过 QwenPaw 原生安装流程"
                     "写入；外部内容插件使用 QwenPaw 生成的原生包装器。"
                     "需要时请在迁移后重载智能体。",
                 )
@@ -913,9 +913,8 @@ class ProviderImportService(ImportPlanningMixin):
                             "Failed to restore replaced scheduled task %s",
                             getattr(previous_job, "id", ""),
                         )
-            for skill_name in reversed(imported_skills):
+            for skill_name in imported_skills:
                 try:
-                    skill_service.disable_skill(skill_name)
                     await run_sync_io(
                         skill_service.delete_skill,
                         skill_name,

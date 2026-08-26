@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import stat
 from collections.abc import Sequence
 from datetime import datetime, timezone
@@ -152,6 +154,39 @@ class CompatibilityManifest(BaseModel):
 
     def by_zone(self, zone: AssetZone) -> list[CompatibilityAsset]:
         return [item for item in self.assets if item.zone is zone]
+
+    @property
+    def goal_complete(self) -> bool:
+        return not self.by_zone(AssetZone.STAGING) and not self.by_zone(
+            AssetZone.REPAIR,
+        )
+
+    @property
+    def next_asset(self) -> CompatibilityAsset | None:
+        all_staging = self.by_zone(AssetZone.STAGING)
+        staging = [item for item in all_staging if not item.budget_exhausted]
+        if staging:
+            return staging[0]
+        if all_staging:
+            return None
+        repair = [
+            item
+            for item in self.by_zone(AssetZone.REPAIR)
+            if not item.budget_exhausted
+        ]
+        if not repair:
+            return None
+        return min(
+            repair,
+            key=lambda item: (
+                not bool(
+                    item.test_is_current
+                    and item.last_test
+                    and item.last_test.passed,
+                ),
+                item.repair_rounds,
+            ),
+        )
 
 
 def _now() -> datetime:
@@ -630,6 +665,20 @@ def write_summary(path: Path, manifest: CompatibilityManifest) -> None:
     os.chmod(path, 0o600)
 
 
+def error_fingerprint(error: Any, *, code: str = "error") -> str:
+    """Stable, secret-free failure fingerprint retained for receipts."""
+    value = redact_sensitive_text(error, limit=4000)
+    value = re.sub(r"/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+", "<path>", value)
+    value = re.sub(
+        r"\b[0-9a-f]{8}-[0-9a-f-]{27,}\b",
+        "<id>",
+        value,
+        flags=re.I,
+    )
+    value = re.sub(r"\b(?:line\s+)?\d+\b", "<n>", value, flags=re.I)
+    return hashlib.sha256(f"{code}:{value}".encode()).hexdigest()[:24]
+
+
 __all__ = [
     "AssetType",
     "AssetZone",
@@ -640,6 +689,7 @@ __all__ = [
     "PluginDisposition",
     "RunState",
     "counts",
+    "error_fingerprint",
     "load_manifest",
     "mcp_inline_secret_risks",
     "redact_sensitive_text",

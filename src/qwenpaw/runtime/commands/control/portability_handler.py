@@ -289,6 +289,7 @@ def _render_receipt(receipt: ImportReceipt) -> str:
         f"{receipt.discovered_scheduled_task_count}\n"
         f"- 自动兼容检查：{receipt.adaptation_status}{adaptation}\n"
         f"- 兼容迁移记录：`{receipt.adaptation_summary or '未生成'}`\n"
+        "- 运行时后端已改变：否\n"
         f"- 迁移计划：`{receipt.plan_id or '即时计划'}`\n"
         f"- 迁移回执：`{receipt.migration_id}`"
         f"{doctor}{warnings}"

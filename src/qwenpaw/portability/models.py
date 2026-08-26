@@ -96,9 +96,8 @@ class SourcePlugin(BaseModel):
 class SourceScheduledTask(BaseModel):
     """One external scheduled task normalized for safe QwenPaw staging.
 
-    ``enabled`` records the state at the source only.  The compatibility
-    workflow decides whether the imported QwenPaw job is enabled or held for
-    repair.
+    ``enabled`` records the state at the source only.  The compatibility Goal
+    decides whether the imported QwenPaw job is enabled or held for repair.
     ``unsupported`` is a first-class schedule type so that a task definition
     can be audited without guessing at lossy timing semantics.
     """
@@ -157,6 +156,7 @@ class MigrationAssetPlan(BaseModel):
     name: str
     action: str
     fidelity: str
+    default_enabled: bool = False
     reason_zh: str = ""
 
 
@@ -231,6 +231,7 @@ class ImportReceipt(BaseModel):
     adaptation_summary: str = ""
     adaptation_counts: dict[str, int] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+    backend_changed: bool = False
     doctor_report: MigrationDoctorReport | None = None
 
 

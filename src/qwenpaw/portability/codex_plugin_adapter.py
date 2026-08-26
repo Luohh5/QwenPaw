@@ -4,17 +4,17 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
-from .content_plugin_wrapper import (
-    staging_target,
-    write_wrapper,
-)
 from .models import SourcePlugin
 from .skill_transfer import read_bounded_tree, write_tree_entry
 
 ADAPTER = "codex_content_bundle_v1"
+_PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SOURCE_MANIFESTS = (
     Path(".codex-plugin/plugin.json"),
     Path(".claude-plugin/plugin.json"),
@@ -24,6 +24,14 @@ _ROOT_CONFLICTS = {
     Path("plugin.py"),
     Path("requirements.txt"),
 }
+
+
+def _text(value: Any, limit: int) -> str:
+    return "".join(
+        character
+        for character in str(value or "")[:limit]
+        if ord(character) >= 32 and ord(character) != 127
+    ).strip()
 
 
 def _manifest(source: Path) -> tuple[dict[str, Any], Path]:
@@ -64,6 +72,68 @@ def _skill_paths(source: Path, manifest: dict[str, Any]) -> list[Path]:
     return paths
 
 
+def _backend(skill_paths: list[Path], root: Path, enabled: bool) -> str:
+    calls = []
+    for path in skill_paths:
+        relative = path.relative_to(root).as_posix()
+        calls.append(
+            "        api.register_skill_provider(\n"
+            f"            skills_dir=_ROOT / {relative!r},\n"
+            f"            enabled_by_default={enabled!r},\n"
+            '            channels=["all"],\n'
+            "        )",
+        )
+    body = "\n".join(calls) or "        return None"
+    return (
+        "# -*- coding: utf-8 -*-\n"
+        '"""Generated adapter for a Codex content plugin."""\n\n'
+        "from pathlib import Path\n\n"
+        "_ROOT = Path(__file__).parent\n\n\n"
+        "class ImportedCodexContentPlugin:\n"
+        "    def register(self, api) -> None:\n"
+        f"{body}\n\n\n"
+        "plugin = ImportedCodexContentPlugin()\n"
+    )
+
+
+def _qwenpaw_manifest(
+    plugin: SourcePlugin,
+    manifest: dict[str, Any],
+    enabled: bool,
+) -> dict[str, Any]:
+    plugin_id = _text(manifest.get("name") or plugin.name, 128)
+    if not _PLUGIN_ID_RE.fullmatch(plugin_id):
+        raise ValueError("Codex plugin name is unsafe")
+    interface = manifest.get("interface")
+    display_name = (
+        interface.get("displayName") if isinstance(interface, dict) else ""
+    )
+    author = manifest.get("author")
+    if isinstance(author, dict):
+        author = author.get("name") or author.get("email")
+    return {
+        "id": plugin_id,
+        "name": _text(display_name or plugin.name or plugin_id, 200),
+        "version": _text(
+            manifest.get("version") or plugin.version or "0.0.0",
+            100,
+        ),
+        "type": "general",
+        "description": _text(manifest.get("description"), 4096),
+        "author": _text(author or "Imported from Codex", 200),
+        "entry": {"backend": "plugin.py"},
+        "dependencies": [],
+        "meta": {
+            "migration": {
+                "source": "codex",
+                "source_id": plugin.source_id,
+                "adapter": ADAPTER,
+                "requires_review": not enabled,
+            },
+        },
+    }
+
+
 def stage_codex_content_plugin(
     plugin: SourcePlugin,
     *,
@@ -78,12 +148,10 @@ def stage_codex_content_plugin(
     skills = _skill_paths(source, manifest)
     if not skills and not manifest.get("mcpServers"):
         raise ValueError("Codex plugin has no portable Skills or MCP servers")
-    interface = manifest.get("interface")
-    display_name = (
-        interface.get("displayName") if isinstance(interface, dict) else ""
-    )
 
-    with staging_target("qwenpaw-codex-plugin-") as target:
+    temp_root = Path(tempfile.mkdtemp(prefix="qwenpaw-codex-plugin-"))
+    target = temp_root / "plugin"
+    try:
         target.mkdir(mode=0o700)
         for entry in read_bounded_tree(
             source,
@@ -92,24 +160,23 @@ def stage_codex_content_plugin(
             if entry.relative in _ROOT_CONFLICTS:
                 continue
             write_tree_entry(target, entry)
-        write_wrapper(
-            target,
-            plugin,
-            manifest,
-            source="codex",
-            adapter=ADAPTER,
-            default_author="Imported from Codex",
-            backend_description=(
-                "Generated adapter for a Codex content plugin."
-            ),
-            class_name="ImportedCodexContentPlugin",
-            skill_paths=[
-                path.relative_to(source).as_posix() for path in skills
-            ],
-            display_name=display_name or plugin.name,
-            enabled=enabled,
+        (target / "plugin.py").write_text(
+            _backend(skills, source, enabled),
+            encoding="utf-8",
         )
-    return target
+        (target / "plugin.json").write_text(
+            json.dumps(
+                _qwenpaw_manifest(plugin, manifest, enabled),
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return target
+    except BaseException:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise
 
 
 __all__ = ["ADAPTER", "stage_codex_content_plugin"]

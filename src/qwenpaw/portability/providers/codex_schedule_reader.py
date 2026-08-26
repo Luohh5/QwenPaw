@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any, Iterator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from ..safe_files import read_regular_file
 from .schedule_fields import (
     contains_control as _contains_control,
     encoded as _encoded,
@@ -244,11 +243,19 @@ def _read_project_roots(
     warnings: list[str],
 ) -> dict[str, list[str]]:
     path = codex_home / ".codex-global-state.json"
-    try:
-        encoded = read_regular_file(path, max_bytes=_MAX_STATE_BYTES)
-        payload = json.loads(encoded.decode("utf-8"))
-    except FileNotFoundError:
+    if not path.exists():
         return {}
+    if path.is_symlink() or not path.is_file():
+        warnings.append(
+            "Skipped unsafe Codex project state path "
+            "(expected a regular file).",
+        )
+        return {}
+    try:
+        if path.stat().st_size > _MAX_STATE_BYTES:
+            raise ValueError("file exceeds the read safety limit")
+        with path.open(encoding="utf-8") as stream:
+            payload = json.load(stream)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         warnings.append(
             "Could not read Codex project-to-workspace mapping: "
@@ -409,27 +416,27 @@ def _read_toml_candidates(
         if directory.is_symlink() or not directory.is_dir():
             continue
         path = directory / "automation.toml"
+        if not path.exists():
+            continue
         raw_candidate_id = directory.name
         candidate_id = _safe_source_id(raw_candidate_id)
         count_key = candidate_id or _unsafe_identity_token(
             raw_candidate_id,
             fallback="toml-directory",
         )
+        discovered_ids.add(count_key)
         display_id = candidate_id or "<unsafe-id>"
-        try:
-            encoded = read_regular_file(path, max_bytes=_MAX_TOML_BYTES)
-        except FileNotFoundError:
-            continue
-        except (OSError, ValueError) as exc:
-            discovered_ids.add(count_key)
+        if path.is_symlink() or not path.is_file():
             warnings.append(
-                f"Could not parse Codex automation {display_id!r}: "
-                f"{type(exc).__name__}: {_warning_detail(exc)}",
+                "Skipped unsafe Codex automation definition "
+                f"{display_id!r}.",
             )
             continue
-        discovered_ids.add(count_key)
         try:
-            document = tomllib.loads(encoded.decode("utf-8"))
+            if path.stat().st_size > _MAX_TOML_BYTES:
+                raise ValueError("file exceeds the read safety limit")
+            with path.open("rb") as stream:
+                document = tomllib.load(stream)
             if not isinstance(document, dict):
                 raise ValueError("TOML root is not a table")
         except (OSError, tomllib.TOMLDecodeError, ValueError) as exc:

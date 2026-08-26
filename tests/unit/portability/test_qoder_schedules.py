@@ -368,57 +368,80 @@ def test_malformed_schedule_is_retained_as_unsupported(tmp_path: Path) -> None:
     assert any("index 1" in warning for warning in warnings)
 
 
-@pytest.mark.parametrize(
-    ("case", "warning", "mentions_v1"),
-    [
-        ("missing-runs", "no valid runs array", True),
-        ("oversized", "64-byte safety limit", True),
-        ("symlink", "symbolic-link", False),
-        ("too-many-tasks", "exceeding the 2-task safety limit", False),
-    ],
-    ids=["missing-runs", "oversized", "symlink", "too-many-tasks"],
-)
-def test_unsafe_v2_store_is_rejected(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    case: str,
-    warning: str,
-    mentions_v1: bool,
-) -> None:
+def test_v2_without_runs_array_is_treated_as_corrupt(tmp_path: Path) -> None:
     user_data = tmp_path / "User"
     path = _store_path(user_data, 2)
     path.parent.mkdir(parents=True)
-    if case == "missing-runs":
-        path.write_text(
-            json.dumps({"version": 2, "tasks": [_v2_task("task")]}),
-            encoding="utf-8",
-        )
-    elif case == "oversized":
-        monkeypatch.setattr(qoder_schedules, "_MAX_STORE_BYTES", 64)
-        path.write_bytes(b"{" + (b"x" * 128))
-    elif case == "symlink":
-        target = tmp_path / "outside-store.json"
-        target.write_text(
-            json.dumps({"version": 2, "tasks": [], "runs": []}),
-            encoding="utf-8",
-        )
-        path.symlink_to(target)
-    else:
-        monkeypatch.setattr(qoder_schedules, "_MAX_TASKS", 2)
-        _write_store(
-            user_data,
-            version=2,
-            tasks=[_v2_task(str(index)) for index in range(3)],
-        )
+    path.write_text(
+        json.dumps({"version": 2, "tasks": [_v2_task("task")]}),
+        encoding="utf-8",
+    )
 
     tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
 
     assert not tasks
     assert discovered == 0
     assert len(warnings) == 1
-    assert warning in warnings[0]
-    if mentions_v1:
-        assert "Qoder v1 was not used" in warnings[0]
+    assert "no valid runs array" in warnings[0]
+    assert "Qoder v1 was not used" in warnings[0]
+
+
+def test_oversized_store_is_rejected_before_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_data = tmp_path / "User"
+    path = _store_path(user_data, 2)
+    path.parent.mkdir(parents=True)
+    monkeypatch.setattr(qoder_schedules, "_MAX_STORE_BYTES", 64)
+    path.write_bytes(b"{" + (b"x" * 128))
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert not tasks
+    assert discovered == 0
+    assert len(warnings) == 1
+    assert "64-byte safety limit" in warnings[0]
+    assert "Qoder v1 was not used" in warnings[0]
+
+
+def test_symbolic_link_store_is_rejected(tmp_path: Path) -> None:
+    user_data = tmp_path / "User"
+    target = tmp_path / "outside-store.json"
+    target.write_text(
+        json.dumps({"version": 2, "tasks": [], "runs": []}),
+        encoding="utf-8",
+    )
+    path = _store_path(user_data, 2)
+    path.parent.mkdir(parents=True)
+    path.symlink_to(target)
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert not tasks
+    assert discovered == 0
+    assert len(warnings) == 1
+    assert "symbolic-link" in warnings[0]
+
+
+def test_store_with_too_many_tasks_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_data = tmp_path / "User"
+    monkeypatch.setattr(qoder_schedules, "_MAX_TASKS", 2)
+    _write_store(
+        user_data,
+        version=2,
+        tasks=[_v2_task(str(index)) for index in range(3)],
+    )
+
+    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
+
+    assert not tasks
+    assert discovered == 0
+    assert len(warnings) == 1
+    assert "exceeding the 2-task safety limit" in warnings[0]
 
 
 def test_arbitrary_nested_metadata_is_not_copied(tmp_path: Path) -> None:

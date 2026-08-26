@@ -69,45 +69,44 @@ def test_tree_fingerprint_detects_added_empty_directory(
     assert inventory_fingerprint(inventory) != before
 
 
-@pytest.mark.parametrize(
-    ("limit_name", "limit", "files", "message"),
-    [
-        (
-            "_MAX_FINGERPRINT_ENTRIES",
-            3,
-            {f"file-{index}.txt": "x" for index in range(3)},
-            "fingerprint entry limit",
-        ),
-        (
-            "_MAX_FINGERPRINT_FILES",
-            1,
-            {"one.txt": "one", "two.txt": "two"},
-            "fingerprint file limit",
-        ),
-        (
-            "_MAX_FINGERPRINT_BYTES",
-            4,
-            {"large.bin": "12345"},
-            "fingerprint byte limit",
-        ),
-    ],
-    ids=["entries", "files", "bytes"],
-)
-def test_tree_fingerprint_limits_fail_closed(
-    write_tree,
+def test_tree_entry_limit_stops_wide_directory_scan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    limit_name: str,
-    limit: int,
-    files: dict[str, str],
-    message: str,
 ) -> None:
     root = tmp_path / "skill"
     root.mkdir()
-    write_tree(root, files)
-    monkeypatch.setattr(planner, limit_name, limit)
+    for index in range(3):
+        (root / f"file-{index}.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(planner, "_MAX_FINGERPRINT_ENTRIES", 3)
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ValueError, match="fingerprint entry limit"):
+        inventory_fingerprint(_skill_inventory(root))
+
+
+def test_tree_file_limit_is_global_across_source_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "skill"
+    root.mkdir()
+    (root / "one.txt").write_text("one", encoding="utf-8")
+    (root / "two.txt").write_text("two", encoding="utf-8")
+    monkeypatch.setattr(planner, "_MAX_FINGERPRINT_FILES", 1)
+
+    with pytest.raises(ValueError, match="fingerprint file limit"):
+        inventory_fingerprint(_skill_inventory(root))
+
+
+def test_tree_byte_limit_is_checked_before_large_file_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "skill"
+    root.mkdir()
+    (root / "large.bin").write_bytes(b"12345")
+    monkeypatch.setattr(planner, "_MAX_FINGERPRINT_BYTES", 4)
+
+    with pytest.raises(ValueError, match="fingerprint byte limit"):
         inventory_fingerprint(_skill_inventory(root))
 
 

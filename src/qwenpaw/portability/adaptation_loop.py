@@ -14,18 +14,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ..agents.acp.meta import ACP_EPHEMERAL_META_KEY
 from ..agents.tools.agent_management import MAX_SPAWN_BATCH_CONCURRENCY
 from ..modes.mission import MissionMode
-from ..utils.io_utils import run_sync_io
+from ..schemas import AgentRequest
+from ..utils.io_utils import run_async_to_completion, run_sync_io
 from .adaptation_mission import prepare_mission, sync_mission
-from .adaptation_phase import (
-    REPAIR_PHASE,
-    TRIAGE_PHASE,
-    AccessBinding,
-    AdaptationAccessGuard,
-    PhaseOutcome,
-    PhaseRunner,
-)
+from .adaptation_prompts import repair_prompt, triage_prompt
 from .adaptation_staging import component_map, stage_local_assets
 from .compatibility import (
     AssetType,
@@ -46,9 +41,24 @@ from .compatibility_testing import (
 from .models import ProviderInventory
 from .providers.base import ProgressReporter, report_progress as _report
 
+_MAX_REACT_ITERATIONS = 4_000
+_HEARTBEAT_SECONDS = 12
 _MAX_FILE_BYTES = 256 * 1024
 _EXCERPT_BYTES = 16 * 1024
 _MAX_REPLACEMENT_BYTES = 32 * 1024
+_TRIAGE_TOOLS = (
+    "migration_compat_inspect",
+    "migration_compat_read_file",
+    "migration_compat_classify",
+)
+_REPAIR_TOOLS = (
+    "migration_compat_inspect",
+    "migration_compat_read_file",
+    "migration_compat_write_file",
+    "migration_compat_update",
+    "migration_compat_test",
+    "migration_compat_classify",
+)
 
 
 @dataclass(frozen=True)
@@ -61,11 +71,23 @@ class AdaptationResult:
     warnings: list[str] = field(default_factory=list)
 
 
-_ACCESS_GUARD = AdaptationAccessGuard()
+@dataclass(frozen=True)
+class _RequestBinding:
+    context: "ActiveAdaptationContext"
+    phase: str
+    asset_key: str
+
+
+_ACTIVE_CONTEXTS: dict[str, _RequestBinding] = {}
 
 
 def get_active_adaptation_context() -> "ActiveAdaptationContext":
-    return _ACCESS_GUARD.current().context
+    from ..app.agent_context import get_current_session_id
+
+    binding = _ACTIVE_CONTEXTS.get(get_current_session_id() or "")
+    if binding is None:
+        raise PermissionError("migration compatibility tools are unavailable")
+    return binding.context
 
 
 class ActiveAdaptationContext:
@@ -95,12 +117,17 @@ class ActiveAdaptationContext:
         )
         self._lock = asyncio.Lock()
 
-    def _binding(self) -> AccessBinding:
-        return _ACCESS_GUARD.current(expected_context=self)
+    def _binding(self) -> _RequestBinding:
+        from ..app.agent_context import get_current_session_id
+
+        binding = _ACTIVE_CONTEXTS.get(get_current_session_id() or "")
+        if binding is None or binding.context is not self:
+            raise PermissionError("migration request is not bound")
+        return binding
 
     @property
     def phase(self) -> str:
-        return self._binding().phase.name
+        return self._binding().phase
 
     @property
     def active_asset_key(self) -> str:
@@ -108,9 +135,6 @@ class ActiveAdaptationContext:
 
     def activity(self, session_id: str) -> str:
         return self._activities.get(session_id, "等待 Agent 开始处理。")
-
-    def clear_activity(self, session_id: str) -> None:
-        self._activities.pop(session_id, None)
 
     async def _publish(self, message: str) -> None:
         from ..app.agent_context import get_current_session_id
@@ -148,7 +172,7 @@ class ActiveAdaptationContext:
         return load_manifest(self.store.path).get_asset(key)
 
     def _require_repair_phase(self) -> None:
-        if not self._binding().phase.mutable:
+        if self.phase != "mission_repair":
             raise PermissionError("compatibility changes require repair phase")
 
     def _audit(self, action: str, key: str, detail: str = "") -> None:
@@ -221,6 +245,67 @@ class ActiveAdaptationContext:
             excerpt += "\n\n[... middle omitted ...]\n\n"
             excerpt += tail.decode("utf-8", errors="replace")
         return redact_sensitive_text(excerpt)
+
+    async def list_assets(
+        self,
+        *,
+        zone: str = "",
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        async with self._lock:
+            self._consume()
+            manifest = load_manifest(self.store.path)
+            items = manifest.assets
+            if zone:
+                items = manifest.by_zone(AssetZone(zone))
+            start = max(0, offset)
+            selected = items[start:][:50]
+            return {
+                "ok": True,
+                "counts": counts(manifest),
+                "next_asset": (
+                    manifest.next_asset.asset_key
+                    if manifest.next_asset is not None
+                    else None
+                ),
+                "tool_calls": self.tool_calls,
+                "tool_budget": self.total_tool_budget,
+                "assets": [
+                    {
+                        "asset_key": item.asset_key,
+                        "type": item.asset_type.value,
+                        "name": item.name,
+                        "zone": item.zone.value,
+                        "reason": item.reason,
+                        "tested": item.test_is_current,
+                        "inspected": item.inspected,
+                        "content_reviewed": item.content_reviewed,
+                        "plugin_disposition": (
+                            item.plugin_disposition.value
+                            if item.plugin_disposition
+                            else None
+                        ),
+                        "tool_calls": item.tool_calls,
+                        "tool_budget": item.tool_budget,
+                        "components": [
+                            {
+                                "id": component.component_id,
+                                "kind": component.kind,
+                                "paths": component.paths,
+                                "read": component.read_paths,
+                                "verdict": component.verdict,
+                            }
+                            for component in item.components
+                        ],
+                        "test_passed": (
+                            item.last_test.passed
+                            if item.test_is_current and item.last_test
+                            else None
+                        ),
+                    }
+                    for item in selected
+                ],
+            }
 
     async def inspect_asset(self, key: str) -> dict[str, Any]:
         async with self._lock:
@@ -445,7 +530,11 @@ class ActiveAdaptationContext:
     ) -> dict[str, Any]:
         async with self._lock:
             asset = self._asset(key)
-            expected = self._binding().phase.source_zone
+            expected = (
+                AssetZone.STAGING
+                if self.phase == "triage"
+                else AssetZone.REPAIR
+            )
             if asset.zone is not expected:
                 raise PermissionError(
                     f"{self.phase} phase cannot classify {asset.zone.value}",
@@ -490,8 +579,141 @@ def _mission_mode(workspace: Any) -> MissionMode:
     return matches[0]
 
 
+def _iteration_budget(tool_budget: int) -> int:
+    """Leave room for both tool calls and the reasoning around them."""
+    return min(_MAX_REACT_ITERATIONS, max(80, tool_budget * 2))
+
+
+def _request(
+    session_id: str,
+    agent_id: str,
+    prompt: str,
+    phase: str,
+    allowed_tools: tuple[str, ...],
+    react_iterations: int,
+) -> AgentRequest:
+    return AgentRequest.model_validate(
+        {
+            "input": [
+                {
+                    "role": "user",
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt,
+                        },
+                    ],
+                },
+            ],
+            "session_id": session_id,
+            "user_id": session_id,
+            "agent_id": agent_id,
+            "channel": "console",
+            "request_context": {
+                "source": "portability_adaptation",
+                "portability_phase": phase,
+                "max_react_iterations": react_iterations,
+                ACP_EPHEMERAL_META_KEY: True,
+                "approval_level": "off",
+                "subagent_allowed_tools": list(allowed_tools),
+                "subagent_skills": [],
+            },
+        },
+    )
+
+
+async def _run_agent(
+    workspace: Any,
+    request: AgentRequest,
+    progress: ProgressReporter | None,
+    context: ActiveAdaptationContext,
+    label: str,
+) -> None:
+    async def consume() -> None:
+        async for _event in workspace.stream_query(request):
+            pass
+
+    task = asyncio.create_task(consume())
+    try:
+        while not task.done():
+            done, _ = await asyncio.wait({task}, timeout=_HEARTBEAT_SECONDS)
+            if task not in done:
+                await _report(
+                    progress,
+                    f"{label}仍在运行：{context.activity(request.session_id)}",
+                )
+        await task
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await run_async_to_completion(task)
+            except (
+                asyncio.CancelledError,
+                Exception,
+            ):  # pylint: disable=broad-except
+                pass
+
+
+async def _run_bound_agent(
+    workspace: Any,
+    context: ActiveAdaptationContext,
+    *,
+    session_id: str,
+    asset: CompatibilityAsset,
+    phase: str,
+    prompt: str,
+    tools: tuple[str, ...],
+    label: str,
+) -> None:
+    _ACTIVE_CONTEXTS[session_id] = _RequestBinding(
+        context=context,
+        phase=phase,
+        asset_key=asset.asset_key,
+    )
+    try:
+        await _run_agent(
+            workspace,
+            _request(
+                session_id,
+                workspace.agent_id,
+                prompt,
+                phase,
+                tools,
+                _iteration_budget(asset.tool_budget - asset.tool_calls),
+            ),
+            context.progress,
+            context,
+            label,
+        )
+    finally:
+        _ACTIVE_CONTEXTS.pop(session_id, None)
+        context._activities.pop(  # pylint: disable=protected-access
+            session_id,
+            None,
+        )
+
+
+async def _bounded_parallel(keys: list[str], worker: Any) -> None:
+    """Run a rolling Mission-sized worker pool."""
+    semaphore = asyncio.Semaphore(MAX_SPAWN_BATCH_CONCURRENCY)
+
+    async def run(key: str) -> None:
+        async with semaphore:
+            await worker(key)
+
+    results = await asyncio.gather(
+        *(run(key) for key in keys),
+        return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+
+
 async def _triage_asset(
-    runner: PhaseRunner,
+    workspace: Any,
     context: ActiveAdaptationContext,
     key: str,
     warnings: list[str],
@@ -504,10 +726,14 @@ async def _triage_asset(
         before = asset.tool_calls
         label = context._label(asset)  # pylint: disable=protected-access
         try:
-            await runner.run_asset(
-                asset,
-                TRIAGE_PHASE,
+            await _run_bound_agent(
+                workspace,
+                context,
                 session_id=session_id,
+                asset=asset,
+                phase="triage",
+                prompt=triage_prompt(asset),
+                tools=_TRIAGE_TOOLS,
                 label=f"正在检查 {label}",
             )
         except Exception as exc:  # pylint: disable=broad-except
@@ -535,34 +761,24 @@ async def _triage_asset(
 
 
 async def _triage_assets(
-    runner: PhaseRunner,
+    workspace: Any,
     context: ActiveAdaptationContext,
     warnings: list[str],
-) -> PhaseOutcome:
+) -> None:
     keys = [
         item.asset_key
         for item in load_manifest(context.store.path).by_zone(
             AssetZone.STAGING,
         )
     ]
-    await runner.run_batch(
+    await _bounded_parallel(
         keys,
-        lambda key: _triage_asset(runner, context, key, warnings),
+        lambda key: _triage_asset(workspace, context, key, warnings),
     )
-    remaining = len(
-        load_manifest(context.store.path).by_zone(AssetZone.STAGING),
-    )
-    if not remaining:
-        return PhaseOutcome(completed=True)
-    if context.tool_calls >= context.total_tool_budget:
-        reason = f"第一阶段达到总工具调用上限（{context.total_tool_budget} 次）。"
-    else:
-        reason = f"第一阶段仍有 {remaining} 项未完成语义判断。"
-    return PhaseOutcome(False, remaining, reason)
 
 
 async def _repair_asset(
-    runner: PhaseRunner,
+    workspace: Any,
     context: ActiveAdaptationContext,
     key: str,
     warnings: list[str],
@@ -570,10 +786,14 @@ async def _repair_asset(
     asset = context._asset(key)  # pylint: disable=protected-access
     label = context._label(asset)  # pylint: disable=protected-access
     try:
-        await runner.run_asset(
-            asset,
-            REPAIR_PHASE,
+        await _run_bound_agent(
+            workspace,
+            context,
             session_id=f"migration-worker:{secrets.token_urlsafe(24)}",
+            asset=asset,
+            phase="mission_repair",
+            prompt=repair_prompt(asset),
+            tools=_REPAIR_TOOLS,
             label=f"Mission 正在修复 {label}",
         )
     except Exception as exc:  # pylint: disable=broad-except
@@ -582,11 +802,10 @@ async def _repair_asset(
 
 async def _repair_with_mission(
     workspace: Any,
-    runner: PhaseRunner,
     context: ActiveAdaptationContext,
     root: Path,
     warnings: list[str],
-) -> PhaseOutcome:
+) -> str:
     mode = _mission_mode(workspace)
     max_attempts = mode.max_retries_per_story + 1
     session_id = f"migration-mission:{secrets.token_urlsafe(24)}"
@@ -599,7 +818,8 @@ async def _repair_with_mission(
         max_attempts,
     )
     attempts: dict[str, int] = {}
-    with mode.internal_mission(session_id, loop_dir) as mission:
+    mode.start_internal_mission(session_id, loop_dir)
+    try:
         for round_number in range(1, max_attempts + 1):
             manifest = load_manifest(context.store.path)
             pending = [
@@ -618,26 +838,24 @@ async def _repair_with_mission(
             )
             for key in pending:
                 attempts[key] = attempts.get(key, 0) + 1
-            await runner.run_batch(
+            await _bounded_parallel(
                 pending,
-                lambda key: _repair_asset(runner, context, key, warnings),
+                lambda key: _repair_asset(workspace, context, key, warnings),
             )
             manifest = load_manifest(context.store.path)
             await run_sync_io(sync_mission, loop_dir, manifest)
-            if await mission.check():
-                return PhaseOutcome(completed=True)
+            if await mode.check_internal_mission(session_id):
+                return ""
         manifest = load_manifest(context.store.path)
         await run_sync_io(sync_mission, loop_dir, manifest, stopped=True)
-        await mission.check()
+        await mode.check_internal_mission(session_id)
         remaining = len(manifest.by_zone(AssetZone.REPAIR))
-        return PhaseOutcome(
-            completed=False,
-            remaining=remaining,
-            reason=(
-                f"兼容性修复 Mission 已达到每项最多 {max_attempts} 次尝试，"
-                f"仍有 {remaining} 项未通过原生检查。"
-            ),
+        return (
+            f"兼容性修复 Mission 已达到每项最多 {max_attempts} 次尝试，"
+            f"仍有 {remaining} 项未通过原生检查。"
         )
+    finally:
+        mode.finish_internal_mission(session_id)
 
 
 async def run_adaptation_loop(
@@ -694,15 +912,22 @@ async def run_adaptation_loop(
         audit_path=root / "progress.jsonl",
         progress=progress,
     )
-    runner = PhaseRunner(workspace, context, _ACCESS_GUARD)
     await _report(
         progress,
         f"两阶段共享 {context.total_tool_budget} 次工具调用；" + "不设总时长限制，推理上限按剩余预算动态分配。",
     )
-    outcome = await _triage_assets(runner, context, warnings)
-    stopped_reason = outcome.reason
+    stopped_reason = ""
+    await _triage_assets(workspace, context, warnings)
 
-    if outcome.completed:
+    manifest = load_manifest(store.path)
+    staging = manifest.by_zone(AssetZone.STAGING)
+    if staging and not stopped_reason:
+        if context.tool_calls >= context.total_tool_budget:
+            stopped_reason = f"第一阶段达到总工具调用上限（{context.total_tool_budget} 次）。"
+        else:
+            stopped_reason = f"第一阶段仍有 {len(staging)} 项未完成语义判断。"
+
+    if not staging and not stopped_reason:
         manifest = load_manifest(store.path)
         if manifest.by_zone(AssetZone.REPAIR):
             await _report(
@@ -710,15 +935,13 @@ async def run_adaptation_loop(
                 "第一阶段完成，安全暂存区已清空；正在启动 QwenPaw " + "Mission 并行进行兼容性测试与修复…",
             )
             try:
-                outcome = await _repair_with_mission(
+                stopped_reason = await _repair_with_mission(
                     workspace,
-                    runner,
                     context,
                     root,
                     warnings,
                 )
-                stopped_reason = outcome.reason
-                if not outcome.completed:
+                if stopped_reason:
                     warnings.append(stopped_reason)
             except Exception as exc:  # pylint: disable=broad-except
                 stopped_reason = (

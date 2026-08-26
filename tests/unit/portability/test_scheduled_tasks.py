@@ -45,9 +45,7 @@ def test_build_imported_job_is_stable_disabled_and_safe(tmp_path) -> None:
     assert first.meta["portability"]["requires_review"] is True
 
 
-def test_compatibility_approved_job_is_enabled_without_review_gate(
-    tmp_path,
-) -> None:
+def test_goal_approved_job_is_enabled_without_review_gate(tmp_path) -> None:
     task = SourceScheduledTask(
         source_id="approved",
         name="Approved",
@@ -113,13 +111,6 @@ def test_build_imported_job_does_not_bind_missing_source_cwd(tmp_path) -> None:
         {"remote_unverified": True},
         {"workspace_status": "remote_unverified"},
         {"execution_environment": "cloud"},
-    ],
-    ids=[
-        "source-authority",
-        "target-authority",
-        "remote-unverified",
-        "workspace-status",
-        "execution-environment",
     ],
 )
 def test_build_imported_job_never_binds_remote_cwd_that_exists_locally(
