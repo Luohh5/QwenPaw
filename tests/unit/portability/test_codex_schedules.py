@@ -514,6 +514,40 @@ projectId = "project-1"
     assert any("multiple workspaces" in item for item in warnings)
 
 
+def test_plain_schedule_files_use_the_shared_no_follow_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / ".codex"
+    home.mkdir()
+    (home / ".codex-global-state.json").write_text(
+        '{"local-projects":{"project-1":{"id":"project-1",'
+        '"rootPaths":["/project/one"]}}}',
+        encoding="utf-8",
+    )
+    _write_automation(
+        home,
+        "project-task",
+        'name = "Project task"\nprompt = "Inspect"\nstatus = "ACTIVE"\n'
+        'rrule = "FREQ=DAILY;BYHOUR=10;BYMINUTE=0"\n'
+        'projectId = "project-1"\n',
+    )
+
+    def fail_path_open(_self, *args, **kwargs):
+        del args, kwargs
+        raise AssertionError("ordinary schedule reads must use safe_files")
+
+    monkeypatch.setattr(Path, "open", fail_path_open)
+
+    tasks, warnings, discovered_count, _ = discover_codex_scheduled_tasks(
+        home,
+    )
+
+    assert discovered_count == 1
+    assert tasks[0].cwd == "/project/one"
+    assert not any("Could not" in warning for warning in warnings)
+
+
 def test_schema_drift_corruption_and_bad_rows_do_not_abort_discovery(
     tmp_path: Path,
 ) -> None:
