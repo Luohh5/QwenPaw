@@ -191,7 +191,7 @@ def _adaptation_check(
         "工具和设置兼容清单",
         f"已检查 {len(manifest.assets)} 项：待迁移 {migrate}，待修复 "
         f"{repair}，丢弃 {discard}，仍在安全暂存区 {staging}；"
-        f"Goal 状态为 {manifest.state.value}。",
+        f"兼容流程状态为 {manifest.state.value}。",
     )
 
 
@@ -349,7 +349,7 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
                 status,
                 "Skill 安全状态",
                 f"计划导入 {len(receipt.imported_skills)} 个，实际可见 {present} 个；"
-                f"启用状态与 Goal 分区一致 {activation_ok} 个。",
+                f"启用状态与兼容分区一致 {activation_ok} 个。",
             ),
         )
 
@@ -378,7 +378,7 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
         )
         detail = (
             f"计划导入 {len(receipt.imported_mcp_servers)} 个，实际保存 {present} 个；"
-            f"启用状态与 Goal 分区一致 {activation_ok} 个。"
+            f"启用状态与兼容分区一致 {activation_ok} 个。"
         )
         checks.append(_check("mcp", status, "MCP DriverCard", detail))
 
@@ -442,7 +442,7 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
                 status,
                 "插件安装状态",
                 f"原生安装流程返回 {len(receipt.installed_plugins)} 个插件，"
-                f"磁盘清单确认 {present} 个；实际启用状态由兼容性 Goal 的"
+                f"磁盘清单确认 {present} 个；实际启用状态由兼容流程的"
                 "migrate/repair 分区决定。",
             ),
         )
@@ -621,7 +621,7 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
                         "定时任务安全状态",
                         discovery_detail
                         + f" 唯一落盘 {unique}/{len(expected)} 个，启用或禁用"
-                        f"状态与 Goal 分区一致 {activation_safe}/"
+                        f"状态与兼容分区一致 {activation_safe}/"
                         f"{len(expected)} 个；远程或未验证工作区"
                         f"未绑定本机目录 {remote_unmapped}/"
                         f"{len(remote_expected)} 个。"

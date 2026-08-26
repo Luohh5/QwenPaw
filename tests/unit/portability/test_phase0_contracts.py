@@ -1,0 +1,358 @@
+# -*- coding: utf-8 -*-
+"""Behavioral contracts that protect the Pawport refactor baseline."""
+
+from __future__ import annotations
+
+import json
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from qwenpaw.portability.codex_plugin_adapter import (
+    stage_codex_content_plugin,
+)
+from qwenpaw.portability.compatibility import (
+    AssetType,
+    AssetZone,
+    CompatibilityAsset,
+    CompatibilityManifest,
+    PluginDisposition,
+    RunState,
+    write_summary,
+)
+from qwenpaw.portability.models import (
+    ImportReceipt,
+    MigrationPlan,
+    SourcePlugin,
+)
+from qwenpaw.portability.providers import create_migration_provider
+from qwenpaw.portability.providers.qoder import QoderMigrationProvider
+from qwenpaw.portability.qoder_plugin_adapter import stage_qoder_skill_plugin
+
+_FIXTURES = Path(__file__).parents[2] / "fixtures" / "portability"
+
+
+class _UnexpectedHarnessRuntime:
+    async def adapter(self, provider_id: str, settings: dict[str, Any]):
+        del provider_id, settings
+        raise AssertionError("explicit source-home must stay local-only")
+
+
+def _workspace(tmp_path: Path) -> SimpleNamespace:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    return SimpleNamespace(
+        workspace_dir=root,
+        config=SimpleNamespace(backend="qwenpaw", backend_settings={}),
+        harness_runtime=_UnexpectedHarnessRuntime(),
+    )
+
+
+def _copy_fixture(tmp_path: Path, name: str) -> Path:
+    target = tmp_path / name
+    shutil.copytree(_FIXTURES / name, target)
+    return target
+
+
+def _history(item: Any) -> dict[str, str]:
+    return {
+        "kind": item.kind.value,
+        "text": item.text,
+    }
+
+
+def _inventory_contract(inventory: Any) -> dict[str, Any]:
+    """Keep only stable, user-visible provider output."""
+    return {
+        "provider": inventory.provider_id,
+        "sessions": sorted(
+            (
+                {
+                    "id": item.source_id,
+                    "title": item.title,
+                    "cwd": item.cwd,
+                    "history": [_history(event) for event in item.history],
+                }
+                for item in inventory.sessions
+            ),
+            key=lambda item: item["id"],
+        ),
+        "ignored_sessions": sorted(inventory.ignored_session_ids),
+        "skills": sorted(
+            (
+                {"name": item.name, "scope": item.scope}
+                for item in inventory.skills
+            ),
+            key=lambda item: (item["name"], item["scope"]),
+        ),
+        "mcp": sorted(
+            (
+                {
+                    "id": item.source_id,
+                    "name": item.name,
+                    "transport": item.transport,
+                    "command": item.command,
+                    "args": item.args,
+                    "url": item.url,
+                    "plugin": str(item.metadata.get("source_plugin") or ""),
+                }
+                for item in inventory.mcp_servers
+            ),
+            key=lambda item: item["id"],
+        ),
+        "memory": sorted(
+            (
+                {
+                    "id": item.source_id,
+                    "cwd": item.cwd,
+                    "files": sorted(
+                        file.relative_path.as_posix() for file in item.files
+                    ),
+                }
+                for item in inventory.memory_projects
+            ),
+            key=lambda item: item["id"],
+        ),
+        "marketplaces": sorted(
+            (
+                {
+                    "id": item.source_id,
+                    "name": item.name,
+                    "type": item.source_type,
+                }
+                for item in inventory.marketplaces
+            ),
+            key=lambda item: item["id"],
+        ),
+        "plugins": sorted(
+            (
+                {
+                    "id": item.source_id,
+                    "name": item.name,
+                    "version": item.version,
+                    "adapter": str(item.metadata.get("adapter") or ""),
+                }
+                for item in inventory.plugins
+            ),
+            key=lambda item: item["id"],
+        ),
+        "scheduled_tasks": sorted(
+            (
+                {
+                    "id": item.source_id,
+                    "name": item.name,
+                    "type": item.schedule_type,
+                    "cron": item.cron,
+                    "timezone": item.timezone,
+                    "enabled_at_source": item.enabled,
+                }
+                for item in inventory.scheduled_tasks
+            ),
+            key=lambda item: item["id"],
+        ),
+        "discovered_mcp_count": inventory.discovered_mcp_count,
+        "discovered_scheduled_task_count": (
+            inventory.discovered_scheduled_task_count
+        ),
+    }
+
+
+def _golden(name: str) -> dict[str, Any]:
+    path = _FIXTURES / "golden" / f"{name}-inventory.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.asyncio
+async def test_codex_mini_home_matches_golden_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider refactors must not lose or detach Codex assets."""
+    monkeypatch.setenv("HOME", str(tmp_path / "isolated-home"))
+    codex_home = _copy_fixture(tmp_path, "codex-mini")
+
+    inventory = await create_migration_provider(
+        "codex",
+        _workspace(tmp_path),
+        source_home=codex_home,
+    ).inventory(limit=20)
+
+    assert _inventory_contract(inventory) == _golden("codex-mini")
+
+
+@pytest.mark.asyncio
+async def test_qoder_mini_home_matches_golden_inventory(
+    tmp_path: Path,
+) -> None:
+    """Provider refactors must preserve Qoder component ownership."""
+    qoder_home = _copy_fixture(tmp_path, "qoder-mini")
+    user_data = _copy_fixture(tmp_path, "qoder-user-data-mini")
+    ledger = qoder_home / "plugins" / "installed_plugins_v2.json"
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8").replace(
+            "__QODER_HOME__",
+            str(qoder_home),
+        ),
+        encoding="utf-8",
+    )
+
+    inventory = await QoderMigrationProvider(
+        SimpleNamespace(workspace_dir=tmp_path / "workspace"),
+        qoder_home=qoder_home,
+        qoder_user_data=user_data,
+    ).inventory(limit=20)
+
+    assert _inventory_contract(inventory) == _golden("qoder-mini")
+
+
+def test_four_zone_summary_matches_reviewed_contract(tmp_path: Path) -> None:
+    """Summary refactors must preserve all zones and stopped reasons."""
+    now = datetime(2026, 8, 20, tzinfo=timezone.utc)
+    manifest = CompatibilityManifest(
+        migration_id="migration-fixture",
+        source="qoder",
+        created_at=now,
+        updated_at=now,
+        state=RunState.STOPPED_LIMIT,
+        stop_reason="fixture limit",
+        assets=[
+            CompatibilityAsset(
+                asset_key="skills:ready",
+                asset_type=AssetType.SKILL,
+                source_id="ready",
+                name="ready",
+                zone=AssetZone.MIGRATE,
+                reason="native test passed",
+                updated_at=now,
+            ),
+            CompatibilityAsset(
+                asset_key="mcp:repair",
+                asset_type=AssetType.MCP,
+                source_id="repair",
+                name="repair",
+                zone=AssetZone.REPAIR,
+                reason="needs a local command",
+                changes=["rewrote command"],
+                updated_at=now,
+            ),
+            CompatibilityAsset(
+                asset_key="plugins:discard",
+                asset_type=AssetType.PLUGIN,
+                source_id="discard",
+                name="discard",
+                zone=AssetZone.DISCARD,
+                reason="QwenPaw already provides it",
+                plugin_disposition=PluginDisposition.UNUSABLE,
+                updated_at=now,
+            ),
+            CompatibilityAsset(
+                asset_key="scheduled_tasks:pending",
+                asset_type=AssetType.SCHEDULED_TASK,
+                source_id="pending",
+                name="pending",
+                reason="",
+                updated_at=now,
+            ),
+        ],
+    )
+    summary = tmp_path / "summary.md"
+
+    write_summary(summary, manifest)
+
+    expected = _FIXTURES / "golden" / "four-zone-summary.md"
+    assert summary.read_text(encoding="utf-8") == expected.read_text(
+        encoding="utf-8",
+    )
+
+
+def test_old_plan_and_receipt_fields_remain_loadable() -> None:
+    """Deleting obsolete optional fields must not break durable records."""
+    created = "2026-08-20T00:00:00Z"
+    plan = MigrationPlan.model_validate(
+        {
+            "plan_id": "plan-legacy",
+            "source": "codex",
+            "agent_id": "agent-1",
+            "created_at": created,
+            "inventory_fingerprint": "sha256:fixture",
+            "actions": [
+                {
+                    "asset_type": "plugins",
+                    "source_id": "expo@mini-market",
+                    "name": "Expo",
+                    "action": "import",
+                    "fidelity": "full",
+                    "default_enabled": False,
+                    "reason_zh": "兼容",
+                },
+            ],
+            "legacy_hint": "ignored by the current schema",
+        },
+    )
+    receipt = ImportReceipt.model_validate(
+        {
+            "migration_id": "migration-legacy",
+            "source": "codex",
+            "agent_id": "agent-1",
+            "started_at": created,
+            "completed_at": created,
+            "installed_plugins": ["expo"],
+            "backend_changed": False,
+            "legacy_hint": "ignored by the current schema",
+        },
+    )
+
+    assert plan.actions[0].source_id == "expo@mini-market"
+    assert receipt.source == "codex"
+    assert receipt.installed_plugins == ["expo"]
+
+
+def test_generated_plugin_ids_do_not_depend_on_display_names(
+    tmp_path: Path,
+) -> None:
+    """Display-name changes must not create a second generated plugin."""
+    codex_home = _copy_fixture(tmp_path, "codex-mini")
+    codex_source = codex_home / "plugins/cache/mini-market/expo/1.0.0"
+    codex = SourcePlugin(
+        source_id="expo@mini-market",
+        name="Renamed Expo Display",
+        marketplace="mini-market",
+        version="1.0.0",
+        install_source=str(codex_source),
+    )
+    qoder_home = _copy_fixture(tmp_path, "qoder-mini")
+    qoder_source = qoder_home / "plugins/custom/mini-plugin-0.1.0"
+    qoder = SourcePlugin(
+        source_id="mini-plugin@local-custom",
+        name="Renamed Mini Plugin Display",
+        marketplace="local-custom",
+        version="0.1.0",
+        install_source=str(qoder_source),
+        metadata={"canonical_plugin_source": str(qoder_source.resolve())},
+    )
+
+    codex_staged = stage_codex_content_plugin(codex)
+    qoder_staged = stage_qoder_skill_plugin(qoder)
+    try:
+        codex_manifest = json.loads(
+            (codex_staged / "plugin.json").read_text(encoding="utf-8"),
+        )
+        qoder_manifest = json.loads(
+            (qoder_staged / "plugin.json").read_text(encoding="utf-8"),
+        )
+
+        assert (codex_manifest["id"], codex_manifest["name"]) == (
+            "expo",
+            "Expo",
+        )
+        assert (qoder_manifest["id"], qoder_manifest["name"]) == (
+            "mini-plugin",
+            "Mini Plugin",
+        )
+    finally:
+        shutil.rmtree(codex_staged.parent)
+        shutil.rmtree(qoder_staged.parent)

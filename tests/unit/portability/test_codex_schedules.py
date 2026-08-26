@@ -55,6 +55,25 @@ def _create_codex_database(path: Path) -> None:
         )
 
 
+def _insert_automation(
+    connection: sqlite3.Connection,
+    automation_id: str,
+    name: str,
+    prompt: str | bytes,
+    rrule: str,
+    *,
+    status: str = "ACTIVE",
+    cwds: str = "[]",
+    updated_at: int = 1,
+) -> None:
+    connection.execute(
+        "INSERT INTO automations "
+        "(id, name, prompt, status, cwds, rrule, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (automation_id, name, prompt, status, cwds, rrule, updated_at),
+    )
+
+
 @pytest.fixture(autouse=True)
 def _stable_local_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
@@ -84,33 +103,24 @@ cwd = "/toml/project"
     database = home / "sqlite" / "codex-dev.db"
     _create_codex_database(database)
     with sqlite3.connect(database) as connection:
-        connection.execute(
-            "INSERT INTO automations "
-            "(id, name, prompt, status, cwds, rrule, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                "daily",
-                "stale DB task",
-                "stale prompt",
-                "PAUSED",
-                '["/sqlite/project"]',
-                "FREQ=HOURLY;INTERVAL=2;BYMINUTE=0",
-                1,
-            ),
+        _insert_automation(
+            connection,
+            "daily",
+            "stale DB task",
+            "stale prompt",
+            "FREQ=HOURLY;INTERVAL=2;BYMINUTE=0",
+            status="PAUSED",
+            cwds='["/sqlite/project"]',
         )
-        connection.execute(
-            "INSERT INTO automations "
-            "(id, name, prompt, status, cwds, rrule, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                "weekly",
-                "DB task",
-                "Read the DB definition",
-                "PAUSED",
-                '["/sqlite/project"]',
-                "FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=8;BYMINUTE=0",
-                2,
-            ),
+        _insert_automation(
+            connection,
+            "weekly",
+            "DB task",
+            "Read the DB definition",
+            "FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=8;BYMINUTE=0",
+            status="PAUSED",
+            cwds='["/sqlite/project"]',
+            updated_at=2,
         )
         connection.execute(
             "INSERT INTO automation_runs VALUES (?, ?, ?, ?, ?)",
@@ -159,19 +169,13 @@ def test_live_wal_is_read_from_private_snapshot_without_source_writes(
     try:
         assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
         connection.execute("PRAGMA wal_autocheckpoint = 0")
-        connection.execute(
-            "INSERT INTO automations "
-            "(id, name, prompt, status, cwds, rrule, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                "wal-only",
-                "WAL task",
-                "Read the committed WAL state",
-                "ACTIVE",
-                "[]",
-                "FREQ=DAILY;BYHOUR=11;BYMINUTE=25",
-                3,
-            ),
+        _insert_automation(
+            connection,
+            "wal-only",
+            "WAL task",
+            "Read the committed WAL state",
+            "FREQ=DAILY;BYHOUR=11;BYMINUTE=25",
+            updated_at=3,
         )
         connection.execute(
             "INSERT INTO automation_runs VALUES (?, ?, ?, ?, ?)",
@@ -272,17 +276,12 @@ def test_database_without_automation_runs_table_is_read_safely(
             "id TEXT, name TEXT, prompt TEXT, status TEXT, cwds TEXT, "
             "rrule TEXT, updated_at INTEGER)",
         )
-        connection.execute(
-            "INSERT INTO automations VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                "no-runs-table",
-                "No runs table",
-                "Read this definition",
-                "ACTIVE",
-                "[]",
-                "FREQ=DAILY;BYHOUR=12;BYMINUTE=5",
-                1,
-            ),
+        _insert_automation(
+            connection,
+            "no-runs-table",
+            "No runs table",
+            "Read this definition",
+            "FREQ=DAILY;BYHOUR=12;BYMINUTE=5",
         )
 
     (
@@ -317,19 +316,12 @@ def test_disappearing_sqlite_sidecar_warns_and_continues_to_next_database(
     good_database = home / "sqlite" / "b-good.db"
     _create_codex_database(good_database)
     with sqlite3.connect(good_database) as connection:
-        connection.execute(
-            "INSERT INTO automations "
-            "(id, name, prompt, status, cwds, rrule, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                "good-after-race",
-                "Good database",
-                "Continue scanning",
-                "ACTIVE",
-                "[]",
-                "FREQ=DAILY;BYHOUR=13;BYMINUTE=15",
-                1,
-            ),
+        _insert_automation(
+            connection,
+            "good-after-race",
+            "Good database",
+            "Continue scanning",
+            "FREQ=DAILY;BYHOUR=13;BYMINUTE=15",
         )
 
     original_copy = codex_schedule_reader._copy_bounded_regular_file
@@ -616,12 +608,17 @@ def test_missing_codex_schedule_stores_are_an_empty_inventory(
 @pytest.mark.parametrize(
     ("prompt", "reason"),
     [
-        (
+        pytest.param(
             "PROMPT_MUST_NOT_LEAK_"
             + "x" * (codex_schedule_reader._MAX_PROMPT_CHARS + 1),
             "source_prompt_exceeds_limit",
+            id="character-limit",
         ),
-        ("PROMPT_MUST_NOT_LEAK_\x01tail", "source_prompt_unsafe"),
+        pytest.param(
+            "PROMPT_MUST_NOT_LEAK_\x01tail",
+            "source_prompt_unsafe",
+            id="control-character",
+        ),
     ],
 )
 def test_unsafe_prompt_is_omitted_audited_and_never_scheduled(
@@ -633,19 +630,12 @@ def test_unsafe_prompt_is_omitted_audited_and_never_scheduled(
     database = home / "sqlite" / "codex-dev.db"
     _create_codex_database(database)
     with sqlite3.connect(database) as connection:
-        connection.execute(
-            "INSERT INTO automations "
-            "(id, name, prompt, status, cwds, rrule, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                "unsafe-prompt",
-                "Safe title",
-                prompt,
-                "ACTIVE",
-                "[]",
-                "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-                1,
-            ),
+        _insert_automation(
+            connection,
+            "unsafe-prompt",
+            "Safe title",
+            prompt,
+            "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
         )
 
     tasks, warnings, discovered_count, _ = discover_codex_scheduled_tasks(home)
@@ -679,19 +669,12 @@ def test_non_text_prompt_is_omitted_and_hashed_without_blob_leakage(
     _create_codex_database(database)
     prompt = b"BLOB_PROMPT_MUST_NOT_LEAK\x00tail"
     with sqlite3.connect(database) as connection:
-        connection.execute(
-            "INSERT INTO automations "
-            "(id, name, prompt, status, cwds, rrule, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                "blob-prompt",
-                "Safe title",
-                sqlite3.Binary(prompt),
-                "ACTIVE",
-                "[]",
-                "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-                1,
-            ),
+        _insert_automation(
+            connection,
+            "blob-prompt",
+            "Safe title",
+            sqlite3.Binary(prompt),
+            "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
         )
 
     tasks, warnings, _, _ = discover_codex_scheduled_tasks(home)
@@ -811,19 +794,12 @@ def test_unsafe_source_ids_are_skipped_but_counted_without_leaking(
     _create_codex_database(database)
     unsafe_sqlite_id = "SQLITE_ID_MUST_NOT_LEAK\x01"
     with sqlite3.connect(database) as connection:
-        connection.execute(
-            "INSERT INTO automations "
-            "(id, name, prompt, status, cwds, rrule, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                unsafe_sqlite_id,
-                "Unsafe",
-                "Do it",
-                "ACTIVE",
-                "[]",
-                "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-                1,
-            ),
+        _insert_automation(
+            connection,
+            unsafe_sqlite_id,
+            "Unsafe",
+            "Do it",
+            "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
         )
 
     tasks, warnings, discovered_count, _ = discover_codex_scheduled_tasks(home)

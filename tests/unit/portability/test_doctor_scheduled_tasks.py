@@ -93,32 +93,60 @@ def _receipt(
     return receipt
 
 
-@pytest.mark.asyncio
-async def test_doctor_reconciles_ready_remote_job_and_review_gate(
-    tmp_path: Path,
-) -> None:
-    task = _task(tmp_path)
-    job = build_imported_job("qoder", task)
-    workspace_dir = tmp_path / "workspace"
-    workspace_dir.mkdir()
-    receipt = _receipt(workspace_dir, task)
-    workspace = SimpleNamespace(
-        workspace_dir=workspace_dir,
-        cron_manager=_CronManager([job]),
-    )
-    inventory = ProviderInventory(
-        provider_id="qoder",
-        provider_name="Qoder",
-        detected=True,
-        scheduled_tasks=[task],
-        discovered_scheduled_task_count=1,
-    )
+@pytest.fixture(name="doctor_case")
+def _doctor_case_fixture(tmp_path: Path):
+    """Build the common imported-schedule Doctor fixture."""
 
-    report = await run_migration_doctor(workspace, inventory, receipt)
+    def make(*, discovered: int = 1, zone=AssetZone.REPAIR):
+        task = _task(tmp_path)
+        job = build_imported_job("qoder", task)
+        workspace_dir = tmp_path / "workspace"
+        workspace_dir.mkdir()
+        receipt = _receipt(
+            workspace_dir,
+            task,
+            discovered=discovered,
+            zone=zone,
+        )
+        workspace = SimpleNamespace(
+            workspace_dir=workspace_dir,
+            cron_manager=_CronManager([job]),
+        )
+        inventory = ProviderInventory(
+            provider_id="qoder",
+            provider_name="Qoder",
+            detected=True,
+            scheduled_tasks=[task],
+            discovered_scheduled_task_count=discovered,
+        )
+        return SimpleNamespace(
+            job=job,
+            workspace=workspace,
+            inventory=inventory,
+            receipt=receipt,
+        )
 
-    check = next(
+    return make
+
+
+def _scheduled_task_check(report):
+    return next(
         item for item in report.checks if item.category == "scheduled_tasks"
     )
+
+
+@pytest.mark.asyncio
+async def test_doctor_reconciles_ready_remote_job_and_review_gate(
+    doctor_case,
+) -> None:
+    case = doctor_case()
+    report = await run_migration_doctor(
+        case.workspace,
+        case.inventory,
+        case.receipt,
+    )
+
+    check = _scheduled_task_check(report)
     assert check.status == "pass"
     assert "兼容清单确认已分类 1/1" in check.detail_zh
     assert "远程或未验证工作区未绑定本机目录 1/1" in check.detail_zh
@@ -127,12 +155,12 @@ async def test_doctor_reconciles_ready_remote_job_and_review_gate(
 
 @pytest.mark.asyncio
 async def test_doctor_fails_if_remote_job_was_bound_to_local_project_dir(
+    doctor_case,
     tmp_path: Path,
 ) -> None:
-    task = _task(tmp_path)
-    job = build_imported_job("qoder", task)
-    assert job.request is not None
-    request = job.request.model_copy(
+    case = doctor_case()
+    assert case.job.request is not None
+    request = case.job.request.model_copy(
         update={
             "request_context": {
                 "source": "cron",
@@ -141,57 +169,32 @@ async def test_doctor_fails_if_remote_job_was_bound_to_local_project_dir(
             },
         },
     )
-    job = job.model_copy(update={"request": request})
-    workspace_dir = tmp_path / "workspace"
-    workspace_dir.mkdir()
-    receipt = _receipt(workspace_dir, task)
-    workspace = SimpleNamespace(
-        workspace_dir=workspace_dir,
-        cron_manager=_CronManager([job]),
+    case.workspace.cron_manager.jobs[0] = case.job.model_copy(
+        update={"request": request},
     )
-    inventory = ProviderInventory(
-        provider_id="qoder",
-        provider_name="Qoder",
-        detected=True,
-        scheduled_tasks=[task],
-        discovered_scheduled_task_count=1,
+    report = await run_migration_doctor(
+        case.workspace,
+        case.inventory,
+        case.receipt,
     )
 
-    report = await run_migration_doctor(workspace, inventory, receipt)
-
-    check = next(
-        item for item in report.checks if item.category == "scheduled_tasks"
-    )
+    check = _scheduled_task_check(report)
     assert check.status == "fail"
     assert "远程或未验证工作区未绑定本机目录 0/1" in check.detail_zh
 
 
 @pytest.mark.asyncio
 async def test_doctor_warns_when_source_reader_rejected_raw_definitions(
-    tmp_path: Path,
+    doctor_case,
 ) -> None:
-    task = _task(tmp_path)
-    job = build_imported_job("qoder", task)
-    workspace_dir = tmp_path / "workspace"
-    workspace_dir.mkdir()
-    receipt = _receipt(workspace_dir, task, discovered=2)
-    workspace = SimpleNamespace(
-        workspace_dir=workspace_dir,
-        cron_manager=_CronManager([job]),
-    )
-    inventory = ProviderInventory(
-        provider_id="qoder",
-        provider_name="Qoder",
-        detected=True,
-        scheduled_tasks=[task],
-        discovered_scheduled_task_count=2,
+    case = doctor_case(discovered=2)
+    report = await run_migration_doctor(
+        case.workspace,
+        case.inventory,
+        case.receipt,
     )
 
-    report = await run_migration_doctor(workspace, inventory, receipt)
-
-    check = next(
-        item for item in report.checks if item.category == "scheduled_tasks"
-    )
+    check = _scheduled_task_check(report)
     assert check.status == "warning"
     assert "另有 1 个来源记录未进入可迁移定义" in check.detail_zh
     assert "已结束、已取消、损坏或规则无法等价转换" in check.detail_zh
@@ -199,60 +202,32 @@ async def test_doctor_warns_when_source_reader_rejected_raw_definitions(
 
 @pytest.mark.asyncio
 async def test_doctor_fails_if_imported_job_is_not_compatibility_ready(
-    tmp_path: Path,
+    doctor_case,
 ) -> None:
-    task = _task(tmp_path)
-    job = build_imported_job("qoder", task)
-    workspace_dir = tmp_path / "workspace"
-    workspace_dir.mkdir()
-    receipt = _receipt(workspace_dir, task, zone=None)
-    workspace = SimpleNamespace(
-        workspace_dir=workspace_dir,
-        cron_manager=_CronManager([job]),
-    )
-    inventory = ProviderInventory(
-        provider_id="qoder",
-        provider_name="Qoder",
-        detected=True,
-        scheduled_tasks=[task],
-        discovered_scheduled_task_count=1,
+    case = doctor_case(zone=None)
+    report = await run_migration_doctor(
+        case.workspace,
+        case.inventory,
+        case.receipt,
     )
 
-    report = await run_migration_doctor(workspace, inventory, receipt)
-
-    check = next(
-        item for item in report.checks if item.category == "scheduled_tasks"
-    )
+    check = _scheduled_task_check(report)
     assert check.status == "fail"
     assert "兼容清单确认已分类 0/1" in check.detail_zh
 
 
 @pytest.mark.asyncio
 async def test_doctor_fails_if_imported_job_loses_review_gate(
-    tmp_path: Path,
+    doctor_case,
 ) -> None:
-    task = _task(tmp_path)
-    job = build_imported_job("qoder", task)
-    job.meta["portability"]["requires_review"] = False
-    workspace_dir = tmp_path / "workspace"
-    workspace_dir.mkdir()
-    receipt = _receipt(workspace_dir, task)
-    workspace = SimpleNamespace(
-        workspace_dir=workspace_dir,
-        cron_manager=_CronManager([job]),
-    )
-    inventory = ProviderInventory(
-        provider_id="qoder",
-        provider_name="Qoder",
-        detected=True,
-        scheduled_tasks=[task],
-        discovered_scheduled_task_count=1,
+    case = doctor_case()
+    case.job.meta["portability"]["requires_review"] = False
+    report = await run_migration_doctor(
+        case.workspace,
+        case.inventory,
+        case.receipt,
     )
 
-    report = await run_migration_doctor(workspace, inventory, receipt)
-
-    check = next(
-        item for item in report.checks if item.category == "scheduled_tasks"
-    )
+    check = _scheduled_task_check(report)
     assert check.status == "fail"
-    assert "状态与 Goal 分区一致 0/1" in check.detail_zh
+    assert "状态与兼容分区一致 0/1" in check.detail_zh

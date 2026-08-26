@@ -127,7 +127,7 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
         warnings.append(
             "Qoder built-in IDE runtime, credentials and tool policies are "
             "not copied. Components of enabled third-party plugins enter "
-            "the compatibility Goal as one plugin asset for Agent review.",
+            "the compatibility workflow as one plugin asset for Agent review.",
         )
         if progress is not None:
             await progress(
