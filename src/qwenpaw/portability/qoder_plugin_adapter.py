@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
 
+from .content_plugin_wrapper import canonical_plugin_id
 from .models import SourcePlugin
 from .safe_files import (
     TreeLimits,
@@ -28,7 +28,6 @@ _PLUGIN_LIMITS = TreeLimits(
     files=_MAX_PLUGIN_FILES,
     bytes=_MAX_PLUGIN_BYTES,
 )
-_PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _QODER_NATIVE_PLUGIN_FEATURES = {
     "agents",
     "canvas",
@@ -278,12 +277,10 @@ def _qwenpaw_manifest(
     manifest: dict[str, Any],
     enabled: bool,
 ) -> dict[str, Any]:
-    plugin_id = _bounded_manifest_text(
-        manifest.get("name") or plugin.name,
-        128,
-    )
-    if not _PLUGIN_ID_RE.fullmatch(plugin_id):
-        raise ValueError("Qoder custom plugin name is unsafe")
+    try:
+        plugin_id = canonical_plugin_id(manifest, plugin.source_id)
+    except ValueError as exc:
+        raise ValueError("Qoder custom plugin name is unsafe") from exc
     descriptions = {}
     description_zh = manifest.get("descriptionZh")
     if isinstance(description_zh, str) and description_zh.strip():

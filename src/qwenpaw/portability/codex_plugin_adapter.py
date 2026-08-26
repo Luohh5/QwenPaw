@@ -4,17 +4,16 @@
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
 
+from .content_plugin_wrapper import canonical_plugin_id
 from .models import SourcePlugin
 from .skill_transfer import read_bounded_tree, write_tree_entry
 
 ADAPTER = "codex_content_bundle_v1"
-_PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SOURCE_MANIFESTS = (
     Path(".codex-plugin/plugin.json"),
     Path(".claude-plugin/plugin.json"),
@@ -101,9 +100,10 @@ def _qwenpaw_manifest(
     manifest: dict[str, Any],
     enabled: bool,
 ) -> dict[str, Any]:
-    plugin_id = _text(manifest.get("name") or plugin.name, 128)
-    if not _PLUGIN_ID_RE.fullmatch(plugin_id):
-        raise ValueError("Codex plugin name is unsafe")
+    try:
+        plugin_id = canonical_plugin_id(manifest, plugin.source_id)
+    except ValueError as exc:
+        raise ValueError("Codex plugin name is unsafe") from exc
     interface = manifest.get("interface")
     display_name = (
         interface.get("displayName") if isinstance(interface, dict) else ""
