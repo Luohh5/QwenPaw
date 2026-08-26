@@ -20,6 +20,16 @@ class TreeLimits:
     bytes: int
 
 
+class TreeLimitError(ValueError):
+    """An aggregate tree budget was exhausted."""
+
+    def __init__(self, kind: str, path: Path, limit: int) -> None:
+        self.kind = kind
+        self.path = path
+        self.limit = limit
+        super().__init__(f"source exceeds the {kind} safety limit: {path}")
+
+
 @dataclass
 class TreeBudget:
     """Mutable counters that may be shared across several tree walks."""
@@ -27,6 +37,29 @@ class TreeBudget:
     entries: int = 0
     files: int = 0
     bytes: int = 0
+
+    def add_entry(self, path: Path, limits: TreeLimits) -> None:
+        """Account for one directory entry or rejected marker."""
+        self.entries += 1
+        if self.entries > limits.entries:
+            raise TreeLimitError("entry", path, limits.entries)
+
+    def add(
+        self,
+        path: Path,
+        info: os.stat_result,
+        limits: TreeLimits,
+    ) -> None:
+        """Account for one lstat result against aggregate limits."""
+        self.add_entry(path, limits)
+        if not stat.S_ISREG(info.st_mode):
+            return
+        self.files += 1
+        self.bytes += info.st_size
+        if self.files > limits.files:
+            raise TreeLimitError("file", path, limits.files)
+        if info.st_size < 0 or self.bytes > limits.bytes:
+            raise TreeLimitError("byte", path, limits.bytes)
 
 
 @dataclass(frozen=True)
@@ -71,25 +104,6 @@ def _identity(info: os.stat_result) -> tuple[int, ...]:
 
 def _unsafe(path: Path, reason: str) -> ValueError:
     return ValueError(f"unsafe portable file {path}: {reason}")
-
-
-def _add_entry(
-    budget: TreeBudget,
-    limits: TreeLimits,
-    path: Path,
-    info: os.stat_result,
-) -> None:
-    budget.entries += 1
-    if budget.entries > limits.entries:
-        raise ValueError(f"source exceeds the entry safety limit: {path}")
-    if not stat.S_ISREG(info.st_mode):
-        return
-    budget.files += 1
-    budget.bytes += info.st_size
-    if budget.files > limits.files:
-        raise ValueError(f"source exceeds the file safety limit: {path}")
-    if info.st_size < 0 or budget.bytes > limits.bytes:
-        raise ValueError(f"source exceeds the byte safety limit: {path}")
 
 
 def _within(path: Path, root: Path) -> None:
@@ -169,7 +183,7 @@ def read_regular_file(
     return data
 
 
-def walk_tree(  # pylint: disable=too-many-arguments
+def walk_tree(  # pylint: disable=too-many-arguments,too-many-branches
     source: Path,
     *,
     limits: TreeLimits,
@@ -188,19 +202,26 @@ def walk_tree(  # pylint: disable=too-many-arguments
     root = source.resolve(strict=True)
     counters = budget or TreeBudget()
     if include_root:
-        _add_entry(counters, limits, root, root_info)
-        yield TreeSourceEntry(root, Path(), root_info)
-
-    pending = [root]
+        counters.add(root, root_info, limits)
+    pending = [TreeSourceEntry(root, Path(), root_info)]
     while pending:
-        directory = pending.pop()
-        _within(directory, root)
+        current = pending.pop()
+        if current.relative == Path():
+            if include_root:
+                yield current
+        else:
+            yield current
+        if not current.is_dir or (
+            current.relative != Path() and current.path.name in excluded_dirs
+        ):
+            continue
+        _within(current.path, root)
         children: list[TreeSourceEntry] = []
-        with os.scandir(directory) as iterator:
+        with os.scandir(current.path) as iterator:
             for item in iterator:
                 path = Path(item.path)
                 info = item.stat(follow_symlinks=False)
-                _add_entry(counters, limits, path, info)
+                counters.add(path, info, limits)
                 entry = TreeSourceEntry(path, path.relative_to(root), info)
                 if stat.S_ISLNK(info.st_mode):
                     if unsafe == "raise":
@@ -215,16 +236,14 @@ def walk_tree(  # pylint: disable=too-many-arguments
                 _within(path, root)
                 children.append(entry)
         children.sort(key=lambda entry: entry.relative.as_posix())
-        for entry in children:
-            if entry.is_dir and entry.path.name not in excluded_dirs:
-                pending.append(entry.path)
-            yield entry
+        pending.extend(reversed(children))
 
 
 def read_tree(
     source: Path,
     *,
     limits: TreeLimits,
+    budget: TreeBudget | None = None,
     required_file: str = "",
 ) -> Iterator[TreeEntry]:
     """Snapshot one bounded, link-free source tree."""
@@ -240,7 +259,7 @@ def read_tree(
             ) from exc
         if not stat.S_ISREG(info.st_mode):
             raise ValueError(f"portable source has no {required_file}")
-    for entry in walk_tree(source, limits=limits):
+    for entry in walk_tree(source, limits=limits, budget=budget):
         if entry.is_dir:
             yield TreeEntry(entry.relative, 0o700)
         else:
@@ -267,6 +286,7 @@ def write_tree_entry(root: Path, entry: TreeEntry) -> None:
 __all__ = [
     "TreeBudget",
     "TreeEntry",
+    "TreeLimitError",
     "TreeLimits",
     "TreeSourceEntry",
     "open_regular_file",

@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 
 from qwenpaw.portability.safe_files import (
+    TreeBudget,
+    TreeLimitError,
     TreeLimits,
     read_tree,
     write_tree_entry,
@@ -77,3 +79,20 @@ def test_tree_snapshot_enforces_each_aggregate_limit(
 
     with pytest.raises(ValueError, match=message):
         list(read_tree(source, limits=limits))
+
+
+def test_tree_budget_is_shared_across_multiple_roots(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "one.txt").write_bytes(b"123")
+    (second / "two.txt").write_bytes(b"456")
+    limits = TreeLimits(entries=10, files=10, bytes=5)
+    budget = TreeBudget()
+
+    list(read_tree(first, limits=limits, budget=budget))
+    with pytest.raises(TreeLimitError) as caught:
+        list(read_tree(second, limits=limits, budget=budget))
+
+    assert caught.value.kind == "byte"
