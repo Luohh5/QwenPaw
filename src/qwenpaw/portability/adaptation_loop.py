@@ -246,67 +246,6 @@ class ActiveAdaptationContext:
             excerpt += tail.decode("utf-8", errors="replace")
         return redact_sensitive_text(excerpt)
 
-    async def list_assets(
-        self,
-        *,
-        zone: str = "",
-        offset: int = 0,
-    ) -> dict[str, Any]:
-        async with self._lock:
-            self._consume()
-            manifest = load_manifest(self.store.path)
-            items = manifest.assets
-            if zone:
-                items = manifest.by_zone(AssetZone(zone))
-            start = max(0, offset)
-            selected = items[start:][:50]
-            return {
-                "ok": True,
-                "counts": counts(manifest),
-                "next_asset": (
-                    manifest.next_asset.asset_key
-                    if manifest.next_asset is not None
-                    else None
-                ),
-                "tool_calls": self.tool_calls,
-                "tool_budget": self.total_tool_budget,
-                "assets": [
-                    {
-                        "asset_key": item.asset_key,
-                        "type": item.asset_type.value,
-                        "name": item.name,
-                        "zone": item.zone.value,
-                        "reason": item.reason,
-                        "tested": item.test_is_current,
-                        "inspected": item.inspected,
-                        "content_reviewed": item.content_reviewed,
-                        "plugin_disposition": (
-                            item.plugin_disposition.value
-                            if item.plugin_disposition
-                            else None
-                        ),
-                        "tool_calls": item.tool_calls,
-                        "tool_budget": item.tool_budget,
-                        "components": [
-                            {
-                                "id": component.component_id,
-                                "kind": component.kind,
-                                "paths": component.paths,
-                                "read": component.read_paths,
-                                "verdict": component.verdict,
-                            }
-                            for component in item.components
-                        ],
-                        "test_passed": (
-                            item.last_test.passed
-                            if item.test_is_current and item.last_test
-                            else None
-                        ),
-                    }
-                    for item in selected
-                ],
-            }
-
     async def inspect_asset(self, key: str) -> dict[str, Any]:
         async with self._lock:
             self._consume(key)

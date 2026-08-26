@@ -153,39 +153,6 @@ class CompatibilityManifest(BaseModel):
     def by_zone(self, zone: AssetZone) -> list[CompatibilityAsset]:
         return [item for item in self.assets if item.zone is zone]
 
-    @property
-    def goal_complete(self) -> bool:
-        return not self.by_zone(AssetZone.STAGING) and not self.by_zone(
-            AssetZone.REPAIR,
-        )
-
-    @property
-    def next_asset(self) -> CompatibilityAsset | None:
-        all_staging = self.by_zone(AssetZone.STAGING)
-        staging = [item for item in all_staging if not item.budget_exhausted]
-        if staging:
-            return staging[0]
-        if all_staging:
-            return None
-        repair = [
-            item
-            for item in self.by_zone(AssetZone.REPAIR)
-            if not item.budget_exhausted
-        ]
-        if not repair:
-            return None
-        return min(
-            repair,
-            key=lambda item: (
-                not bool(
-                    item.test_is_current
-                    and item.last_test
-                    and item.last_test.passed,
-                ),
-                item.repair_rounds,
-            ),
-        )
-
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)

@@ -31,7 +31,6 @@
   "adaptation_summary": "adaptation/summary.md",
   "adaptation_counts": {"migrate": 4, "repair": 0, "discard": 0, "staging": 0},
   "warnings": ["fixture warning"],
-  "backend_changed": false,
   "doctor_report": {
     "status": "pass",
     "summary_zh": "迁移结果已通过检查。",

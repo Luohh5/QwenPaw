@@ -79,7 +79,7 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
         progress: ProgressReporter | None = None,
     ) -> ProviderInventory:
         """Discover and normalize local Qoder JSONL sessions."""
-        discovery = await asyncio.gather(
+        discovery: Any = await asyncio.gather(
             asyncio.to_thread(discover_qoder_memory, self._qoder_home),
             asyncio.to_thread(discover_qoder_plugins, self._qoder_home),
             asyncio.to_thread(discover_qoder_skills, self._qoder_home),
@@ -127,7 +127,7 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
         warnings.append(
             "Qoder built-in IDE runtime, credentials and tool policies are "
             "not copied. Components of enabled third-party plugins enter "
-            "the compatibility Goal as one plugin asset for Agent review.",
+            "compatibility review as one plugin asset.",
         )
         if progress is not None:
             await progress(

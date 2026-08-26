@@ -45,7 +45,7 @@ def test_build_imported_job_is_stable_disabled_and_safe(tmp_path) -> None:
     assert first.meta["portability"]["requires_review"] is True
 
 
-def test_goal_approved_job_is_enabled_without_review_gate(tmp_path) -> None:
+def test_mission_approved_job_is_enabled_without_review_gate(tmp_path) -> None:
     task = SourceScheduledTask(
         source_id="approved",
         name="Approved",

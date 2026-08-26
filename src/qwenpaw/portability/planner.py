@@ -379,8 +379,6 @@ def _asset(
     action: str,
     fidelity: str,
     reason_zh: str,
-    *,
-    default_enabled: bool = False,
 ) -> MigrationAssetPlan:
     return MigrationAssetPlan(
         asset_type=asset_type,
@@ -388,7 +386,6 @@ def _asset(
         name=name,
         action=action,
         fidelity=fidelity,
-        default_enabled=default_enabled,
         reason_zh=reason_zh,
     )
 
@@ -460,9 +457,9 @@ async def build_migration_plan(
                 "skill",
                 skill.source_id,
                 skill.name,
-                "agent_goal_test_and_adapt",
+                "agent_mission_test_and_adapt",
                 "agent_decision",
-                "进入安全暂存区，由 Agent 语义判断，必要时再由兼容性 Goal 修复。",
+                "进入安全暂存区，由 Agent 语义判断，必要时再由兼容流程修复。",
             ),
         )
 
@@ -472,9 +469,9 @@ async def build_migration_plan(
                 "mcp",
                 server.source_id,
                 server.name,
-                "agent_goal_test_and_adapt",
+                "agent_mission_test_and_adapt",
                 "agent_decision",
-                "进入安全暂存区，由 Agent 语义判断，必要时再由兼容性 Goal 修复。",
+                "进入安全暂存区，由 Agent 语义判断，必要时再由兼容流程修复。",
             ),
         )
 
@@ -517,9 +514,9 @@ async def build_migration_plan(
                 "plugin",
                 plugin.source_id,
                 plugin.name,
-                "agent_goal_test_and_adapt",
+                "agent_mission_test_and_adapt",
                 "agent_decision",
-                "进入安全暂存区，由 Agent 判断整体可用性，必要时再启动修复 Goal。",
+                "进入安全暂存区，由 Agent 判断整体可用性，必要时再启动兼容修复。",
             ),
         )
 
@@ -529,9 +526,9 @@ async def build_migration_plan(
                 "scheduled_task",
                 task.source_id,
                 task.name,
-                "agent_goal_test_and_adapt",
+                "agent_mission_test_and_adapt",
                 "agent_decision",
-                "进入安全暂存区，由 Agent 语义判断，必要时再由修复 Goal 验证。",
+                "进入安全暂存区，由 Agent 语义判断，必要时再由兼容流程验证。",
             ),
         )
 

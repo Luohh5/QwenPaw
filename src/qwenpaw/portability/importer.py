@@ -388,7 +388,7 @@ class ProviderImportService(ImportPlanningMixin):
                         )
             if installed_plugins:
                 warnings.append(
-                    "兼容性 Goal 批准的插件已通过 QwenPaw 原生安装流程"
+                    "兼容流程批准的插件已通过 QwenPaw 原生安装流程"
                     "写入；外部内容插件使用 QwenPaw 生成的原生包装器。"
                     "需要时请在迁移后重载智能体。",
                 )

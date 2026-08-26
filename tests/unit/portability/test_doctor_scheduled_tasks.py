@@ -255,4 +255,4 @@ async def test_doctor_fails_if_imported_job_loses_review_gate(
         item for item in report.checks if item.category == "scheduled_tasks"
     )
     assert check.status == "fail"
-    assert "状态与 Goal 分区一致 0/1" in check.detail_zh
+    assert "状态与兼容分区一致 0/1" in check.detail_zh

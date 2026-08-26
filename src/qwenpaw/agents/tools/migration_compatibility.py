@@ -36,15 +36,6 @@ _COMMON = {
 
 
 @tool_descriptor(
-    name="migration_compat_list",
-    description="List assets by migration compatibility zone.",
-    **_COMMON,
-)
-async def migration_compat_list(zone: str = "", offset: int = 0) -> str:
-    return await _invoke("list_assets", zone=zone, offset=offset)
-
-
-@tool_descriptor(
     name="migration_compat_inspect",
     description="Inspect one staged asset and current QwenPaw capabilities.",
     **_COMMON,
@@ -134,7 +125,6 @@ async def migration_compat_classify(
 
 
 MIGRATION_COMPAT_TOOL_NAMES = (
-    "migration_compat_list",
     "migration_compat_inspect",
     "migration_compat_read_file",
     "migration_compat_write_file",

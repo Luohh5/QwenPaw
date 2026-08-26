@@ -55,7 +55,6 @@ def test_four_zone_workflow_requires_current_passing_test(
 
     store.record_test("demo", passed=True, summary="native loader passed")
     manifest = store.classify("demo", AssetZone.MIGRATE, "works")
-    assert manifest.goal_complete
     assert manifest.by_zone(AssetZone.MIGRATE)[0].revision == 1
 
 
@@ -70,7 +69,7 @@ def test_semantic_triage_can_discard_without_static_test(
     )
     store.record_inspection("demo")
     manifest = store.classify("demo", AssetZone.DISCARD, "QwenPaw has it")
-    assert manifest.goal_complete
+    assert manifest.by_zone(AssetZone.DISCARD)
     with pytest.raises(RuntimeError, match="repair zone"):
         store.record_test("demo", passed=True, summary="irrelevant")
 
@@ -84,10 +83,10 @@ def test_hard_stop_preserves_unreviewed_staging_items(
         source="codex",
         skills=[_skill(tmp_path)],
     )
-    manifest = store.finish(stopped=True, reason="goal limit")
+    manifest = store.finish(stopped=True, reason="mission limit")
     assert manifest.state is RunState.STOPPED_LIMIT
     assert manifest.assets[0].zone is AssetZone.STAGING
-    assert manifest.stop_reason == "goal limit"
+    assert manifest.stop_reason == "mission limit"
 
 
 def test_exhausted_staging_asset_is_not_reclassified_as_repair(
@@ -103,7 +102,6 @@ def test_exhausted_staging_asset_is_not_reclassified_as_repair(
         store.consume("demo")
     asset = load_manifest(store.path).assets[0]
     assert asset.zone is AssetZone.STAGING
-    assert load_manifest(store.path).next_asset is None
 
 
 def test_asset_budget_reserves_final_classification_call(

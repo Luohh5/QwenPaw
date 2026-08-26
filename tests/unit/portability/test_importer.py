@@ -217,7 +217,7 @@ async def test_provider_imports_scheduled_tasks_disabled_and_idempotent(
 
 
 @pytest.mark.asyncio
-async def test_unfinished_goal_materializes_repair_items_disabled(
+async def test_unfinished_mission_materializes_repair_items_disabled(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1129,7 +1129,7 @@ async def test_provider_import_rejects_inline_mcp_argument_secret(
 
 
 @pytest.mark.asyncio
-async def test_dry_run_routes_inline_mcp_secret_to_agent_goal(
+async def test_dry_run_routes_inline_mcp_secret_to_agent_mission(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1155,9 +1155,9 @@ async def test_dry_run_routes_inline_mcp_secret_to_agent_goal(
     plan = await ProviderImportService(workspace).plan_from("codex")
 
     action = next(item for item in plan.actions if item.asset_type == "mcp")
-    assert action.action == "agent_goal_test_and_adapt"
+    assert action.action == "agent_mission_test_and_adapt"
     assert action.fidelity == "agent_decision"
-    assert "兼容性 Mission" in action.reason_zh
+    assert "兼容流程" in action.reason_zh
 
 
 @pytest.mark.asyncio

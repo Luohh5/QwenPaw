@@ -217,7 +217,7 @@ def build_imported_job(
     if enabled:
         portability.update(
             promoted_at=datetime.now(timezone.utc).isoformat(),
-            promoted_by="compatibility_goal",
+            promoted_by="compatibility_mission",
         )
     return CronJobSpec.model_validate(
         {
