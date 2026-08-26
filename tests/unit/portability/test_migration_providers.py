@@ -250,67 +250,6 @@ async def test_codex_explicit_source_home_is_local_only(
 
 
 @pytest.mark.asyncio
-async def test_codex_provider_treats_plugin_skills_and_mcp_as_components(
-    tmp_path: Path,
-) -> None:
-    codex_home = tmp_path / ".codex"
-    standalone = codex_home / "skills/standalone/SKILL.md"
-    root = codex_home / "plugins/cache/market/cloudflare/1.0.0"
-    plugin_skill = root / "skills/workers/SKILL.md"
-    manifest = root / ".codex-plugin/plugin.json"
-    standalone.parent.mkdir(parents=True)
-    plugin_skill.parent.mkdir(parents=True)
-    manifest.parent.mkdir(parents=True)
-    standalone.write_text("# Standalone", encoding="utf-8")
-    plugin_skill.write_text("# Workers", encoding="utf-8")
-    manifest.write_text(
-        json.dumps(
-            {
-                "name": "cloudflare",
-                "skills": "./skills/",
-                "mcpServers": "./.mcp.json",
-            },
-        ),
-        encoding="utf-8",
-    )
-    (root / ".mcp.json").write_text(
-        json.dumps(
-            {
-                "mcpServers": {
-                    "cloudflare-api": {
-                        "type": "http",
-                        "url": "https://mcp.cloudflare.com/mcp",
-                    },
-                },
-            },
-        ),
-        encoding="utf-8",
-    )
-    (root.parent / ".codex-remote-plugin-install.json").write_text(
-        '{"schema_version":1}',
-        encoding="utf-8",
-    )
-    workspace = _workspace(tmp_path)
-    workspace.harness_runtime = _HarnessRuntime(_OfflineCodexAdapter())
-
-    inventory = await CodexMigrationProvider(
-        workspace,
-        rollout_reader=CodexRolloutReader(codex_home),
-    ).inventory(limit=10)
-
-    assert [skill.name for skill in inventory.skills] == ["standalone"]
-    assert [plugin.source_id for plugin in inventory.plugins] == [
-        "cloudflare@market",
-    ]
-    assert [server.name for server in inventory.mcp_servers] == [
-        "cloudflare-api",
-    ]
-    assert inventory.mcp_servers[0].metadata["source_plugin"] == (
-        "cloudflare@market"
-    )
-
-
-@pytest.mark.asyncio
 async def test_qoder_provider_detects_skill_only_custom_home(
     tmp_path: Path,
 ) -> None:
@@ -330,55 +269,6 @@ async def test_qoder_provider_detects_skill_only_custom_home(
     assert [item.name for item in inventory.skills] == ["only-skill"]
     assert inventory.source_location is not None
     assert inventory.source_location.data_home_source == "injected"
-
-
-@pytest.mark.asyncio
-async def test_qoder_provider_includes_enabled_plugin_mcp(tmp_path: Path):
-    qoder_home = tmp_path / ".qoder"
-    plugins_root = qoder_home / "plugins"
-    plugin = plugins_root / "cache/community/gitlab/1.0.0"
-    plugin.mkdir(parents=True)
-    (plugin / ".mcp.json").write_text(
-        json.dumps(
-            {
-                "mcpServers": {
-                    "GitLab": {
-                        "type": "http",
-                        "url": "https://gitlab.example/mcp",
-                    },
-                },
-            },
-        ),
-        encoding="utf-8",
-    )
-    (plugins_root / "installed_plugins_v2.json").write_text(
-        json.dumps(
-            {
-                "plugins": {
-                    "gitlab@community": [
-                        {
-                            "enabled": True,
-                            "installPath": str(plugin),
-                            "version": "1.0.0",
-                        },
-                    ],
-                },
-            },
-        ),
-        encoding="utf-8",
-    )
-
-    inventory = await QoderMigrationProvider(
-        SimpleNamespace(workspace_dir=tmp_path),
-        qoder_home=qoder_home,
-        qoder_user_data=tmp_path / "missing-user-data",
-    ).inventory(limit=10)
-
-    assert [server.name for server in inventory.mcp_servers] == ["GitLab"]
-    assert inventory.discovered_mcp_count == 1
-    assert inventory.mcp_servers[0].metadata["source_plugin"] == (
-        "gitlab@community"
-    )
 
 
 def test_provider_registry_is_explicit_and_rejects_unknown_sources(

@@ -52,6 +52,13 @@ class _Provider:
         return self._inventory
 
 
+def _bind_inventory(monkeypatch, inventory: ProviderInventory) -> None:
+    monkeypatch.setattr(
+        "qwenpaw.portability.importer.create_migration_provider",
+        lambda _source, _workspace: _Provider(inventory),
+    )
+
+
 def _mock_adaptation(
     monkeypatch,
     workspace,
@@ -188,10 +195,7 @@ async def test_provider_imports_scheduled_tasks_disabled_and_idempotent(
         ],
         discovered_scheduled_task_count=1,
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
     first = await ProviderImportService(workspace).import_from("codex")
@@ -253,10 +257,7 @@ async def test_unfinished_mission_materializes_repair_items_disabled(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory, status="stopped_limit")
 
     receipt = await ProviderImportService(workspace).import_from("codex")
@@ -318,10 +319,7 @@ async def test_migrate_zone_materializes_and_enables_assets(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
     async def _approved(*_args, **_kwargs):
@@ -384,10 +382,7 @@ async def test_import_repairs_unreviewed_invalid_legacy_scheduled_task(
         update={"cron": "99 99 * * *"},
     )
     workspace.cron_manager.jobs[ghost.id] = ghost
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
     receipt = await ProviderImportService(workspace).import_from("codex")
@@ -434,10 +429,7 @@ async def test_import_repairs_missing_review_gate_on_valid_legacy_task(
         },
     )
     workspace.cron_manager.jobs[legacy.id] = legacy
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
     receipt = await ProviderImportService(workspace).import_from("codex")
@@ -475,10 +467,7 @@ async def test_failed_import_restores_invalid_legacy_scheduled_task(
         update={"cron": "99 99 * * *"},
     )
     workspace.cron_manager.jobs[ghost.id] = ghost
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
 
     async def _fail_receipt(*_args, **_kwargs):
         raise OSError("receipt unavailable")
@@ -540,10 +529,7 @@ async def test_provider_import_is_additive_and_idempotent(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
 
     first = await ProviderImportService(workspace).import_from("codex")
     second = await ProviderImportService(workspace).import_from("codex")
@@ -594,10 +580,7 @@ async def test_dry_run_plan_can_be_revalidated_and_applied(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
     service = ProviderImportService(workspace)
 
     plan = await service.plan_from("codex")
@@ -656,10 +639,7 @@ async def test_apply_plan_refuses_changed_source_files(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
     service = ProviderImportService(workspace)
     plan = await service.plan_from("codex")
     memory.write_text("version two", encoding="utf-8")
@@ -702,10 +682,7 @@ async def test_qoder_reimport_archives_internal_traces_from_old_import(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
 
     await ProviderImportService(workspace).import_from("qoder")
     inventory.sessions = []
@@ -746,10 +723,7 @@ async def test_codex_reimport_archives_previously_imported_guardian_chat(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
 
     await ProviderImportService(workspace).import_from("codex")
     inventory.sessions = []
@@ -786,10 +760,7 @@ async def test_provider_import_reports_progress(tmp_path, monkeypatch):
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
     updates: list[str] = []
 
     async def _progress(message: str) -> None:
@@ -814,10 +785,7 @@ async def test_provider_not_detected_does_not_write(tmp_path, monkeypatch):
         detected=False,
         warnings=["not installed"],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
 
     with pytest.raises(ValueError, match="not found"):
         await ProviderImportService(workspace).import_from("codex")
@@ -848,10 +816,7 @@ async def test_concurrent_imports_are_serialized_and_do_not_duplicate(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
 
     first, second = await asyncio.gather(
         ProviderImportService(workspace).import_from("codex"),
@@ -891,10 +856,7 @@ async def test_provider_skill_symbolic_link_is_skipped(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
 
     receipt = await ProviderImportService(workspace).import_from("codex")
 
@@ -931,10 +893,7 @@ async def test_provider_skill_uses_existing_scanner_and_stays_disabled(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
     receipt = await ProviderImportService(workspace).import_from("codex")
@@ -971,10 +930,7 @@ async def test_provider_import_persists_disabled_mcp_with_encrypted_secret(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
     first = await ProviderImportService(workspace).import_from("codex")
@@ -1024,10 +980,7 @@ async def test_provider_import_encrypts_even_public_named_mcp_bindings(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
     receipt = await ProviderImportService(workspace).import_from("codex")
@@ -1108,10 +1061,7 @@ async def test_provider_import_rejects_inline_mcp_argument_secret(
         discovered_mcp_count=1,
         mcp_servers=[server],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
 
     receipt = await ProviderImportService(workspace).import_from("codex")
 
@@ -1147,10 +1097,7 @@ async def test_dry_run_routes_inline_mcp_secret_to_agent_mission(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
 
     plan = await ProviderImportService(workspace).plan_from("codex")
 
@@ -1183,10 +1130,7 @@ async def test_provider_import_sets_and_repairs_source_project_directory(
         detected=True,
         sessions=[session],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
 
     await ProviderImportService(workspace).import_from("codex")
     session.cwd = str(project)
@@ -1225,10 +1169,7 @@ async def test_provider_memory_is_scoped_exact_and_idempotent(
         detected=True,
         memory_projects=[project],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
 
     first = await ProviderImportService(workspace).import_from("codex")
     second = await ProviderImportService(workspace).import_from("codex")
@@ -1299,10 +1240,7 @@ async def test_provider_plugin_restores_marketplace_then_native_installs(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
     receipt = await ProviderImportService(workspace).import_from("codex")
@@ -1352,10 +1290,7 @@ async def test_provider_plugin_never_falls_back_to_installed_cache(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
 
     receipt = await ProviderImportService(workspace).import_from("qoder")
 
@@ -1462,10 +1397,7 @@ async def test_qoder_custom_skill_plugin_uses_native_adapter(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
     receipt = await ProviderImportService(workspace).import_from("qoder")
@@ -1572,10 +1504,7 @@ async def test_codex_content_plugin_registers_skills_and_owned_mcp(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory, zone="migrate")
 
     receipt = await ProviderImportService(workspace).import_from("codex")
@@ -1690,10 +1619,7 @@ async def test_failed_receipt_rolls_back_memory_and_native_plugin(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory, zone="migrate")
 
     with pytest.raises(OSError, match="receipt storage unavailable"):
@@ -1767,10 +1693,7 @@ async def test_failed_receipt_rolls_back_all_core_asset_writers(
             ),
         ],
     )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
-    )
+    _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory, zone="migrate")
 
     async def _fail_receipt(*_args, **_kwargs):

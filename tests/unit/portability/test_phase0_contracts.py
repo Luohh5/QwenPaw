@@ -164,14 +164,37 @@ def _inventory_contract(inventory: Any) -> dict[str, Any]:
     }
 
 
-def _golden(name: str) -> dict[str, Any]:
-    path = _FIXTURES / "golden" / f"{name}-inventory.json"
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def _golden_json(name: str) -> dict[str, Any]:
     path = _FIXTURES / "golden" / name
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _content_plugins(
+    tmp_path: Path,
+    codex_name: str,
+    qoder_name: str,
+) -> tuple[SourcePlugin, SourcePlugin]:
+    codex_home = _copy_fixture(tmp_path, "codex-mini")
+    codex_source = codex_home / "plugins/cache/mini-market/expo/1.0.0"
+    qoder_home = _copy_fixture(tmp_path, "qoder-mini")
+    qoder_source = qoder_home / "plugins/custom/mini-plugin-0.1.0"
+    return (
+        SourcePlugin(
+            source_id="expo@mini-market",
+            name=codex_name,
+            marketplace="mini-market",
+            version="1.0.0",
+            install_source=str(codex_source),
+        ),
+        SourcePlugin(
+            source_id="mini-plugin@local-custom",
+            name=qoder_name,
+            marketplace="local-custom",
+            version="0.1.0",
+            install_source=str(qoder_source),
+            metadata={"canonical_plugin_source": str(qoder_source.resolve())},
+        ),
+    )
 
 
 def _four_zone_manifest() -> CompatibilityManifest:
@@ -240,7 +263,9 @@ async def test_codex_mini_home_matches_golden_inventory(
         source_home=codex_home,
     ).inventory(limit=20)
 
-    assert _inventory_contract(inventory) == _golden("codex-mini")
+    assert _inventory_contract(inventory) == _golden_json(
+        "codex-mini-inventory.json",
+    )
 
 
 @pytest.mark.asyncio
@@ -265,7 +290,9 @@ async def test_qoder_mini_home_matches_golden_inventory(
         qoder_user_data=user_data,
     ).inventory(limit=20)
 
-    assert _inventory_contract(inventory) == _golden("qoder-mini")
+    assert _inventory_contract(inventory) == _golden_json(
+        "qoder-mini-inventory.json",
+    )
 
 
 def test_four_zone_summary_matches_reviewed_contract(tmp_path: Path) -> None:
@@ -389,24 +416,10 @@ def test_generated_plugin_ids_do_not_depend_on_display_names(
     tmp_path: Path,
 ) -> None:
     """Display-name changes must not create a second generated plugin."""
-    codex_home = _copy_fixture(tmp_path, "codex-mini")
-    codex_source = codex_home / "plugins/cache/mini-market/expo/1.0.0"
-    codex = SourcePlugin(
-        source_id="expo@mini-market",
-        name="Renamed Expo Display",
-        marketplace="mini-market",
-        version="1.0.0",
-        install_source=str(codex_source),
-    )
-    qoder_home = _copy_fixture(tmp_path, "qoder-mini")
-    qoder_source = qoder_home / "plugins/custom/mini-plugin-0.1.0"
-    qoder = SourcePlugin(
-        source_id="mini-plugin@local-custom",
-        name="Renamed Mini Plugin Display",
-        marketplace="local-custom",
-        version="0.1.0",
-        install_source=str(qoder_source),
-        metadata={"canonical_plugin_source": str(qoder_source.resolve())},
+    codex, qoder = _content_plugins(
+        tmp_path,
+        "Renamed Expo Display",
+        "Renamed Mini Plugin Display",
     )
 
     codex_staged = stage_codex_content_plugin(codex)
@@ -437,27 +450,13 @@ async def test_canonical_plugin_ids_block_duplicate_native_installs(
     tmp_path: Path,
 ) -> None:
     """Renamed Codex and Qoder sources must not create second plugins."""
-    codex_home = _copy_fixture(tmp_path, "codex-mini")
-    codex_source = codex_home / "plugins/cache/mini-market/expo/1.0.0"
-    first_codex = SourcePlugin(
-        source_id="expo@mini-market",
-        name="First display name",
-        marketplace="mini-market",
-        version="1.0.0",
-        install_source=str(codex_source),
+    first_codex, first_qoder = _content_plugins(
+        tmp_path,
+        "First display name",
+        "First Qoder display name",
     )
     second_codex = first_codex.model_copy(
         update={"name": "A different display name"},
-    )
-    qoder_home = _copy_fixture(tmp_path, "qoder-mini")
-    qoder_source = qoder_home / "plugins/custom/mini-plugin-0.1.0"
-    first_qoder = SourcePlugin(
-        source_id="mini-plugin@local-custom",
-        name="First Qoder display name",
-        marketplace="local-custom",
-        version="0.1.0",
-        install_source=str(qoder_source),
-        metadata={"canonical_plugin_source": str(qoder_source.resolve())},
     )
     second_qoder = first_qoder.model_copy(
         update={"name": "A different Qoder display name"},

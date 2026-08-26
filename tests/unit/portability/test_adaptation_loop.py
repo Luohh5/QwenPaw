@@ -5,6 +5,7 @@ import inspect
 from pathlib import Path
 import json
 import sys
+from textwrap import indent
 from types import SimpleNamespace
 
 import pytest
@@ -118,128 +119,100 @@ def _write_native_plugin(root: Path, backend: str) -> None:
     (root / "plugin.py").write_text(backend, encoding="utf-8")
 
 
-def test_native_plugin_test_uses_current_plugin_api_contract(
-    tmp_path: Path,
-) -> None:
-    _write_native_plugin(
-        tmp_path,
-        "async def command(ctx, args):\n"
-        "    return None\n\n"
-        "class NativePlugin:\n"
-        "    def register(self, api):\n"
-        "        api.register_slash_command(\n"
-        "            name='demo', async_handler=command)\n\n"
-        "plugin = NativePlugin()\n",
+def _native_backend(
+    registration: str,
+    *,
+    definitions: str = "",
+    register_args: str = "self, api",
+) -> str:
+    prefix = f"{definitions.rstrip()}\n\n" if definitions else ""
+    return (
+        f"{prefix}class NativePlugin:\n"
+        f"    def register({register_args}):\n"
+        f"{indent(registration.strip(), '        ')}\n\n"
+        "plugin = NativePlugin()\n"
     )
-
-    with pytest.raises(ValueError, match="unexpected keyword.*async_handler"):
-        CompatibilityTester._test_native_plugin(tmp_path)
 
 
 @pytest.mark.parametrize(
-    "handler",
-    [
-        "async def command(args):\n    return None\n",
-        "def command(ctx, args):\n    return None\n",
-    ],
-)
-def test_native_plugin_test_validates_slash_handler_signature(
-    tmp_path: Path,
-    handler: str,
-) -> None:
-    _write_native_plugin(
-        tmp_path,
-        handler + "\nclass NativePlugin:\n"
-        "    def register(self, api):\n"
-        "        api.register_slash_command('demo', command)\n\n"
-        "plugin = NativePlugin()\n",
-    )
-
-    with pytest.raises(ValueError, match="register_slash_command.handler"):
-        CompatibilityTester._test_native_plugin(tmp_path)
-
-
-def test_native_plugin_test_validates_every_plugin_api_call(
-    tmp_path: Path,
-) -> None:
-    _write_native_plugin(
-        tmp_path,
-        "class NativePlugin:\n"
-        "    def register(self, api):\n"
-        "        api.register_skill_provider('skills', True)\n\n"
-        "plugin = NativePlugin()\n",
-    )
-
-    with pytest.raises(ValueError, match="register_skill_provider"):
-        CompatibilityTester._test_native_plugin(tmp_path)
-
-
-def test_native_plugin_test_validates_register_invocation(tmp_path: Path):
-    _write_native_plugin(
-        tmp_path,
-        "class NativePlugin:\n"
-        "    def register(self, api, required):\n"
-        "        pass\n\n"
-        "plugin = NativePlugin()\n",
-    )
-
-    with pytest.raises(ValueError, match=r"callable as register\(api\)"):
-        CompatibilityTester._test_native_plugin(tmp_path)
-
-
-@pytest.mark.parametrize(
-    ("callback", "registration", "message"),
+    ("backend", "message"),
     [
         (
-            "def startup(required):\n    pass\n",
-            "api.register_startup_hook('start', startup)",
+            _native_backend(
+                "api.register_slash_command(\n"
+                "    name='demo', async_handler=command)",
+                definitions="async def command(ctx, args):\n    return None",
+            ),
+            "unexpected keyword.*async_handler",
+        ),
+        (
+            _native_backend(
+                "api.register_slash_command('demo', command)",
+                definitions="async def command(args):\n    return None",
+            ),
+            "register_slash_command.handler",
+        ),
+        (
+            _native_backend(
+                "api.register_slash_command('demo', command)",
+                definitions="def command(ctx, args):\n    return None",
+            ),
+            "register_slash_command.handler",
+        ),
+        (
+            _native_backend("api.register_skill_provider('skills', True)"),
+            "register_skill_provider",
+        ),
+        (
+            _native_backend("pass", register_args="self, api, required"),
+            r"callable as register\(api\)",
+        ),
+        (
+            _native_backend(
+                "api.register_startup_hook('start', startup)",
+                definitions="def startup(required):\n    pass",
+            ),
             "register_startup_hook.callback",
         ),
         (
-            "async def middleware(ctx, config):\n    pass\n",
-            "api.register_middleware(middleware)",
+            _native_backend(
+                "api.register_middleware(middleware)",
+                definitions="async def middleware(ctx, config):\n    pass",
+            ),
             "register_middleware.middleware_factory",
         ),
         (
-            "class Handler:\n"
-            "    command_name = '/demo'\n"
-            "    def handle(self, context):\n        pass\n",
-            "api.register_control_command(Handler())",
+            _native_backend(
+                "api.register_control_command(Handler())",
+                definitions=(
+                    "class Handler:\n"
+                    "    command_name = '/demo'\n"
+                    "    def handle(self, context):\n"
+                    "        pass"
+                ),
+            ),
             "register_control_command.handler",
+        ),
+        (
+            _native_backend(
+                "configure(api)",
+                definitions=(
+                    "def configure(api):\n"
+                    "    api.register_skill_provider('skills')"
+                ),
+            ),
+            "PluginApi value escapes",
         ),
     ],
 )
-def test_native_plugin_test_validates_other_callback_contracts(
+def test_native_plugin_rejects_invalid_registration_contract(
     tmp_path: Path,
-    callback: str,
-    registration: str,
+    backend: str,
     message: str,
 ) -> None:
-    _write_native_plugin(
-        tmp_path,
-        callback
-        + "\nclass NativePlugin:\n"
-        + "    def register(self, api):\n"
-        + f"        {registration}\n\n"
-        + "plugin = NativePlugin()\n",
-    )
+    _write_native_plugin(tmp_path, backend)
 
     with pytest.raises(ValueError, match=message):
-        CompatibilityTester._test_native_plugin(tmp_path)
-
-
-def test_native_plugin_test_rejects_untraceable_plugin_api_calls(tmp_path):
-    _write_native_plugin(
-        tmp_path,
-        "def configure(api):\n"
-        "    api.register_skill_provider('skills')\n\n"
-        "class NativePlugin:\n"
-        "    def register(self, api):\n"
-        "        configure(api)\n\n"
-        "plugin = NativePlugin()\n",
-    )
-
-    with pytest.raises(ValueError, match="PluginApi value escapes"):
         CompatibilityTester._test_native_plugin(tmp_path)
 
 
