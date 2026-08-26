@@ -4,19 +4,19 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
-import stat
 import tempfile
 from pathlib import Path
 from typing import Any
 
 from .models import SourcePlugin
+from .skill_transfer import (
+    read_bounded_tree,
+    read_regular_file,
+    write_tree_entry,
+)
 
-_MAX_PLUGIN_FILES = 5000
-_MAX_PLUGIN_ENTRIES = 6000
-_MAX_PLUGIN_BYTES = 64 * 1024 * 1024
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _QODER_NATIVE_PLUGIN_FEATURES = {
@@ -53,81 +53,14 @@ def _has_skill_directory(root: Path) -> bool:
     return False
 
 
-def _iter_regular_tree(root: Path):
-    """Yield a bounded tree without following links or buffering all paths."""
-    canonical = root.resolve(strict=True)
-    pending = [canonical]
-    entries = 0
-    files = 0
-    total = 0
-    while pending:
-        directory = pending.pop()
-        with os.scandir(directory) as iterator:
-            for directory_entry in iterator:
-                entries += 1
-                if entries > _MAX_PLUGIN_ENTRIES:
-                    raise ValueError(
-                        "Qoder custom plugin exceeds the 6,000 entry limit",
-                    )
-                path = Path(directory_entry.path)
-                if directory_entry.is_symlink():
-                    raise ValueError(
-                        f"Qoder custom plugin contains a link: {path}",
-                    )
-                resolved = path.resolve(strict=True)
-                if not resolved.is_relative_to(canonical):
-                    raise ValueError(
-                        f"Qoder custom plugin file escaped: {path}",
-                    )
-                if directory_entry.is_dir(follow_symlinks=False):
-                    pending.append(path)
-                    continue
-                if not directory_entry.is_file(follow_symlinks=False):
-                    raise ValueError(
-                        "Qoder custom plugin contains a non-regular entry: "
-                        f"{path}",
-                    )
-                before = directory_entry.stat(follow_symlinks=False)
-                files += 1
-                total += before.st_size
-                if files > _MAX_PLUGIN_FILES or total > _MAX_PLUGIN_BYTES:
-                    raise ValueError(
-                        "Qoder custom plugin exceeds the 5,000 file / "
-                        "64 MiB limit",
-                    )
-                yield path, before
-
-
-def _open_verified(path: Path, before: os.stat_result) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    opened = os.fstat(descriptor)
-    if not stat.S_ISREG(opened.st_mode) or (
-        opened.st_dev,
-        opened.st_ino,
-        opened.st_size,
-    ) != (before.st_dev, before.st_ino, before.st_size):
-        os.close(descriptor)
-        raise ValueError(f"Qoder custom plugin file changed: {path}")
-    return descriptor
-
-
 def _contains_qoder_bindings(skills_root: Path) -> bool:
-    for path, before in _iter_regular_tree(skills_root):
-        if before.st_size > 2 * 1024 * 1024:
+    for entry in read_bounded_tree(skills_root):
+        if entry.is_dir or len(entry.data or b"") > 2 * 1024 * 1024:
             continue
-        descriptor = -1
-        try:
-            descriptor = _open_verified(path, before)
-            with os.fdopen(descriptor, "rb") as stream:
-                descriptor = -1
-                content = stream.read(2 * 1024 * 1024 + 1).lower()
-        except OSError:
-            continue
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-        if any(marker in content for marker in _QODER_BINDING_MARKERS):
+        if any(
+            marker in (entry.data or b"").lower()
+            for marker in _QODER_BINDING_MARKERS
+        ):
             return True
     return False
 
@@ -242,25 +175,19 @@ def _validated_source(plugin: SourcePlugin) -> Path:
 def _read_qoder_manifest(source: Path) -> dict[str, Any]:
     path = source / ".qoder-plugin" / "plugin.json"
     try:
-        before = path.lstat()
+        encoded = read_regular_file(path, max_bytes=_MAX_MANIFEST_BYTES)
+    except ValueError as exc:
+        if "byte safety limit" in str(exc):
+            raise ValueError(
+                "Qoder custom plugin manifest exceeds 1 MiB",
+            ) from exc
+        raise ValueError(
+            "Qoder custom plugin manifest is unavailable",
+        ) from exc
     except OSError as exc:
         raise ValueError(
             "Qoder custom plugin manifest is unavailable",
         ) from exc
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-        raise ValueError("Qoder custom plugin manifest is unavailable")
-    if before.st_size > _MAX_MANIFEST_BYTES:
-        raise ValueError("Qoder custom plugin manifest exceeds 1 MiB")
-    descriptor = _open_verified(path, before)
-    try:
-        with os.fdopen(descriptor, "rb") as stream:
-            descriptor = -1
-            encoded = stream.read(_MAX_MANIFEST_BYTES + 1)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    if len(encoded) > _MAX_MANIFEST_BYTES:
-        raise ValueError("Qoder custom plugin manifest exceeds 1 MiB")
     manifest = json.loads(encoded.decode("utf-8"))
     if not isinstance(manifest, dict):
         raise ValueError("Qoder custom plugin manifest is invalid")
@@ -290,59 +217,25 @@ def _validated_skills_root(
 
 
 def _validate_source_tree(source: Path) -> None:
-    for _path, _before in _iter_regular_tree(source):
+    for _entry in read_bounded_tree(source):
         pass
 
 
 def _copy_skill_tree(source: Path, target: Path) -> None:
     """Copy only verified regular files into the generated wrapper."""
     target.mkdir(mode=0o700)
-    canonical = source.resolve(strict=True)
-    for path, before in _iter_regular_tree(canonical):
-        relative = path.relative_to(canonical)
-        output = target / relative
-        output.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-        descriptor = _open_verified(path, before)
-        try:
-            with os.fdopen(descriptor, "rb") as source_stream:
-                descriptor = -1
-                with output.open("xb") as target_stream:
-                    shutil.copyfileobj(
-                        source_stream,
-                        target_stream,
-                        length=1024 * 1024,
-                    )
-            os.chmod(
-                output,
-                0o700 if before.st_mode & stat.S_IXUSR else 0o600,
-            )
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
+    for entry in read_bounded_tree(source):
+        write_tree_entry(target, entry)
 
 
 def _copy_optional_readme(source: Path, target: Path) -> None:
     """Copy one optional README through the same no-follow boundary."""
     try:
-        before = source.lstat()
+        data = read_regular_file(source)
     except FileNotFoundError:
         return
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-        raise ValueError("Qoder custom plugin README is not a regular file")
-    descriptor = _open_verified(source, before)
-    try:
-        with os.fdopen(descriptor, "rb") as source_stream:
-            descriptor = -1
-            with target.open("xb") as target_stream:
-                shutil.copyfileobj(
-                    source_stream,
-                    target_stream,
-                    length=1024 * 1024,
-                )
-        os.chmod(target, 0o600)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+    target.write_bytes(data)
+    target.chmod(0o600)
 
 
 def _plugin_backend(enabled: bool) -> str:
