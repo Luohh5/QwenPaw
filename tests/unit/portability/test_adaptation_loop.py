@@ -815,6 +815,7 @@ async def test_static_failure_keeps_remote_plugin_in_repair(
     )
     result = await run_adaptation_loop(workspace, inventory, "migration-3")
     assert result.status == "stopped_limit"
+    assert result.counts["repair"] == 1
     assert result.asset_zones["plugins:remote"] == "repair"
     assert "每项最多 4 次尝试" in result.summary_path.read_text(
         encoding="utf-8",
@@ -1192,6 +1193,10 @@ async def test_mission_repairs_assets_in_parallel_with_isolated_scope(
         "migration-parallel",
     )
     assert result.status == "completed"
+    assert result.asset_zones == {
+        "skills:first": "migrate",
+        "skills:second": "migrate",
+    }
     assert workspace.max_active_queries == 2
     phases = [
         item.request_context["portability_phase"]

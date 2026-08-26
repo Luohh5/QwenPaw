@@ -23,6 +23,7 @@ from .adaptation_phase import (
     TRIAGE_PHASE,
     AccessBinding,
     AdaptationAccessGuard,
+    PhaseOutcome,
     PhaseRunner,
 )
 from .adaptation_staging import component_map, stage_local_assets
@@ -537,7 +538,7 @@ async def _triage_assets(
     runner: PhaseRunner,
     context: ActiveAdaptationContext,
     warnings: list[str],
-) -> None:
+) -> PhaseOutcome:
     keys = [
         item.asset_key
         for item in load_manifest(context.store.path).by_zone(
@@ -548,6 +549,16 @@ async def _triage_assets(
         keys,
         lambda key: _triage_asset(runner, context, key, warnings),
     )
+    remaining = len(
+        load_manifest(context.store.path).by_zone(AssetZone.STAGING),
+    )
+    if not remaining:
+        return PhaseOutcome(completed=True)
+    if context.tool_calls >= context.total_tool_budget:
+        reason = f"第一阶段达到总工具调用上限（{context.total_tool_budget} 次）。"
+    else:
+        reason = f"第一阶段仍有 {remaining} 项未完成语义判断。"
+    return PhaseOutcome(False, remaining, reason)
 
 
 async def _repair_asset(
@@ -575,7 +586,7 @@ async def _repair_with_mission(
     context: ActiveAdaptationContext,
     root: Path,
     warnings: list[str],
-) -> str:
+) -> PhaseOutcome:
     mode = _mission_mode(workspace)
     max_attempts = mode.max_retries_per_story + 1
     session_id = f"migration-mission:{secrets.token_urlsafe(24)}"
@@ -614,14 +625,18 @@ async def _repair_with_mission(
             manifest = load_manifest(context.store.path)
             await run_sync_io(sync_mission, loop_dir, manifest)
             if await mission.check():
-                return ""
+                return PhaseOutcome(completed=True)
         manifest = load_manifest(context.store.path)
         await run_sync_io(sync_mission, loop_dir, manifest, stopped=True)
         await mission.check()
         remaining = len(manifest.by_zone(AssetZone.REPAIR))
-        return (
-            f"兼容性修复 Mission 已达到每项最多 {max_attempts} 次尝试，"
-            f"仍有 {remaining} 项未通过原生检查。"
+        return PhaseOutcome(
+            completed=False,
+            remaining=remaining,
+            reason=(
+                f"兼容性修复 Mission 已达到每项最多 {max_attempts} 次尝试，"
+                f"仍有 {remaining} 项未通过原生检查。"
+            ),
         )
 
 
@@ -684,18 +699,10 @@ async def run_adaptation_loop(
         progress,
         f"两阶段共享 {context.total_tool_budget} 次工具调用；" + "不设总时长限制，推理上限按剩余预算动态分配。",
     )
-    stopped_reason = ""
-    await _triage_assets(runner, context, warnings)
+    outcome = await _triage_assets(runner, context, warnings)
+    stopped_reason = outcome.reason
 
-    manifest = load_manifest(store.path)
-    staging = manifest.by_zone(AssetZone.STAGING)
-    if staging and not stopped_reason:
-        if context.tool_calls >= context.total_tool_budget:
-            stopped_reason = f"第一阶段达到总工具调用上限（{context.total_tool_budget} 次）。"
-        else:
-            stopped_reason = f"第一阶段仍有 {len(staging)} 项未完成语义判断。"
-
-    if not staging and not stopped_reason:
+    if outcome.completed:
         manifest = load_manifest(store.path)
         if manifest.by_zone(AssetZone.REPAIR):
             await _report(
@@ -703,14 +710,15 @@ async def run_adaptation_loop(
                 "第一阶段完成，安全暂存区已清空；正在启动 QwenPaw " + "Mission 并行进行兼容性测试与修复…",
             )
             try:
-                stopped_reason = await _repair_with_mission(
+                outcome = await _repair_with_mission(
                     workspace,
                     runner,
                     context,
                     root,
                     warnings,
                 )
-                if stopped_reason:
+                stopped_reason = outcome.reason
+                if not outcome.completed:
                     warnings.append(stopped_reason)
             except Exception as exc:  # pylint: disable=broad-except
                 stopped_reason = (
