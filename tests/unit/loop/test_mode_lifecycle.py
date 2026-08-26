@@ -136,12 +136,28 @@ async def test_internal_mission_uses_native_prd_gate(tmp_path):
     }
     write_prd_json(tmp_path, prd)
 
-    mode.start_internal_mission("migration-mission", tmp_path)
-    assert not await mode.check_internal_mission("migration-mission")
-    prd["userStories"][0]["passes"] = True
-    write_prd_json(tmp_path, prd)
-    assert await mode.check_internal_mission("migration-mission")
-    mode.finish_internal_mission("migration-mission")
+    with mode.internal_mission("migration-mission", tmp_path) as mission:
+        assert not await mission.check()
+        prd["userStories"][0]["passes"] = True
+        write_prd_json(tmp_path, prd)
+        assert await mission.check()
+
+
+def test_internal_mission_cleans_gate_after_error(tmp_path):
+    mode = MissionMode()
+    write_loop_config(tmp_path, {"current_phase": "execution"})
+    write_prd_json(tmp_path, {"userStories": []})
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        with mode.internal_mission("migration-mission", tmp_path):
+            raise RuntimeError("worker failed")
+
+    with patch(
+        "qwenpaw.loop.gates.loop_gate._session_id",
+        return_value="migration-mission",
+    ):
+        assert mode._gate is not None
+        assert mode._gate._state() is None
 
 
 @pytest.mark.asyncio

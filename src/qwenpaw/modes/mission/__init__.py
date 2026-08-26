@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -31,6 +33,20 @@ if TYPE_CHECKING:
     from .gates import MissionGate
 
 logger = logging.getLogger(__name__)
+
+
+class _InternalMission:
+    """Small scoped facade over the native Mission gate."""
+
+    def __init__(self, gate: "MissionGate", session_id: str) -> None:
+        self._gate = gate
+        self._session_id = session_id
+
+    async def check(self) -> bool:
+        """Return whether the native Mission gate accepts its PRD."""
+        with scoped_session_id(self._session_id):
+            result = await self._gate.check({})
+        return result.action is StopAction.TERMINATE
 
 
 class MissionMode(AgentMode):
@@ -258,29 +274,24 @@ class MissionMode(AgentMode):
         """Configured retry allowance used by Mission workers."""
         return self._max_retries_per_story
 
-    def start_internal_mission(self, session_id: str, loop_dir: Path) -> None:
-        """Activate existing Mission state for a private workflow."""
+    @contextmanager
+    def internal_mission(
+        self,
+        session_id: str,
+        loop_dir: Path,
+    ) -> Iterator[_InternalMission]:
+        """Scope an internal workflow to the native Mission gate."""
         from .gates import MissionGate
 
         if self._gate is None:
             self._gate = MissionGate()
         with scoped_session_id(session_id):
             self._gate.activate_for_mission(Path(loop_dir))
-
-    async def check_internal_mission(self, session_id: str) -> bool:
-        """Return whether MissionGate accepts the current PRD state."""
-        if self._gate is None:
-            raise RuntimeError("MissionMode is not initialized")
-        with scoped_session_id(session_id):
-            result = await self._gate.check({})
-        return result.action is StopAction.TERMINATE
-
-    def finish_internal_mission(self, session_id: str) -> None:
-        """Clear private Mission gate state."""
-        if self._gate is None:
-            return
-        with scoped_session_id(session_id):
-            self._gate.reset_session()
+        try:
+            yield _InternalMission(self._gate, session_id)
+        finally:
+            with scoped_session_id(session_id):
+                self._gate.reset_session()
 
 
 def _info_msg(text: str) -> Msg:

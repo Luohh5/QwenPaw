@@ -588,8 +588,7 @@ async def _repair_with_mission(
         max_attempts,
     )
     attempts: dict[str, int] = {}
-    mode.start_internal_mission(session_id, loop_dir)
-    try:
+    with mode.internal_mission(session_id, loop_dir) as mission:
         for round_number in range(1, max_attempts + 1):
             manifest = load_manifest(context.store.path)
             pending = [
@@ -614,18 +613,16 @@ async def _repair_with_mission(
             )
             manifest = load_manifest(context.store.path)
             await run_sync_io(sync_mission, loop_dir, manifest)
-            if await mode.check_internal_mission(session_id):
+            if await mission.check():
                 return ""
         manifest = load_manifest(context.store.path)
         await run_sync_io(sync_mission, loop_dir, manifest, stopped=True)
-        await mode.check_internal_mission(session_id)
+        await mission.check()
         remaining = len(manifest.by_zone(AssetZone.REPAIR))
         return (
             f"兼容性修复 Mission 已达到每项最多 {max_attempts} 次尝试，"
             f"仍有 {remaining} 项未通过原生检查。"
         )
-    finally:
-        mode.finish_internal_mission(session_id)
 
 
 async def run_adaptation_loop(
