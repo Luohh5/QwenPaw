@@ -1157,7 +1157,7 @@ async def test_dry_run_routes_inline_mcp_secret_to_agent_goal(
     action = next(item for item in plan.actions if item.asset_type == "mcp")
     assert action.action == "agent_goal_test_and_adapt"
     assert action.fidelity == "agent_decision"
-    assert "兼容性 Goal" in action.reason_zh
+    assert "兼容性 Mission" in action.reason_zh
 
 
 @pytest.mark.asyncio
@@ -1706,3 +1706,94 @@ async def test_failed_receipt_rolls_back_memory_and_native_plugin(
     assert (
         workspace.marketplace_registry_path.read_bytes() == original_registry
     )
+
+
+@pytest.mark.asyncio
+async def test_failed_receipt_rolls_back_all_core_asset_writers(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A late failure must leave no conversation, Skill, MCP, or Cron."""
+    workspace = _workspace(tmp_path)
+    workspace.cron_manager = _CronManager()
+    skill_source = tmp_path / "rollback-skill"
+    skill_source.mkdir()
+    (skill_source / "SKILL.md").write_text(
+        "---\n"
+        "name: rollback-skill\n"
+        "description: Rollback fixture\n"
+        "---\n\n"
+        "Use ordinary QwenPaw tools.\n",
+        encoding="utf-8",
+    )
+    inventory = ProviderInventory(
+        provider_id="codex",
+        provider_name="Codex",
+        detected=True,
+        sessions=[
+            SourceSession(
+                source_id="rollback-session",
+                title="Rollback session",
+                history=[
+                    HarnessHistoryItem(
+                        kind=HarnessHistoryKind.USER,
+                        text="Do rollback work",
+                        item_id="rollback-message",
+                    ),
+                ],
+            ),
+        ],
+        skills=[
+            SourceSkill(
+                source_id="rollback-skill",
+                name="rollback-skill",
+                directory=skill_source,
+            ),
+        ],
+        mcp_servers=[
+            SourceMCPServer(
+                source_id="rollback-mcp",
+                name="rollback-mcp",
+                command=sys.executable,
+            ),
+        ],
+        scheduled_tasks=[
+            SourceScheduledTask(
+                source_id="rollback-task",
+                name="Rollback task",
+                schedule_type="cron",
+                cron="30 9 * * *",
+                prompt="Review rollback state",
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        "qwenpaw.portability.importer.create_migration_provider",
+        lambda _source, _workspace: _Provider(inventory),
+    )
+    _mock_adaptation(monkeypatch, workspace, inventory, zone="migrate")
+
+    async def _fail_receipt(*_args, **_kwargs):
+        raise OSError("receipt storage unavailable")
+
+    monkeypatch.setattr(
+        "qwenpaw.portability.importer.write_json_atomic_async",
+        _fail_receipt,
+    )
+
+    with pytest.raises(OSError, match="receipt storage unavailable"):
+        await ProviderImportService(workspace).import_from("codex")
+
+    assert await workspace.chat_manager.list_chats(archived=None) == []
+    assert not (workspace.workspace_dir / "skills/rollback-skill").exists()
+    skill_manifest = workspace.workspace_dir / "skill.json"
+    if skill_manifest.exists():
+        assert "rollback-skill" not in skill_manifest.read_text(
+            encoding="utf-8",
+        )
+    assert not (
+        workspace.workspace_dir / "drivers/mcp/rollback-mcp.yaml"
+    ).exists()
+    assert workspace.cron_manager.jobs == {}
+    imports = workspace.workspace_dir / ".qwenpaw/imports"
+    assert not list(imports.glob("migration-*.json"))

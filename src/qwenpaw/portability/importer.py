@@ -913,8 +913,9 @@ class ProviderImportService(ImportPlanningMixin):
                             "Failed to restore replaced scheduled task %s",
                             getattr(previous_job, "id", ""),
                         )
-            for skill_name in imported_skills:
+            for skill_name in reversed(imported_skills):
                 try:
+                    skill_service.disable_skill(skill_name)
                     await run_sync_io(
                         skill_service.delete_skill,
                         skill_name,

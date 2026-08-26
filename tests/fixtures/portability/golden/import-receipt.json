@@ -1,0 +1,48 @@
+{
+  "migration_id": "migration-fixture",
+  "plan_id": "plan-fixture",
+  "schema_version": "1",
+  "source": "qoder",
+  "source_locator": "/fixture/qoder",
+  "agent_id": "agent-fixture",
+  "started_at": "2026-08-20T00:00:00Z",
+  "completed_at": "2026-08-20T00:05:00Z",
+  "imported_sessions": ["session-1"],
+  "skipped_sessions": ["session-existing"],
+  "ignored_source_sessions": ["internal-1"],
+  "archived_internal_sessions": ["internal-1"],
+  "imported_skills": ["skill-1"],
+  "skipped_skills": [],
+  "imported_mcp_servers": ["mcp-1"],
+  "skipped_mcp_servers": [],
+  "imported_memory_projects": ["memory-1"],
+  "skipped_memory_projects": [],
+  "restored_marketplaces": ["market-1"],
+  "skipped_marketplaces": [],
+  "prepared_plugins": ["plugin-1@market-1"],
+  "installed_plugins": ["plugin-1"],
+  "skipped_plugins": [],
+  "imported_scheduled_tasks": ["cron-1"],
+  "skipped_scheduled_tasks": [],
+  "discovered_mcp_count": 1,
+  "discovered_scheduled_task_count": 1,
+  "adaptation_status": "completed",
+  "adaptation_manifest": "adaptation/manifest.json",
+  "adaptation_summary": "adaptation/summary.md",
+  "adaptation_counts": {"migrate": 4, "repair": 0, "discard": 0, "staging": 0},
+  "warnings": ["fixture warning"],
+  "backend_changed": false,
+  "doctor_report": {
+    "status": "pass",
+    "summary_zh": "迁移结果已通过检查。",
+    "checked_at": "2026-08-20T00:05:00Z",
+    "checks": [
+      {
+        "category": "plugins",
+        "status": "pass",
+        "title_zh": "插件注册",
+        "detail_zh": "插件已完成原生注册。"
+      }
+    ]
+  }
+}
