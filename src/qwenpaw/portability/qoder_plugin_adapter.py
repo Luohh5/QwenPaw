@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import json
-import shutil
-import tempfile
 from pathlib import Path
 from typing import Any
 
-from .content_plugin_wrapper import canonical_plugin_id
+from .content_plugin_wrapper import (
+    staging_target,
+    write_wrapper,
+)
 from .models import SourcePlugin
 from .safe_files import (
     TreeLimits,
@@ -43,6 +44,7 @@ _QODER_BINDING_MARKERS = (
     b"qoder-",
     b"sharedclientcache",
 )
+ADAPTER = "qoder_skill_only_v1"
 
 
 def _has_skill_directory(root: Path) -> bool:
@@ -147,7 +149,7 @@ def discover_qoder_custom_skill_adapter(
     except (OSError, ValueError):
         return None
     return {
-        "adapter": "qoder_skill_only_v1",
+        "adapter": ADAPTER,
         "canonical_plugin_source": str(source),
         "qoder_source_kind": source_kind,
         "skills_relative_path": str(skills_root.relative_to(source)),
@@ -239,83 +241,6 @@ def _copy_optional_readme(source: Path, target: Path) -> None:
     target.chmod(0o600)
 
 
-def _plugin_backend(enabled: bool) -> str:
-    return (
-        "# -*- coding: utf-8 -*-\n"
-        '"""Generated adapter for a Qoder Skill-only plugin."""\n\n'
-        "from pathlib import Path\n\n"
-        "_ROOT = Path(__file__).parent\n\n\n"
-        "class ImportedQoderSkillPlugin:\n"
-        "    def register(self, api) -> None:\n"
-        "        api.register_skill_provider(\n"
-        '            skills_dir=_ROOT / "skills",\n'
-        f"            enabled_by_default={enabled!r},\n"
-        '            channels=["all"],\n'
-        "        )\n\n\n"
-        "plugin = ImportedQoderSkillPlugin()\n"
-    )
-
-
-def _author(value: Any) -> str:
-    if isinstance(value, dict):
-        value = value.get("name") or value.get("email") or ""
-    return _bounded_manifest_text(value or "Imported from Qoder", 200)
-
-
-def _bounded_manifest_text(value: Any, limit: int) -> str:
-    """Return bounded display metadata without control characters."""
-    text = str(value or "")
-    return "".join(
-        character
-        for character in text[:limit]
-        if ord(character) >= 32 and ord(character) != 127
-    ).strip()
-
-
-def _qwenpaw_manifest(
-    plugin: SourcePlugin,
-    manifest: dict[str, Any],
-    enabled: bool,
-) -> dict[str, Any]:
-    try:
-        plugin_id = canonical_plugin_id(manifest, plugin.source_id)
-    except ValueError as exc:
-        raise ValueError("Qoder custom plugin name is unsafe") from exc
-    descriptions = {}
-    description_zh = manifest.get("descriptionZh")
-    if isinstance(description_zh, str) and description_zh.strip():
-        descriptions["zh-CN"] = _bounded_manifest_text(description_zh, 4096)
-    return {
-        "id": plugin_id,
-        "name": _bounded_manifest_text(
-            manifest.get("displayName") or plugin_id,
-            200,
-        ),
-        "version": _bounded_manifest_text(
-            manifest.get("version") or plugin.version or "0.0.0",
-            100,
-        ),
-        "type": "general",
-        "description": _bounded_manifest_text(
-            manifest.get("description"),
-            4096,
-        ),
-        "description_i18n": descriptions,
-        "author": _author(manifest.get("author")),
-        "entry": {"backend": "plugin.py"},
-        "dependencies": [],
-        "meta": {
-            "migration": {
-                "source": "qoder",
-                "source_id": plugin.source_id,
-                "adapter": "qoder_skill_only_v1",
-                "harness_bound": bool(plugin.metadata.get("harness_bound")),
-                "requires_review": not enabled,
-            },
-        },
-    }
-
-
 def stage_qoder_skill_plugin(
     plugin: SourcePlugin,
     *,
@@ -326,35 +251,39 @@ def stage_qoder_skill_plugin(
     manifest = _read_qoder_manifest(source)
     skills_root = _validated_skills_root(source, manifest)
     _validate_source_tree(source)
-    temp_root = Path(tempfile.mkdtemp(prefix="qwenpaw-qoder-plugin-"))
-    target = temp_root / "plugin"
-    try:
+    with staging_target("qwenpaw-qoder-plugin-") as target:
         target.mkdir()
         _copy_skill_tree(skills_root, target / "skills")
         _copy_optional_readme(
             source / "README.md",
             target / "README.qoder.md",
         )
-        (target / "plugin.py").write_text(
-            _plugin_backend(enabled),
-            encoding="utf-8",
+        write_wrapper(
+            target,
+            plugin,
+            manifest,
+            source="qoder",
+            adapter=ADAPTER,
+            default_author="Imported from Qoder",
+            backend_description=(
+                "Generated adapter for a Qoder Skill-only plugin."
+            ),
+            class_name="ImportedQoderSkillPlugin",
+            skill_paths=["skills"],
+            display_name=manifest.get("displayName"),
+            enabled=enabled,
+            double_quote_paths=True,
+            include_description_i18n=True,
+            description_zh=manifest.get("descriptionZh"),
+            migration_extra={
+                "harness_bound": bool(plugin.metadata.get("harness_bound")),
+            },
         )
-        (target / "plugin.json").write_text(
-            json.dumps(
-                _qwenpaw_manifest(plugin, manifest, enabled),
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        return target
-    except BaseException:
-        shutil.rmtree(temp_root, ignore_errors=True)
-        raise
+    return target
 
 
 __all__ = [
+    "ADAPTER",
     "discover_qoder_custom_skill_adapter",
     "stage_qoder_skill_plugin",
 ]
