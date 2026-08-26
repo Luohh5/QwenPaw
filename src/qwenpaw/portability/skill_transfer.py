@@ -37,7 +37,13 @@ def write_tree_entry(root: Path, entry: SkillTreeEntry) -> None:
 
 
 def _identity(info: os.stat_result) -> tuple[int, ...]:
-    return info.st_dev, info.st_ino, info.st_size
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
 
 
 def read_regular_file(

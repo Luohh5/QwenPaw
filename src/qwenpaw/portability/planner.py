@@ -18,11 +18,11 @@ from .models import (
     MigrationPlan,
     ProviderInventory,
 )
+from .skill_transfer import read_regular_file
 
 _MAX_FINGERPRINT_ENTRIES = 6_000
 _MAX_FINGERPRINT_FILES = 5_000
 _MAX_FINGERPRINT_BYTES = 64 * 1024 * 1024
-_HASH_CHUNK_BYTES = 1024 * 1024
 
 
 @dataclass
@@ -107,46 +107,19 @@ def _hash_regular_file(
     if not stat.S_ISREG(before.st_mode):
         raise _fingerprint_error(path, "entry is not a regular file")
 
-    descriptor = -1
+    budget.add_file(path, before.st_size)
     try:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(path, flags)
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode):
-            raise _fingerprint_error(path, "entry is not a regular file")
-        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
-            raise _fingerprint_error(path, "file changed while being opened")
-        budget.add_file(path, opened.st_size)
-        _hash_record(hasher, "file", str(path))
-        hasher.update(opened.st_size.to_bytes(8, "big"))
-
-        with os.fdopen(descriptor, "rb") as stream:
-            descriptor = -1
-            remaining = opened.st_size
-            while remaining:
-                chunk = stream.read(min(_HASH_CHUNK_BYTES, remaining))
-                if not chunk:
-                    raise _fingerprint_error(path, "file shrank while hashing")
-                hasher.update(chunk)
-                remaining -= len(chunk)
-            if stream.read(1):
-                raise _fingerprint_error(path, "file grew while hashing")
-            after = os.fstat(stream.fileno())
-        if (
-            (after.st_dev, after.st_ino, after.st_size)
-            != (opened.st_dev, opened.st_ino, opened.st_size)
-            or after.st_mtime_ns != opened.st_mtime_ns
-            or after.st_ctime_ns != opened.st_ctime_ns
-        ):
-            raise _fingerprint_error(path, "file changed while hashing")
+        data = read_regular_file(path, expected=before)
+    except ValueError as exc:
+        raise _fingerprint_error(path, str(exc)) from exc
     except OSError as exc:
         raise _fingerprint_error(
             path,
             f"cannot read ({type(exc).__name__})",
         ) from exc
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+    _hash_record(hasher, "file", str(path))
+    hasher.update(len(data).to_bytes(8, "big"))
+    hasher.update(data)
 
 
 def _hash_tree(
@@ -360,10 +333,8 @@ def _imported_memory_ids(workspace: Any, provider_id: str) -> set[str]:
     if not root.is_dir() or root.is_symlink():
         return source_ids
     for path in root.glob(f"**/imports/{provider_id}/*/_scope.json"):
-        if path.is_symlink() or not path.is_file():
-            continue
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
+            value = json.loads(read_regular_file(path).decode("utf-8"))
         except (OSError, ValueError, TypeError):
             continue
         source_id = value.get("source_id") if isinstance(value, dict) else None
