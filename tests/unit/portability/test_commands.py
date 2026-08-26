@@ -14,7 +14,6 @@ from qwenpaw.portability.models import (
     MigrationPlan,
 )
 from qwenpaw.runtime.commands.control.portability_handler import (
-    ExportCommandHandler,
     ImportCommandHandler,
 )
 
@@ -149,31 +148,6 @@ async def test_import_apply_displays_doctor_entirely_in_chinese(
 
 
 @pytest.mark.asyncio
-async def test_export_rejects_removed_profiles() -> None:
-    with pytest.raises(ValueError, match="Only `backup` and `trace`"):
-        await ExportCommandHandler().handle(_context("to portable"))
-
-
-@pytest.mark.asyncio
-async def test_export_help_exposes_only_two_profiles() -> None:
-    text = await ExportCommandHandler().handle(_context("help"))
-    assert "/export to backup" in text
-    assert "/export to trace" in text
-    assert "/export portable" not in text
-    assert "/export handoff" not in text
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "handler,raw",
-    [
-        (ImportCommandHandler(), "from codex"),
-        (ExportCommandHandler(), "to trace"),
-    ],
-)
-async def test_portability_commands_reject_remote_channels(
-    handler,
-    raw: str,
-) -> None:
+async def test_import_rejects_remote_channels() -> None:
     with pytest.raises(PermissionError, match="local Console/ACP"):
-        await handler.handle(_remote_context(raw))
+        await ImportCommandHandler().handle(_remote_context("from codex"))

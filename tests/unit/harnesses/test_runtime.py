@@ -411,14 +411,14 @@ async def test_runtime_handles_qwenpaw_control_before_provider_routing(
         input=[
             Message(
                 role=Role.USER,
-                content=[TextContent(text="/export to trace")],
+                content=[TextContent(text="/import inspect")],
             ),
         ],
     )
 
     with patch(
         "qwenpaw.runtime.commands.control.handle_control_command",
-        return_value="Trace ready",
+        return_value="Import ready",
     ) as control:
         output = [
             item
@@ -432,7 +432,7 @@ async def test_runtime_handles_qwenpaw_control_before_provider_routing(
     control.assert_awaited_once()
     assert not runtime._adapters
     assert output[-1].status == "completed"
-    assert output[-1].output[-1].content[0].text == "Trace ready"
+    assert output[-1].output[-1].content[0].text == "Import ready"
 
 
 @pytest.mark.asyncio

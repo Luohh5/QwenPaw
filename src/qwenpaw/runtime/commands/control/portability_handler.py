@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Built-in ``/import`` and ``/export`` portability commands."""
+"""Built-in ``/import`` portability command."""
 
 from __future__ import annotations
 
@@ -18,8 +18,6 @@ from ....portability import (
     ProviderImportService,
     ProviderInventory,
     SourceLocation,
-    export_to_backup,
-    export_trace,
     import_backup_path,
     provider_names,
     resolve_source_location,
@@ -49,18 +47,6 @@ never modifies source data.
 
 Imported backup ZIPs are placed in the existing Backup library. Use the
 existing Backup restore flow to inspect the scope and apply a restore safely.\
-"""
-
-EXPORT_HELP = """\
-**Export**
-
-**Commands**
-- `/export to backup` - create a restorable QwenPaw backup for this Agent
-- `/export to trace` - export all this Agent's sessions as redacted PawTrace
-
-Backup export reuses the existing signed backup system and excludes the
-global secrets directory. Trace export always applies local secret/PII/path
-redaction and does not include hidden chain-of-thought.\
 """
 
 
@@ -422,51 +408,4 @@ class ImportCommandHandler(BaseControlCommandHandler):
         return _render_receipt(receipt)
 
 
-class ExportCommandHandler(BaseControlCommandHandler):
-    """Export only the supported backup and trace profiles."""
-
-    command_name = "/export"
-    description = "Export a QwenPaw backup or redacted PawTrace archive"
-
-    async def handle(self, context: ControlContext) -> str:
-        _require_local_console(context)
-        raw = str(context.args.get("_raw_args") or "").strip()
-        if raw.lower() in {"", "help", "-h", "--help"}:
-            return EXPORT_HELP
-        tokens = _tokens(raw)
-        if len(tokens) != 2 or tokens[0].lower() != "to":
-            return f"Usage: `/export to <backup|trace>`\n\n{EXPORT_HELP}"
-        target = tokens[1].lower()
-        if target == "backup":
-            meta, path, name = await export_to_backup(context.workspace)
-            return (
-                "**Backup export complete**\n\n"
-                f"- Name: `{name}`\n"
-                f"- Backup ID: `{meta['id']}`\n"
-                f"- File: `{path}`\n"
-                "- Agent workspaces: current Agent\n"
-                "- Global config: included\n"
-                "- Skill Pool: included\n"
-                "- Global secrets directory: excluded\n"
-                "- Signature: local HMAC"
-            )
-        if target == "trace":
-            result = await export_trace(context.workspace)
-            return (
-                "**Trace export complete**\n\n"
-                f"- File: `{result.path}`\n"
-                f"- Sessions: {result.session_count}\n"
-                f"- Events: {result.event_count}\n"
-                f"- Redactions: {result.redaction_count}\n"
-                f"- Skipped/truncated fields: {result.skipped_count}\n"
-                f"- Trace SHA-256: `{result.sha256}`\n"
-                "- Hidden chain-of-thought: excluded"
-            )
-        supported = ", ".join(provider_names())
-        raise ValueError(
-            f"Unsupported export target {target!r}. Only `backup` and "
-            f"`trace` are available. Import providers: {supported}.",
-        )
-
-
-__all__ = ["ExportCommandHandler", "ImportCommandHandler"]
+__all__ = ["ImportCommandHandler"]

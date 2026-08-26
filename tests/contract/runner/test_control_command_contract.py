@@ -13,6 +13,7 @@ Specifically:
 - the global registry includes every expected default handler;
 - the registry rejects empty ``command_name`` registrations.
 """
+
 # pylint: disable=protected-access,redefined-outer-name,unused-argument
 # pylint: disable=wrong-import-position,no-name-in-module,c-extension-no-member
 # flake8: noqa: E402
@@ -29,12 +30,10 @@ from qwenpaw.runtime.commands.control.base import (
     BaseControlCommandHandler,
 )
 
-
 _EXPECTED_DEFAULTS = {
     "/approval",
     "/approve",
     "/deny",
-    "/export",
     "/import",
     "/model",
     "/skills",

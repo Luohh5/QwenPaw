@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Stable models shared by QwenPaw import and export flows."""
+"""Stable models shared by QwenPaw import flows."""
 
 from __future__ import annotations
 
@@ -235,17 +235,6 @@ class ImportReceipt(BaseModel):
     doctor_report: MigrationDoctorReport | None = None
 
 
-class TraceExportResult(BaseModel):
-    """Summary returned after a PawTrace archive is published."""
-
-    path: Path
-    session_count: int
-    event_count: int
-    redaction_count: int
-    skipped_count: int
-    sha256: str
-
-
 __all__ = [
     "ImportReceipt",
     "MigrationAssetPlan",
@@ -262,5 +251,4 @@ __all__ = [
     "SourceSkill",
     "SourceMCPServer",
     "SourceLocation",
-    "TraceExportResult",
 ]

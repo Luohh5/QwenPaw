@@ -88,10 +88,9 @@ class CommandRegistry:
         # Approval commands (control commands, not daemon commands)
         self.register_command("/approval", priority_level=10)
 
-        # Data portability commands perform bounded local I/O and should not
+        # Data import performs bounded local I/O and should not
         # be queued behind a long-running agent turn.
         self.register_command("/import", priority_level=10)
-        self.register_command("/export", priority_level=10)
 
         # Note: Conversation commands (/compact, /new) remain at
         # default level (20) and do not need explicit registration
