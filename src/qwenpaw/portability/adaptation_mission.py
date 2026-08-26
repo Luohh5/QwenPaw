@@ -92,6 +92,3 @@ def sync_mission(
     elif stopped:
         cfg["current_phase"] = "max_iterations_reached"
     write_loop_config(loop_dir, cfg)
-
-
-__all__ = ["prepare_mission", "sync_mission"]

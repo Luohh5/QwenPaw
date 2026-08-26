@@ -81,13 +81,17 @@ class _RequestBinding:
 _ACTIVE_CONTEXTS: dict[str, _RequestBinding] = {}
 
 
-def get_active_adaptation_context() -> "ActiveAdaptationContext":
+def _active_binding() -> _RequestBinding:
     from ..app.agent_context import get_current_session_id
 
     binding = _ACTIVE_CONTEXTS.get(get_current_session_id() or "")
     if binding is None:
         raise PermissionError("migration compatibility tools are unavailable")
-    return binding.context
+    return binding
+
+
+def get_active_adaptation_context() -> "ActiveAdaptationContext":
+    return _active_binding().context
 
 
 class ActiveAdaptationContext:
@@ -118,10 +122,8 @@ class ActiveAdaptationContext:
         self._lock = asyncio.Lock()
 
     def _binding(self) -> _RequestBinding:
-        from ..app.agent_context import get_current_session_id
-
-        binding = _ACTIVE_CONTEXTS.get(get_current_session_id() or "")
-        if binding is None or binding.context is not self:
+        binding = _active_binding()
+        if binding.context is not self:
             raise PermissionError("migration request is not bound")
         return binding
 
@@ -135,6 +137,9 @@ class ActiveAdaptationContext:
 
     def activity(self, session_id: str) -> str:
         return self._activities.get(session_id, "等待 Agent 开始处理。")
+
+    def clear_activity(self, session_id: str) -> None:
+        self._activities.pop(session_id, None)
 
     async def _publish(self, message: str) -> None:
         from ..app.agent_context import get_current_session_id
@@ -523,64 +528,60 @@ def _iteration_budget(tool_budget: int) -> int:
     return min(_MAX_REACT_ITERATIONS, max(80, tool_budget * 2))
 
 
-def _request(
+async def _run_phase(
+    workspace: Any,
+    context: ActiveAdaptationContext,
+    *,
     session_id: str,
-    agent_id: str,
-    prompt: str,
+    asset: CompatibilityAsset,
     phase: str,
-    allowed_tools: tuple[str, ...],
-    react_iterations: int,
-) -> AgentRequest:
-    return AgentRequest.model_validate(
+    prompt: str,
+    tools: tuple[str, ...],
+    label: str,
+) -> None:
+    request = AgentRequest.model_validate(
         {
             "input": [
                 {
                     "role": "user",
                     "type": "message",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": prompt,
-                        },
+                        {"type": "text", "text": prompt},
                     ],
                 },
             ],
             "session_id": session_id,
             "user_id": session_id,
-            "agent_id": agent_id,
+            "agent_id": workspace.agent_id,
             "channel": "console",
             "request_context": {
                 "source": "portability_adaptation",
                 "portability_phase": phase,
-                "max_react_iterations": react_iterations,
+                "max_react_iterations": _iteration_budget(
+                    asset.tool_budget - asset.tool_calls,
+                ),
                 ACP_EPHEMERAL_META_KEY: True,
                 "approval_level": "off",
-                "subagent_allowed_tools": list(allowed_tools),
+                "subagent_allowed_tools": list(tools),
                 "subagent_skills": [],
             },
         },
     )
-
-
-async def _run_agent(
-    workspace: Any,
-    request: AgentRequest,
-    progress: ProgressReporter | None,
-    context: ActiveAdaptationContext,
-    label: str,
-) -> None:
-    async def consume() -> None:
-        async for _event in workspace.stream_query(request):
-            pass
-
-    task = asyncio.create_task(consume())
+    _ACTIVE_CONTEXTS[session_id] = _RequestBinding(
+        context,
+        phase,
+        asset.asset_key,
+    )
+    task = asyncio.create_task(
+        _consume_query(workspace, request),
+    )
     try:
         while not task.done():
             done, _ = await asyncio.wait({task}, timeout=_HEARTBEAT_SECONDS)
             if task not in done:
                 await _report(
-                    progress,
-                    f"{label}仍在运行：{context.activity(request.session_id)}",
+                    context.progress,
+                    f"{label}仍在运行：{context.activity(session_id)}",
                 )
         await task
     finally:
@@ -593,45 +594,13 @@ async def _run_agent(
                 Exception,
             ):  # pylint: disable=broad-except
                 pass
-
-
-async def _run_bound_agent(
-    workspace: Any,
-    context: ActiveAdaptationContext,
-    *,
-    session_id: str,
-    asset: CompatibilityAsset,
-    phase: str,
-    prompt: str,
-    tools: tuple[str, ...],
-    label: str,
-) -> None:
-    _ACTIVE_CONTEXTS[session_id] = _RequestBinding(
-        context=context,
-        phase=phase,
-        asset_key=asset.asset_key,
-    )
-    try:
-        await _run_agent(
-            workspace,
-            _request(
-                session_id,
-                workspace.agent_id,
-                prompt,
-                phase,
-                tools,
-                _iteration_budget(asset.tool_budget - asset.tool_calls),
-            ),
-            context.progress,
-            context,
-            label,
-        )
-    finally:
         _ACTIVE_CONTEXTS.pop(session_id, None)
-        context._activities.pop(  # pylint: disable=protected-access
-            session_id,
-            None,
-        )
+        context.clear_activity(session_id)
+
+
+async def _consume_query(workspace: Any, request: AgentRequest) -> None:
+    async for _event in workspace.stream_query(request):
+        pass
 
 
 async def _bounded_parallel(keys: list[str], worker: Any) -> None:
@@ -665,7 +634,7 @@ async def _triage_asset(
         before = asset.tool_calls
         label = context._label(asset)  # pylint: disable=protected-access
         try:
-            await _run_bound_agent(
+            await _run_phase(
                 workspace,
                 context,
                 session_id=session_id,
@@ -703,7 +672,7 @@ async def _triage_assets(
     workspace: Any,
     context: ActiveAdaptationContext,
     warnings: list[str],
-) -> None:
+) -> str:
     keys = [
         item.asset_key
         for item in load_manifest(context.store.path).by_zone(
@@ -714,6 +683,12 @@ async def _triage_assets(
         keys,
         lambda key: _triage_asset(workspace, context, key, warnings),
     )
+    remaining = load_manifest(context.store.path).by_zone(AssetZone.STAGING)
+    if not remaining:
+        return ""
+    if context.tool_calls >= context.total_tool_budget:
+        return f"第一阶段达到总工具调用上限（{context.total_tool_budget} 次）。"
+    return f"第一阶段仍有 {len(remaining)} 项未完成语义判断。"
 
 
 async def _repair_asset(
@@ -725,7 +700,7 @@ async def _repair_asset(
     asset = context._asset(key)  # pylint: disable=protected-access
     label = context._label(asset)  # pylint: disable=protected-access
     try:
-        await _run_bound_agent(
+        await _run_phase(
             workspace,
             context,
             session_id=f"migration-worker:{secrets.token_urlsafe(24)}",
@@ -855,18 +830,9 @@ async def run_adaptation_loop(
         progress,
         f"两阶段共享 {context.total_tool_budget} 次工具调用；" + "不设总时长限制，推理上限按剩余预算动态分配。",
     )
-    stopped_reason = ""
-    await _triage_assets(workspace, context, warnings)
+    stopped_reason = await _triage_assets(workspace, context, warnings)
 
-    manifest = load_manifest(store.path)
-    staging = manifest.by_zone(AssetZone.STAGING)
-    if staging and not stopped_reason:
-        if context.tool_calls >= context.total_tool_budget:
-            stopped_reason = f"第一阶段达到总工具调用上限（{context.total_tool_budget} 次）。"
-        else:
-            stopped_reason = f"第一阶段仍有 {len(staging)} 项未完成语义判断。"
-
-    if not staging and not stopped_reason:
+    if not stopped_reason:
         manifest = load_manifest(store.path)
         if manifest.by_zone(AssetZone.REPAIR):
             await _report(
