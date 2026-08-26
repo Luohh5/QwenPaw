@@ -158,7 +158,7 @@ On its first start, the monitor records only the latest current UID as its basel
 
 For each message, the automatic workflow fetches at most the first 64 KiB and uses roughly 2,000 characters as the body preview. Attachments are not downloaded as message text. Plain text is preferred; when only HTML is available, QwenPaw extracts readable text.
 
-![Email processing in the Inbox](https://img.alicdn.com/imgextra/i4/O1CN01kbVL0racQQB53hVE_!!6000000002661-0-tps-2492-1400.jpg)
+![Email processing in the Inbox](https://img.alicdn.com/imgextra/i4/O1CN017zX0IQLGnEF6ftsW_!!6000000000639-0-tps-3288-976.jpg)
 
 ### Agent Mail-Handling Rules and Workflow
 
@@ -185,7 +185,7 @@ For each message, the automatic workflow fetches at most the first 64 KiB and us
    3. It validates the format after editing so the Agent can keep learning new scenarios and user preferences.
 5. If the Agent replies to a message, it updates the contact list in `CONTACTS.md` based on the exchange.
 
-![F1 approval workflow](https://img.alicdn.com/imgextra/i3/O1CN01NubmFYW99PD4x9fQ_!!6000000004150-0-tps-2440-1420.jpg)
+![F1 approval workflow](https://img.alicdn.com/imgextra/i3/O1CN01X41b3TuSmxC6f95q_!!6000000003354-0-tps-3282-1140.jpg)
 
 ## Mail Access Control
 
