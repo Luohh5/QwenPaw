@@ -20,7 +20,7 @@ from ..models import (
     SourceSkill,
 )
 from ._utils import parse_datetime
-from .base import ProgressReporter
+from .base import ProgressReporter, make_inventory, progress_milestone
 from .external_state import (
     codex_memory_status,
     discover_codex_memory,
@@ -33,13 +33,6 @@ from .locator import resolve_source_location
 _DISCOVERY_TIMEOUT_SECONDS = 60
 _SESSION_TIMEOUT_SECONDS = 90
 _READ_CONCURRENCY = 2
-
-
-def _milestone(index: int, total: int) -> bool:
-    if total <= 20:
-        return True
-    step = max(1, total // 20)
-    return index == 1 or index == total or index % step == 0
 
 
 def _error_detail(exc: BaseException) -> str:
@@ -232,12 +225,11 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
                 if status is not None
                 else "Codex runtime detection timed out after 60s."
             )
-            return ProviderInventory(
-                provider_id=self.provider_id,
-                provider_name="Codex",
+            return make_inventory(
+                self.provider_id,
+                self._source_location,
                 detected=False,
                 locator=str(rollout_reader.codex_home),
-                source_location=self._source_location,
                 metadata={"memory": memory_state},
                 warnings=[
                     *warnings,
@@ -359,12 +351,11 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
         self._source_location.data_home_exists = (
             rollout_reader.codex_home.is_dir()
         )
-        return ProviderInventory(
-            provider_id=self.provider_id,
-            provider_name="Codex",
+        return make_inventory(
+            self.provider_id,
+            self._source_location,
             detected=True,
             locator=locator or str(rollout_reader.codex_home),
-            source_location=self._source_location,
             sessions=sessions,
             ignored_session_ids=ignored_session_ids,
             skills=skills,
@@ -582,7 +573,7 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
                 )
             async with progress_lock:
                 completed += 1
-                if progress is not None and _milestone(
+                if progress is not None and progress_milestone(
                     completed,
                     len(raw_threads),
                 ):

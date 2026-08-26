@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from ..models import ProviderInventory, SourceLocation, SourceSession
-from .base import ProgressReporter
+from .base import ProgressReporter, make_inventory, progress_milestone
 from .external_state import (
     discover_qoder_mcp,
     discover_qoder_memory,
@@ -27,13 +27,6 @@ from .locator import resolve_source_location
 
 _SESSION_TIMEOUT_SECONDS = 60
 _READ_CONCURRENCY = 4
-
-
-def _milestone(index: int, total: int) -> bool:
-    if total <= 20:
-        return True
-    step = max(1, total // 20)
-    return index == 1 or index == total or index % step == 0
 
 
 class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
@@ -172,7 +165,7 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
                 )
             async with progress_lock:
                 completed += 1
-                if progress is not None and _milestone(
+                if progress is not None and progress_milestone(
                     completed,
                     len(records),
                 ):
@@ -296,9 +289,9 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
                 "execution history were not resumed or copied.",
             )
         projects = self._qoder_home / "projects"
-        return ProviderInventory(
-            provider_id=self.provider_id,
-            provider_name="Qoder",
+        return make_inventory(
+            self.provider_id,
+            self._source_location,
             detected=(
                 bool(records)
                 or projects.is_dir()
@@ -310,7 +303,6 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
                 or bool(scheduled_tasks)
             ),
             locator=str(self._qoder_home),
-            source_location=self._source_location,
             sessions=sessions,
             ignored_session_ids=ignored_session_ids,
             skills=skills,

@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Protocol
+from typing import Any, Protocol
 
-from ..models import ProviderInventory
+from ..models import ProviderInventory, SourceLocation
 
 ProgressReporter = Callable[[str], Awaitable[None]]
 logger = logging.getLogger(__name__)
@@ -26,6 +26,24 @@ async def report_progress(
         logger.debug("Migration progress reporter failed", exc_info=True)
 
 
+def progress_milestone(index: int, total: int) -> bool:
+    step = max(1, total // 20)
+    return total <= 20 or index in {1, total} or index % step == 0
+
+
+def make_inventory(
+    provider_id: str,
+    source_location: SourceLocation,
+    **values: Any,
+) -> ProviderInventory:
+    return ProviderInventory(
+        provider_id=provider_id,
+        provider_name=provider_id.title(),
+        source_location=source_location,
+        **values,
+    )
+
+
 class MigrationProvider(Protocol):
     """A source adapter may inspect external state but never mutate it."""
 
@@ -38,6 +56,3 @@ class MigrationProvider(Protocol):
         progress: ProgressReporter | None = None,
     ) -> ProviderInventory:
         """Return a bounded, normalized inventory from the source."""
-
-
-__all__ = ["MigrationProvider", "ProgressReporter", "report_progress"]

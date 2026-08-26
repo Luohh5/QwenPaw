@@ -457,23 +457,17 @@ def _validate_plugin_api_calls(  # pylint: disable=too-many-branches
                         "be compatibility-tested",
                     )
                 signature = _public_signature(method)
-                accepts_extra_keywords = any(
-                    item.kind is inspect.Parameter.VAR_KEYWORD
-                    for item in signature.parameters.values()
-                )
                 keyword_names = [
                     item.arg for item in call.keywords if item.arg is not None
                 ]
-                unknown_keywords = [
-                    name
-                    for name in keyword_names
-                    if name not in signature.parameters
-                ]
-                if unknown_keywords and not accepts_extra_keywords:
+                unexpected = set(keyword_names) - signature.parameters.keys()
+                if unexpected and not any(
+                    item.kind is inspect.Parameter.VAR_KEYWORD
+                    for item in signature.parameters.values()
+                ):
                     raise ValueError(
-                        f"invalid PluginApi call {method_name}{signature}: "
-                        "unexpected keyword argument(s): "
-                        + ", ".join(unknown_keywords),
+                        f"unexpected keyword(s) for {method_name}: "
+                        + ", ".join(sorted(unexpected)),
                     )
                 try:
                     signature.bind(

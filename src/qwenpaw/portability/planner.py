@@ -361,6 +361,35 @@ def _asset(
     )
 
 
+_ADAPTABLE = {
+    "skills": ("skill", "语义判断，必要时再由兼容流程修复"),
+    "mcp_servers": ("mcp", "语义判断，必要时再由兼容流程修复"),
+    "plugins": ("plugin", "判断整体可用性，必要时再启动兼容修复"),
+    "scheduled_tasks": (
+        "scheduled_task",
+        "语义判断，必要时再由兼容流程验证",
+    ),
+}
+
+
+def _adaptable_actions(
+    inventory: ProviderInventory,
+    *collections: str,
+) -> list[MigrationAssetPlan]:
+    return [
+        _asset(
+            _ADAPTABLE[collection][0],
+            item.source_id,
+            item.name,
+            "agent_mission_test_and_adapt",
+            "agent_decision",
+            f"进入安全暂存区，由 Agent {_ADAPTABLE[collection][1]}。",
+        )
+        for collection in collections
+        for item in getattr(inventory, collection)
+    ]
+
+
 # pylint: disable-next=too-many-branches,too-many-statements
 async def build_migration_plan(
     workspace: Any,
@@ -422,29 +451,7 @@ async def build_migration_plan(
                 ),
             )
 
-    for skill in inventory.skills:
-        actions.append(
-            _asset(
-                "skill",
-                skill.source_id,
-                skill.name,
-                "agent_mission_test_and_adapt",
-                "agent_decision",
-                "进入安全暂存区，由 Agent 语义判断，必要时再由兼容流程修复。",
-            ),
-        )
-
-    for server in inventory.mcp_servers:
-        actions.append(
-            _asset(
-                "mcp",
-                server.source_id,
-                server.name,
-                "agent_mission_test_and_adapt",
-                "agent_decision",
-                "进入安全暂存区，由 Agent 语义判断，必要时再由兼容流程修复。",
-            ),
-        )
+    actions.extend(_adaptable_actions(inventory, "skills", "mcp_servers"))
 
     for project in inventory.memory_projects:
         already = project.source_id in existing_memory
@@ -479,29 +486,9 @@ async def build_migration_plan(
             ),
         )
 
-    for plugin in inventory.plugins:
-        actions.append(
-            _asset(
-                "plugin",
-                plugin.source_id,
-                plugin.name,
-                "agent_mission_test_and_adapt",
-                "agent_decision",
-                "进入安全暂存区，由 Agent 判断整体可用性，必要时再启动兼容修复。",
-            ),
-        )
-
-    for task in inventory.scheduled_tasks:
-        actions.append(
-            _asset(
-                "scheduled_task",
-                task.source_id,
-                task.name,
-                "agent_mission_test_and_adapt",
-                "agent_decision",
-                "进入安全暂存区，由 Agent 语义判断，必要时再由兼容流程验证。",
-            ),
-        )
+    actions.extend(
+        _adaptable_actions(inventory, "plugins", "scheduled_tasks"),
+    )
 
     counts = {
         "sessions": len(inventory.sessions),

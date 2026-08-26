@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import stat
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -25,8 +26,26 @@ from .compatibility import (
     AssetZone,
     CompatibilityManifest,
     RunState,
+    counts,
     load_manifest,
 )
+
+
+@dataclass(frozen=True)
+class _DoctorContext:
+    workspace: Any
+    inventory: ProviderInventory
+    receipt: ImportReceipt
+    manifest: CompatibilityManifest | None
+    manifest_error: str
+
+    def assets(self, asset_type: AssetType, identity: str = "name") -> dict:
+        items = self.manifest.assets if self.manifest else ()
+        return {
+            str(getattr(item, identity)): item
+            for item in items
+            if item.asset_type is asset_type
+        }
 
 
 def _check(
@@ -41,6 +60,10 @@ def _check(
         title_zh=title,
         detail_zh=detail,
     )
+
+
+def _status(actual: int, expected: list[str], success: str = "pass") -> str:
+    return success if actual == len(expected) else "fail"
 
 
 def _installed_plugin_ids() -> set[str]:
@@ -78,10 +101,10 @@ def _memory_scope_ids(workspace: Any, provider_id: str) -> set[str]:
         if not isinstance(value, dict):
             continue
         source_id = str(value.get("source_id") or "")
-        trusted_source = (
-            value.get("trust") == "source_material_not_instructions"
-        )
-        if source_id and trusted_source:
+        if (
+            source_id
+            and value.get("trust") == "source_material_not_instructions"
+        ):
             ids.add(source_id)
     return ids
 
@@ -103,9 +126,9 @@ def _skill_states(workspace: Any) -> dict[str, bool]:
 
 
 def _receipt_check(
-    workspace: Any,
-    receipt: ImportReceipt,
+    context: _DoctorContext,
 ) -> MigrationDoctorCheck:
+    workspace, receipt = context.workspace, context.receipt
     path = (
         Path(workspace.workspace_dir)
         / ".qwenpaw"
@@ -151,15 +174,15 @@ def _receipt_check(
 
 
 def _adaptation_check(
-    workspace: Any,
-    receipt: ImportReceipt,
+    context: _DoctorContext,
 ) -> MigrationDoctorCheck | None:
+    receipt = context.receipt
     if (
         receipt.adaptation_status == "not_run"
         and not receipt.adaptation_manifest
     ):
         return None
-    manifest, error = _verified_adaptation_manifest(workspace, receipt)
+    manifest, error = context.manifest, context.manifest_error
     if not receipt.adaptation_manifest:
         return _check(
             "compatibility",
@@ -174,17 +197,14 @@ def _adaptation_check(
             "工具和设置兼容清单",
             f"兼容清单无法读取或验证：{error}",
         )
-    counts: dict[str, int] = {}
-    for asset in manifest.assets:
-        counts[asset.zone.value] = counts.get(asset.zone.value, 0) + 1
-    migrate = counts.get("migrate", 0)
-    repair = counts.get("repair", 0)
-    discard = counts.get("discard", 0)
-    staging = counts.get("staging", 0)
+    zone_counts = counts(manifest)
+    migrate = zone_counts.get("migrate", 0)
+    repair = zone_counts.get("repair", 0)
+    discard = zone_counts.get("discard", 0)
+    staging = zone_counts.get("staging", 0)
+    status = "warning"
     if manifest.state is RunState.COMPLETED and not repair and not staging:
         status = "pass"
-    else:
-        status = "warning"
     return _check(
         "compatibility",
         status,
@@ -232,26 +252,25 @@ def _job_request_context(job: Any) -> dict[str, Any]:
 
 
 def _job_portability(job: Any) -> dict[str, Any]:
-    meta = getattr(job, "meta", None)
-    if not isinstance(meta, dict):
-        return {}
-    portability = meta.get("portability")
+    meta = getattr(job, "meta", {})
+    portability = meta.get("portability") if isinstance(meta, dict) else None
     return portability if isinstance(portability, dict) else {}
 
 
 def _remote_or_unverified_source(job: Any) -> bool:
     portability = _job_portability(job)
-    if portability.get("source_cwd_remote_or_unverified") is True:
-        return True
     metadata = portability.get("source_metadata")
-    return isinstance(metadata, dict) and is_nonlocal_workspace(metadata)
+    return portability.get("source_cwd_remote_or_unverified") is True or (
+        isinstance(metadata, dict) and is_nonlocal_workspace(metadata)
+    )
 
 
 async def _session_check(
-    workspace: Any,
-    inventory: ProviderInventory,
-    receipt: ImportReceipt,
+    context: _DoctorContext,
 ) -> MigrationDoctorCheck | None:
+    workspace = context.workspace
+    inventory = context.inventory
+    receipt = context.receipt
     expected = set(receipt.imported_sessions)
     if not expected:
         return None
@@ -310,11 +329,13 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
     receipt: ImportReceipt,
 ) -> MigrationDoctorReport:
     """Verify imported assets and return user-facing Chinese results."""
+    manifest, error = _verified_adaptation_manifest(workspace, receipt)
+    context = _DoctorContext(workspace, inventory, receipt, manifest, error)
     checks: list[MigrationDoctorCheck] = []
-    session_result = await _session_check(workspace, inventory, receipt)
+    session_result = await _session_check(context)
     if session_result is not None:
         checks.append(session_result)
-    adaptation_result = _adaptation_check(workspace, receipt)
+    adaptation_result = _adaptation_check(context)
     if adaptation_result is not None:
         checks.append(adaptation_result)
 
@@ -325,11 +346,9 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
         }
         states = _skill_states(workspace)
         present = sum(name in visible for name in receipt.imported_skills)
-        manifest, _ = _verified_adaptation_manifest(workspace, receipt)
         zones = {
-            item.name: item.zone
-            for item in (manifest.assets if manifest else [])
-            if item.asset_type is AssetType.SKILL
+            name: item.zone
+            for name, item in context.assets(AssetType.SKILL).items()
         }
         activation_ok = sum(
             name in visible
@@ -337,11 +356,9 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
             is (zones.get(name) is AssetZone.MIGRATE)
             for name in receipt.imported_skills
         )
-        status = (
-            "pass"
-            if present == len(receipt.imported_skills)
-            and activation_ok == len(receipt.imported_skills)
-            else "fail"
+        status = _status(
+            min(present, activation_ok),
+            receipt.imported_skills,
         )
         checks.append(
             _check(
@@ -359,22 +376,18 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
             for card in await DriverConfigService(workspace).list_cards()
         }
         present = sum(name in cards for name in receipt.imported_mcp_servers)
-        manifest, _ = _verified_adaptation_manifest(workspace, receipt)
         zones = {
-            item.name: item.zone
-            for item in (manifest.assets if manifest else [])
-            if item.asset_type is AssetType.MCP
+            name: item.zone
+            for name, item in context.assets(AssetType.MCP).items()
         }
         activation_ok = sum(
             name in cards
             and cards[name].enabled is (zones.get(name) is AssetZone.MIGRATE)
             for name in receipt.imported_mcp_servers
         )
-        status = (
-            "pass"
-            if present == len(receipt.imported_mcp_servers)
-            and activation_ok == len(receipt.imported_mcp_servers)
-            else "fail"
+        status = _status(
+            min(present, activation_ok),
+            receipt.imported_mcp_servers,
         )
         detail = (
             f"计划导入 {len(receipt.imported_mcp_servers)} 个，实际保存 {present} 个；"
@@ -387,11 +400,7 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
         verified = sum(
             item in ids for item in receipt.imported_memory_projects
         )
-        status = (
-            "pass"
-            if verified == len(receipt.imported_memory_projects)
-            else "fail"
-        )
+        status = _status(verified, receipt.imported_memory_projects)
         checks.append(
             _check(
                 "memory",
@@ -415,11 +424,7 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
             )
             for name in receipt.restored_marketplaces
         )
-        status = (
-            "pass"
-            if restored == len(receipt.restored_marketplaces)
-            else "fail"
-        )
+        status = _status(restored, receipt.restored_marketplaces)
         checks.append(
             _check(
                 "marketplaces",
@@ -433,9 +438,7 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
     if receipt.installed_plugins:
         installed = _installed_plugin_ids()
         present = sum(item in installed for item in receipt.installed_plugins)
-        status = (
-            "warning" if present == len(receipt.installed_plugins) else "fail"
-        )
+        status = _status(present, receipt.installed_plugins, "warning")
         checks.append(
             _check(
                 "plugins",
@@ -492,15 +495,10 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
                     len(grouped_by_source.get(key, [])) == 1
                     for key in expected
                 )
-                manifest, _ = _verified_adaptation_manifest(
-                    workspace,
-                    receipt,
+                schedule_assets = context.assets(
+                    AssetType.SCHEDULED_TASK,
+                    "source_id",
                 )
-                schedule_assets = {
-                    asset.source_id: asset
-                    for asset in (manifest.assets if manifest else [])
-                    if asset.asset_type is AssetType.SCHEDULED_TASK
-                }
 
                 def activation_matches(key: tuple[str, str]) -> bool:
                     jobs_for_key = grouped_by_source.get(key, [])
@@ -563,7 +561,7 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
                 )
 
                 compatibility_classified: int | None = None
-                if manifest is not None:
+                if context.manifest is not None:
                     compatibility_classified = sum(
                         source_id in schedule_assets
                         and schedule_assets[source_id].zone
@@ -639,7 +637,7 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
                     ),
                 )
 
-    checks.append(_receipt_check(workspace, receipt))
+    checks.append(_receipt_check(context))
     if any(item.status == "fail" for item in checks):
         status = "fail"
         summary = "迁移完成，但体检发现失败项，请先处理失败项再继续使用。"
