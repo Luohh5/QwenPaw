@@ -42,6 +42,17 @@ class SkillTreeEntry:
         return self.data is None
 
 
+def write_tree_entry(root: Path, entry: SkillTreeEntry) -> None:
+    """Write one bounded snapshot entry under a private target root."""
+    output = root / entry.relative
+    if entry.is_dir:
+        output.mkdir(parents=True, mode=0o700, exist_ok=True)
+        return
+    output.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    output.write_bytes(entry.data or b"")
+    os.chmod(output, 0o700 if entry.mode & stat.S_IXUSR else 0o600)
+
+
 def read_bounded_tree(  # pylint: disable=too-many-branches,too-many-statements
     source: Path,
     *,
@@ -136,4 +147,5 @@ __all__ = [
     "SkillTreeEntry",
     "read_bounded_tree",
     "read_bounded_skill_tree",
+    "write_tree_entry",
 ]

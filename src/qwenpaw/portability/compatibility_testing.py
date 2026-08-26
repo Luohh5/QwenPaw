@@ -24,11 +24,18 @@ from .compatibility import (
     AssetType,
     CompatibilityAsset,
     CompatibilityStore,
-    PluginComponent,
 )
 from .compatibility_safety import (
     mcp_inline_secret_risks,
     redact_sensitive_text,
+)
+from .codex_plugin_adapter import (
+    ADAPTER as CODEX_PLUGIN_ADAPTER,
+    stage_codex_content_plugin,
+)
+from .component_discovery import (
+    ADAPTATION_TEXT_SUFFIXES,
+    discover_components,
 )
 from .models import ProviderInventory
 from .qoder_plugin_adapter import stage_qoder_skill_plugin
@@ -41,39 +48,6 @@ class NativeTestResult:
     summary: str
     evidence: list[str]
 
-
-ADAPTATION_TEXT_SUFFIXES = {
-    "",
-    ".bash",
-    ".cjs",
-    ".js",
-    ".json",
-    ".jsonc",
-    ".jsx",
-    ".md",
-    ".mjs",
-    ".ps1",
-    ".py",
-    ".sh",
-    ".toml",
-    ".ts",
-    ".tsx",
-    ".txt",
-    ".yaml",
-    ".yml",
-    ".zsh",
-}
-_IGNORED_PARTS = {
-    ".git",
-    "__MACOSX",
-    "__pycache__",
-    "assets",
-    "build",
-    "dist",
-    "node_modules",
-    "tests",
-    "vendor",
-}
 
 _CallbackContract = tuple[int | None, tuple[str, ...], str, str]
 
@@ -550,130 +524,6 @@ def _validate_plugin_api_calls(  # pylint: disable=too-many-branches
     return validated
 
 
-def _text_files(root: Path) -> list[str]:
-    return sorted(
-        str(path.relative_to(root))
-        for path in root.rglob("*")
-        if path.is_file()
-        and not path.is_symlink()
-        and path.name != ".DS_Store"
-        and not path.name.startswith("._")
-        and path.suffix.lower() in ADAPTATION_TEXT_SUFFIXES
-        and not set(path.relative_to(root).parts[:-1]) & _IGNORED_PARTS
-    )
-
-
-def _component(component_id: str, kind: str, paths: list[str]):
-    return PluginComponent(
-        component_id=component_id,
-        kind=kind,
-        paths=sorted(set(paths)),
-    )
-
-
-def _in_component_dir(path: str, *names: str) -> bool:
-    parts = Path(path).parts
-    return bool(
-        parts
-        and (
-            parts[0] in names
-            or (
-                len(parts) > 1
-                and parts[0] in {".qoder-plugin", ".claude-plugin"}
-                and parts[1] in names
-            )
-        ),
-    )
-
-
-def discover_components(
-    asset_type: AssetType,
-    value: Any,
-) -> list[PluginComponent]:
-    """Build a reading checklist; the Agent still owns every verdict."""
-    if asset_type is AssetType.SKILL:
-        root = Path(value.directory)
-        files = _text_files(root) if root.is_dir() else []
-        return [_component("skill:root", "skill", files)] if files else []
-    if asset_type is not AssetType.PLUGIN:
-        return []
-    source = str(value.install_source or "")
-    if not source or "://" in source or not Path(source).is_dir():
-        return []
-    root = Path(source)
-    files = _text_files(root)
-    used: set[str] = set()
-    result: list[PluginComponent] = []
-
-    def add(component_id: str, kind: str, paths: list[str]) -> None:
-        selected = [
-            path for path in paths if path in files and path not in used
-        ]
-        if selected:
-            used.update(selected)
-            result.append(_component(component_id, kind, selected))
-
-    overview = [
-        path
-        for path in files
-        if path
-        in {
-            "plugin.json",
-            ".qoder-plugin/plugin.json",
-            ".claude-plugin/plugin.json",
-            "README.md",
-            "UPSTREAM.md",
-            "package.json",
-            "pyproject.toml",
-            "requirements.txt",
-        }
-    ]
-    add("manifest", "manifest", overview)
-    for path in files:
-        if _in_component_dir(path, "skills") and Path(path).name == "SKILL.md":
-            skill_root = Path(path).parent
-            add(
-                f"skill:{path}",
-                "skill",
-                [
-                    candidate
-                    for candidate in files
-                    if candidate == path
-                    or Path(candidate).is_relative_to(skill_root / "scripts")
-                ],
-            )
-        elif _in_component_dir(path, "commands"):
-            add(f"command:{path}", "command", [path])
-        elif _in_component_dir(path, "agents"):
-            add(f"agent:{path}", "agent", [path])
-        elif _in_component_dir(path, "rules"):
-            add(f"rule:{path}", "rule", [path])
-        elif _in_component_dir(path, "mcp", "mcps") or Path(path).name in {
-            ".mcp.json",
-            "mcp.json",
-        }:
-            add(f"mcp:{path}", "mcp", [path])
-    add(
-        "hooks",
-        "hook",
-        [path for path in files if _in_component_dir(path, "hooks")],
-    )
-    add(
-        "runtime",
-        "runtime",
-        [
-            path
-            for path in files
-            if path not in used
-            and (
-                len(Path(path).parts) == 1
-                or Path(path).parts[0] in {"src", "backend", "frontend", "lib"}
-            )
-        ],
-    )
-    return result
-
-
 def find_source(
     inventory: ProviderInventory,
     asset: CompatibilityAsset,
@@ -850,8 +700,7 @@ class CompatibilityTester:
             [f"name={name}", f"description={description[:300]}"],
         )
 
-    @staticmethod
-    def _test_mcp(server: Any) -> NativeTestResult:
+    def _test_mcp(self, server: Any) -> NativeTestResult:
         risks = mcp_inline_secret_risks(
             server.command,
             server.args,
@@ -874,7 +723,34 @@ class CompatibilityTester:
         evidence = [f"protocol={card.protocol}"]
         if server.transport == "stdio":
             executable = shutil.which(server.command)
-            if not executable and not Path(server.command).is_file():
+            command_path = Path(server.command)
+            plugin_id = str(server.metadata.get("source_plugin") or "")
+            relative_cwd = str(
+                server.metadata.get("source_plugin_relative_cwd") or "",
+            )
+            if plugin_id and relative_cwd and not command_path.is_absolute():
+                plugin = next(
+                    (
+                        item
+                        for item in self.inventory.plugins
+                        if item.source_id == plugin_id
+                    ),
+                    None,
+                )
+                if plugin is not None:
+                    runtime_root = (
+                        Path(plugin.install_source) / relative_cwd
+                    ).resolve()
+                    candidate = (runtime_root / command_path).resolve()
+                    if (
+                        candidate.is_relative_to(
+                            runtime_root,
+                        )
+                        and candidate.is_file()
+                    ):
+                        executable = str(candidate)
+                        evidence.append(f"plugin_runtime={runtime_root}")
+            if not executable and not command_path.is_file():
                 return NativeTestResult(
                     False,
                     "当前环境找不到 MCP 启动程序。",
@@ -892,9 +768,7 @@ class CompatibilityTester:
         if plugin.metadata.get("adapter") == "qoder_skill_only_v1":
             wrapper = stage_qoder_skill_plugin(plugin, enabled=False)
             try:
-                for skill_file in sorted(
-                    (wrapper / "skills").glob("*/SKILL.md"),
-                ):
+                for skill_file in sorted(wrapper.rglob("SKILL.md")):
                     content = skill_file.read_text(encoding="utf-8")
                     name, _description = validate_skill_content(content)
                     scan_skill_dir_or_raise(skill_file.parent, name)
@@ -903,6 +777,21 @@ class CompatibilityTester:
                     result.passed,
                     "Qoder Skill-only 插件通过 QwenPaw 包装和加载测试。",
                     ["adapter=qoder_skill_only_v1", *result.evidence],
+                )
+            finally:
+                shutil.rmtree(wrapper.parent, ignore_errors=True)
+        if plugin.metadata.get("adapter") == CODEX_PLUGIN_ADAPTER:
+            wrapper = stage_codex_content_plugin(plugin, enabled=False)
+            try:
+                for skill_file in sorted(wrapper.rglob("SKILL.md")):
+                    content = skill_file.read_text(encoding="utf-8")
+                    name, _description = validate_skill_content(content)
+                    scan_skill_dir_or_raise(skill_file.parent, name)
+                result = CompatibilityTester._test_native_plugin(wrapper)
+                return NativeTestResult(
+                    result.passed,
+                    "Codex 内容插件通过 QwenPaw 包装和加载测试。",
+                    [f"adapter={CODEX_PLUGIN_ADAPTER}", *result.evidence],
                 )
             finally:
                 shutil.rmtree(wrapper.parent, ignore_errors=True)

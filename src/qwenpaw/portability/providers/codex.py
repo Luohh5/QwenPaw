@@ -11,6 +11,7 @@ from ...harnesses.codex.rollout_reader import (
     CodexRolloutReader,
     codex_non_root_session_kind,
 )
+from ..codex_plugin_adapter import ADAPTER as CODEX_PLUGIN_ADAPTER
 from ..models import (
     ProviderInventory,
     SourceLocation,
@@ -23,6 +24,7 @@ from .base import ProgressReporter
 from .external_state import (
     codex_memory_status,
     discover_codex_memory,
+    discover_codex_plugin_mcp,
     discover_codex_plugins,
 )
 from .codex_schedules import discover_codex_scheduled_tasks
@@ -78,15 +80,19 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
         progress: ProgressReporter | None = None,
     ) -> ProviderInventory:
         """Discover and normalize Codex-owned portable objects."""
-        settings = (
-            dict(self._workspace.config.backend_settings)
-            if self._workspace.config.backend == self.provider_id
-            else {}
-        )
-        adapter = await self._workspace.harness_runtime.adapter(
-            self.provider_id,
-            settings,
-        )
+        local_only = self._source_location.data_home_source == "explicit"
+        adapter = None
+        status = None
+        if not local_only:
+            settings = (
+                dict(self._workspace.config.backend_settings)
+                if self._workspace.config.backend == self.provider_id
+                else {}
+            )
+            adapter = await self._workspace.harness_runtime.adapter(
+                self.provider_id,
+                settings,
+            )
         rollout_reader = self._rollout_reader
         offline_threads = await asyncio.to_thread(
             rollout_reader.list_threads,
@@ -96,16 +102,22 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             rollout_reader.list_non_root_thread_ids,
         )
 
-        try:
-            status = await asyncio.wait_for(
-                adapter.status(),
-                timeout=_DISCOVERY_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            status = None
+        if adapter is not None:
+            try:
+                status = await asyncio.wait_for(
+                    adapter.status(),
+                    timeout=_DISCOVERY_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                status = None
         installed = bool(status is not None and status.installed)
         warnings: list[str] = []
-        if not installed:
+        if local_only:
+            warnings.append(
+                "Explicit Codex source-home is local-only; the live "
+                "app-server was not queried.",
+            )
+        elif not installed:
             if offline_threads:
                 warnings.append(
                     "Codex CLI was unavailable, so local rollout JSONL files "
@@ -176,11 +188,13 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
         skills = await self._discover_skills(
             adapter,
             rollout_reader,
+            plugins,
             installed=installed,
             warnings=warnings,
         )
         mcp_servers = await self._discover_mcp(
             adapter,
+            plugins,
             installed=installed,
             warnings=warnings,
         )
@@ -312,12 +326,17 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
                 "into QwenPaw MEMORY.md.",
             )
         if plugins:
-            compatible = sum(bool(item.install_source) for item in plugins)
+            native = sum(bool(item.install_source) for item in plugins)
+            content = sum(
+                item.metadata.get("adapter") == CODEX_PLUGIN_ADAPTER
+                for item in plugins
+            )
             warnings.append(
                 f"Found {len(plugins)} enabled Codex plugin(s) across "
-                f"{len(marketplaces)} Marketplace source(s); {compatible} "
-                "expose a QwenPaw-compatible native install source. "
-                "Installed Codex cache directories are never copied.",
+                f"{len(marketplaces)} Marketplace source(s); {native} have "
+                f"a native source and {content} contain portable Skills/MCP. "
+                "Content caches enter bounded review snapshots and are "
+                "installed only through generated QwenPaw wrappers.",
             )
         if scheduled_tasks:
             warnings.append(
@@ -364,6 +383,7 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
         self,
         adapter: Any,
         rollout_reader: CodexRolloutReader,
+        plugins: list[Any],
         *,
         installed: bool,
         warnings: list[str],
@@ -386,6 +406,14 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             records = await asyncio.to_thread(rollout_reader.skill_records)
 
         workspace_skills = self._workspace.workspace_dir.resolve() / "skills"
+        plugin_roots = []
+        for plugin in plugins:
+            source = str(plugin.metadata.get("install_path") or "")
+            if source:
+                try:
+                    plugin_roots.append(Path(source).resolve(strict=True))
+                except OSError:
+                    pass
         skills: list[SourceSkill] = []
         seen: set[Path] = set()
         for item in records:
@@ -398,7 +426,11 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             ):
                 continue
             directory = raw_path.parent.resolve()
-            if directory in seen or directory.is_relative_to(workspace_skills):
+            if (
+                directory in seen
+                or directory.is_relative_to(workspace_skills)
+                or any(directory.is_relative_to(root) for root in plugin_roots)
+            ):
                 continue
             seen.add(directory)
             skills.append(
@@ -415,12 +447,17 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
     async def _discover_mcp(
         self,
         adapter: Any,
+        plugins: list[Any],
         *,
         installed: bool,
         warnings: list[str],
     ) -> list[SourceMCPServer]:
+        plugin_servers, plugin_warnings, _count = discover_codex_plugin_mcp(
+            plugins,
+        )
+        warnings.extend(plugin_warnings)
         if not installed:
-            return []
+            return plugin_servers
         external_records = getattr(adapter, "external_mcp_records", None)
         if external_records is None:
             try:
@@ -432,12 +469,12 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
                         f"Found {len(discovered)} Codex MCP server(s), but "
                         "this Codex adapter exposes redacted discovery only.",
                     )
-                return []
+                return plugin_servers
             except Exception as exc:  # pylint: disable=broad-except
                 warnings.append(
                     f"Codex MCP discovery failed: {_error_detail(exc)}",
                 )
-                return []
+                return plugin_servers
         try:
             records = await asyncio.wait_for(
                 external_records(self._workspace.workspace_dir.resolve()),
@@ -447,12 +484,16 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             warnings.append(
                 f"Codex MCP discovery failed: {_error_detail(exc)}",
             )
-            return []
+            return plugin_servers
         servers: list[SourceMCPServer] = []
         for item in records:
             server = _mcp_server(item)
             if server is not None:
                 servers.append(server)
+        seen = {server.name for server in servers}
+        servers.extend(
+            server for server in plugin_servers if server.name not in seen
+        )
         return servers
 
     # pylint: disable-next=too-many-locals

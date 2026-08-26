@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -1482,6 +1483,109 @@ async def test_qoder_custom_skill_plugin_uses_native_adapter(
         if item.category == "plugins"
     )
     assert plugin_check.status == "warning"
+
+
+@pytest.mark.asyncio
+async def test_codex_content_plugin_registers_skills_and_owned_mcp(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "creative-production"
+    manifest = source / ".codex-plugin/plugin.json"
+    skill = source / "skills/produce/SKILL.md"
+    server = source / "mcp/server.mjs"
+    manifest.parent.mkdir(parents=True)
+    skill.parent.mkdir(parents=True)
+    server.parent.mkdir(parents=True)
+    manifest.write_text(
+        json.dumps(
+            {
+                "name": "creative-production",
+                "version": "1.0.0",
+                "skills": "./skills/",
+                "mcpServers": "./.mcp.json",
+            },
+        ),
+        encoding="utf-8",
+    )
+    skill.write_text(
+        "---\nname: produce\ndescription: Produce visuals\n---\n",
+        encoding="utf-8",
+    )
+    server.write_text("// bundled MCP", encoding="utf-8")
+    (source / ".mcp.json").write_text(
+        '{"mcpServers":{}}',
+        encoding="utf-8",
+    )
+    installed_root = tmp_path / "installed-plugins"
+    installed_root.mkdir()
+
+    async def _install(source_path, *, app, force, reload_agents):
+        del app, force, reload_agents
+        staged = Path(source_path)
+        installed = installed_root / "creative-production"
+        shutil.copytree(staged, installed)
+        return SimpleNamespace(
+            manifest=SimpleNamespace(id="creative-production"),
+            source_path=installed,
+        )
+
+    app = SimpleNamespace(state=SimpleNamespace(plugin_loader=object()))
+    monkeypatch.setattr(
+        "qwenpaw.plugins.registry.PluginRegistry.get_plugin_http_app",
+        lambda _self: app,
+    )
+    monkeypatch.setattr(
+        "qwenpaw.app.routers.plugins.install_plugin_source",
+        _install,
+    )
+    monkeypatch.setattr(
+        "qwenpaw.portability.doctor.get_plugins_dir",
+        lambda: installed_root,
+    )
+    plugin_id = "creative-production@openai-curated-remote"
+    inventory = ProviderInventory(
+        provider_id="codex",
+        provider_name="Codex",
+        detected=True,
+        plugins=[
+            SourcePlugin(
+                source_id=plugin_id,
+                name="Creative Production",
+                marketplace="openai-curated-remote",
+                install_source=str(source),
+                metadata={"adapter": "codex_content_bundle_v1"},
+            ),
+        ],
+        discovered_mcp_count=1,
+        mcp_servers=[
+            SourceMCPServer(
+                source_id=f"codex:plugin-mcp:{plugin_id}:creative",
+                name="creative",
+                command="node",
+                args=["./mcp/server.mjs"],
+                metadata={
+                    "source_plugin": plugin_id,
+                    "source_plugin_relative_cwd": ".",
+                },
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        "qwenpaw.portability.importer.create_migration_provider",
+        lambda _source, _workspace: _Provider(inventory),
+    )
+    _mock_adaptation(monkeypatch, workspace, inventory, zone="migrate")
+
+    receipt = await ProviderImportService(workspace).import_from("codex")
+
+    assert receipt.installed_plugins == ["creative-production"]
+    assert receipt.imported_mcp_servers == ["creative"]
+    backend = (installed_root / "creative-production/plugin.py").read_text()
+    assert "register_skill_provider" in backend
+    card = (workspace.workspace_dir / "drivers/mcp/creative.yaml").read_text()
+    assert str(installed_root / "creative-production") in card
 
 
 @pytest.mark.asyncio

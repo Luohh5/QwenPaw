@@ -3,18 +3,21 @@
 
 from __future__ import annotations
 
-import os
 import re
 import secrets
 import shutil
-import stat
 from pathlib import Path
 from typing import Any
 
 from .compatibility import AssetType
+from .codex_plugin_adapter import ADAPTER as CODEX_PLUGIN_ADAPTER
 from .compatibility_testing import discover_components
 from .models import ProviderInventory
-from .skill_transfer import read_bounded_skill_tree, read_bounded_tree
+from .skill_transfer import (
+    read_bounded_skill_tree,
+    read_bounded_tree,
+    write_tree_entry,
+)
 
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -36,13 +39,7 @@ def _copy(source: Path, target: Path, required_file: str) -> None:
         else read_bounded_tree(source, required_file=required_file)
     )
     for entry in entries:
-        output = target / entry.relative
-        if entry.is_dir:
-            output.mkdir(parents=True, mode=0o700, exist_ok=True)
-            continue
-        output.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-        output.write_bytes(entry.data or b"")
-        os.chmod(output, 0o700 if entry.mode & stat.S_IXUSR else 0o600)
+        write_tree_entry(target, entry)
 
 
 def stage_local_assets(inventory: ProviderInventory, root: Path) -> list[str]:
@@ -75,14 +72,20 @@ def stage_local_assets(inventory: ProviderInventory, root: Path) -> list[str]:
         target = _target(plugins_root, plugin.name, f"plugin-{index}")
         plugin.install_source = str(target)
         try:
-            qoder_manifest = source / ".qoder-plugin" / "plugin.json"
-            required = (
-                ".qoder-plugin/plugin.json"
-                if qoder_manifest.is_file()
-                else "plugin.json"
-            )
+            required = "plugin.json"
+            for candidate in (
+                ".qoder-plugin/plugin.json",
+                ".codex-plugin/plugin.json",
+                ".claude-plugin/plugin.json",
+            ):
+                if (source / candidate).is_file():
+                    required = candidate
+                    break
             _copy(source, target, required)
-            if plugin.metadata.get("adapter") == "qoder_skill_only_v1":
+            if plugin.metadata.get("adapter") in {
+                "qoder_skill_only_v1",
+                CODEX_PLUGIN_ADAPTER,
+            }:
                 plugin.metadata["canonical_plugin_source"] = str(
                     target.resolve(),
                 )

@@ -22,6 +22,10 @@ from ..utils.io_utils import (
 )
 from .adaptation_loop import run_adaptation_loop
 from .compatibility import mcp_inline_secret_risks
+from .codex_plugin_adapter import (
+    ADAPTER as CODEX_PLUGIN_ADAPTER,
+    stage_codex_content_plugin,
+)
 from .doctor import run_migration_doctor
 from .models import (
     ImportReceipt,
@@ -49,6 +53,11 @@ from .import_support import (
 from .import_planning import ImportPlanningMixin
 
 logger = logging.getLogger(__name__)
+
+_GENERATED_PLUGIN_ADAPTERS = {
+    CODEX_PLUGIN_ADAPTER,
+    "qoder_skill_only_v1",
+}
 
 
 class ProviderImportService(ImportPlanningMixin):
@@ -101,6 +110,7 @@ class ProviderImportService(ImportPlanningMixin):
         skipped_marketplaces: list[str] = []
         prepared_plugins: list[str] = []
         installed_plugins: list[str] = []
+        installed_plugin_paths: dict[str, Path] = {}
         skipped_plugins: list[str] = []
         imported_scheduled_tasks: list[str] = []
         skipped_scheduled_tasks: list[str] = []
@@ -247,7 +257,7 @@ class ProviderImportService(ImportPlanningMixin):
                         )
                         == "repair"
                         and plugin.metadata.get("adapter")
-                        == "qoder_skill_only_v1"
+                        in _GENERATED_PLUGIN_ADAPTERS
                     )
                 )
             ]
@@ -299,7 +309,8 @@ class ProviderImportService(ImportPlanningMixin):
                     continue
                 if (
                     compatibility_zone == "repair"
-                    and plugin.metadata.get("adapter") != "qoder_skill_only_v1"
+                    and plugin.metadata.get("adapter")
+                    not in _GENERATED_PLUGIN_ADAPTERS
                 ):
                     prepared_plugins.append(plugin.source_id)
                     warnings.append(
@@ -331,6 +342,15 @@ class ProviderImportService(ImportPlanningMixin):
                             enabled=compatibility_zone == "migrate",
                         )
                         install_source = str(staged_plugin)
+                    elif (
+                        plugin.metadata.get("adapter") == CODEX_PLUGIN_ADAPTER
+                    ):
+                        staged_plugin = await run_sync_io(
+                            stage_codex_content_plugin,
+                            plugin,
+                            enabled=compatibility_zone == "migrate",
+                        )
+                        install_source = str(staged_plugin)
                     record = await install_plugin_source(
                         install_source,
                         app=plugin_app,
@@ -338,11 +358,15 @@ class ProviderImportService(ImportPlanningMixin):
                         reload_agents=False,
                     )
                     installed_plugins.append(record.manifest.id)
+                    source_path = getattr(record, "source_path", None)
+                    if source_path is not None:
+                        installed_plugin_paths[plugin.source_id] = Path(
+                            source_path,
+                        ).resolve()
                     if staged_plugin is not None:
                         warnings.append(
-                            f"Adapted local Qoder Skill-only plugin "
-                            f"{plugin.source_id!r} into a QwenPaw native "
-                            "wrapper; its Skills are "
+                            f"Adapted content plugin {plugin.source_id!r} "
+                            "into a QwenPaw native wrapper; its Skills are "
                             + (
                                 "enabled."
                                 if compatibility_zone == "migrate"
@@ -365,8 +389,8 @@ class ProviderImportService(ImportPlanningMixin):
             if installed_plugins:
                 warnings.append(
                     "兼容性 Goal 批准的插件已通过 QwenPaw 原生安装流程"
-                    "写入；Qoder Skill-only 插件使用 QwenPaw 生成的安全"
-                    "包装器。需要时请在迁移后重载智能体。",
+                    "写入；外部内容插件使用 QwenPaw 生成的原生包装器。"
+                    "需要时请在迁移后重载智能体。",
                 )
 
             memory_total = len(inventory.memory_projects)
@@ -502,9 +526,38 @@ class ProviderImportService(ImportPlanningMixin):
                     continue
                 credential_ref = ""
                 try:
+                    translated_server = server
+                    relative_cwd = str(
+                        server.metadata.get("source_plugin_relative_cwd")
+                        or "",
+                    )
+                    if relative_cwd:
+                        plugin_id = str(
+                            server.metadata.get("source_plugin") or "",
+                        )
+                        plugin_root = installed_plugin_paths.get(plugin_id)
+                        relative = Path(relative_cwd)
+                        if (
+                            plugin_root is None
+                            or relative.is_absolute()
+                            or ".." in relative.parts
+                        ):
+                            raise ValueError(
+                                "plugin-owned MCP has no safe installed root",
+                            )
+                        cwd = (plugin_root / relative).resolve()
+                        if not cwd.is_dir() or not cwd.is_relative_to(
+                            plugin_root,
+                        ):
+                            raise ValueError(
+                                "plugin-owned MCP directory is missing",
+                            )
+                        translated_server = server.model_copy(
+                            update={"cwd": str(cwd)},
+                        )
                     card, credential = legacy_mcp_client_to_driver(
                         server.name,
-                        _mcp_client_data(server),
+                        _mcp_client_data(translated_server),
                         force_encrypt_bindings=True,
                     )
                     card.enabled = compatibility_zone == "migrate"

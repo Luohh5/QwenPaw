@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
 """Read-only discovery for external memory and plugin source state.
 
-Installed plugin caches are intentionally used only as metadata. Marketplace
-plugins remain installable only from an independent source. Qoder's explicit
-``plugins/custom`` store is treated differently: it is user-authored source,
-not a downloaded cache, and a narrowly compatible Skill-only plugin can be
-translated by the importer before going through QwenPaw's native installer.
+Downloaded caches are never installed directly. Portable content may enter an
+isolated migration snapshot and be translated before QwenPaw's native loader
+sees it; independently sourced native plugins still use their original source.
 """
 
 from __future__ import annotations
@@ -17,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from ..qoder_plugin_adapter import discover_qoder_custom_skill_adapter
+from ..codex_plugin_adapter import ADAPTER as CODEX_PLUGIN_ADAPTER
 from ..models import (
     SourceMCPServer,
     SourceMarketplace,
@@ -490,8 +489,9 @@ def _qoder_mcp_servers(
     *,
     source_prefix: str,
     source_manifest: str,
+    harness: str = "Qoder",
 ) -> tuple[list[SourceMCPServer], list[str], int]:
-    """Normalize one Qoder MCP manifest through the shared MCP pipeline."""
+    """Normalize one external MCP manifest through the shared pipeline."""
     if not isinstance(records, dict):
         return [], [], 0
     servers: list[SourceMCPServer] = []
@@ -499,7 +499,7 @@ def _qoder_mcp_servers(
     for name, raw in sorted(records.items()):
         if not isinstance(raw, dict):
             warnings.append(
-                f"Qoder MCP {name!r} has an invalid configuration.",
+                f"{harness} MCP {name!r} has an invalid configuration.",
             )
             continue
         command = str(raw.get("command") or "")
@@ -512,7 +512,7 @@ def _qoder_mcp_servers(
         elif url:
             transport = "streamable_http"
         else:
-            warning = f"Qoder MCP {name!r} has neither a command nor URL"
+            warning = f"{harness} MCP {name!r} has neither a command nor URL"
             warnings.append(
                 f"{warning} and was skipped.",
             )
@@ -521,7 +521,17 @@ def _qoder_mcp_servers(
         if not isinstance(args, list):
             args = []
         env = _credential_placeholders(raw.get("env"))
+        for variable in raw.get("env_vars") or []:
+            name_value = str(variable)
+            if name_value:
+                env.setdefault(name_value, f"${{{name_value}}}")
         headers = _credential_placeholders(raw.get("headers"))
+        for header, variable in dict(
+            raw.get("env_http_headers") or {},
+        ).items():
+            name_value = str(variable)
+            if name_value:
+                headers.setdefault(str(header), f"${{{name_value}}}")
         credentials_removed = bool(env or headers)
         runtime_bound = ".qoder/plugins/cache" in command.replace("\\", "/")
         servers.append(
@@ -597,6 +607,70 @@ def discover_qoder_plugin_mcp(
     return servers, warnings, discovered
 
 
+def discover_codex_plugin_mcp(
+    plugins: list[SourcePlugin],
+) -> tuple[list[SourceMCPServer], list[str], int]:
+    """Discover MCP definitions declared by staged Codex content plugins."""
+    servers: list[SourceMCPServer] = []
+    warnings: list[str] = []
+    discovered = 0
+    for plugin in plugins:
+        source = str(plugin.metadata.get("install_path") or "")
+        if not source:
+            continue
+        root = Path(source).expanduser()
+        manifest = next(
+            (
+                value
+                for value in (
+                    _read_json(root / ".codex-plugin/plugin.json"),
+                    _read_json(root / ".claude-plugin/plugin.json"),
+                )
+                if isinstance(value, dict)
+            ),
+            None,
+        )
+        if not isinstance(manifest, dict):
+            continue
+        declared = manifest.get("mcpServers")
+        records: Any = declared if isinstance(declared, dict) else None
+        if isinstance(declared, str):
+            relative = Path(declared)
+            if relative.is_absolute() or ".." in relative.parts:
+                warnings.append(
+                    f"Codex plugin {plugin.name!r} has an unsafe MCP path.",
+                )
+                continue
+            config = _read_json(root / relative)
+            records = (
+                config.get("mcpServers") if isinstance(config, dict) else None
+            )
+        elif records is None:
+            for filename in (".mcp.json", "mcp.json"):
+                config = _read_json(root / filename)
+                if isinstance(config, dict):
+                    records = config.get("mcpServers")
+                    if isinstance(records, dict):
+                        break
+        found, found_warnings, count = _qoder_mcp_servers(
+            records,
+            source_prefix=f"codex:plugin-mcp:{plugin.source_id}",
+            source_manifest="codex_plugin_mcp_json",
+            harness="Codex",
+        )
+        for server in found:
+            server.metadata["source_plugin"] = plugin.source_id
+            raw = records.get(server.name, {})
+            cwd = str(raw.get("cwd") or ".")
+            if server.transport == "stdio" and not Path(cwd).is_absolute():
+                server.cwd = ""
+                server.metadata["source_plugin_relative_cwd"] = cwd
+            servers.append(server)
+        warnings.extend(found_warnings)
+        discovered += count
+    return servers, warnings, discovered
+
+
 def _marketplace_source(config: dict[str, Any], base: Path) -> tuple[str, str]:
     source_type = str(config.get("source_type") or config.get("type") or "")
     source = str(
@@ -663,23 +737,50 @@ def _qwen_plugin_source(  # pylint: disable=too-many-return-statements
     return ""
 
 
-def _cached_plugin_version(
+def _cached_plugin_details(
     cache_root: Path,
     marketplace: str,
     name: str,
-) -> str:
+) -> tuple[str, str, Path | None, dict[str, Any]]:
     plugin_root = cache_root / marketplace / name
-    manifests = list(plugin_root.glob("*/.codex-plugin/plugin.json"))
+    manifests = [
+        *plugin_root.glob("*/.codex-plugin/plugin.json"),
+        *plugin_root.glob("*/.claude-plugin/plugin.json"),
+    ]
     if not manifests:
-        return ""
+        return "", "", None, {}
     manifests.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    manifest = _read_json(manifests[0])
-    if isinstance(manifest, dict):
-        return str(manifest.get("version") or "")
-    return ""
+    manifest_path = manifests[0]
+    manifest = _read_json(manifest_path)
+    if not isinstance(manifest, dict):
+        return "", "", None, {}
+    source = manifest_path.parent.parent
+    if source.is_symlink() or not source.is_dir():
+        source = None
+    interface = manifest.get("interface")
+    display_name = manifest.get("displayName")
+    if not isinstance(display_name, str) and isinstance(interface, dict):
+        display_name = interface.get("displayName")
+    return (
+        str(manifest.get("version") or ""),
+        display_name.strip() if isinstance(display_name, str) else "",
+        source.resolve() if source is not None else None,
+        manifest,
+    )
 
 
-# pylint: disable-next=too-many-locals,too-many-branches
+def _codex_content_bundle(root: Path, manifest: dict[str, Any]) -> bool:
+    """Return whether a Codex plugin has portable Skill/MCP components."""
+    return bool(
+        manifest.get("skills")
+        or manifest.get("mcpServers")
+        or _skill_directories(root / "skills")
+        or (root / ".mcp.json").is_file()
+        or (root / "mcp.json").is_file(),
+    )
+
+
+# pylint: disable-next=too-many-locals,too-many-branches,too-many-statements
 def discover_codex_plugins(
     codex_home: Path,
 ) -> tuple[list[SourceMarketplace], list[SourcePlugin]]:
@@ -747,25 +848,38 @@ def discover_codex_plugins(
 
     plugins: list[SourcePlugin] = []
     for plugin_id in sorted(enabled_ids):
-        name, marketplace = plugin_id.rsplit("@", 1)
+        source_name, marketplace = plugin_id.rsplit("@", 1)
+        (
+            version,
+            display_name,
+            cached_source,
+            cached_manifest,
+        ) = _cached_plugin_details(
+            cache_root,
+            marketplace,
+            source_name,
+        )
         root = resolved_roots.get(marketplace)
+        metadata: dict[str, Any] = {
+            "source_manifest": "codex",
+            "remote_install": plugin_id in remote_ids,
+        }
+        if cached_source is not None:
+            metadata["install_path"] = str(cached_source)
+            if _codex_content_bundle(cached_source, cached_manifest):
+                metadata["adapter"] = CODEX_PLUGIN_ADAPTER
         plugins.append(
             SourcePlugin(
                 source_id=plugin_id,
-                name=name,
+                name=display_name or source_name,
                 marketplace=marketplace,
-                version=_cached_plugin_version(
-                    cache_root,
-                    marketplace,
-                    name,
-                ),
+                version=version,
                 install_source=(
-                    _qwen_plugin_source(root, name) if root is not None else ""
+                    _qwen_plugin_source(root, source_name)
+                    if root is not None
+                    else ""
                 ),
-                metadata={
-                    "source_manifest": "codex",
-                    "remote_install": plugin_id in remote_ids,
-                },
+                metadata=metadata,
             ),
         )
     return marketplaces, plugins
@@ -888,6 +1002,7 @@ def discover_qoder_plugins(
 __all__ = [
     "discover_codex_memory",
     "codex_memory_status",
+    "discover_codex_plugin_mcp",
     "discover_codex_plugins",
     "discover_project_memory",
     "discover_qoder_mcp",

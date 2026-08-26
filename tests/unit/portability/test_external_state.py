@@ -5,6 +5,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from qwenpaw.portability.models import SourcePlugin
 from qwenpaw.portability.qoder_plugin_adapter import (
     discover_qoder_custom_skill_adapter,
@@ -13,6 +15,7 @@ from qwenpaw.portability.providers.external_state import (
     codex_memory_status,
     discover_codex_memory,
     discover_codex_plugins,
+    discover_codex_plugin_mcp,
     discover_project_memory,
     discover_qoder_mcp,
     discover_qoder_memory,
@@ -169,16 +172,113 @@ def test_codex_plugin_uses_marketplace_source_not_installed_cache(
     cache = codex_home / "plugins/cache/local/demo/cache-id/.codex-plugin"
     cache.mkdir(parents=True)
     (cache / "plugin.json").write_text(
-        json.dumps({"name": "demo", "version": "9.9.9"}),
+        json.dumps(
+            {
+                "name": "demo",
+                "version": "9.9.9",
+                "interface": {"displayName": "Demo Plugin"},
+            },
+        ),
         encoding="utf-8",
     )
 
     marketplaces, plugins = discover_codex_plugins(codex_home)
 
     assert marketplaces[0].source == str(marketplace.resolve())
+    assert plugins[0].name == "Demo Plugin"
     assert plugins[0].version == "9.9.9"
     assert plugins[0].install_source == str(plugin.resolve())
     assert "cache" not in plugins[0].install_source
+
+
+def test_codex_content_plugin_cache_is_staging_input_not_install_source(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / ".codex"
+    plugin = codex_home / "plugins/cache/openai-curated-remote/expo/1.0.2"
+    manifest = plugin / ".codex-plugin/plugin.json"
+    skill = plugin / "skills/building-native-ui/SKILL.md"
+    manifest.parent.mkdir(parents=True)
+    skill.parent.mkdir(parents=True)
+    manifest.write_text(
+        json.dumps(
+            {
+                "name": "expo",
+                "version": "1.0.2",
+                "skills": "./skills/",
+                "interface": {"displayName": "Expo"},
+            },
+        ),
+        encoding="utf-8",
+    )
+    skill.write_text("# Expo", encoding="utf-8")
+    (plugin.parent / ".codex-remote-plugin-install.json").write_text(
+        '{"schema_version":1}',
+        encoding="utf-8",
+    )
+
+    _marketplaces, plugins = discover_codex_plugins(codex_home)
+
+    assert len(plugins) == 1
+    assert plugins[0].name == "Expo"
+    assert plugins[0].install_source == ""
+    assert plugins[0].metadata["install_path"] == str(plugin.resolve())
+    assert plugins[0].metadata["adapter"] == "codex_content_bundle_v1"
+
+
+@pytest.mark.parametrize("manifest_dir", [".codex-plugin", ".claude-plugin"])
+def test_codex_content_plugin_discovers_owned_mcp(
+    tmp_path: Path,
+    manifest_dir: str,
+) -> None:
+    root = tmp_path / "cloudflare"
+    manifest = root / manifest_dir / "plugin.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        json.dumps(
+            {
+                "name": "cloudflare",
+                "mcpServers": "./.mcp.json",
+            },
+        ),
+        encoding="utf-8",
+    )
+    (root / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "cloudflare-api": {
+                        "type": "http",
+                        "url": "https://mcp.cloudflare.com/mcp",
+                    },
+                    "local": {
+                        "command": "node",
+                        "args": ["./mcp/server.mjs"],
+                        "cwd": ".",
+                        "env_vars": ["CODEX_HOME"],
+                    },
+                },
+            },
+        ),
+        encoding="utf-8",
+    )
+    plugin = SourcePlugin(
+        source_id="cloudflare@openai-curated-remote",
+        name="Cloudflare",
+        marketplace="openai-curated-remote",
+        metadata={"install_path": str(root)},
+    )
+
+    servers, warnings, discovered = discover_codex_plugin_mcp([plugin])
+
+    assert not warnings
+    assert discovered == 2
+    assert [server.name for server in servers] == ["cloudflare-api", "local"]
+    assert servers[0].url == "https://mcp.cloudflare.com/mcp"
+    assert servers[0].metadata["source_plugin"] == plugin.source_id
+    assert servers[1].cwd == ""
+    assert servers[1].env == {"CODEX_HOME": "${CODEX_HOME}"}
+    assert servers[1].metadata["source_plugin_relative_cwd"] == "."
 
 
 def test_qoder_plugin_cache_is_metadata_only(tmp_path: Path):

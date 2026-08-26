@@ -16,6 +16,10 @@ from qwenpaw.portability.adaptation_loop import (
     get_active_adaptation_context,
     run_adaptation_loop,
 )
+from qwenpaw.portability.adaptation_staging import (
+    component_map,
+    stage_local_assets,
+)
 from qwenpaw.portability.compatibility import (
     AssetType,
     AssetZone,
@@ -261,6 +265,90 @@ def test_native_plugin_test_accepts_valid_registration_contract(
     assert "plugin_api_calls_validated=2" in result.evidence
 
 
+def test_codex_content_adapter_generates_a_native_plugin_contract(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / ".codex-plugin/plugin.json"
+    skill = tmp_path / "skills/building-native-ui/SKILL.md"
+    manifest.parent.mkdir()
+    skill.parent.mkdir(parents=True)
+    manifest.write_text(
+        json.dumps(
+            {
+                "name": "expo",
+                "version": "1.0.2",
+                "description": "Expo workflows",
+                "skills": "./skills/",
+                "interface": {"displayName": "Expo"},
+            },
+        ),
+        encoding="utf-8",
+    )
+    skill.write_text(
+        "---\nname: building-native-ui\ndescription: Build Expo UI\n---\n",
+        encoding="utf-8",
+    )
+    plugin = SourcePlugin(
+        source_id="expo@openai-curated-remote",
+        name="Expo",
+        marketplace="openai-curated-remote",
+        install_source=str(tmp_path),
+        metadata={"adapter": "codex_content_bundle_v1"},
+    )
+
+    try:
+        result = CompatibilityTester._test_plugin(plugin)
+    except Exception as exc:  # pragma: no cover - assertion reports the cause
+        pytest.fail(f"Codex content adapter did not build a wrapper: {exc}")
+
+    assert result.passed
+    assert "adapter=codex_content_bundle_v1" in result.evidence
+    assert "plugin_api_calls_validated=1" in result.evidence
+
+
+def test_codex_plugin_mcp_resolves_command_in_staged_container(
+    tmp_path: Path,
+) -> None:
+    command = tmp_path / "scripts/launch"
+    command.parent.mkdir()
+    command.write_text("#!/bin/sh\n", encoding="utf-8")
+    command.chmod(0o700)
+    plugin_id = "tools@openai-bundled"
+    server = SourceMCPServer(
+        source_id="codex:plugin-mcp:tools:server",
+        name="server",
+        command="./scripts/launch",
+        metadata={
+            "source_plugin": plugin_id,
+            "source_plugin_relative_cwd": ".",
+        },
+    )
+    inventory = ProviderInventory(
+        provider_id="codex",
+        provider_name="Codex",
+        detected=True,
+        plugins=[
+            SourcePlugin(
+                source_id=plugin_id,
+                name="Tools",
+                marketplace="openai-bundled",
+                install_source=str(tmp_path),
+            ),
+        ],
+        mcp_servers=[server],
+    )
+    tester = CompatibilityTester(
+        SimpleNamespace(workspace_dir=tmp_path),
+        inventory,
+        SimpleNamespace(),
+    )
+
+    result = tester._test_mcp(server)
+
+    assert result.passed
+    assert any("plugin_runtime=" in item for item in result.evidence)
+
+
 def test_inspect_returns_exact_live_plugin_api_signatures(tmp_path: Path):
     workspace = _Workspace(tmp_path, lambda _context: None)
     tester = CompatibilityTester(
@@ -328,6 +416,56 @@ def test_large_plugin_checklist_uses_behavioral_entries_not_doc_corpus(
     assert "docs/examples/agents/example.md" not in paths
     assert ".DS_Store" not in paths
     assert "__MACOSX/._plugin.json" not in paths
+
+
+def test_codex_plugin_is_staged_and_read_as_component_container(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "cache/cloudflare/0.1.2"
+    files = {
+        ".codex-plugin/plugin.json": json.dumps(
+            {
+                "name": "cloudflare",
+                "version": "0.1.2",
+                "skills": "./skills/",
+                "mcpServers": "./.mcp.json",
+            },
+        ),
+        "skills/cloudflare/SKILL.md": "Cloudflare guidance",
+        ".mcp.json": '{"mcpServers":{}}',
+    }
+    for relative, content in files.items():
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    inventory = ProviderInventory(
+        provider_id="codex",
+        provider_name="Codex",
+        detected=True,
+        plugins=[
+            SourcePlugin(
+                source_id="cloudflare@openai-curated-remote",
+                name="Cloudflare",
+                marketplace="openai-curated-remote",
+                metadata={
+                    "adapter": "codex_content_bundle_v1",
+                    "install_path": str(source),
+                },
+            ),
+        ],
+    )
+
+    warnings = stage_local_assets(inventory, tmp_path / "staging")
+    components = component_map(inventory)[
+        "plugins:cloudflare@openai-curated-remote"
+    ]
+
+    assert not warnings
+    assert Path(inventory.plugins[0].install_source) != source
+    assert {item.kind for item in components} >= {"manifest", "skill", "mcp"}
+    assert any(
+        ".codex-plugin/plugin.json" in item.paths for item in components
+    )
 
 
 @pytest.mark.asyncio
@@ -473,6 +611,66 @@ async def test_triage_can_finish_without_starting_mission(
     assert (
         workspace.requests[0].request_context["portability_phase"] == "triage"
     )
+
+
+@pytest.mark.asyncio
+async def test_triage_reads_oversized_plugin_file_once_as_excerpt(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-plugin"
+    source.mkdir()
+    (source / "plugin.json").write_text(
+        '{"id":"large","version":"1.0.0"}',
+        encoding="utf-8",
+    )
+    (source / "server.mjs").write_text(
+        "export const payload = '" + "x" * (257 * 1024) + "';\n",
+        encoding="utf-8",
+    )
+
+    async def action(context):
+        inspected = await context.inspect_asset("plugins:large")
+        assessments = {}
+        for component in inspected["asset"]["components"]:
+            for path in component["paths"]:
+                result = await context.read_file("plugins:large", path)
+                if path == "server.mjs":
+                    assert result["read_mode"] == "bounded_excerpt"
+                    assert result["has_more"] is False
+                    assert result["size_bytes"] > 256 * 1024
+            assessments[component["component_id"]] = {
+                "verdict": "unusable",
+                "reason": "QwenPaw already provides this capability",
+            }
+        await context.classify_asset(
+            "plugins:large",
+            "discard",
+            "QwenPaw already has an equivalent",
+            "unusable",
+            json.dumps(assessments),
+        )
+
+    inventory = ProviderInventory(
+        provider_id="codex",
+        provider_name="Codex",
+        detected=True,
+        plugins=[
+            SourcePlugin(
+                source_id="large",
+                name="large",
+                marketplace="test",
+                install_source=str(source),
+            ),
+        ],
+    )
+    result = await run_adaptation_loop(
+        _Workspace(tmp_path, action),
+        inventory,
+        "migration-large-plugin",
+    )
+
+    assert result.status == "completed"
+    assert result.asset_zones["plugins:large"] == "discard"
 
 
 @pytest.mark.asyncio

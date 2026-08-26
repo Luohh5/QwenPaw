@@ -44,6 +44,7 @@ from .providers.base import ProgressReporter, report_progress as _report
 _MAX_REACT_ITERATIONS = 4_000
 _HEARTBEAT_SECONDS = 12
 _MAX_FILE_BYTES = 256 * 1024
+_EXCERPT_BYTES = 16 * 1024
 _MAX_REPLACEMENT_BYTES = 32 * 1024
 _TRIAGE_TOOLS = (
     "migration_compat_inspect",
@@ -230,6 +231,21 @@ class ActiveAdaptationContext:
             raise PermissionError("asset path is not a regular staged file")
         return path
 
+    @staticmethod
+    def _excerpt(path: Path, size: int) -> str:
+        with path.open("rb") as stream:
+            head = stream.read(_EXCERPT_BYTES)
+            if size <= _EXCERPT_BYTES:
+                tail = b""
+            else:
+                stream.seek(max(_EXCERPT_BYTES, size - _EXCERPT_BYTES))
+                tail = stream.read(_EXCERPT_BYTES)
+        excerpt = head.decode("utf-8", errors="replace")
+        if tail:
+            excerpt += "\n\n[... middle omitted ...]\n\n"
+            excerpt += tail.decode("utf-8", errors="replace")
+        return redact_sensitive_text(excerpt)
+
     async def list_assets(
         self,
         *,
@@ -319,8 +335,23 @@ class ActiveAdaptationContext:
             path = self._asset_file(self._asset_root(asset), relative_path)
             if not path.is_file():
                 raise FileNotFoundError(relative_path)
-            if path.stat().st_size > _MAX_FILE_BYTES:
-                raise ValueError("staged text file exceeds read limit")
+            size = path.stat().st_size
+            if size > _MAX_FILE_BYTES:
+                self.store.record_read(
+                    key,
+                    relative_path,
+                    started=True,
+                    finished=True,
+                )
+                return {
+                    "ok": True,
+                    "path": relative_path,
+                    "read_mode": "bounded_excerpt",
+                    "size_bytes": size,
+                    "text": self._excerpt(path, size),
+                    "has_more": False,
+                    "next_line": None,
+                }
             lines = redact_sensitive_text(
                 path.read_text(encoding="utf-8"),
             ).splitlines()
