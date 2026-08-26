@@ -99,6 +99,22 @@ def _within(path: Path, root: Path) -> None:
         raise _unsafe(path, "entry escapes its source root") from exc
 
 
+def regular_file_info(
+    path: Path,
+    *,
+    max_bytes: int | None = None,
+) -> os.stat_result:
+    """Return bounded lstat metadata for one regular, non-link file."""
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        raise _unsafe(path, "symbolic links are not allowed")
+    if not stat.S_ISREG(info.st_mode):
+        raise _unsafe(path, "entry is not a regular file")
+    if max_bytes is not None and info.st_size > max_bytes:
+        raise ValueError(f"source exceeds the byte safety limit: {path}")
+    return info
+
+
 @contextmanager
 def open_regular_file(
     path: Path,
@@ -107,9 +123,7 @@ def open_regular_file(
     max_bytes: int | None = None,
 ) -> Iterator[tuple[BinaryIO, os.stat_result]]:
     """Open one stable regular file without following a replaced link."""
-    before = expected or path.lstat()
-    if stat.S_ISLNK(before.st_mode):
-        raise _unsafe(path, "symbolic links are not allowed")
+    before = expected or regular_file_info(path, max_bytes=max_bytes)
     if not stat.S_ISREG(before.st_mode):
         raise _unsafe(path, "entry is not a regular file")
     if max_bytes is not None and before.st_size > max_bytes:
@@ -256,6 +270,7 @@ __all__ = [
     "TreeLimits",
     "TreeSourceEntry",
     "open_regular_file",
+    "regular_file_info",
     "read_regular_file",
     "read_tree",
     "walk_tree",
