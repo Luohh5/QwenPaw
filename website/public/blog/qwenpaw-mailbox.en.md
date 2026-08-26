@@ -60,7 +60,7 @@ QwenPaw's managed mailbox flow currently supports the following nine email domai
 
 ### Manage Your Personal Mailbox
 
-Before you begin, enable **IMAP/SMTP** in your provider's web settings and prepare a client authorization code or app password.
+Follow the [reference document](https://qwenpaw.agentscope.io/docs/mailbox/#%E4%BD%BF%E7%94%A8%E5%89%8D%E5%87%86%E5%A4%87) to complete the preparation work before starting. First, enable **IMAP/SMTP** in your provider's web settings and prepare a client authorization code or app password.
 
 Keep in mind that a **16-character authorization code is not your mailbox password**. To obtain a Gmail app password, first enable 2-Step Verification from your Google Account, then create an app password for Gmail.
 
