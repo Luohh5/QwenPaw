@@ -13,11 +13,7 @@ from .compatibility import AssetType
 from .codex_plugin_adapter import ADAPTER as CODEX_PLUGIN_ADAPTER
 from .compatibility_testing import discover_components
 from .models import ProviderInventory
-from .skill_transfer import (
-    read_bounded_skill_tree,
-    read_bounded_tree,
-    write_tree_entry,
-)
+from .skill_transfer import copy_bounded_tree
 
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -31,17 +27,6 @@ def _target(root: Path, name: str, fallback: str) -> Path:
     return target
 
 
-def _copy(source: Path, target: Path, required_file: str) -> None:
-    target.mkdir(mode=0o700)
-    entries = (
-        read_bounded_skill_tree(source)
-        if required_file == "SKILL.md"
-        else read_bounded_tree(source, required_file=required_file)
-    )
-    for entry in entries:
-        write_tree_entry(target, entry)
-
-
 def stage_local_assets(inventory: ProviderInventory, root: Path) -> list[str]:
     """Copy local Skill and plugin inputs into the private staging tree."""
     warnings: list[str] = []
@@ -53,7 +38,7 @@ def stage_local_assets(inventory: ProviderInventory, root: Path) -> list[str]:
         target = _target(skills_root, skill.name, f"skill-{index}")
         skill.directory = target
         try:
-            _copy(source, target, "SKILL.md")
+            copy_bounded_tree(source, target, required_file="SKILL.md")
         except Exception as exc:  # pylint: disable=broad-except
             shutil.rmtree(target, ignore_errors=True)
             skill.directory = skills_root / f".failed-{secrets.token_hex(12)}"
@@ -81,7 +66,7 @@ def stage_local_assets(inventory: ProviderInventory, root: Path) -> list[str]:
                 if (source / candidate).is_file():
                     required = candidate
                     break
-            _copy(source, target, required)
+            copy_bounded_tree(source, target, required_file=required)
             if plugin.metadata.get("adapter") in {
                 "qoder_skill_only_v1",
                 CODEX_PLUGIN_ADAPTER,

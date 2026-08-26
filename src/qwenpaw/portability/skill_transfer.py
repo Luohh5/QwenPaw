@@ -137,3 +137,15 @@ def read_bounded_tree(  # pylint: disable=too-many-branches
 def read_bounded_skill_tree(source: Path) -> Iterator[SkillTreeEntry]:
     """Yield one link-free Skill tree with stable, bounded snapshots."""
     yield from read_bounded_tree(source, required_file="SKILL.md")
+
+
+def copy_bounded_tree(
+    source: Path,
+    target: Path,
+    *,
+    required_file: str = "",
+) -> None:
+    """Copy one bounded source tree into a new private directory."""
+    target.mkdir(mode=0o700)
+    for entry in read_bounded_tree(source, required_file=required_file):
+        write_tree_entry(target, entry)
