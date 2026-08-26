@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .compatibility import AssetType, PluginComponent
+from .skill_transfer import read_bounded_tree
 
 ADAPTATION_TEXT_SUFFIXES = {
     "",
@@ -29,30 +30,34 @@ ADAPTATION_TEXT_SUFFIXES = {
     ".yml",
     ".zsh",
 }
-_IGNORED_PARTS = {
-    ".git",
-    "__MACOSX",
-    "__pycache__",
-    "assets",
-    "build",
-    "dist",
-    "node_modules",
-    "tests",
-    "vendor",
-}
+_IGNORED_PARTS = frozenset(
+    {
+        ".git",
+        "__MACOSX",
+        "__pycache__",
+        "assets",
+        "build",
+        "dist",
+        "node_modules",
+        "tests",
+        "vendor",
+    },
+)
 _MANIFEST_DIRS = {".qoder-plugin", ".claude-plugin", ".codex-plugin"}
 
 
 def _text_files(root: Path) -> list[str]:
     return sorted(
-        str(path.relative_to(root))
-        for path in root.rglob("*")
-        if path.is_file()
-        and not path.is_symlink()
-        and path.name != ".DS_Store"
-        and not path.name.startswith("._")
-        and path.suffix.lower() in ADAPTATION_TEXT_SUFFIXES
-        and not set(path.relative_to(root).parts[:-1]) & _IGNORED_PARTS
+        entry.relative.as_posix()
+        for entry in read_bounded_tree(
+            root,
+            excluded_dirs=_IGNORED_PARTS,
+            reject_unsafe=False,
+        )
+        if not entry.is_dir
+        and entry.relative.name != ".DS_Store"
+        and not entry.relative.name.startswith("._")
+        and entry.relative.suffix.lower() in ADAPTATION_TEXT_SUFFIXES
     )
 
 
@@ -66,17 +71,9 @@ def _component(component_id: str, kind: str, paths: list[str]):
 
 def _in_component_dir(path: str, *names: str) -> bool:
     parts = Path(path).parts
-    return bool(
-        parts
-        and (
-            parts[0] in names
-            or (
-                len(parts) > 1
-                and parts[0] in _MANIFEST_DIRS
-                and parts[1] in names
-            )
-        ),
-    )
+    if parts and parts[0] in _MANIFEST_DIRS:
+        parts = parts[1:]
+    return bool(parts and parts[0] in names)
 
 
 def discover_components(
