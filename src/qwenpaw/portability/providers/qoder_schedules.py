@@ -14,7 +14,6 @@ deleted after Qoder migrated the store.
 from __future__ import annotations
 
 import json
-import os
 import re
 import stat
 from dataclasses import dataclass
@@ -24,6 +23,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..models import SourceScheduledTask
+from ..skill_transfer import read_regular_file
 from .schedule_fields import (
     contains_control as _contains_control,
     metadata_text as _metadata_text,
@@ -135,47 +135,25 @@ def _load_store(
             f"{_MAX_STORE_BYTES}-byte safety limit.",
         )
 
-    descriptor = -1
     try:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(path, flags)
-        opened_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(opened_stat.st_mode):
-            return None, f"Qoder schedule store {path} is not a regular file."
-        if (opened_stat.st_dev, opened_stat.st_ino) != (
-            source_stat.st_dev,
-            source_stat.st_ino,
-        ):
-            return (
-                None,
-                f"Qoder schedule store {path} changed while being opened.",
-            )
-        if opened_stat.st_size > _MAX_STORE_BYTES:
-            return (
-                None,
-                f"Qoder schedule store {path} exceeds the "
-                f"{_MAX_STORE_BYTES}-byte safety limit.",
-            )
-        with os.fdopen(descriptor, "rb") as stream:
-            descriptor = -1
-            encoded = stream.read(_MAX_STORE_BYTES + 1)
-        if len(encoded) > _MAX_STORE_BYTES:
-            return (
-                None,
-                f"Qoder schedule store {path} grew beyond the "
-                f"{_MAX_STORE_BYTES}-byte safety limit while reading.",
-            )
+        encoded = read_regular_file(
+            path,
+            expected=source_stat,
+            max_bytes=_MAX_STORE_BYTES,
+        )
+    except ValueError:
+        return None, f"Qoder schedule store {path} changed while being read."
+    except OSError as exc:
+        return None, f"Could not read Qoder schedule store {path}: {exc}."
+
+    try:
         payload = json.loads(encoded.decode("utf-8"))
     except (
-        OSError,
         UnicodeError,
         json.JSONDecodeError,
         RecursionError,
     ) as exc:
         return None, f"Could not read Qoder schedule store {path}: {exc}."
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
 
     if not isinstance(payload, dict) or payload.get("version") != version:
         return (
