@@ -290,12 +290,7 @@ class CronManager(ManagerBase):
         *,
         actor: Optional[str] = None,
     ) -> CronJobSpec:
-        """Clear an imported job's review gate without enabling the job.
-
-        Promotion is deliberately separate from the generic update and resume
-        paths.  It records the review decision, but leaves ``enabled=False``;
-        callers must make a second, explicit decision to resume the job.
-        """
+        """Clear an imported job's review gate without enabling it."""
         async with self._lock:
             job = await self._repo.get_job(job_id)
             if job is None:
@@ -323,21 +318,12 @@ class CronManager(ManagerBase):
         previous: Optional[CronJobSpec],
         allow_gate_clear: bool = False,
     ) -> None:
-        """Persist and register a job as one logical transaction.
-
-        Repository implementations are expected to save atomically.  This
-        method extends that guarantee across APScheduler: trigger validation
-        happens before persistence, and any later registration failure restores
-        both the previous repository record and scheduler registration.
-        """
+        """Persist and register atomically, restoring both sides on failure."""
         self.validate_job_spec(spec)
         assert spec.id is not None
         if not allow_gate_clear:
             self._validate_review_gate_update(previous, spec)
 
-        # Validate timezone, cron fields and trigger construction before the
-        # repository is changed.  _register_or_update rebuilds it to keep that
-        # method independently safe for startup callers.
         job_id = spec.id
         old_runtime = self._rt.get(job_id)
         old_state = self._states.get(job_id)
@@ -471,13 +457,7 @@ class CronManager(ManagerBase):
         return cls._with_portability_review(job, pending=True)
 
     async def restore_imported_job_snapshot(self, job: CronJobSpec) -> None:
-        """Restore a quarantined import snapshot without registering it.
-
-        This is intentionally limited to migration provenance and always
-        restores a disabled, review-gated record.  It lets a larger import
-        transaction roll back an invalid legacy Cron definition without
-        asking APScheduler to accept that invalid trigger.
-        """
+        """Restore a disabled imported snapshot without registering it."""
         async with self._lock:
             restored = self.canonicalize_imported_job_for_review(job)
             portability = self._portability_metadata(restored)
@@ -574,8 +554,8 @@ class CronManager(ManagerBase):
         actor: Optional[str] = None,
     ) -> CronJobSpec:
         """Write one review state to all duplicated Cron payload fields."""
-        promoted_at = datetime.now(timezone.utc).isoformat()
-        portability = copy.deepcopy(cls._portability_metadata(job) or {})
+        updated = job.model_copy(deep=True)
+        portability = cls._portability_metadata(updated) or {}
         portability["requires_review"] = pending
         portability["safety"] = (
             "disabled_until_explicit_promotion"
@@ -586,37 +566,18 @@ class CronManager(ManagerBase):
             portability.pop("promoted_at", None)
             portability.pop("promoted_by", None)
         else:
-            portability["promoted_at"] = promoted_at
+            portability["promoted_at"] = datetime.now(timezone.utc).isoformat()
             if actor:
                 portability["promoted_by"] = actor
 
-        meta = copy.deepcopy(job.meta)
-        meta["portability"] = copy.deepcopy(portability)
-
-        dispatch = job.dispatch.model_copy(deep=True)
-        dispatch_meta = copy.deepcopy(dispatch.meta)
-        dispatch_meta["portability"] = copy.deepcopy(portability)
-        dispatch.meta = dispatch_meta
-
-        request = job.request.model_copy(deep=True) if job.request else None
-        if request is not None:
-            request_context = getattr(request, "request_context", None)
-            updated_context = (
-                copy.deepcopy(request_context)
-                if isinstance(request_context, dict)
-                else {}
-            )
-            updated_context["portability_review_required"] = pending
-            request.request_context = updated_context
-
-        return job.model_copy(
-            update={
-                "enabled": False,
-                "meta": meta,
-                "dispatch": dispatch,
-                "request": request,
-            },
-        )
+        updated.meta["portability"] = copy.deepcopy(portability)
+        updated.dispatch.meta["portability"] = copy.deepcopy(portability)
+        if updated.request is not None:
+            context = cls._request_context(updated)
+            context["portability_review_required"] = pending
+            updated.request.request_context = context
+        updated.enabled = False
+        return updated
 
     async def reschedule_heartbeat(self) -> None:
         """Reload heartbeat config and update or remove the heartbeat job.
