@@ -9,9 +9,15 @@ from pathlib import Path
 from ..utils import io_utils
 from ..utils.io_utils import get_path_lock, read_json_async
 from .import_support import _PLAN_ID_PATTERN
-from .models import ImportReceipt, MigrationPlan, ProviderInventory
+from .models import (
+    ImportReceipt,
+    ImportSelection,
+    MigrationPlan,
+    ProviderInventory,
+)
 from .planner import build_migration_plan, inventory_fingerprint
 from .providers.base import ProgressReporter, report_progress as _report
+from .selection import select_inventory
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +155,29 @@ class ImportPlanningMixin:
         progress: ProgressReporter | None = None,
     ) -> ImportReceipt:
         """Revalidate a persisted plan and apply the unchanged source."""
+        return await self._apply_stored_plan(plan_id, progress=progress)
+
+    async def apply_selection(
+        self,
+        plan_id: str,
+        selection: ImportSelection,
+        *,
+        progress: ProgressReporter | None = None,
+    ) -> ImportReceipt:
+        """Revalidate a plan, then apply a dependency-complete subset."""
+        return await self._apply_stored_plan(
+            plan_id,
+            progress=progress,
+            selection=selection,
+        )
+
+    async def _apply_stored_plan(
+        self,
+        plan_id: str,
+        *,
+        progress: ProgressReporter | None,
+        selection: ImportSelection | None = None,
+    ) -> ImportReceipt:
         if not _PLAN_ID_PATTERN.fullmatch(plan_id):
             raise ValueError("迁移计划编号格式无效。")
         lock_path = (
@@ -175,6 +204,8 @@ class ImportPlanningMixin:
                 message = "来源数据在预演后发生了变化。请重新运行 --dry-run，"
                 message += "确认新计划后再执行。"
                 raise ValueError(message)
+            if selection is not None:
+                inventory = select_inventory(inventory, selection)
             return await self._execute_plan(
                 plan,
                 inventory,

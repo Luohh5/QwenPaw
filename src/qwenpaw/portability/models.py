@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from ..harnesses.events import HarnessHistoryItem
 
@@ -142,6 +143,47 @@ class ProviderInventory(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ImportAssetState(StrEnum):
+    """The five states exposed by the Console import workflow."""
+
+    PENDING = "pending"
+    REPAIRING = "repairing"
+    NOT_NEEDED = "not_needed"
+    FAILED = "failed"
+    SUCCEEDED = "succeeded"
+
+
+class ImportSelection(BaseModel):
+    """User-selected subset of one provider inventory."""
+
+    sessions: bool = True
+    memory: list[str] = Field(default_factory=list)
+    cron: list[str] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)
+    mcp: list[str] = Field(default_factory=list)
+    plugins: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def reject_duplicates(self) -> "ImportSelection":
+        for field in ("memory", "cron", "skills", "mcp", "plugins"):
+            values = getattr(self, field)
+            if len(values) != len(set(values)):
+                raise ValueError(f"duplicate {field} selection")
+        return self
+
+
+class ImportAssetResult(BaseModel):
+    """Stable per-asset result used by receipts and the Console."""
+
+    asset_type: str
+    source_id: str
+    name: str
+    state: ImportAssetState = ImportAssetState.PENDING
+    enabled: bool | None = None
+    reason_code: str = ""
+    message: str = ""
+
+
 class MigrationAssetPlan(BaseModel):
     """One reviewable action in a provider migration plan."""
 
@@ -228,7 +270,10 @@ class ImportReceipt(BaseModel):
 
 
 __all__ = [
+    "ImportAssetResult",
+    "ImportAssetState",
     "ImportReceipt",
+    "ImportSelection",
     "MigrationAssetPlan",
     "MigrationDoctorCheck",
     "MigrationDoctorReport",
