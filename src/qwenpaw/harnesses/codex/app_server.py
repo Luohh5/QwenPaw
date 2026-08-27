@@ -17,11 +17,7 @@ from .discovery import (
 
 logger = logging.getLogger(__name__)
 
-# Codex returns ``thread/read`` results as one JSON object followed by a
-# newline.  Real threads can easily be several megabytes, while asyncio's
-# subprocess StreamReader defaults to a roughly 64 KiB line limit.  Keep a
-# bounded but deliberately generous ceiling so one large historical thread
-# cannot tear down the shared app-server reader and fail unrelated requests.
+# Large ``thread/read`` responses exceed asyncio's 64 KiB default line limit.
 _STDIO_STREAM_LIMIT_BYTES = 128 * 1024 * 1024
 
 ServerRequestHandler = Callable[
@@ -221,7 +217,7 @@ class CodexAppServerClient:
         process = self._process
         if process is None or process.stdout is None:
             return
-        error: CodexAppServerError | None = None
+        error = CodexAppServerError("Codex app-server exited")
         try:
             while line := await process.stdout.readline():
                 try:
@@ -237,9 +233,7 @@ class CodexAppServerClient:
                 f"Codex app-server output reader failed: {detail}",
             )
         finally:
-            self._fail_pending(
-                error or CodexAppServerError("Codex app-server exited"),
-            )
+            self._fail_pending(error)
 
     async def _read_stderr(self) -> None:
         process = self._process

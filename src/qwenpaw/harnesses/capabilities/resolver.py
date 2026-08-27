@@ -56,11 +56,6 @@ class HarnessCapabilityResolver:
         )
         self._driver_config = DriverConfigService(self._workspace)
 
-    @property
-    def workspace(self) -> Any:
-        """Return the workspace used to resolve controlled capabilities."""
-        return self._workspace
-
     async def resolve(
         self,
         request_context: dict[str, Any] | None = None,

@@ -53,6 +53,7 @@ class HarnessRuntime:
         self._adapters: dict[str, HarnessAdapter] = {}
         self._adapter_keys: dict[str, tuple[Any, ...]] = {}
         self._adapter_lock = asyncio.Lock()
+        self._workspace = workspace
         self._session_bridge = (
             HarnessSessionBridge(session) if session is not None else None
         )
@@ -307,7 +308,7 @@ class HarnessRuntime:
         def _delta(text: str) -> HarnessEvent:
             return HarnessEvent(kind=HarnessEventKind.TEXT_DELTA, text=text)
 
-        workspace = self._capability_resolver.workspace
+        workspace = self._workspace
         if workspace is None:
             raise RuntimeError("QwenPaw workspace is unavailable.")
         # pylint: disable=import-outside-toplevel
