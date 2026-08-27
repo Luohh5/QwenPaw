@@ -304,7 +304,11 @@ class CronManager(ManagerBase):
                 raise ValueError(f"Job does not require promotion: {job_id}")
             self._assert_promotion_workspace_is_local(job)
 
-            promoted = self._promoted_job(job, actor=actor)
+            promoted = self._with_portability_review(
+                job,
+                pending=False,
+                actor=actor,
+            )
             await self._persist_and_register(
                 promoted,
                 previous=job,
@@ -395,22 +399,23 @@ class CronManager(ManagerBase):
 
     @staticmethod
     def _request_review_marker(job: CronJobSpec) -> Any:
-        request_context = (
-            getattr(job.request, "request_context", None)
-            if job.request is not None
-            else None
+        return CronManager._request_context(job).get(
+            "portability_review_required",
         )
-        if not isinstance(request_context, dict):
-            return None
-        return request_context.get("portability_review_required")
+
+    @staticmethod
+    def _request_context(job: CronJobSpec) -> Dict[str, Any]:
+        context = getattr(job.request, "request_context", None)
+        return context if isinstance(context, dict) else {}
 
     @staticmethod
     def _has_imported_provenance(portability: Dict[str, Any]) -> bool:
-        return bool(
-            isinstance(portability.get("source"), str)
-            and portability.get("source", "").strip()
-            and isinstance(portability.get("source_id"), str)
-            and portability.get("source_id", "").strip(),
+        return all(
+            isinstance(value, str) and value.strip()
+            for value in (
+                portability.get("source"),
+                portability.get("source_id"),
+            )
         )
 
     @classmethod
@@ -438,15 +443,12 @@ class CronManager(ManagerBase):
         # records often lack the newer review fields; they are pending until
         # the dedicated promotion path writes a complete, internally
         # consistent decision to every copy of the metadata.
-        explicitly_promoted = bool(
-            request_marker is False
-            and all(
-                portability.get("requires_review") is False
-                and portability.get("safety") == "reviewed_disabled"
-                and isinstance(portability.get("promoted_at"), str)
-                and portability.get("promoted_at", "").strip()
-                for portability in candidates
-            ),
+        explicitly_promoted = request_marker is False and all(
+            portability.get("requires_review") is False
+            and portability.get("safety") == "reviewed_disabled"
+            and isinstance(portability.get("promoted_at"), str)
+            and portability.get("promoted_at", "").strip()
+            for portability in candidates
         )
         return not explicitly_promoted
 
@@ -515,16 +517,7 @@ class CronManager(ManagerBase):
         if not requires_mapping:
             return
 
-        request_context = (
-            getattr(job.request, "request_context", None)
-            if job.request is not None
-            else None
-        )
-        project_dir = (
-            request_context.get("project_dir")
-            if isinstance(request_context, dict)
-            else None
-        )
+        project_dir = cls._request_context(job).get("project_dir")
         if not isinstance(project_dir, str) or not project_dir.strip():
             raise PermissionError(
                 "Remote or unverified imported cron jobs require an explicit "
@@ -571,19 +564,6 @@ class CronManager(ManagerBase):
                 "The portability review gate can only be cleared by "
                 f"promote_imported_job: {previous.id}",
             )
-
-    @classmethod
-    def _promoted_job(
-        cls,
-        job: CronJobSpec,
-        *,
-        actor: Optional[str],
-    ) -> CronJobSpec:
-        return cls._with_portability_review(
-            job,
-            pending=False,
-            actor=actor,
-        )
 
     @classmethod
     def _with_portability_review(
