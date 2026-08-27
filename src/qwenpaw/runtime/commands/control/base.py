@@ -29,9 +29,7 @@ class ControlContext:
         user_id: User ID from request
         agent_id: Agent ID for permission checks
         args: Parsed command arguments (command-specific)
-        progress_reporter: Optional callback used by long-running commands to
-            stream user-visible progress without coupling the command to an
-            HTTP, ACP, or third-party Harness transport.
+        progress_reporter: Optional long-running command progress callback
     """
 
     workspace: "Workspace"
@@ -45,11 +43,9 @@ class ControlContext:
 
     async def report_progress(self, message: str) -> None:
         """Emit best-effort progress when the transport supports it."""
-        reporter = self.progress_reporter
         text = str(message or "").strip()
-        if reporter is None or not text:
-            return
-        await reporter(text)
+        if self.progress_reporter is not None and text:
+            await self.progress_reporter(text)
 
 
 class BaseControlCommandHandler(ABC):

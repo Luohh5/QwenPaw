@@ -1,14 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Mission mode — ``AgentMode`` for autonomous iterative tasks.
-
-Exposes hooks and a prompt contributor so the Runtime
-lifecycle drives mission state load/save.  All domain
-logic (command handler, state files, prompts, gate)
-lives under ``modes.mission``.
-
-The Phase 2 execution loop is driven by ``MissionGate``
-registered into the universal ``StopHandler``.
-"""
+"""Mission mode for autonomous iterative tasks."""
 
 from __future__ import annotations
 
@@ -265,22 +256,20 @@ class MissionMode(AgentMode):
         if self._gate is None:
             self._gate = MissionGate()
         with scoped_session_id(session_id):
-            self._gate.activate_for_mission(Path(loop_dir))
+            self._gate.activate_for_mission(loop_dir)
 
     async def check_internal_mission(self, session_id: str) -> bool:
         """Return whether MissionGate accepts the current PRD state."""
         if self._gate is None:
             raise RuntimeError("MissionMode is not initialized")
         with scoped_session_id(session_id):
-            result = await self._gate.check({})
-        return result.action is StopAction.TERMINATE
+            return (await self._gate.check({})).action is StopAction.TERMINATE
 
     def finish_internal_mission(self, session_id: str) -> None:
         """Clear private Mission gate state."""
-        if self._gate is None:
-            return
-        with scoped_session_id(session_id):
-            self._gate.reset_session()
+        if self._gate is not None:
+            with scoped_session_id(session_id):
+                self._gate.reset_session()
 
 
 def _info_msg(text: str) -> Msg:

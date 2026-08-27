@@ -800,8 +800,6 @@ class Envelope:
         cmd_msg: Any,
     ) -> AsyncGenerator[Any, None]:
         """Finish a slash command after one or more live progress deltas."""
-        from ..schemas import ContentType, RunStatus, TextContent
-
         final_text = cmd_msg.get_text_content() or ""
         state = self._text_blocks.setdefault(
             "__command__",
@@ -811,39 +809,26 @@ class Envelope:
             separator = "\n\n" if state["text"] else ""
             async for item in self.command_delta(separator + final_text):
                 yield item
-
-        full_text = str(state.get("text") or "")
-        tc = TextContent(
-            type=ContentType.TEXT,
-            text=full_text,
-            delta=False,
-            index=0,
-        )
-        tc.msg_id = self._message_id
-        yield self._tag_seq(tc)
-
-        self._completed_message.content.append(tc)
-        self._completed_message.status = RunStatus.Completed
-        self._completed_message.metadata = (
-            getattr(cmd_msg, "metadata", None) or {}
-        )
-        self._response.output.append(self._completed_message)
-        yield self._tag_seq(self._completed_message)
-
-        self._response.status = RunStatus.Completed
-        self._response.completed_at = datetime.now(timezone.utc).isoformat(
-            timespec="seconds",
-        )
-        yield self._tag_seq(self._response)
-        self._finalized = True
+        async for item in self._finish_command(
+            cmd_msg,
+            str(state.get("text") or ""),
+        ):
+            yield item
 
     async def from_msg(self, cmd_msg: Any) -> AsyncGenerator[Any, None]:
-        """Translate a completed ``Msg`` from a slash
-        command into a full envelope sequence.
-        """
-        from ..schemas import ContentType, RunStatus, TextContent
+        """Translate a completed slash-command message."""
+        async for item in self._finish_command(
+            cmd_msg,
+            cmd_msg.get_text_content() or "",
+        ):
+            yield item
 
-        cmd_text = cmd_msg.get_text_content() or ""
+    async def _finish_command(
+        self,
+        cmd_msg: Any,
+        text: str,
+    ) -> AsyncGenerator[Any, None]:
+        from ..schemas import ContentType, RunStatus, TextContent
 
         if not self._message_started:
             yield self._tag_seq(self._completed_message)
@@ -851,7 +836,7 @@ class Envelope:
 
         tc = TextContent(
             type=ContentType.TEXT,
-            text=cmd_text,
+            text=text,
             delta=False,
             index=0,
         )

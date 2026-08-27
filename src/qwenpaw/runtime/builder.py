@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-_PORTABILITY_MAX_REACT_ITERATIONS = 4_000
+_PORTABILITY_MAX_ITERS = 4_000
 
 _PORTABILITY_ADAPTATION_SYSTEM_RULES = (
     "\n\n<portability_adaptation_security>\n"
@@ -43,16 +43,6 @@ _PORTABILITY_ADAPTATION_SYSTEM_RULES = (
 )
 
 
-def _append_internal_request_system_rules(
-    prompt: str,
-    request_context: dict[str, Any],
-) -> str:
-    """Add fixed, non-user-authored rules for privileged internal requests."""
-    if request_context.get("source") == "portability_adaptation":
-        return prompt + _PORTABILITY_ADAPTATION_SYSTEM_RULES
-    return prompt
-
-
 def _resolve_react_iterations(
     configured: int,
     request_context: dict[str, Any],
@@ -66,7 +56,7 @@ def _resolve_react_iterations(
         or requested < 1
     ):
         return configured
-    return max(configured, min(requested, _PORTABILITY_MAX_REACT_ITERATIONS))
+    return max(configured, min(requested, _PORTABILITY_MAX_ITERS))
 
 
 def _descriptor_for(tool: Any) -> Any | None:
@@ -461,10 +451,8 @@ class AgentBuilder:
             ctx,
             agent_config,
         )
-        sys_prompt = _append_internal_request_system_rules(
-            sys_prompt,
-            request_context,
-        )
+        if request_context.get("source") == "portability_adaptation":
+            sys_prompt += _PORTABILITY_ADAPTATION_SYSTEM_RULES
 
         middlewares = self._build_middlewares(
             ctx,

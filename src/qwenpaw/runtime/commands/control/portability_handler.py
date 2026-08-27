@@ -118,6 +118,12 @@ def _provider_options(values: list[str]) -> tuple[bool, Path | None]:
     return dry_run, source_home
 
 
+def _render_notes(title: str, items: list[str]) -> str:
+    if not items:
+        return ""
+    return f"\n\n**{title}**\n" + "\n".join(f"- {item}" for item in items)
+
+
 def _render_location(location: SourceLocation) -> str:
     detected = "是" if location.data_home_exists else "否"
     lines = [
@@ -146,11 +152,7 @@ def _render_inventory(inventory: ProviderInventory) -> str:
         if location
         else (f"- 来源位置：`{inventory.locator or '未知'}`")
     )
-    warnings = ""
-    if inventory.warnings:
-        warnings = "\n\n**扫描提示**\n" + "\n".join(
-            f"- {item}" for item in inventory.warnings
-        )
+    warnings = _render_notes("扫描提示", inventory.warnings)
     return (
         f"**{inventory.provider_name} 迁移来源检查**\n\n"
         f"{location_text}\n\n"
@@ -195,11 +197,7 @@ def _render_plan(plan: MigrationPlan) -> str:
         )
         or "- 没有可执行项"
     )
-    warnings = ""
-    if plan.warnings:
-        warnings = "\n\n**扫描提示**\n" + "\n".join(
-            f"- {item}" for item in plan.warnings
-        )
+    warnings = _render_notes("扫描提示", plan.warnings)
     return (
         "**迁移预演完成（尚未导入）**\n\n"
         f"- 来源：`{plan.source}`\n"
@@ -222,11 +220,7 @@ def _render_plan(plan: MigrationPlan) -> str:
 
 
 def _render_receipt(receipt: ImportReceipt) -> str:
-    warnings = ""
-    if receipt.warnings:
-        warnings = "\n\n**注意事项**\n" + "\n".join(
-            f"- {item}" for item in receipt.warnings
-        )
+    warnings = _render_notes("注意事项", receipt.warnings)
     doctor = ""
     if receipt.doctor_report is not None:
         icons = {"pass": "✅", "warning": "⚠️", "fail": "❌"}

@@ -85,7 +85,7 @@ class Runtime:
             )
             progress_started = False
             try:
-                while not cmd_task.done():
+                while not cmd_task.done() or not progress_queue.empty():
                     try:
                         progress_text = await asyncio.wait_for(
                             progress_queue.get(),
@@ -100,14 +100,6 @@ class Runtime:
                     async for ev in envelope.command_delta(progress_text):
                         yield ev
                 cmd_msg = await cmd_task
-                while not progress_queue.empty():
-                    progress_text = progress_queue.get_nowait()
-                    if not progress_started:
-                        async for ev in envelope.emit_response_created():
-                            yield ev
-                        progress_started = True
-                    async for ev in envelope.command_delta(progress_text):
-                        yield ev
             finally:
                 ctx.extras.pop("_command_progress_reporter", None)
                 if not cmd_task.done():

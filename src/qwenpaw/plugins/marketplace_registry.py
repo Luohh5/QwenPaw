@@ -1,11 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Persistent provenance registry for externally imported Marketplaces.
-
-QwenPaw's public Market providers are fixed search adapters.  This registry is
-deliberately separate: it records third-party plugin sources restored by
-``/import`` so native installation can be attempted without copying another
-harness's installed cache.
-"""
+"""Registry for Marketplace sources restored by ``/import``."""
 
 from __future__ import annotations
 
@@ -21,7 +15,7 @@ from ..utils.io_utils import (
 )
 
 
-def _credential_free_source(source: str) -> tuple[str, bool]:
+def _clean_source(source: str) -> tuple[str, bool]:
     """Remove URL credentials/query/fragment before persisting a source."""
     value = str(source or "").strip()
     if not value.startswith(("http://", "https://")):
@@ -31,8 +25,7 @@ def _credential_free_source(source: str) -> tuple[str, bool]:
     if parsed.port is not None:
         host = f"{host}:{parsed.port}"
     cleaned = urlunsplit((parsed.scheme, host, parsed.path, "", ""))
-    changed = cleaned != value
-    return cleaned, changed
+    return cleaned, cleaned != value
 
 
 class ExternalMarketplaceRegistry:
@@ -43,15 +36,13 @@ class ExternalMarketplaceRegistry:
 
     async def read(self) -> dict[str, Any]:
         """Return a normalized registry, tolerating an absent old file."""
-        if not self.path.is_file():
-            return {"schema_version": "1", "sources": {}}
         try:
-            value = await read_json_async(self.path)
+            value = (
+                await read_json_async(self.path) if self.path.is_file() else {}
+            )
         except (OSError, ValueError, TypeError):
-            return {"schema_version": "1", "sources": {}}
-        if not isinstance(value, dict):
-            return {"schema_version": "1", "sources": {}}
-        sources = value.get("sources")
+            value = {}
+        sources = value.get("sources", {}) if isinstance(value, dict) else {}
         if not isinstance(sources, dict):
             sources = {}
         return {"schema_version": "1", "sources": sources}
@@ -70,9 +61,7 @@ class ExternalMarketplaceRegistry:
         """Add/update a source; return ``(changed, credentials_removed)``."""
         async with get_path_lock(self.path):
             payload = await self.read()
-            cleaned_source, credentials_removed = _credential_free_source(
-                source,
-            )
+            cleaned_source, credentials_removed = _clean_source(source)
             key = f"{provider}:{source_id}"
             record = {
                 "provider": provider,
