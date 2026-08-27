@@ -205,12 +205,7 @@ def legacy_mcp_client_to_driver(
     *,
     force_encrypt_bindings: bool = False,
 ) -> tuple[DriverCard, CredentialRecord | None]:
-    """Convert one legacy MCP config object into Driver contracts.
-
-    ``force_encrypt_bindings`` is used for untrusted third-party imports.  It
-    sends every environment/header value through the encrypted credential
-    store instead of guessing sensitivity from a field name.
-    """
+    """Convert legacy MCP config, optionally encrypting every binding."""
     transport = str(getattr(config, "transport", "stdio") or "stdio")
     oauth = getattr(config, "oauth", None)
     credential_alias = (
