@@ -221,13 +221,7 @@ class CodexAdapter(HarnessAdapter):
         self,
         cwd: Path,
     ) -> list[dict[str, Any]]:
-        """Return full MCP records only for the trusted migration boundary.
-
-        Regular capability discovery remains redacted through
-        :meth:`discover_mcp`.  The import service needs launch configuration
-        so it can translate it into disabled QwenPaw DriverCards and move
-        any literal credentials into the encrypted credential store.
-        """
+        """Return full MCP records for the trusted migration boundary."""
         resolution = getattr(self._client, "binary_resolution", None)
         if resolution is None:
             return []
@@ -261,65 +255,52 @@ class CodexAdapter(HarnessAdapter):
         cwd: Path,
     ) -> list[HarnessDiscoveredSkill]:
         """Discover Codex-owned Skills through the app-server."""
-        await self._client.start()
+        discovered: list[HarnessDiscoveredSkill] = []
+        seen: set[tuple[str, str]] = set()
+        for item in await self._skill_records(cwd):
+            name = str(item.get("name") or "")
+            source = str(item.get("scope") or "")
+            key = (name, source)
+            if not name or key in seen:
+                continue
+            seen.add(key)
+            discovered.append(
+                HarnessDiscoveredSkill(
+                    name=name,
+                    description=str(item.get("description") or ""),
+                    provider_id="codex",
+                    source=source,
+                    enabled=bool(item.get("enabled", True)),
+                ),
+            )
+        return discovered
+
+    async def _skill_records(self, cwd: Path) -> list[dict[str, Any]]:
         result = await self._client.request(
             "skills/list",
             {"cwds": [str(cwd)], "forceReload": False},
         )
-        discovered: list[HarnessDiscoveredSkill] = []
-        seen: set[tuple[str, str]] = set()
-        for entry in (result or {}).get("data", []):
-            if not isinstance(entry, dict):
-                continue
-            for item in entry.get("skills") or []:
-                if not isinstance(item, dict):
-                    continue
-                name = str(item.get("name") or "")
-                source = str(item.get("scope") or "")
-                key = (name, source)
-                if not name or key in seen:
-                    continue
-                seen.add(key)
-                discovered.append(
-                    HarnessDiscoveredSkill(
-                        name=name,
-                        description=str(item.get("description") or ""),
-                        provider_id="codex",
-                        source=source,
-                        enabled=bool(item.get("enabled", True)),
-                    ),
-                )
-        return discovered
+        return [
+            dict(item)
+            for entry in (result or {}).get("data", [])
+            if isinstance(entry, dict)
+            for item in entry.get("skills") or []
+            if isinstance(item, dict)
+        ]
 
     async def external_skill_records(
         self,
         cwd: Path,
     ) -> list[dict[str, Any]]:
-        """Return full Codex Skill records for the migration boundary.
-
-        Normal runtime discovery deliberately returns a small, read-only
-        view. Migration additionally needs the provider-owned ``SKILL.md``
-        path so the portability core can copy it into staging and run the
-        existing QwenPaw Skill scanner. No Skill file is read or changed here.
-        """
-        await self._client.start()
-        result = await self._client.request(
-            "skills/list",
-            {"cwds": [str(cwd)], "forceReload": False},
-        )
+        """Return full Codex Skill records for migration."""
         records: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for entry in (result or {}).get("data", []):
-            if not isinstance(entry, dict):
+        for item in await self._skill_records(cwd):
+            path = str(item.get("path") or "")
+            if not path or path in seen:
                 continue
-            for item in entry.get("skills") or []:
-                if not isinstance(item, dict):
-                    continue
-                path = str(item.get("path") or "")
-                if not path or path in seen:
-                    continue
-                seen.add(path)
-                records.append(dict(item))
+            seen.add(path)
+            records.append(item)
         return records
 
     async def list_external_threads(
@@ -327,13 +308,7 @@ class CodexAdapter(HarnessAdapter):
         *,
         limit: int = 500,
     ) -> list[dict[str, Any]]:
-        """List pre-existing Codex threads through the app-server.
-
-        The adapter previously persisted only QwenPaw-created thread
-        mappings. This paginated method is intentionally read-only and is
-        consumed by ``CodexMigrationProvider`` to import older Codex history.
-        """
-        await self._client.start()
+        """List pre-existing Codex threads through the app-server."""
         remaining = max(0, min(int(limit), 5000))
         cursor: str | None = None
         records: list[dict[str, Any]] = []
@@ -365,7 +340,6 @@ class CodexAdapter(HarnessAdapter):
         thread_id: str,
     ) -> list[HarnessHistoryItem]:
         """Normalize one arbitrary Codex thread without resuming it."""
-        await self._client.start()
         result = await self._client.request(
             "thread/read",
             {"threadId": thread_id, "includeTurns": True},
