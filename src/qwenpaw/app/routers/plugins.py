@@ -495,7 +495,6 @@ async def _load_plugin_with_optional_force_reinstall(
     """
     from ...config.utils import get_plugins_dir
 
-    install_dir = get_plugins_dir()
     collected: dict = {
         "provider_ids": [],
         "command_names": [],
@@ -539,7 +538,7 @@ async def _load_plugin_with_optional_force_reinstall(
 
     return await loader.load_plugin_from_path(
         source_path=source_path,
-        install_dir=install_dir,
+        install_dir=get_plugins_dir(),
         force=force,
         before_force_unload=_before_force_unload if force else None,
         after_force_unload=_after_force_unload if force else None,
@@ -668,24 +667,16 @@ async def install_plugin_source(
     force: bool = False,
     reload_agents: bool = True,
 ):
-    """Run the same native path/URL installation used by the HTTP route.
-
-    Portability imports set ``reload_agents=False`` so installing executable
-    code cannot tear down the workspace that is still committing the import
-    receipt. The plugin is nevertheless validated, copied from its declared
-    Marketplace source, dependency-installed, loaded, and registered through
-    the normal lifecycle.
-    """
+    """Install through the native plugin lifecycle used by the HTTP route."""
     request = SimpleNamespace(app=app)
     loader = getattr(app.state, "plugin_loader", None)
     if loader is None:
         raise RuntimeError("Plugin loader is not ready yet.")
 
     normalized = str(source or "").strip()
-    is_url = normalized.startswith(("http://", "https://"))
     temp_dir: Optional[Path] = None
     try:
-        if is_url:
+        if normalized.startswith(("http://", "https://")):
             temp_dir = Path(await asyncio.to_thread(tempfile.mkdtemp))
             zip_path = temp_dir / "plugin.zip"
             logger.info("Downloading plugin from %s", _log_safe(normalized))
@@ -707,7 +698,7 @@ async def install_plugin_source(
             reload_agents=reload_agents,
         )
     finally:
-        if temp_dir is not None and await asyncio.to_thread(temp_dir.exists):
+        if temp_dir is not None:
             await asyncio.to_thread(shutil.rmtree, temp_dir, True)
 
 
@@ -717,7 +708,7 @@ async def uninstall_plugin_source(
     app,
     reload_agents: bool = True,
 ) -> None:
-    """Run native unload, registration cleanup, and file removal."""
+    """Uninstall through the native plugin lifecycle."""
     request = SimpleNamespace(app=app)
     loader = getattr(app.state, "plugin_loader", None)
     if loader is None:
@@ -899,7 +890,6 @@ async def uninstall_plugin(plugin_id: str, request: Request):
         await uninstall_plugin_source(
             plugin_id,
             app=request.app,
-            reload_agents=True,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
