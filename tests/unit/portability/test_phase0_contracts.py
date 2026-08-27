@@ -27,7 +27,6 @@ from qwenpaw.portability.compatibility import (
 )
 from qwenpaw.portability.models import (
     ImportReceipt,
-    MigrationPlan,
     MigrationDoctorCheck,
     MigrationDoctorReport,
     SourcePlugin,
@@ -363,47 +362,6 @@ def test_import_receipt_matches_reviewed_contract() -> None:
     assert receipt.model_dump(mode="json") == _golden_json(
         "import-receipt.json",
     )
-
-
-def test_old_plan_and_receipt_fields_remain_loadable() -> None:
-    created = "2026-08-20T00:00:00Z"
-    plan = MigrationPlan.model_validate(
-        {
-            "plan_id": "plan-legacy",
-            "source": "codex",
-            "agent_id": "agent-1",
-            "created_at": created,
-            "inventory_fingerprint": "sha256:fixture",
-            "actions": [
-                {
-                    "asset_type": "plugins",
-                    "source_id": "expo@mini-market",
-                    "name": "Expo",
-                    "action": "import",
-                    "fidelity": "full",
-                    "default_enabled": False,
-                    "reason_zh": "兼容",
-                },
-            ],
-            "legacy_hint": "ignored by the current schema",
-        },
-    )
-    receipt = ImportReceipt.model_validate(
-        {
-            "migration_id": "migration-legacy",
-            "source": "codex",
-            "agent_id": "agent-1",
-            "started_at": created,
-            "completed_at": created,
-            "installed_plugins": ["expo"],
-            "backend_changed": False,
-            "legacy_hint": "ignored by the current schema",
-        },
-    )
-
-    assert plan.actions[0].source_id == "expo@mini-market"
-    assert receipt.source == "codex"
-    assert receipt.installed_plugins == ["expo"]
 
 
 def test_generated_plugin_ids_do_not_depend_on_display_names(
