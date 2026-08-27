@@ -1067,12 +1067,10 @@ def promote_imported_job(
         if r.status_code == 404:
             raise click.ClickException("Job not found.")
         if r.status_code == 409:
-            detail = "Imported job is not ready for promotion."
-            try:
-                detail = str(r.json().get("detail") or detail)
-            except (TypeError, ValueError):
-                pass
-            raise click.ClickException(detail)
+            detail = r.json().get("detail")
+            raise click.ClickException(
+                str(detail or "Imported job is not ready for promotion."),
+            )
         r.raise_for_status()
         print_json(r.json())
 

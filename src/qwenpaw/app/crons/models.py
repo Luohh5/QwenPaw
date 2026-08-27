@@ -139,14 +139,8 @@ class ScheduleSpec(BaseModel):
 
 
 class DispatchTarget(BaseModel):
-    user_id: str = Field(
-        max_length=256,
-        description="Bounded user identifier receiving cron output.",
-    )
-    session_id: str = Field(
-        max_length=256,
-        description="Bounded target session; isolated runs derive a safe ID.",
-    )
+    user_id: str = Field(max_length=256)
+    session_id: str = Field(max_length=256)
 
 
 class DispatchSpec(BaseModel):

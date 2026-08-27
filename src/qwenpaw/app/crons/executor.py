@@ -26,20 +26,16 @@ _TRACE_META_MAX_LENGTH = 256
 
 
 def _safe_session_component(value: str | None, *, fallback: str) -> str:
-    """Return a bounded, filesystem-neutral component for a session id.
-
-    Imported jobs can contain arbitrary source identifiers.  Preserve a
-    readable prefix when possible, and add a digest whenever normalization or
-    truncation is needed so two different source identifiers do not collapse
-    into the same cron session.
-    """
+    """Return a bounded, collision-resistant session-id component."""
     raw = (value or "").strip()
     normalized = _SESSION_COMPONENT_RE.sub("-", raw).strip("._-")
-    if not normalized:
-        normalized = fallback
-    if normalized == raw and len(normalized) <= _SESSION_COMPONENT_MAX_LENGTH:
+    if (
+        normalized
+        and normalized == raw
+        and len(normalized) <= _SESSION_COMPONENT_MAX_LENGTH
+    ):
         return normalized
-
+    normalized = normalized or fallback
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
     prefix_length = _SESSION_COMPONENT_MAX_LENGTH - len(digest) - 1
     prefix = normalized[:prefix_length].rstrip("._-") or fallback
@@ -52,23 +48,18 @@ def _isolated_run_session_id(
     job_id: str | None,
     run_id: str,
 ) -> str:
-    """Build one bounded and traceable session id per cron execution."""
-    target = _safe_session_component(
-        target_session_id,
-        fallback="session",
-    )
+    """Build one session id per cron execution."""
+    target = _safe_session_component(target_session_id, fallback="session")
     job = _safe_session_component(job_id, fallback="job")
     return f"cron:{target}:job:{job}:run:{run_id}"
 
 
 def _bounded_trace_meta(value: str | None) -> str:
-    """Keep untrusted target identifiers from bloating trace metadata."""
     raw = value or ""
     if len(raw) <= _TRACE_META_MAX_LENGTH:
         return raw
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
-    prefix_length = _TRACE_META_MAX_LENGTH - len(digest) - 1
-    return f"{raw[:prefix_length]}-{digest}"
+    return f"{raw[: _TRACE_META_MAX_LENGTH - len(digest) - 1]}-{digest}"
 
 
 class CronExecutor:
