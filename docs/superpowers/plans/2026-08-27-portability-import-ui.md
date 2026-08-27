@@ -41,26 +41,21 @@
 - [ ] **Step 4: Verify GREEN** with `.venv/bin/pytest -q tests/unit/portability/test_selection.py tests/unit/portability/test_planner.py`.
 - [ ] **Step 5: Commit** as `feat(pawport): add selective import contract`.
 
-### Task 2: Structured Five-State Results and Progress Observer
+### Task 2: Read-Only Five-State Projection
 
 **Files:**
-- Modify: `src/qwenpaw/portability/models.py`
-- Modify: `src/qwenpaw/portability/import_conversations.py`
-- Modify: `src/qwenpaw/portability/adaptation_loop.py`
-- Modify: `src/qwenpaw/portability/importer.py`
-- Test: `tests/unit/portability/test_importer.py`
-- Test: `tests/unit/portability/test_adaptation_loop.py`
+- Create: `src/qwenpaw/portability/import_status.py`
+- Test: `tests/unit/portability/test_import_status.py`
 
 **Interfaces:**
-- Produces: optional `MigrationObserver` callbacks for phase, session counts and asset state changes.
-- Produces: `ImportReceipt.asset_results` with `outcome`, `enabled`, `reason_code`, and `message`; old receipt lists remain compatible.
+- Produces: `project_asset_results(plan, selection, manifest=None, receipt=None) -> list[ImportAssetResult]`.
+- Reuses: the existing plan, compatibility manifest and receipt as state sources; it does not alter Provider, Mission, Importer or Receipt behavior.
 
-- [ ] **Step 1: Write failing tests** for the five public states, disabled-success semantics, discard reasons, native-install failure, session processed/imported/skipped counts, and old receipts without `asset_results`.
-- [ ] **Step 2: Verify RED** with the two focused pytest files.
-- [ ] **Step 3: Add one optional observer** at existing transition points; retain the current string `ProgressReporter` for `/import` and avoid parsing progress text.
-- [ ] **Step 4: Build `asset_results` beside existing imported/skipped lists** so every selected asset has exactly one terminal result.
-- [ ] **Step 5: Verify GREEN** with `.venv/bin/pytest -q tests/unit/portability/test_importer.py tests/unit/portability/test_adaptation_loop.py tests/unit/portability/test_commands.py`.
-- [ ] **Step 6: Commit** as `feat(pawport): expose structured import progress`.
+- [ ] **Step 1: Write failing tests** for exactly five public states, disabled-success tooltip data, semantic discard reasons, already-present actions, unresolved repair items, native-install failure and successful materialization.
+- [ ] **Step 2: Verify RED** with `.venv/bin/pytest -q tests/unit/portability/test_import_status.py`.
+- [ ] **Step 3: Implement one table-driven projector**; do not parse warning text when a structured plan action, zone or receipt list is available.
+- [ ] **Step 4: Verify GREEN** with the focused test plus existing planner, compatibility and importer tests.
+- [ ] **Step 5: Commit** as `feat(pawport): project import asset status`.
 
 ### Task 3: Persisted Portability Import Jobs
 
