@@ -220,23 +220,16 @@ def legacy_mcp_client_to_driver(
     )
     now = time.time()
 
-    raw_env = {
-        str(key): str(value)
-        for key, value in dict(getattr(config, "env", {}) or {}).items()
-    }
-    raw_headers = {
-        str(key): str(value)
-        for key, value in dict(getattr(config, "headers", {}) or {}).items()
-    }
-    if force_encrypt_bindings:
-        env_public, env_secrets = {}, raw_env
-        header_public, header_secrets = {}, raw_headers
-    else:
-        env_public, env_secrets = split_mcp_binding("env", raw_env)
-        header_public, header_secrets = split_mcp_binding(
-            "headers",
-            raw_headers,
-        )
+    env_public, env_secrets = split_mcp_binding(
+        "env",
+        dict(getattr(config, "env", {}) or {}),
+        force_secret=force_encrypt_bindings,
+    )
+    header_public, header_secrets = split_mcp_binding(
+        "headers",
+        dict(getattr(config, "headers", {}) or {}),
+        force_secret=force_encrypt_bindings,
+    )
     env_plan = plan_env_ref_bindings(env_secrets)
     header_plan = plan_env_ref_bindings(header_secrets)
 
