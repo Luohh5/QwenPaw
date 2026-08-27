@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 from typing import Any
 
@@ -18,9 +17,7 @@ def _context() -> Any:
 
 async def _invoke(method: str, *args: Any, **kwargs: Any) -> str:
     try:
-        value = getattr(_context(), method)(*args, **kwargs)
-        if inspect.isawaitable(value):
-            value = await value
+        value = await getattr(_context(), method)(*args, **kwargs)
     except Exception as exc:  # pylint: disable=broad-except
         value = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     return json.dumps(value, ensure_ascii=False, default=str)
@@ -35,19 +32,21 @@ _COMMON = {
 }
 
 
-@tool_descriptor(
-    name="migration_compat_inspect",
-    description="Inspect one staged asset and current QwenPaw capabilities.",
-    **_COMMON,
+def _compat_tool(name: str, description: str) -> Any:
+    return tool_descriptor(name=name, description=description, **_COMMON)
+
+
+@_compat_tool(
+    "migration_compat_inspect",
+    "Inspect one staged asset and current QwenPaw capabilities.",
 )
 async def migration_compat_inspect(asset_key: str) -> str:
     return await _invoke("inspect_asset", asset_key)
 
 
-@tool_descriptor(
-    name="migration_compat_read_file",
-    description="Read one staged asset file; paginate until has_more=false.",
-    **_COMMON,
+@_compat_tool(
+    "migration_compat_read_file",
+    "Read one staged asset file; paginate until has_more=false.",
 )
 async def migration_compat_read_file(
     asset_key: str,
@@ -64,10 +63,9 @@ async def migration_compat_read_file(
     )
 
 
-@tool_descriptor(
-    name="migration_compat_write_file",
-    description="Create or overwrite one text file inside a repair asset.",
-    **_COMMON,
+@_compat_tool(
+    "migration_compat_write_file",
+    "Create or overwrite one text file inside a repair asset.",
 )
 async def migration_compat_write_file(
     asset_key: str,
@@ -77,10 +75,9 @@ async def migration_compat_write_file(
     return await _invoke("write_file", asset_key, relative_path, content)
 
 
-@tool_descriptor(
-    name="migration_compat_update",
-    description="Update one allowlisted MCP or scheduled-task field.",
-    **_COMMON,
+@_compat_tool(
+    "migration_compat_update",
+    "Update one allowlisted MCP or scheduled-task field.",
 )
 async def migration_compat_update(
     asset_key: str,
@@ -90,22 +87,20 @@ async def migration_compat_update(
     return await _invoke("update_asset", asset_key, field, value_json)
 
 
-@tool_descriptor(
-    name="migration_compat_test",
-    description="Run QwenPaw's native compatibility test for one asset.",
-    **_COMMON,
+@_compat_tool(
+    "migration_compat_test",
+    "Run QwenPaw's native compatibility test for one asset.",
 )
 async def migration_compat_test(asset_key: str) -> str:
     return await _invoke("test_asset", asset_key)
 
 
-@tool_descriptor(
-    name="migration_compat_classify",
-    description=(
+@_compat_tool(
+    "migration_compat_classify",
+    (
         "Triage staging to repair/discard, or promote tested repair "
         "to migrate."
     ),
-    **_COMMON,
 )
 async def migration_compat_classify(
     asset_key: str,
@@ -122,15 +117,3 @@ async def migration_compat_classify(
         plugin_disposition,
         component_assessments_json,
     )
-
-
-MIGRATION_COMPAT_TOOL_NAMES = (
-    "migration_compat_inspect",
-    "migration_compat_read_file",
-    "migration_compat_write_file",
-    "migration_compat_update",
-    "migration_compat_test",
-    "migration_compat_classify",
-)
-
-__all__ = ["MIGRATION_COMPAT_TOOL_NAMES", *MIGRATION_COMPAT_TOOL_NAMES]

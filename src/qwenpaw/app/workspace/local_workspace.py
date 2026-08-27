@@ -35,15 +35,11 @@ def _is_builtin_self_authorizing_tool(name: str, descriptor: Any) -> bool:
     """
     from ...agents.tools import migration_compatibility
 
-    if (
-        name not in migration_compatibility.MIGRATION_COMPAT_TOOL_NAMES
-        or descriptor is None
-    ):
+    if descriptor is None:
         return False
     expected = getattr(migration_compatibility, name, None)
     return bool(
-        expected is not None
-        and descriptor.func is expected
+        descriptor.func is expected
         and getattr(expected, "_tool_descriptor", None) is descriptor
         and descriptor.metadata.get("self_authorizing_request_opt_in") is True,
     )
