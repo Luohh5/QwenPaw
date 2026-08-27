@@ -63,10 +63,7 @@ class _ScheduleMapping:
 def discover_qoder_scheduled_tasks(
     qoder_user_data: Path,
 ) -> tuple[list[SourceScheduledTask], list[str], int]:
-    """Return staged definitions, warnings, and the pre-filter task count.
-
-    ``enabled`` is source provenance only; run history is never imported.
-    """
+    """Return staged definitions, warnings, and the source task count."""
     user_data = qoder_user_data.expanduser()
     store_root = user_data / _SCHEDULE_STORE
     v2_path = store_root / _V2_FILENAME

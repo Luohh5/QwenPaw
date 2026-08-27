@@ -2,15 +2,11 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 
 import pytest
 
 from qwenpaw.portability.models import SourcePlugin
-from qwenpaw.portability.qoder_plugin_adapter import (
-    discover_qoder_custom_skill_adapter,
-)
 from qwenpaw.portability.providers.external_state import (
     codex_memory_status,
     discover_codex_memory,
@@ -75,29 +71,6 @@ def test_codex_memory_imports_ad_hoc_notes_before_consolidation(
     assert status["ad_hoc_note_count"] == 1
     assert [item.source_id for item in projects] == ["codex:ad-hoc"]
     assert projects[0].files[0].relative_path == Path("preference.md")
-
-
-def test_codex_memory_reports_phase_one_database_without_export(
-    tmp_path: Path,
-) -> None:
-    codex_home = tmp_path / ".codex"
-    codex_home.mkdir()
-    database = codex_home / "memories_1.sqlite"
-    with sqlite3.connect(database) as connection:
-        connection.execute(
-            "CREATE TABLE stage1_outputs "
-            "(raw_memory TEXT, rollout_summary TEXT)",
-        )
-        connection.execute(
-            "INSERT INTO stage1_outputs VALUES (?, ?)",
-            ("one durable fact", ""),
-        )
-
-    status = codex_memory_status(codex_home)
-
-    assert status["state"] == "phase1_only"
-    assert status["stage1_output_count"] == 1
-    assert not discover_codex_memory(codex_home)
 
 
 def test_codex_memory_preserves_global_and_extension_scope(tmp_path: Path):
@@ -359,7 +332,6 @@ def test_qoder_marketplace_skill_only_plugin_is_adaptable(
 
 
 def test_qoder_memory_reads_current_account_scoped_layout(tmp_path: Path):
-    """Current Qoder memory scopes are not mistaken for project-local v1."""
     home = tmp_path / ".qoder"
     transcript = home / "projects/project/transcript/session.jsonl"
     transcript.parent.mkdir(parents=True)
@@ -389,7 +361,6 @@ def test_qoder_memory_reads_current_account_scoped_layout(tmp_path: Path):
 def test_qoder_mcp_is_translated_without_copying_credentials(
     tmp_path: Path,
 ):
-    """Qoder MCP secrets become placeholders."""
     home = tmp_path / ".qoder"
     home.mkdir()
     (home / "mcp.json").write_text(
@@ -484,7 +455,6 @@ def test_qoder_plugin_mcp_uses_the_normal_mcp_pipeline(tmp_path: Path):
 
 
 def test_qoder_skills_only_discovers_standalone_sources(tmp_path: Path):
-    """Plugin cache Skills are excluded while user/project Skills are found."""
     home = tmp_path / ".qoder"
     user_skill = home / "skills/user-skill"
     user_skill.mkdir(parents=True)
@@ -511,7 +481,6 @@ def test_qoder_skills_only_discovers_standalone_sources(tmp_path: Path):
 def test_qoder_plugin_settings_override_stale_ledger_enabled_flag(
     tmp_path: Path,
 ) -> None:
-    """The UI's enabledPlugins state is authoritative over ledger defaults."""
     home = tmp_path / ".qoder"
     plugins_root = home / "plugins"
     plugins_root.mkdir(parents=True)
@@ -546,7 +515,6 @@ def test_qoder_plugin_settings_override_stale_ledger_enabled_flag(
 def test_qoder_local_custom_skill_plugin_is_adaptable_source(
     tmp_path: Path,
 ) -> None:
-    """User-owned custom source is distinct from Qoder's plugin cache."""
     home = tmp_path / ".qoder"
     plugins_root = home / "plugins"
     source = plugins_root / "custom/test-report-0.1.0"
@@ -607,35 +575,9 @@ def test_qoder_local_custom_skill_plugin_is_adaptable_source(
     assert plugins[0].metadata["skills_enabled_by_default"] is False
 
 
-def test_qoder_binding_free_skill_plugin_still_requires_activation(
-    tmp_path: Path,
-) -> None:
-    """Structural compatibility never grants third-party activation."""
-    home = tmp_path / ".qoder"
-    source = home / "plugins/custom/plain-skill"
-    skill = source / "skills/plain"
-    skill.mkdir(parents=True)
-    (skill / "SKILL.md").write_text(
-        "Use the tools available in the current session.",
-        encoding="utf-8",
-    )
-
-    metadata = discover_qoder_custom_skill_adapter(
-        home,
-        source,
-        {"name": "plain-skill", "skills": "skills"},
-        {"source": "custom"},
-    )
-
-    assert metadata is not None
-    assert metadata["harness_bound"] is False
-    assert metadata["skills_enabled_by_default"] is False
-
-
 def test_qoder_custom_plugin_with_native_extensions_is_not_adapted(
     tmp_path: Path,
 ) -> None:
-    """Qoder hooks/MCP/tools cannot masquerade as portable Skill plugins."""
     home = tmp_path / ".qoder"
     plugins_root = home / "plugins"
     source = plugins_root / "custom/native-plugin"

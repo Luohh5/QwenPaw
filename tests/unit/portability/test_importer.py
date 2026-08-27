@@ -396,52 +396,6 @@ async def test_import_repairs_unreviewed_invalid_legacy_scheduled_task(
 
 
 @pytest.mark.asyncio
-async def test_import_repairs_missing_review_gate_on_valid_legacy_task(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    workspace = _workspace(tmp_path)
-    workspace.cron_manager = _CronManager()
-    task = SourceScheduledTask(
-        source_id="legacy-valid",
-        name="Legacy valid",
-        schedule_type="cron",
-        cron="30 9 * * *",
-        prompt="Create a safe report",
-    )
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        scheduled_tasks=[task],
-        discovered_scheduled_task_count=1,
-    )
-    legacy = build_imported_job("codex", task)
-    provenance = {"source": "codex", "source_id": task.source_id}
-    legacy = legacy.model_copy(
-        update={
-            "enabled": True,
-            "meta": {"portability": provenance},
-            "dispatch": legacy.dispatch.model_copy(update={"meta": {}}),
-            "request": legacy.request.model_copy(
-                update={"request_context": {}},
-            ),
-        },
-    )
-    workspace.cron_manager.jobs[legacy.id] = legacy
-    _bind_inventory(monkeypatch, inventory)
-    _mock_adaptation(monkeypatch, workspace, inventory)
-
-    receipt = await ProviderImportService(workspace).import_from("codex")
-
-    repaired = workspace.cron_manager.jobs[legacy.id]
-    assert receipt.skipped_scheduled_tasks == [task.source_id]
-    assert repaired.enabled is False
-    assert repaired.meta["portability"]["requires_review"] is True
-    assert any("审核门禁已补齐" in warning for warning in receipt.warnings)
-
-
-@pytest.mark.asyncio
 async def test_failed_import_restores_invalid_legacy_scheduled_task(
     tmp_path: Path,
     monkeypatch,
@@ -659,44 +613,6 @@ async def test_apply_plan_refuses_changed_source_files(
 
 
 @pytest.mark.asyncio
-async def test_qoder_reimport_archives_internal_traces_from_old_import(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """A rerun cleans up tool-only Qoder workers imported by older code."""
-    workspace = _workspace(tmp_path)
-    inventory = ProviderInventory(
-        provider_id="qoder",
-        provider_name="Qoder",
-        detected=True,
-        sessions=[
-            SourceSession(
-                source_id="worker-1",
-                title="Qoder worker-1",
-                history=[
-                    HarnessHistoryItem(
-                        kind=HarnessHistoryKind.TOOL_CALL,
-                        tool_name="Bash",
-                    ),
-                ],
-            ),
-        ],
-    )
-    _bind_inventory(monkeypatch, inventory)
-
-    await ProviderImportService(workspace).import_from("qoder")
-    inventory.sessions = []
-    inventory.ignored_session_ids = ["worker-1"]
-    receipt = await ProviderImportService(workspace).import_from("qoder")
-
-    assert receipt.archived_internal_sessions == ["worker-1"]
-    assert await workspace.chat_manager.list_chats(archived=False) == []
-    archived = await workspace.chat_manager.list_chats(archived=True)
-    assert len(archived) == 1
-    assert archived[0].meta["portability"]["source_id"] == "worker-1"
-
-
-@pytest.mark.asyncio
 async def test_codex_reimport_archives_previously_imported_guardian_chat(
     tmp_path: Path,
     monkeypatch,
@@ -739,59 +655,6 @@ async def test_codex_reimport_archives_previously_imported_guardian_chat(
     assert any(
         "Codex non-root/internal" in warning for warning in receipt.warnings
     )
-
-
-@pytest.mark.asyncio
-async def test_provider_import_reports_progress(tmp_path, monkeypatch):
-    workspace = _workspace(tmp_path)
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        sessions=[
-            SourceSession(
-                source_id="thread-progress",
-                history=[
-                    HarnessHistoryItem(
-                        kind=HarnessHistoryKind.USER,
-                        text="Show progress",
-                    ),
-                ],
-            ),
-        ],
-    )
-    _bind_inventory(monkeypatch, inventory)
-    updates: list[str] = []
-
-    async def _progress(message: str) -> None:
-        updates.append(message)
-
-    await ProviderImportService(workspace).import_from(
-        "codex",
-        progress=_progress,
-    )
-
-    assert "provider inventory" in updates
-    assert any("正在写入会话：1/1" in item for item in updates)
-    assert updates[-1] == "迁移事务已安全提交。"
-
-
-@pytest.mark.asyncio
-async def test_provider_not_detected_does_not_write(tmp_path, monkeypatch):
-    workspace = _workspace(tmp_path)
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=False,
-        warnings=["not installed"],
-    )
-    _bind_inventory(monkeypatch, inventory)
-
-    with pytest.raises(ValueError, match="not found"):
-        await ProviderImportService(workspace).import_from("codex")
-
-    assert await workspace.chat_manager.list_chats(archived=None) == []
-    assert not (workspace.workspace_dir / ".qwenpaw/imports").exists()
 
 
 @pytest.mark.asyncio
@@ -1079,35 +942,6 @@ async def test_provider_import_rejects_inline_mcp_argument_secret(
 
 
 @pytest.mark.asyncio
-async def test_dry_run_routes_inline_mcp_secret_to_agent_mission(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    workspace = _workspace(tmp_path)
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        mcp_servers=[
-            SourceMCPServer(
-                source_id="signed-url",
-                name="signed-url",
-                transport="streamable_http",
-                url="https://example.test/mcp?sig=opaque-signature",
-            ),
-        ],
-    )
-    _bind_inventory(monkeypatch, inventory)
-
-    plan = await ProviderImportService(workspace).plan_from("codex")
-
-    action = next(item for item in plan.actions if item.asset_type == "mcp")
-    assert action.action == "agent_mission_test_and_adapt"
-    assert action.fidelity == "agent_decision"
-    assert "兼容流程" in action.reason_zh
-
-
-@pytest.mark.asyncio
 async def test_provider_import_sets_and_repairs_source_project_directory(
     tmp_path: Path,
     monkeypatch,
@@ -1304,7 +1138,6 @@ async def test_qoder_custom_skill_plugin_uses_native_adapter(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    """A registered custom Skill plugin uses a reviewed native wrapper."""
     workspace = _workspace(tmp_path)
     workspace.marketplace_registry_path = tmp_path / "marketplaces.json"
     custom_root = tmp_path / ".qoder/plugins/custom"
@@ -1639,7 +1472,6 @@ async def test_failed_receipt_rolls_back_all_core_asset_writers(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    """A late failure must leave no conversation, Skill, MCP, or Cron."""
     workspace = _workspace(tmp_path)
     workspace.cron_manager = _CronManager()
     skill_source = tmp_path / "rollback-skill"

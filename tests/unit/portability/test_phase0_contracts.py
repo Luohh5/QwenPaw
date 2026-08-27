@@ -253,7 +253,6 @@ async def test_codex_mini_home_matches_golden_inventory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Provider refactors must not lose or detach Codex assets."""
     monkeypatch.setenv("HOME", str(tmp_path / "isolated-home"))
     codex_home = _copy_fixture(tmp_path, "codex-mini")
 
@@ -272,7 +271,6 @@ async def test_codex_mini_home_matches_golden_inventory(
 async def test_qoder_mini_home_matches_golden_inventory(
     tmp_path: Path,
 ) -> None:
-    """Provider refactors must preserve Qoder component ownership."""
     qoder_home = _copy_fixture(tmp_path, "qoder-mini")
     user_data = _copy_fixture(tmp_path, "qoder-user-data-mini")
     ledger = qoder_home / "plugins" / "installed_plugins_v2.json"
@@ -296,7 +294,6 @@ async def test_qoder_mini_home_matches_golden_inventory(
 
 
 def test_four_zone_summary_matches_reviewed_contract(tmp_path: Path) -> None:
-    """Summary refactors must preserve all zones and stopped reasons."""
     manifest = _four_zone_manifest()
     summary = tmp_path / "summary.md"
 
@@ -309,14 +306,12 @@ def test_four_zone_summary_matches_reviewed_contract(tmp_path: Path) -> None:
 
 
 def test_four_zone_manifest_matches_reviewed_contract() -> None:
-    """Every durable zone field remains compatible with saved manifests."""
     assert _four_zone_manifest().model_dump(mode="json") == _golden_json(
         "four-zone-manifest.json",
     )
 
 
 def test_import_receipt_matches_reviewed_contract() -> None:
-    """Receipt refactors must preserve every persisted asset outcome."""
     started = datetime(2026, 8, 20, tzinfo=timezone.utc)
     completed = datetime(2026, 8, 20, 0, 5, tzinfo=timezone.utc)
     receipt = ImportReceipt(
@@ -371,7 +366,6 @@ def test_import_receipt_matches_reviewed_contract() -> None:
 
 
 def test_old_plan_and_receipt_fields_remain_loadable() -> None:
-    """Deleting obsolete optional fields must not break durable records."""
     created = "2026-08-20T00:00:00Z"
     plan = MigrationPlan.model_validate(
         {
@@ -415,7 +409,6 @@ def test_old_plan_and_receipt_fields_remain_loadable() -> None:
 def test_generated_plugin_ids_do_not_depend_on_display_names(
     tmp_path: Path,
 ) -> None:
-    """Display-name changes must not create a second generated plugin."""
     codex, qoder = _content_plugins(
         tmp_path,
         "Renamed Expo Display",
@@ -449,7 +442,6 @@ def test_generated_plugin_ids_do_not_depend_on_display_names(
 async def test_canonical_plugin_ids_block_duplicate_native_installs(
     tmp_path: Path,
 ) -> None:
-    """Renamed Codex and Qoder sources must not create second plugins."""
     first_codex, first_qoder = _content_plugins(
         tmp_path,
         "First display name",

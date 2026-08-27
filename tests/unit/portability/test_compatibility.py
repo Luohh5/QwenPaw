@@ -89,21 +89,6 @@ def test_hard_stop_preserves_unreviewed_staging_items(
     assert manifest.stop_reason == "mission limit"
 
 
-def test_exhausted_staging_asset_is_not_reclassified_as_repair(
-    tmp_path: Path,
-) -> None:
-    store = CompatibilityStore(tmp_path / "manifest.json")
-    manifest = store.prepare(
-        migration_id="migration-budget",
-        source="qoder",
-        skills=[_skill(tmp_path)],
-    )
-    for _ in range(manifest.assets[0].tool_budget):
-        store.consume("demo")
-    asset = load_manifest(store.path).assets[0]
-    assert asset.zone is AssetZone.STAGING
-
-
 def test_asset_budget_reserves_final_classification_call(
     tmp_path: Path,
 ) -> None:

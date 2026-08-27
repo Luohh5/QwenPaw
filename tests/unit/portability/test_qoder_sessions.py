@@ -111,7 +111,6 @@ def _create_index(user_data: Path, editor_id: str, quest_id: str) -> None:
 async def test_provider_imports_ide_editor_and_quest_transcripts(
     tmp_path: Path,
 ) -> None:
-    """Current IDE editor and non-UUID Quest sessions are both imported."""
     qoder_home = tmp_path / ".qoder"
     user_data = tmp_path / "Qoder" / "User"
     project = qoder_home / "projects" / "-projects-demo" / "transcript"
@@ -220,7 +219,6 @@ async def test_provider_imports_ide_editor_and_quest_transcripts(
 async def test_provider_imports_transcripts_without_sdk_or_ui_database(
     tmp_path: Path,
 ) -> None:
-    """JSONL remains importable when the SDK and UI index are unavailable."""
     qoder_home = tmp_path / ".qoder"
     session_id = "task-no-database.session.execution"
     transcript = (
@@ -259,7 +257,6 @@ async def test_provider_imports_transcripts_without_sdk_or_ui_database(
 def test_discovery_prefers_ide_layout_over_legacy_sdk_copy(
     tmp_path: Path,
 ) -> None:
-    """A current IDE transcript wins over a legacy duplicate session id."""
     qoder_home = tmp_path / ".qoder"
     project = qoder_home / "projects" / "-projects-demo"
     session_id = "11111111-1111-4111-8111-111111111111"
@@ -280,7 +277,6 @@ def test_discovery_prefers_ide_layout_over_legacy_sdk_copy(
 async def test_provider_filters_internal_agent_tool_only_traces(
     tmp_path: Path,
 ) -> None:
-    """Experts child workers stay in their parent instead of chat history."""
     qoder_home = tmp_path / ".qoder"
     transcript = qoder_home / "projects" / "-project" / "transcript"
     worker_id = "22222222-2222-4222-8222-222222222222"

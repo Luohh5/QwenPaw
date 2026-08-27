@@ -583,10 +583,7 @@ def _normalise_task(
 def discover_codex_scheduled_tasks(
     codex_home: Path,
 ) -> tuple[list[SourceScheduledTask], list[str], int, set[str]]:
-    """Return tasks, warnings, identifiable-source count, and run thread IDs.
-
-    Unsafe IDs contribute only a SHA-256 count key; missing IDs are uncounted.
-    """
+    """Return tasks, warnings, source count, and run thread IDs."""
     warnings: list[str] = []
     codex_home = codex_home.expanduser()
     project_roots = _read_project_roots(codex_home, warnings)

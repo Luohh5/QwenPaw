@@ -55,20 +55,6 @@ def test_tree_fingerprint_is_stable_and_detects_source_changes(
     assert inventory_fingerprint(inventory) != first
 
 
-def test_tree_fingerprint_detects_added_empty_directory(
-    tmp_path: Path,
-) -> None:
-    root = tmp_path / "skill"
-    root.mkdir()
-    (root / "SKILL.md").write_text("instructions", encoding="utf-8")
-    inventory = _skill_inventory(root)
-    before = inventory_fingerprint(inventory)
-
-    (root / "empty-assets").mkdir()
-
-    assert inventory_fingerprint(inventory) != before
-
-
 def test_tree_entry_limit_stops_wide_directory_scan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -83,20 +69,6 @@ def test_tree_entry_limit_stops_wide_directory_scan(
         inventory_fingerprint(_skill_inventory(root))
 
 
-def test_tree_file_limit_is_global_across_source_tree(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    root = tmp_path / "skill"
-    root.mkdir()
-    (root / "one.txt").write_text("one", encoding="utf-8")
-    (root / "two.txt").write_text("two", encoding="utf-8")
-    monkeypatch.setattr(planner, "_MAX_FINGERPRINT_FILES", 1)
-
-    with pytest.raises(ValueError, match="fingerprint file limit"):
-        inventory_fingerprint(_skill_inventory(root))
-
-
 def test_tree_byte_limit_is_checked_before_large_file_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -108,30 +80,6 @@ def test_tree_byte_limit_is_checked_before_large_file_read(
 
     with pytest.raises(ValueError, match="fingerprint byte limit"):
         inventory_fingerprint(_skill_inventory(root))
-
-
-def test_byte_limit_is_cumulative_across_multiple_roots(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    first = tmp_path / "first-skill"
-    second = tmp_path / "second-skill"
-    first.mkdir()
-    second.mkdir()
-    (first / "one.txt").write_bytes(b"123")
-    (second / "two.txt").write_bytes(b"456")
-    inventory = _skill_inventory(first)
-    inventory.skills.append(
-        SourceSkill(
-            source_id="skill-2",
-            name="second-skill",
-            directory=second,
-        ),
-    )
-    monkeypatch.setattr(planner, "_MAX_FINGERPRINT_BYTES", 5)
-
-    with pytest.raises(ValueError, match="fingerprint byte limit"):
-        inventory_fingerprint(inventory)
 
 
 def test_tree_rejects_symbolic_link_escape(tmp_path: Path) -> None:

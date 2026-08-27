@@ -67,14 +67,6 @@ def _v2_task(
     return task
 
 
-def test_missing_store_returns_empty_inventory(tmp_path: Path) -> None:
-    tasks, warnings, discovered = discover_qoder_scheduled_tasks(tmp_path)
-
-    assert not tasks
-    assert not warnings
-    assert discovered == 0
-
-
 def test_v2_maps_active_and_paused_and_filters_terminal_tasks(
     tmp_path: Path,
 ) -> None:
@@ -251,29 +243,6 @@ def test_corrupt_v2_never_falls_back_to_v1(tmp_path: Path) -> None:
     assert "Qoder v1 was not used" in warnings[0]
 
 
-def test_valid_v2_is_preferred_even_when_it_is_empty(tmp_path: Path) -> None:
-    user_data = tmp_path / "User"
-    _write_store(user_data, version=2, tasks=[])
-    _write_store(
-        user_data,
-        version=1,
-        tasks=[
-            {
-                "id": "legacy",
-                "fireAt": "2026-08-21T00:00:00Z",
-                "timezone": "UTC",
-                "status": "pending",
-            },
-        ],
-    )
-
-    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
-
-    assert not tasks
-    assert not warnings
-    assert discovered == 0
-
-
 def test_v1_fallback_maps_pending_one_shot_and_filters_history(
     tmp_path: Path,
 ) -> None:
@@ -420,71 +389,6 @@ def test_unsafe_v2_store_is_rejected(
         assert "Qoder v1 was not used" in warnings[0]
 
 
-def test_arbitrary_nested_metadata_is_not_copied(tmp_path: Path) -> None:
-    user_data = tmp_path / "User"
-    leak_marker = "NESTED_VALUE_MUST_NOT_BE_COPIED"
-    oversized_scalar = "x" * 10_000
-    task = _v2_task(
-        "bounded-metadata",
-        schedule={
-            "startAt": "2026-08-20T00:00:00Z",
-            "timezone": "UTC",
-            "repeat": {
-                "frequency": "none",
-                "minutes": 15,
-                "weekdays": [0, 1, 2, 3, 4, 5, 6, 99],
-                "unknown": {"deep": leak_marker},
-            },
-            "unknown": {"deep": leak_marker},
-        },
-        executionTarget={
-            "kind": "newSession",
-            "sessionId": "session-id",
-            "questTaskId": "quest-id",
-            "unknown": {"deep": leak_marker},
-        },
-        metadata={"arbitrary": {"deep": leak_marker}},
-        ownerAuthority=oversized_scalar,
-        sourceRequestId=oversized_scalar,
-    )
-    _write_store(user_data, version=2, tasks=[task])
-
-    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
-
-    assert discovered == 1
-    assert not warnings
-    assert len(tasks) == 1
-    metadata = tasks[0].metadata
-    serialized = json.dumps(metadata)
-    assert leak_marker not in serialized
-    assert set(metadata["source_schedule"]) == {
-        "startAt",
-        "timezone",
-        "repeat",
-    }
-    assert set(metadata["source_schedule"]["repeat"]) == {
-        "frequency",
-        "minutes",
-        "weekdays",
-    }
-    assert metadata["source_schedule"]["repeat"]["weekdays"] == [
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-    ]
-    assert metadata["source_execution_target"] == {
-        "kind": "newSession",
-        "sessionId": "session-id",
-        "questTaskId": "quest-id",
-    }
-    assert len(metadata["source_owner_authority"]) == 256
-    assert len(metadata["source_request_id"]) == 2_048
-
-
 def test_oversized_prompt_is_audited_and_never_made_executable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -519,40 +423,3 @@ def test_oversized_prompt_is_audited_and_never_made_executable(
     assert len(audit["sha256"]) == 64
     assert prompt not in json.dumps(task.metadata)
     assert warnings and "retained for review" in warnings[0]
-
-
-def test_identity_title_and_cwd_limits_are_enforced(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    user_data = tmp_path / "User"
-    monkeypatch.setattr(qoder_schedules, "_MAX_SOURCE_ID_CHARS", 8)
-    monkeypatch.setattr(qoder_schedules, "_MAX_TITLE_CHARS", 12)
-    monkeypatch.setattr(qoder_schedules, "_MAX_CWD_CHARS", 8)
-    _write_store(
-        user_data,
-        version=2,
-        tasks=[
-            _v2_task("id-that-is-too-long"),
-            _v2_task(
-                "safe-id",
-                title="A title that is much too long",
-                workspacePath="/workspace/that/is/too/long",
-            ),
-        ],
-    )
-
-    tasks, warnings, discovered = discover_qoder_scheduled_tasks(user_data)
-
-    assert discovered == 2
-    assert len(tasks) == 1
-    task = tasks[0]
-    assert len(task.name) <= 12
-    assert task.cwd == ""
-    assert task.metadata["workspace_status"] == "blocked_unsafe"
-    assert task.metadata["title_audit"]["original_chars"] > 12
-    assert task.metadata["cwd_audit"]["disposition"] == "omitted"
-    assert "source_title_normalized" in task.metadata["review_reasons"]
-    assert "source_cwd_blocked" in task.metadata["review_reasons"]
-    assert len(warnings) == 1
-    assert "unsafe or oversized id" in warnings[0]

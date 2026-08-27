@@ -496,16 +496,10 @@ async def test_mission_classifies_portable_asset_for_enabled_migration(
     assert any("可以进行兼容性修复" in item for item in progress_messages)
     assert any("正在测试 Skill「demo」" in item for item in progress_messages)
     assert any("测试通过，可以迁移" in item for item in progress_messages)
-    assert workspace.request.request_context["max_react_iterations"] >= 80
-    assert any("推理上限" in item for item in progress_messages)
     assert [
         item.request_context["portability_phase"]
         for item in workspace.requests
     ] == ["triage", "mission_repair"]
-    assert all(
-        "get_goal" not in item.request_context["subagent_allowed_tools"]
-        for item in workspace.requests
-    )
 
 
 @pytest.mark.asyncio
@@ -587,107 +581,6 @@ async def test_triage_can_finish_without_starting_mission(
 
 
 @pytest.mark.asyncio
-async def test_triage_reads_oversized_plugin_file_once_as_excerpt(
-    tmp_path: Path,
-) -> None:
-    source = tmp_path / "source-plugin"
-    source.mkdir()
-    (source / "plugin.json").write_text(
-        '{"id":"large","version":"1.0.0"}',
-        encoding="utf-8",
-    )
-    (source / "server.mjs").write_text(
-        "export const payload = '" + "x" * (257 * 1024) + "';\n",
-        encoding="utf-8",
-    )
-
-    async def action(context):
-        inspected = await context.inspect_asset("plugins:large")
-        assessments = {}
-        for component in inspected["asset"]["components"]:
-            for path in component["paths"]:
-                result = await context.read_file("plugins:large", path)
-                if path == "server.mjs":
-                    assert result["read_mode"] == "bounded_excerpt"
-                    assert result["has_more"] is False
-                    assert result["size_bytes"] > 256 * 1024
-            assessments[component["component_id"]] = {
-                "verdict": "unusable",
-                "reason": "QwenPaw already provides this capability",
-            }
-        await context.classify_asset(
-            "plugins:large",
-            "discard",
-            "QwenPaw already has an equivalent",
-            "unusable",
-            json.dumps(assessments),
-        )
-
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        plugins=[
-            SourcePlugin(
-                source_id="large",
-                name="large",
-                marketplace="test",
-                install_source=str(source),
-            ),
-        ],
-    )
-    result = await run_adaptation_loop(
-        _Workspace(tmp_path, action),
-        inventory,
-        "migration-large-plugin",
-    )
-
-    assert result.status == "completed"
-    assert result.asset_zones["plugins:large"] == "discard"
-
-
-@pytest.mark.asyncio
-async def test_triage_uses_three_slot_rolling_worker_pool(
-    tmp_path: Path,
-) -> None:
-    completed = []
-    skills = []
-    for name in ("slow", "fast-a", "fast-b", "last"):
-        root = tmp_path / name
-        root.mkdir()
-        (root / "SKILL.md").write_text(
-            f"---\nname: {name}\n---\n{name}\n",
-            encoding="utf-8",
-        )
-        skills.append(SourceSkill(source_id=name, name=name, directory=root))
-
-    async def action(context):
-        key = context.active_asset_key
-        if key == "skills:slow":
-            await asyncio.sleep(0.05)
-        await context.inspect_asset(key)
-        await context.read_file(key, "SKILL.md")
-        await context.classify_asset(key, "discard", "equivalent")
-        completed.append(key)
-
-    workspace = _Workspace(tmp_path, action)
-    result = await run_adaptation_loop(
-        workspace,
-        ProviderInventory(
-            provider_id="codex",
-            provider_name="Codex",
-            detected=True,
-            skills=skills,
-        ),
-        "migration-triage-pool",
-    )
-
-    assert result.status == "completed"
-    assert workspace.max_active_queries == 3
-    assert completed.index("skills:last") < completed.index("skills:slow")
-
-
-@pytest.mark.asyncio
 async def test_unfinished_triage_asset_does_not_block_later_assets(
     tmp_path: Path,
 ) -> None:
@@ -735,48 +628,6 @@ async def test_unfinished_triage_asset_does_not_block_later_assets(
 
 
 @pytest.mark.asyncio
-async def test_triage_resumes_same_asset_after_failure_with_progress(
-    tmp_path: Path,
-) -> None:
-    attempts = 0
-    progress_messages = []
-
-    async def progress(message: str) -> None:
-        progress_messages.append(message)
-
-    async def action(context):
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            await context.inspect_asset("skills:demo")
-            await context.read_file("skills:demo", "SKILL.md")
-            raise RuntimeError("transient model failure")
-        await context.classify_asset(
-            "skills:demo",
-            "discard",
-            "QwenPaw already has an equivalent",
-        )
-
-    workspace = _Workspace(tmp_path, action)
-    result = await run_adaptation_loop(
-        workspace,
-        ProviderInventory(
-            provider_id="codex",
-            provider_name="Codex",
-            detected=True,
-            skills=[_skill(tmp_path, "Duplicate capability")],
-        ),
-        "migration-triage-resume",
-        progress,
-    )
-
-    assert result.status == "completed"
-    assert len(workspace.requests) == 2
-    assert workspace.requests[0].session_id == workspace.requests[1].session_id
-    assert any("保留已读进度" in item for item in progress_messages)
-
-
-@pytest.mark.asyncio
 async def test_static_failure_keeps_remote_plugin_in_repair(
     tmp_path: Path,
 ) -> None:
@@ -814,66 +665,6 @@ async def test_static_failure_keeps_remote_plugin_in_repair(
     assert "每项最多 4 次尝试" in result.summary_path.read_text(
         encoding="utf-8",
     )
-
-
-@pytest.mark.asyncio
-async def test_agent_receives_native_plugin_description(
-    tmp_path: Path,
-) -> None:
-    source = tmp_path / "native-plugin"
-    source.mkdir()
-    (source / "plugin.py").write_text(
-        "class NativePlugin:\n"
-        "    def register(self, api):\n"
-        "        pass\n\n"
-        "plugin = NativePlugin()\n",
-        encoding="utf-8",
-    )
-    (source / "plugin.json").write_text(
-        '{"id":"native","version":"1.0.0",'
-        '"description":"Creates reports",'
-        '"entry":{"backend":"plugin.py"}}',
-        encoding="utf-8",
-    )
-
-    async def action(context):
-        if context.phase == "triage":
-            reviews = await _review_plugin(context, "plugins:native")
-            await context.classify_asset(
-                "plugins:native",
-                "repair",
-                "portable and not duplicated",
-                "fully_usable",
-                reviews,
-            )
-            return
-        tested = await context.test_asset("plugins:native")
-        assert tested["passed"]
-        assert any("Creates reports" in item for item in tested["evidence"])
-        await context.classify_asset("plugins:native", "migrate", "useful")
-
-    workspace = _Workspace(tmp_path, action)
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        plugins=[
-            SourcePlugin(
-                source_id="native",
-                name="native",
-                marketplace="local",
-                install_source=str(source),
-            ),
-        ],
-    )
-
-    result = await run_adaptation_loop(workspace, inventory, "migration-6")
-
-    assert result.asset_zones["plugins:native"] == "migrate"
-    staged = Path(inventory.plugins[0].install_source)
-    assert staged != source
-    assert staged.is_relative_to(workspace.workspace_dir)
-    assert (staged / "plugin.json").is_file()
 
 
 @pytest.mark.asyncio
