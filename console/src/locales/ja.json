@@ -63,8 +63,59 @@
     "genericSubTitle": "このページのレンダリング中に予期しないエラーが発生しました。",
     "reload": "再読み込み"
   },
+  "portabilityImport": {
+    "title": "インポート",
+    "description": "他の AI アプリの会話とツール設定を QwenPaw に移行します。",
+    "steps": {
+      "sources": "アプリ",
+      "inventory": "内容を選択",
+      "progress": "インポート"
+    },
+    "chooseSources": "アプリを選択",
+    "chooseSourcesHint": "検出されたアプリを複数選択できます。",
+    "detected": "検出済み",
+    "notDetected": "未検出",
+    "noSources": "対応する AI アプリがこのデバイスで見つかりませんでした。",
+    "continue": "続行",
+    "scanning": "会話とツール設定を確認しています…",
+    "chooseContent": "インポートする内容を選択",
+    "defaultSelected": "初期状態ではすべて選択されています。不要な項目は解除できます。",
+    "conversations": "会話履歴",
+    "items": "{{count}} 件",
+    "start": "インポート開始",
+    "groups": {
+      "memory": "メモリ",
+      "cron": "定期タスク",
+      "skill": "スキル",
+      "mcp": "MCP",
+      "plugin": "プラグイン"
+    },
+    "states": {
+      "pending": "待機中",
+      "repairing": "修復中",
+      "not_needed": "不要",
+      "failed": "失敗",
+      "succeeded": "成功"
+    },
+    "hints": {
+      "notNeeded": "元の AI アプリに依存しているか、QwenPaw に同等の機能があります。",
+      "failed": "関連する設定を手動で修正してください。",
+      "disabled": "正常に移行しましたが、確認して有効化するまで無効のままです。"
+    },
+    "sessionStates": {
+      "failed": "インポート失敗",
+      "succeeded": "{{count}}/{{total}} 件を移行",
+      "importing": "{{count}}/{{total}} 件を移行中"
+    },
+    "finished": "インポート完了",
+    "importing": "インポート中",
+    "keepOpen": "各項目の状態を確認できます。処理中は QwenPaw を閉じないでください。",
+    "details": "移行の詳細",
+    "done": "完了"
+  },
   "nav": {
     "chat": "チャット",
+    "import": "インポート",
     "files": "ファイル",
     "control": "コントロール",
     "channels": "チャンネル",

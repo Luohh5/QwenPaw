@@ -110,6 +110,56 @@
     "chatGptAuthenticated": "已连接 ChatGPT",
     "cliAuthenticated": "{{type}} CLI 已认证"
   },
+  "portabilityImport": {
+    "title": "导入",
+    "description": "将其他 AI 应用中的会话和工具设置迁移到 QwenPaw。",
+    "steps": {
+      "sources": "选择应用",
+      "inventory": "选择内容",
+      "progress": "开始导入"
+    },
+    "chooseSources": "选择要导入的应用",
+    "chooseSourcesHint": "可同时选择多个已检测到的 AI 应用。",
+    "detected": "已检测到",
+    "notDetected": "未检测到",
+    "noSources": "此设备上未检测到受支持的 AI 应用。",
+    "continue": "继续",
+    "scanning": "正在清点会话和工具设置…",
+    "chooseContent": "选择要导入的内容",
+    "defaultSelected": "默认全部勾选，可取消不需要的内容。",
+    "conversations": "聊天记录",
+    "items": "{{count}} 项",
+    "start": "开始导入",
+    "groups": {
+      "memory": "Memory",
+      "cron": "定时任务",
+      "skill": "Skill",
+      "mcp": "MCP",
+      "plugin": "插件"
+    },
+    "states": {
+      "pending": "等待中",
+      "repairing": "兼容性修复中",
+      "not_needed": "无需导入",
+      "failed": "导入失败",
+      "succeeded": "导入成功"
+    },
+    "hints": {
+      "notNeeded": "该工具绑定来源 Harness 生态，或 QwenPaw 中已有等价功能。",
+      "failed": "请手动修改相关配置。",
+      "disabled": "已成功导入，但为保证安全暂未启用；请审核后手动启用。"
+    },
+    "sessionStates": {
+      "failed": "导入失败",
+      "succeeded": "已导入 {{count}}/{{total}}",
+      "importing": "{{count}}/{{total}} 正在导入"
+    },
+    "finished": "导入完成",
+    "importing": "正在导入",
+    "keepOpen": "可在下方查看每一项的状态。导入期间请勿关闭 QwenPaw。",
+    "details": "迁移详情",
+    "done": "完成"
+  },
   "nav": {
     "chat": "聊天",
     "files": "文件",
@@ -118,6 +168,7 @@
     "sessions": "会话",
     "inbox": "收件箱",
     "apps": "应用",
+    "import": "导入",
     "cronJobs": "定时任务",
     "heartbeat": "心跳",
     "agent": "工作区",

@@ -55,6 +55,7 @@ const PluginManagerPage = lazyImportWithRetry(
 );
 const AppCenterPage = lazyImportWithRetry("../../pages/AppCenter");
 const FilesPage = lazyImportWithRetry("../../pages/Files");
+const ImportPage = lazyImportWithRetry("../../pages/Import");
 
 /**
  * "/" always lands on the canonical Chat workspace.
@@ -117,6 +118,7 @@ export const BUILTIN_ROUTES: Route[] = [
     component: PluginManagerPage,
   },
   { id: "core.app-center", path: "/apps", component: AppCenterPage },
+  { id: "core.import", path: "/imports", component: ImportPage },
   // Deep-link / refresh target: `/apps/<id>` also lands on the App Center,
   // which opens the app inline (with the “← App Center” bar) from the URL.
   {

@@ -65,8 +65,59 @@
     "genericSubTitle": "Có lỗi không mong muốn khi hiển thị trang này.",
     "reload": "Tải lại"
   },
+  "portabilityImport": {
+    "title": "Nhập dữ liệu",
+    "description": "Chuyển cuộc trò chuyện và thiết lập công cụ từ ứng dụng AI khác vào QwenPaw.",
+    "steps": {
+      "sources": "Ứng dụng",
+      "inventory": "Chọn nội dung",
+      "progress": "Nhập"
+    },
+    "chooseSources": "Chọn ứng dụng",
+    "chooseSourcesHint": "Chọn một hoặc nhiều ứng dụng đã phát hiện.",
+    "detected": "Đã phát hiện",
+    "notDetected": "Chưa phát hiện",
+    "noSources": "Không phát hiện ứng dụng AI được hỗ trợ trên thiết bị này.",
+    "continue": "Tiếp tục",
+    "scanning": "Đang kiểm tra cuộc trò chuyện và thiết lập công cụ…",
+    "chooseContent": "Chọn nội dung cần nhập",
+    "defaultSelected": "Mọi mục được chọn sẵn. Bỏ chọn những mục bạn không cần.",
+    "conversations": "Cuộc trò chuyện",
+    "items": "{{count}} mục",
+    "start": "Bắt đầu nhập",
+    "groups": {
+      "memory": "Bộ nhớ",
+      "cron": "Lịch chạy",
+      "skill": "Kỹ năng",
+      "mcp": "MCP",
+      "plugin": "Plugin"
+    },
+    "states": {
+      "pending": "Đang chờ",
+      "repairing": "Đang sửa",
+      "not_needed": "Không cần",
+      "failed": "Thất bại",
+      "succeeded": "Thành công"
+    },
+    "hints": {
+      "notNeeded": "Mục này phụ thuộc vào ứng dụng AI nguồn hoặc QwenPaw đã có chức năng tương đương.",
+      "failed": "Vui lòng chỉnh sửa cấu hình liên quan theo cách thủ công.",
+      "disabled": "Đã nhập thành công nhưng vẫn tắt cho đến khi bạn xem xét và bật."
+    },
+    "sessionStates": {
+      "failed": "Nhập thất bại",
+      "succeeded": "Đã nhập {{count}}/{{total}}",
+      "importing": "Đang nhập {{count}}/{{total}}"
+    },
+    "finished": "Nhập hoàn tất",
+    "importing": "Đang nhập dữ liệu",
+    "keepOpen": "Bạn có thể xem trạng thái từng mục bên dưới. Không đóng QwenPaw trong khi nhập.",
+    "details": "Chi tiết di chuyển",
+    "done": "Hoàn tất"
+  },
   "nav": {
     "chat": "Trò chuyện",
+    "import": "Nhập dữ liệu",
     "files": "Tệp",
     "control": "Điều khiển",
     "channels": "Kênh",
