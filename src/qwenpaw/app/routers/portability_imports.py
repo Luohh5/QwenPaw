@@ -1,0 +1,146 @@
+# -*- coding: utf-8 -*-
+"""Agent-pinned HTTP bridge for Codex/Qoder imports."""
+
+from __future__ import annotations
+
+import json
+
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+from ...portability.import_jobs import PortabilityImportJobManager
+from ...portability.models import ImportSelection
+from ...portability.providers import provider_names, resolve_source_location
+from ..agent_context import get_agent_for_request
+
+portability_import_router = APIRouter(
+    prefix="/portability/imports",
+    tags=["portability-imports"],
+)
+PORTABILITY_IMPORT_JOBS = PortabilityImportJobManager()
+_LOCALHOST = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
+class CreateImportJobRequest(BaseModel):
+    """Applications selected on the source step."""
+
+    sources: list[str] = Field(min_length=1, max_length=2)
+
+
+class StartImportJobRequest(BaseModel):
+    """Per-source assets selected on the inventory step."""
+
+    selections: dict[str, ImportSelection]
+
+
+def _local_only(request: Request) -> None:
+    client = request.client
+    if client and client.host not in _LOCALHOST:
+        raise HTTPException(
+            status_code=403,
+            detail="Import endpoints are localhost-only",
+        )
+
+
+def _api_error(exc: Exception) -> HTTPException:
+    return HTTPException(
+        status_code=409 if isinstance(exc, RuntimeError) else 400,
+        detail=str(exc),
+    )
+
+
+@portability_import_router.get("/sources")
+async def list_import_sources(request: Request) -> list[dict]:
+    """Report supported applications without exposing local source paths."""
+    _local_only(request)
+    result = []
+    for source in provider_names():
+        location = resolve_source_location(source)
+        result.append(
+            {
+                "source": source,
+                "name": source.title(),
+                "detected": bool(
+                    location.data_home_exists
+                    or location.user_data_home_exists
+                    or location.runtime_path,
+                ),
+            },
+        )
+    return result
+
+
+@portability_import_router.post("/jobs", status_code=202)
+async def create_import_job(
+    body: CreateImportJobRequest,
+    request: Request,
+):
+    """Start inventory scans for the selected applications."""
+    _local_only(request)
+    workspace = await get_agent_for_request(request)
+    try:
+        return await PORTABILITY_IMPORT_JOBS.create(workspace, body.sources)
+    except (ValueError, RuntimeError) as exc:
+        raise _api_error(exc) from exc
+
+
+@portability_import_router.get("/jobs/{job_id}")
+async def get_import_job(job_id: str, request: Request):
+    """Return the latest durable job snapshot."""
+    _local_only(request)
+    workspace = await get_agent_for_request(request)
+    try:
+        return await PORTABILITY_IMPORT_JOBS.snapshot(workspace, job_id)
+    except (ValueError, RuntimeError) as exc:
+        raise _api_error(exc) from exc
+
+
+@portability_import_router.post("/jobs/{job_id}/start", status_code=202)
+async def start_import_job(
+    job_id: str,
+    body: StartImportJobRequest,
+    request: Request,
+):
+    """Apply an explicit per-source selection."""
+    _local_only(request)
+    workspace = await get_agent_for_request(request)
+    try:
+        return await PORTABILITY_IMPORT_JOBS.start(
+            workspace,
+            job_id,
+            body.selections,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise _api_error(exc) from exc
+
+
+@portability_import_router.get("/jobs/{job_id}/events")
+async def stream_import_events(
+    job_id: str,
+    request: Request,
+    after: int = Query(default=0, ge=0),
+) -> StreamingResponse:
+    """Stream reconnectable full-snapshot events."""
+    _local_only(request)
+    workspace = await get_agent_for_request(request)
+
+    async def events():
+        try:
+            async for event in PORTABILITY_IMPORT_JOBS.subscribe(
+                workspace,
+                job_id,
+                after=after,
+            ):
+                yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
+        except (ValueError, RuntimeError) as exc:
+            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+__all__ = ["portability_import_router"]
