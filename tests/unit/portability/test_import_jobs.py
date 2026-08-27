@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# pylint: disable=protected-access
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from qwenpaw.portability.import_jobs import (
+    ImportProviderSnapshot,
     PortabilityImportJobManager,
 )
 from qwenpaw.portability.models import (
@@ -87,6 +89,7 @@ class _FakeServices:
                 if progress:
                     await progress("正在写入会话：1/2（聊天记录阶段）")
                     await progress(f"正在修复 Skill「{source.title()} Skill」")
+                    await progress("api_key=sk-test-secret-1234567890")
                 if source in owner.fail_apply:
                     raise RuntimeError(f"{source} failed")
                 now = datetime.now(timezone.utc)
@@ -102,6 +105,22 @@ class _FakeServices:
                 )
 
         return Service()
+
+
+def test_only_materialization_milestone_updates_session_progress() -> None:
+    provider = ImportProviderSnapshot(source="qoder", sessions_total=1)
+
+    PortabilityImportJobManager._project_progress(
+        provider,
+        "正在扫描 Qoder 会话：2/2",
+    )
+    assert (provider.sessions_processed, provider.sessions_total) == (0, 1)
+
+    PortabilityImportJobManager._project_progress(
+        provider,
+        "正在写入会话：1/1（聊天记录阶段）",
+    )
+    assert (provider.sessions_processed, provider.sessions_total) == (1, 1)
 
 
 @pytest.mark.asyncio
@@ -165,6 +184,7 @@ async def test_apply_projects_progress_and_replays_terminal_event(
     assert snapshot.providers[0].sessions_imported == 1
     assert snapshot.providers[0].assets[0].state is ImportAssetState.SUCCEEDED
     assert snapshot.providers[0].assets[0].enabled is False
+    assert "sk-test-secret" not in "\n".join(snapshot.logs)
     assert events[-1]["snapshot"]["state"] == "completed"
     assert [event["seq"] for event in events] == sorted(
         event["seq"] for event in events

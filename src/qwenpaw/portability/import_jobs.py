@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from ..utils.io_utils import read_json_async, write_json_atomic_async
 from .compatibility import load_manifest
+from .compatibility_safety import redact_sensitive_text
 from .import_status import project_asset_results
 from .importer import ProviderImportService
 from .models import (
@@ -28,7 +29,9 @@ from .models import (
 
 _SUPPORTED_SOURCES = {"codex", "qoder"}
 _TERMINAL = {"completed", "completed_with_issues", "failed", "interrupted"}
-_SESSIONS = re.compile(r"会话[^0-9]*(\d+)\s*/\s*(\d+)")
+_SESSIONS = re.compile(
+    r"^正在写入会话[：:]\s*(\d+)\s*/\s*(\d+)[（(]聊天记录阶段[）)]$",
+)
 _ASSET_NAME = re.compile(r"[「『](.+?)[」』]")
 _TYPE_FIELDS = {
     "memory": "memory",
@@ -234,11 +237,14 @@ class PortabilityImportJobManager:
                     plan,
                     provider.selection,
                 )
-                provider.warnings = plan.warnings[:20]
+                provider.warnings = [
+                    redact_sensitive_text(item, limit=500)
+                    for item in plan.warnings[:20]
+                ]
                 provider.state = "ready"
             except Exception as exc:  # pylint: disable=broad-except
                 provider.state = "failed"
-                provider.error = str(exc)[:500]
+                provider.error = redact_sensitive_text(exc, limit=500)
             await self._emit(live, persist=True)
 
         await asyncio.gather(*(scan(item) for item in live.snapshot.providers))
@@ -280,10 +286,16 @@ class PortabilityImportJobManager:
                 provider.sessions_processed = provider.sessions_total
                 provider.sessions_imported = len(receipt.imported_sessions)
                 provider.sessions_skipped = len(receipt.skipped_sessions)
-                provider.warnings = (provider.warnings + receipt.warnings)[:20]
+                provider.warnings = (
+                    provider.warnings
+                    + [
+                        redact_sensitive_text(item, limit=500)
+                        for item in receipt.warnings
+                    ]
+                )[:20]
                 provider.state = "completed"
             except Exception as exc:  # pylint: disable=broad-except
-                provider.error = str(exc)[:500]
+                provider.error = redact_sensitive_text(exc, limit=500)
                 provider.state = "failed"
                 for asset in provider.assets:
                     if asset.state is not ImportAssetState.NOT_NEEDED:
@@ -403,7 +415,8 @@ class PortabilityImportJobManager:
 
     @staticmethod
     def _log(live: _LiveJob, message: str) -> None:
-        live.snapshot.logs = (live.snapshot.logs + [message[:500]])[-50:]
+        safe = redact_sensitive_text(message, limit=500)
+        live.snapshot.logs = (live.snapshot.logs + [safe])[-50:]
 
     @staticmethod
     def _manifest(workspace: Any, receipt: ImportReceipt):
