@@ -1,15 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Read-only discovery and normalization of Codex automations.
-
-Codex Desktop currently treats ``automations/*/automation.toml`` as the
-authoritative definition store.  Older app builds also maintain an SQLite
-projection.  This module reads both without executing a prompt, touching the
-source files, or reading archived automation-run message bodies.
-"""
-
-# The format adapters and their deliberately conservative recurrence parser
-# live together so source precedence can be audited in one place.
-# pylint: disable=too-many-lines
+"""Read Codex TOML/SQLite automations without mutating or executing them."""
 
 from __future__ import annotations
 
@@ -593,14 +583,9 @@ def _normalise_task(
 def discover_codex_scheduled_tasks(
     codex_home: Path,
 ) -> tuple[list[SourceScheduledTask], list[str], int, set[str]]:
-    """Discover Codex schedules without mutating or executing source data.
+    """Return tasks, warnings, identifiable-source count, and run thread IDs.
 
-    The integer is the count of unique, identifiable source definitions
-    observed, including definitions rejected for an unsafe id (represented
-    internally only by a SHA-256 count key).  Rows with no id cannot be
-    identified and are not counted.  The final set contains bounded,
-    structured automation-run thread ids and can be used to keep those
-    implementation traces out of the ordinary conversation list.
+    Unsafe IDs contribute only a SHA-256 count key; missing IDs are uncounted.
     """
     warnings: list[str] = []
     codex_home = codex_home.expanduser()

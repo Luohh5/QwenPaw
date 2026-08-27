@@ -1,15 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Read Qoder scheduled tasks without activating or mutating them.
-
-Qoder stores scheduled-task definitions in the extension global storage,
-separately from ``~/.qoder`` conversations and from the generated
-``SharedClientCache/.../mcps/schedule`` descriptors.  The latter only describe
-Qoder's built-in Schedule MCP and are deliberately not consulted here.
-
-Version 2 is authoritative whenever it exists.  In particular, a malformed
-v2 store must not fall back to v1: doing so can resurrect tasks that were
-deleted after Qoder migrated the store.
-"""
+"""Read Qoder schedules safely; an existing v2 store is authoritative."""
 
 from __future__ import annotations
 
@@ -31,7 +21,6 @@ from .schedule_fields import (
     safe_prompt as _shared_safe_prompt,
     safe_title as _shared_safe_title,
     text as _text,
-    text_audit as _text_audit,
 )
 
 _SCHEDULE_STORE = (
@@ -74,15 +63,9 @@ class _ScheduleMapping:
 def discover_qoder_scheduled_tasks(
     qoder_user_data: Path,
 ) -> tuple[list[SourceScheduledTask], list[str], int]:
-    """Return Qoder schedule definitions normalized for safe staging.
+    """Return staged definitions, warnings, and the pre-filter task count.
 
-    The returned ``enabled`` value records Qoder's source state.  It is not an
-    instruction to activate the destination job; all returned records carry
-    ``target_default_enabled=False`` and an explicit review reason.
-
-    The integer result is the number of task records in the selected source
-    store before lifecycle and validity filtering.  Run history is neither
-    counted nor imported.
+    ``enabled`` is source provenance only; run history is never imported.
     """
     user_data = qoder_user_data.expanduser()
     store_root = user_data / _SCHEDULE_STORE
@@ -114,7 +97,7 @@ def _path_present(path: Path) -> bool:
         return True
 
 
-# pylint: disable-next=too-many-return-statements,too-many-branches
+# pylint: disable-next=too-many-return-statements
 def _load_store(
     path: Path,
     *,
@@ -679,13 +662,7 @@ def _interval_cron(
     start_at: datetime,
     zone: ZoneInfo,
 ) -> str:
-    """Return one exact five-field phase pattern, or an empty string.
-
-    Five-field cron has minute precision and its fields repeat every day.
-    Therefore a minute interval must divide an hour, while an integral-hour
-    interval must divide a day.  Longer and mixed-hour intervals cannot be
-    represented by one cron expression without drift or extra occurrences.
-    """
+    """Return an exact five-field phase pattern, or an empty string."""
     local_start = start_at.astimezone(zone)
     if local_start.second or local_start.microsecond:
         return ""

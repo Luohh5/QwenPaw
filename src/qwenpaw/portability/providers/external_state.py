@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Read-only discovery for external memory and plugin source state.
-
-Downloaded caches are never installed directly. Portable content may enter an
-isolated migration snapshot and be translated before QwenPaw's native loader
-sees it; independently sourced native plugins still use their original source.
-"""
+"""Read external memory and plugin sources without installing caches."""
 
 from __future__ import annotations
 
@@ -14,7 +9,6 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from ..qoder_plugin_adapter import discover_qoder_custom_skill_adapter
 from ..codex_plugin_adapter import ADAPTER as CODEX_PLUGIN_ADAPTER
 from ..models import (
     SourceMCPServer,
@@ -24,6 +18,8 @@ from ..models import (
     SourcePlugin,
     SourceSkill,
 )
+from ..qoder_plugin_adapter import discover_qoder_custom_skill_adapter
+from ._utils import find_nested_value
 
 _CODEX_BUILTIN_MARKETPLACES = {
     "openai-bundled",
@@ -228,21 +224,7 @@ def _absolute_cwd(value: Any) -> str:
 
 
 def _cwd_in_value(value: Any) -> str:
-    if isinstance(value, dict):
-        for key in _CWD_KEYS:
-            cwd = _absolute_cwd(value.get(key))
-            if cwd:
-                return cwd
-        for child in value.values():
-            cwd = _cwd_in_value(child)
-            if cwd:
-                return cwd
-    elif isinstance(value, list):
-        for child in value:
-            cwd = _cwd_in_value(child)
-            if cwd:
-                return cwd
-    return ""
+    return find_nested_value(value, _CWD_KEYS, _absolute_cwd)
 
 
 def _project_cwd_from_transcripts(project_root: Path) -> str:

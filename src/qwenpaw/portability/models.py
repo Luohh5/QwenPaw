@@ -94,14 +94,7 @@ class SourcePlugin(BaseModel):
 
 
 class SourceScheduledTask(BaseModel):
-    """One external scheduled task normalized for safe QwenPaw staging.
-
-    ``enabled`` records the state at the source only.  The compatibility
-    workflow decides whether the imported QwenPaw job is enabled or held for
-    repair.
-    ``unsupported`` is a first-class schedule type so that a task definition
-    can be audited without guessing at lossy timing semantics.
-    """
+    """Staged task; ``enabled`` is source provenance, not authorization."""
 
     source_id: str
     name: str

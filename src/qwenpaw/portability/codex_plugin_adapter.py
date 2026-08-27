@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .compatibility_safety import bounded_plain_text
 from .models import SourcePlugin
 from .skill_transfer import read_bounded_tree, write_tree_entry
 
@@ -24,14 +25,6 @@ _ROOT_CONFLICTS = {
     Path("plugin.py"),
     Path("requirements.txt"),
 }
-
-
-def _text(value: Any, limit: int) -> str:
-    return "".join(
-        character
-        for character in str(value or "")[:limit]
-        if ord(character) >= 32 and ord(character) != 127
-    ).strip()
 
 
 def _manifest(source: Path) -> tuple[dict[str, Any], Path]:
@@ -101,7 +94,7 @@ def _qwenpaw_manifest(
     manifest: dict[str, Any],
     enabled: bool,
 ) -> dict[str, Any]:
-    plugin_id = _text(manifest.get("name") or plugin.name, 128)
+    plugin_id = bounded_plain_text(manifest.get("name") or plugin.name, 128)
     if not _PLUGIN_ID_RE.fullmatch(plugin_id):
         raise ValueError("Codex plugin name is unsafe")
     interface = manifest.get("interface")
@@ -113,14 +106,17 @@ def _qwenpaw_manifest(
         author = author.get("name") or author.get("email")
     return {
         "id": plugin_id,
-        "name": _text(display_name or plugin.name or plugin_id, 200),
-        "version": _text(
+        "name": bounded_plain_text(
+            display_name or plugin.name or plugin_id,
+            200,
+        ),
+        "version": bounded_plain_text(
             manifest.get("version") or plugin.version or "0.0.0",
             100,
         ),
         "type": "general",
-        "description": _text(manifest.get("description"), 4096),
-        "author": _text(author or "Imported from Codex", 200),
+        "description": bounded_plain_text(manifest.get("description"), 4096),
+        "author": bounded_plain_text(author or "Imported from Codex", 200),
         "entry": {"backend": "plugin.py"},
         "dependencies": [],
         "meta": {

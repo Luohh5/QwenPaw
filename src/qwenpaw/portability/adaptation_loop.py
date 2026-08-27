@@ -592,7 +592,7 @@ async def _run_phase(
             except (
                 asyncio.CancelledError,
                 Exception,
-            ):  # pylint: disable=broad-except
+            ):
                 pass
         _ACTIVE_CONTEXTS.pop(session_id, None)
         context.clear_activity(session_id)

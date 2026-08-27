@@ -1,11 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Read Qoder IDE transcripts and their optional UI indexes.
-
-Qoder Agent SDK sessions live directly below ``projects/<project>``.  Qoder
-IDE sessions use a newer layout under ``projects/<project>/transcript`` and
-Quest execution ids are not necessarily UUIDs.  This module deliberately
-parses both layouts without depending on the optional SDK.
-"""
+"""Read Qoder SDK/IDE transcripts and optional UI indexes."""
 
 from __future__ import annotations
 
@@ -24,7 +18,7 @@ from ...harnesses.events import (
     HarnessHistoryKind,
 )
 from ..models import SourceSession
-from ._utils import parse_datetime
+from ._utils import find_nested_value, parse_datetime
 
 _HISTORY_PREFIX = "lingma.chat.localHistory."
 _MODE_PREFIX = "chat.chatMode.session."
@@ -280,21 +274,7 @@ def _walk_dicts(value: Any) -> Iterator[dict[str, Any]]:
 
 
 def _cwd_in_value(value: Any) -> str:
-    if isinstance(value, dict):
-        for key in _CWD_KEYS:
-            cwd = _absolute_path(value.get(key))
-            if cwd:
-                return cwd
-        for child in value.values():
-            cwd = _cwd_in_value(child)
-            if cwd:
-                return cwd
-    elif isinstance(value, list):
-        for child in value:
-            cwd = _cwd_in_value(child)
-            if cwd:
-                return cwd
-    return ""
+    return find_nested_value(value, _CWD_KEYS, _absolute_path)
 
 
 def _absolute_path(value: Any) -> str:

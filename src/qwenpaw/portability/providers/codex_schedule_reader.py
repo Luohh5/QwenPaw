@@ -238,7 +238,7 @@ def _local_timezone_name() -> tuple[str, str]:
     return "UTC", "utc_fallback"
 
 
-# pylint: disable-next=too-many-locals,too-many-branches
+# pylint: disable-next=too-many-locals
 def _read_project_roots(
     codex_home: Path,
     warnings: list[str],

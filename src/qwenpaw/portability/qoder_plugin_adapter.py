@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .compatibility_safety import bounded_plain_text
 from .models import SourcePlugin
 from .skill_transfer import (
     read_bounded_tree,
@@ -258,17 +259,7 @@ def _plugin_backend(enabled: bool) -> str:
 def _author(value: Any) -> str:
     if isinstance(value, dict):
         value = value.get("name") or value.get("email") or ""
-    return _bounded_manifest_text(value or "Imported from Qoder", 200)
-
-
-def _bounded_manifest_text(value: Any, limit: int) -> str:
-    """Return bounded display metadata without control characters."""
-    text = str(value or "")
-    return "".join(
-        character
-        for character in text[:limit]
-        if ord(character) >= 32 and ord(character) != 127
-    ).strip()
+    return bounded_plain_text(value or "Imported from Qoder", 200)
 
 
 def _qwenpaw_manifest(
@@ -276,7 +267,7 @@ def _qwenpaw_manifest(
     manifest: dict[str, Any],
     enabled: bool,
 ) -> dict[str, Any]:
-    plugin_id = _bounded_manifest_text(
+    plugin_id = bounded_plain_text(
         manifest.get("name") or plugin.name,
         128,
     )
@@ -285,19 +276,19 @@ def _qwenpaw_manifest(
     descriptions = {}
     description_zh = manifest.get("descriptionZh")
     if isinstance(description_zh, str) and description_zh.strip():
-        descriptions["zh-CN"] = _bounded_manifest_text(description_zh, 4096)
+        descriptions["zh-CN"] = bounded_plain_text(description_zh, 4096)
     return {
         "id": plugin_id,
-        "name": _bounded_manifest_text(
+        "name": bounded_plain_text(
             manifest.get("displayName") or plugin_id,
             200,
         ),
-        "version": _bounded_manifest_text(
+        "version": bounded_plain_text(
             manifest.get("version") or plugin.version or "0.0.0",
             100,
         ),
         "type": "general",
-        "description": _bounded_manifest_text(
+        "description": bounded_plain_text(
             manifest.get("description"),
             4096,
         ),

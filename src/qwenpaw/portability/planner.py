@@ -390,7 +390,6 @@ def _adaptable_actions(
     ]
 
 
-# pylint: disable-next=too-many-branches,too-many-statements
 async def build_migration_plan(
     workspace: Any,
     inventory: ProviderInventory,

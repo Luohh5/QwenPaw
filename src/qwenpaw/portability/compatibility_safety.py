@@ -38,6 +38,15 @@ _WEBHOOK_PATH = re.compile(
 )
 
 
+def bounded_plain_text(value: Any, limit: int) -> str:
+    """Return bounded text without control characters."""
+    return "".join(
+        char
+        for char in str(value or "")[:limit]
+        if ord(char) >= 32 and ord(char) != 127
+    ).strip()
+
+
 def redact_sensitive_text(value: Any, *, limit: int = 32_000) -> str:
     """Return bounded text with common inline credentials removed."""
     text = str(value or "")[:limit]
@@ -143,6 +152,7 @@ def secret_names(values: Any, *, prefix: str = "") -> list[str]:
 
 
 __all__ = [
+    "bounded_plain_text",
     "mcp_inline_secret_risks",
     "redact_sensitive_text",
     "safe_url",

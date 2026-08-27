@@ -26,6 +26,7 @@ from .models import (
     SourceSession,
     SourceSkill,
 )
+from .providers.base import progress_milestone as _progress_milestone
 from .skill_transfer import read_bounded_skill_tree
 
 logger = logging.getLogger(__name__)
@@ -44,14 +45,6 @@ class _RegistrySnapshot:
 
     path: Path
     content: bytes | None
-
-
-def _progress_milestone(index: int, total: int) -> bool:
-    """Report roughly five-percent increments without flooding the chat."""
-    if total <= 20:
-        return True
-    step = max(1, total // 20)
-    return index == 1 or index == total or index % step == 0
 
 
 def _snapshot_registry_file(path: Path) -> bytes | None:

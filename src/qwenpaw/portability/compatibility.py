@@ -423,7 +423,6 @@ class CompatibilityStore:
             if asset.zone is not AssetZone.REPAIR:
                 raise RuntimeError("only repair-zone assets can be changed")
             asset.revision += 1
-            asset.zone = AssetZone.REPAIR
             asset.reason = ""
             asset.changes.append(_text(change, 500))
             asset.updated_at = _now()

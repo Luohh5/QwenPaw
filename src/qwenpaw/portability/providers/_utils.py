@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 
 def parse_datetime(value: Any) -> datetime | None:
@@ -24,4 +24,25 @@ def parse_datetime(value: Any) -> datetime | None:
     return None
 
 
-__all__ = ["parse_datetime"]
+def find_nested_value(
+    value: Any,
+    keys: tuple[str, ...],
+    normalize: Callable[[Any], str],
+) -> str:
+    """Return the first normalized keyed value in a nested JSON tree."""
+    if isinstance(value, dict):
+        for key in keys:
+            if result := normalize(value.get(key)):
+                return result
+        children = value.values()
+    elif isinstance(value, list):
+        children = value
+    else:
+        return ""
+    for child in children:
+        if result := find_nested_value(child, keys, normalize):
+            return result
+    return ""
+
+
+__all__ = ["find_nested_value", "parse_datetime"]
