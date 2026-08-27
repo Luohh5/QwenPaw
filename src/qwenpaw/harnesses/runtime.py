@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -125,8 +125,6 @@ class HarnessRuntime:
         command, arguments = (
             self._parse_command(prompt) if not attachments else ("", "")
         )
-        # Delayed import avoids a package cycle:
-        # control -> portability -> harnesses.events -> harnesses.runtime.
         # pylint: disable=import-outside-toplevel
         from ..runtime.commands.control import (
             is_control_command,
@@ -266,74 +264,32 @@ class HarnessRuntime:
         response.completed_at = datetime.now(timezone.utc).isoformat(
             timespec="seconds",
         )
-        if local_control:
-            # Administrative commands are not conversation training data and
-            # can contain local export paths. Match the native command path by
-            # keeping them out of persisted provider transcripts.
-            pass
-        elif self._session_bridge is not None and clear_history:
+        if not local_control and self._session_bridge is not None:
             try:
-                await self._session_bridge.clear(
-                    session_id=session_id,
-                    user_id=str(
-                        getattr(request, "user_id", "") or session_id,
-                    ),
-                    channel=str(getattr(request, "channel", "") or ""),
-                )
+                if clear_history:
+                    await self._session_bridge.clear(
+                        session_id=session_id,
+                        user_id=str(
+                            getattr(request, "user_id", "") or session_id,
+                        ),
+                        channel=str(getattr(request, "channel", "") or ""),
+                    )
+                else:
+                    await self._session_bridge.append_turn(
+                        request=request,
+                        response=response,
+                        backend=backend,
+                    )
             except Exception:
                 logger.warning(
-                    "Failed to clear third-party session %s",
-                    session_id,
-                    exc_info=True,
-                )
-        elif self._session_bridge is not None:
-            try:
-                await self._session_bridge.append_turn(
-                    request=request,
-                    response=response,
-                    backend=backend,
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to persist third-party session %s",
+                    "Failed to %s third-party session %s",
+                    "clear" if clear_history else "persist",
                     session_id,
                     exc_info=True,
                 )
         if task_cancelled:
             raise asyncio.CancelledError
         yield tagged(response)
-
-    async def _handle_local_control(
-        self,
-        *,
-        prompt: str,
-        request: Any,
-        session_id: str,
-        progress_reporter: Callable[[str], Awaitable[None]] | None = None,
-    ) -> str:
-        """Execute QwenPaw-owned controls before provider command routing."""
-        workspace = self._capability_resolver.workspace
-        if workspace is None:
-            raise RuntimeError("QwenPaw workspace is unavailable.")
-        # pylint: disable=import-outside-toplevel
-        from ..runtime.commands.control import (
-            handle_control_command,
-        )
-        from ..runtime.commands.control.base import (
-            ControlContext,
-        )
-
-        context = ControlContext(
-            workspace=workspace,
-            payload=request,
-            channel=None,
-            session_id=session_id,
-            user_id=str(getattr(request, "user_id", "") or session_id),
-            agent_id=self._agent_id,
-            args={},
-            progress_reporter=progress_reporter,
-        )
-        return await handle_control_command(prompt, context)
 
     async def _stream_local_control(
         self,
@@ -348,12 +304,31 @@ class HarnessRuntime:
         async def _report(message: str) -> None:
             await progress_queue.put(f"⏳ {message}\n")
 
+        def _delta(text: str) -> HarnessEvent:
+            return HarnessEvent(kind=HarnessEventKind.TEXT_DELTA, text=text)
+
+        workspace = self._capability_resolver.workspace
+        if workspace is None:
+            raise RuntimeError("QwenPaw workspace is unavailable.")
+        # pylint: disable=import-outside-toplevel
+        from ..runtime.commands.control import handle_control_command
+        from ..runtime.commands.control.base import ControlContext
+
         task = asyncio.create_task(
-            self._handle_local_control(
-                prompt=prompt,
-                request=request,
-                session_id=session_id,
-                progress_reporter=_report,
+            handle_control_command(
+                prompt,
+                ControlContext(
+                    workspace=workspace,
+                    payload=request,
+                    channel=None,
+                    session_id=session_id,
+                    user_id=str(
+                        getattr(request, "user_id", "") or session_id,
+                    ),
+                    agent_id=self._agent_id,
+                    args={},
+                    progress_reporter=_report,
+                ),
             ),
         )
         progress_started = False
@@ -367,22 +342,13 @@ class HarnessRuntime:
                 except asyncio.TimeoutError:
                     continue
                 progress_started = True
-                yield HarnessEvent(
-                    kind=HarnessEventKind.TEXT_DELTA,
-                    text=text,
-                )
+                yield _delta(text)
             final_text = await task
             while not progress_queue.empty():
                 progress_started = True
-                yield HarnessEvent(
-                    kind=HarnessEventKind.TEXT_DELTA,
-                    text=progress_queue.get_nowait(),
-                )
+                yield _delta(progress_queue.get_nowait())
             if final_text:
-                yield HarnessEvent(
-                    kind=HarnessEventKind.TEXT_DELTA,
-                    text=("\n" if progress_started else "") + final_text,
-                )
+                yield _delta(("\n" if progress_started else "") + final_text)
             yield HarnessEvent(kind=HarnessEventKind.COMPLETED)
         finally:
             if not task.done():
