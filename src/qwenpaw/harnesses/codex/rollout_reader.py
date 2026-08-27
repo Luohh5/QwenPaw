@@ -17,8 +17,25 @@ _UUID_PATTERN = re.compile(
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
     re.IGNORECASE,
 )
-_MAX_ROLLOUT_BYTES = 128 * 1024 * 1024
-_MAX_LINE_BYTES = 128 * 1024 * 1024
+_MAX_ROLLOUT_BYTES = _MAX_LINE_BYTES = 128 * 1024 * 1024
+_EVENT_KINDS = {
+    "user_message": HarnessHistoryKind.USER,
+    "agent_message": HarnessHistoryKind.MESSAGE,
+    "agent_reasoning": HarnessHistoryKind.REASONING,
+}
+_TOOL_CALL_TYPES = {
+    "custom_tool_call",
+    "function_call",
+    "local_shell_call",
+    "computer_call",
+    "web_search_call",
+}
+_TOOL_OUTPUT_TYPES = {
+    "custom_tool_call_output",
+    "function_call_output",
+    "local_shell_call_output",
+    "computer_call_output",
+}
 
 
 def _source_label(value: Any) -> str:
@@ -33,14 +50,7 @@ def _source_label(value: Any) -> str:
 
 
 def codex_non_root_session_kind(metadata: Mapping[str, Any]) -> str:
-    """Classify Codex internal/child sessions from structural metadata.
-
-    Codex's app-server omits these sessions from its default ``thread/list``
-    response.  The JSONL fallback must apply the same boundary or Guardian,
-    compaction, memory and delegated worker rollouts appear as user chats.
-    Message text is deliberately ignored because a normal conversation may
-    quote an internal prompt while debugging it.
-    """
+    """Classify non-root sessions structurally, never by message text."""
     source = metadata.get("source")
     if isinstance(source, Mapping):
         for raw_key, value in source.items():
@@ -116,8 +126,7 @@ class _RolloutMetadataState:
 
     def update(self, entry: dict[str, Any]) -> None:
         """Merge metadata carried by one rollout entry."""
-        timestamp = str(entry.get("timestamp") or "")
-        if timestamp:
+        if timestamp := str(entry.get("timestamp") or ""):
             self.created_at = self.created_at or timestamp
             self.updated_at = timestamp
         payload = entry.get("payload")
@@ -260,24 +269,17 @@ class CodexRolloutReader:
                         self._records[record.thread_id] = record
                         continue
                     lineage = tuple(
-                        sorted(
-                            {*existing.paths, *record.paths},
-                            key=str,
-                        ),
+                        sorted({*existing.paths, *record.paths}, key=str),
                     )
-                    latest = (
-                        record
-                        if record.updated_at >= existing.updated_at
-                        else existing
+                    latest = max(
+                        (record, existing),
+                        key=lambda item: item.updated_at,
                     )
                     self._records[record.thread_id] = replace(
                         latest,
                         created_at=min(
-                            filter(
-                                None,
-                                (existing.created_at, record.created_at),
-                            ),
-                            default="",
+                            existing.created_at or record.created_at,
+                            record.created_at or existing.created_at,
                         ),
                         non_root_kind=existing.non_root_kind
                         or record.non_root_kind,
@@ -328,14 +330,13 @@ def _read_rollout_history(path: Path) -> list[HarnessHistoryItem]:
         raise ValueError(f"Codex rollout exceeds 128 MiB: {path.name}")
     history: list[HarnessHistoryItem] = []
     with path.open("rb") as stream:
-        for index, entry in _jsonl_entries(stream):
+        for _, entry in _jsonl_entries(stream):
             payload = entry.get("payload")
             if not isinstance(payload, dict):
                 continue
             item = _history_item(
                 str(entry.get("type") or ""),
                 payload,
-                index,
                 str(entry.get("timestamp") or ""),
             )
             history.extend(item)
@@ -360,32 +361,20 @@ def _jsonl_entries(
 def _history_item(
     entry_type: str,
     payload: dict[str, Any],
-    index: int,
     timestamp: str,
 ) -> list[HarnessHistoryItem]:
     payload_type = str(payload.get("type") or "")
     item_id = str(
         payload.get("id")
         or payload.get("call_id")
-        or _fallback_item_id(entry_type, payload, index, timestamp),
+        or _fallback_item_id(entry_type, payload, timestamp),
     )
-    event_kinds = {
-        "user_message": HarnessHistoryKind.USER,
-        "agent_message": HarnessHistoryKind.MESSAGE,
-        "agent_reasoning": HarnessHistoryKind.REASONING,
-    }
     if entry_type == "event_msg":
-        kind = event_kinds.get(payload_type)
+        kind = _EVENT_KINDS.get(payload_type)
         return _text_item(kind, payload, item_id) if kind is not None else []
     if entry_type != "response_item":
         return []
-    if payload_type in {
-        "custom_tool_call",
-        "function_call",
-        "local_shell_call",
-        "computer_call",
-        "web_search_call",
-    }:
+    if payload_type in _TOOL_CALL_TYPES:
         tool_name = str(
             payload.get("name")
             or (
@@ -405,12 +394,7 @@ def _history_item(
                 data={"arguments": arguments, "provider_type": payload_type},
             ),
         ]
-    if payload_type in {
-        "custom_tool_call_output",
-        "function_call_output",
-        "local_shell_call_output",
-        "computer_call_output",
-    }:
+    if payload_type in _TOOL_OUTPUT_TYPES:
         return [
             HarnessHistoryItem(
                 kind=HarnessHistoryKind.TOOL_OUTPUT,
@@ -425,7 +409,6 @@ def _history_item(
 def _fallback_item_id(
     entry_type: str,
     payload: dict[str, Any],
-    index: int,
     timestamp: str,
 ) -> str:
     """Build a stable ID for copied lineage events lacking provider IDs."""
@@ -444,7 +427,7 @@ def _fallback_item_id(
             errors="replace",
         ),
     ).hexdigest()[:24]
-    return f"rollout-{digest or index}"
+    return f"rollout-{digest}"
 
 
 def _text_item(
