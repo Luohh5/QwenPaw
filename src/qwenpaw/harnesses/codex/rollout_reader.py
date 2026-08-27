@@ -9,7 +9,7 @@ import os
 import re
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 from ..events import HarnessHistoryItem, HarnessHistoryKind
 
@@ -27,12 +27,9 @@ def _source_label(value: Any) -> str:
         return re.sub(r"(?<!^)(?=[A-Z])", "_", value).lower()
     if not isinstance(value, Mapping):
         return "unknown"
-    for key, child in value.items():
-        label = _source_label(key)
-        if label == "other" and isinstance(child, str):
-            return _source_label(child)
-        return label
-    return "unknown"
+    key, child = next(iter(value.items()), ("unknown", None))
+    label = _source_label(key)
+    return _source_label(child) if label == "other" else label
 
 
 def codex_non_root_session_kind(metadata: Mapping[str, Any]) -> str:
@@ -169,25 +166,24 @@ class CodexRolloutReader:
 
     def list_threads(self, *, limit: int = 500) -> list[dict[str, Any]]:
         """Return newest user-facing root rollout metadata records."""
-        records = sorted(
-            (
-                item
-                for item in self._index().values()
-                if not item.non_root_kind
-            ),
-            key=lambda item: (item.updated_at, str(item.path)),
-            reverse=True,
-        )
+        records = self._ordered_records(non_root=False)
         return [item.as_thread() for item in records[: max(0, limit)]]
 
     def list_non_root_thread_ids(self, *, limit: int = 5000) -> list[str]:
         """Return bounded child/internal IDs for prior-import cleanup."""
-        records = sorted(
-            (item for item in self._index().values() if item.non_root_kind),
+        records = self._ordered_records(non_root=True)
+        return [item.thread_id for item in records[: max(0, limit)]]
+
+    def _ordered_records(self, *, non_root: bool) -> list[CodexRolloutRecord]:
+        return sorted(
+            (
+                item
+                for item in self._index().values()
+                if bool(item.non_root_kind) is non_root
+            ),
             key=lambda item: (item.updated_at, str(item.path)),
             reverse=True,
         )
-        return [item.thread_id for item in records[: max(0, limit)]]
 
     def has_thread(self, thread_id: str) -> bool:
         """Return whether a local rollout exists for ``thread_id``."""
@@ -225,8 +221,7 @@ class CodexRolloutReader:
             if not root.is_dir():
                 continue
             try:
-                candidates = root.rglob("SKILL.md")
-                for path in candidates:
+                for path in root.rglob("SKILL.md"):
                     if len(records) >= limit:
                         return records
                     if path.is_symlink() or not path.is_file():
@@ -275,20 +270,17 @@ class CodexRolloutReader:
                         if record.updated_at >= existing.updated_at
                         else existing
                     )
-                    created_values = [
-                        value
-                        for value in (existing.created_at, record.created_at)
-                        if value
-                    ]
-                    earliest_created = (
-                        min(created_values) if created_values else ""
-                    )
                     self._records[record.thread_id] = replace(
                         latest,
-                        created_at=earliest_created,
-                        non_root_kind=(
-                            existing.non_root_kind or record.non_root_kind
+                        created_at=min(
+                            filter(
+                                None,
+                                (existing.created_at, record.created_at),
+                            ),
+                            default="",
                         ),
+                        non_root_kind=existing.non_root_kind
+                        or record.non_root_kind,
                         parent_thread_id=(
                             latest.parent_thread_id
                             or existing.parent_thread_id
@@ -309,17 +301,9 @@ def _read_rollout_metadata(path: Path) -> CodexRolloutRecord | None:
     state = _RolloutMetadataState(match.group(1) if match else "")
     try:
         with path.open("rb") as stream:
-            for raw_line in stream:
-                if len(raw_line) > _MAX_LINE_BYTES:
-                    return None
-                try:
-                    entry = json.loads(raw_line)
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    continue
-                if not isinstance(entry, dict):
-                    continue
+            for _, entry in _jsonl_entries(stream):
                 state.update(entry)
-    except OSError:
+    except (OSError, ValueError):
         return None
     if not state.thread_id:
         return None
@@ -344,17 +328,7 @@ def _read_rollout_history(path: Path) -> list[HarnessHistoryItem]:
         raise ValueError(f"Codex rollout exceeds 128 MiB: {path.name}")
     history: list[HarnessHistoryItem] = []
     with path.open("rb") as stream:
-        for index, raw_line in enumerate(stream, start=1):
-            if len(raw_line) > _MAX_LINE_BYTES:
-                raise ValueError(
-                    f"Codex rollout line {index} exceeds 128 MiB",
-                )
-            try:
-                entry = json.loads(raw_line)
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if not isinstance(entry, dict):
-                continue
+        for index, entry in _jsonl_entries(stream):
             payload = entry.get("payload")
             if not isinstance(payload, dict):
                 continue
@@ -366,6 +340,21 @@ def _read_rollout_history(path: Path) -> list[HarnessHistoryItem]:
             )
             history.extend(item)
     return history
+
+
+def _jsonl_entries(
+    stream: Any,
+) -> Iterator[tuple[int, dict[str, Any]]]:
+    """Yield valid, bounded JSON objects from a rollout stream."""
+    for index, raw_line in enumerate(stream, start=1):
+        if len(raw_line) > _MAX_LINE_BYTES:
+            raise ValueError(f"Codex rollout line {index} exceeds 128 MiB")
+        try:
+            entry = json.loads(raw_line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(entry, dict):
+            yield index, entry
 
 
 def _history_item(
@@ -493,10 +482,3 @@ def _visible_text(payload: dict[str, Any]) -> str:
         except (TypeError, ValueError):
             return str(payload["output"])
     return ""
-
-
-__all__ = [
-    "CodexRolloutReader",
-    "CodexRolloutRecord",
-    "codex_non_root_session_kind",
-]
