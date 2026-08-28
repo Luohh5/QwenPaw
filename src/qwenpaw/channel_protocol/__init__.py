@@ -139,6 +139,10 @@ from .requirements import (
     canonicalize_requirement,
     canonicalize_requirements,
 )
+from .release_target_registry import (
+    RELEASE_TARGET_PLATFORM_TAGS,
+    RELEASE_TARGET_REGISTRY_VERSION,
+)
 
 __all__ = [
     "DescriptorValidationError",
@@ -170,6 +174,8 @@ __all__ = [
     "canonical_json",
     "canonicalize_requirement",
     "canonicalize_requirements",
+    "RELEASE_TARGET_PLATFORM_TAGS",
+    "RELEASE_TARGET_REGISTRY_VERSION",
     "condition_set_sha256",
     "current_python_abi",
     "dir_key",

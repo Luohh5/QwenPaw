@@ -20,6 +20,8 @@ from qwenpaw.channel_protocol import (
     LockManifestEntry,
     LockPackage,
     ProtocolRange,
+    RELEASE_TARGET_PLATFORM_TAGS,
+    RELEASE_TARGET_REGISTRY_VERSION,
     VersionRange,
     build_reproducible_zip,
     code_root_digest,
@@ -37,11 +39,7 @@ from scripts.channel_isolation.audit_channel_dependencies import (
 from scripts.channel_isolation.build_fixture_artifact import build_fixture
 
 
-PLATFORMS = {
-    "macosx_11_0_arm64",
-    "manylinux_2_28_x86_64",
-    "win_amd64",
-}
+PLATFORMS = RELEASE_TARGET_PLATFORM_TAGS
 EMPTY_CONDITION_DIGEST = (
     "dc4e5b494b66d21b82ac92cf406a37d007c80b7d5b986203d5b8d3094d1d051f"
 )
@@ -167,13 +165,17 @@ def test_lock_canonicalizes_requirements_and_wheel_inventory() -> None:
             "python_abi": "cp313-cp313",
             "platform_tag": "macosx_11_0_arm64",
             "condition_set_sha256": EMPTY_CONDITION_DIGEST,
-            "direct_requirements": ["Demo_Package >= 1"],
+            "direct_requirements": [
+                'Demo_Package >= 1; python_version >= "3.11"',
+            ],
             "packages": [package.to_mapping()],
         },
         allowed_platform_tags=PLATFORMS,
     )
 
-    assert lock.direct_requirements == ("demo-package>=1",)
+    assert lock.direct_requirements == (
+        'demo-package>=1 ; python_version >= "3.11"',
+    )
     assert lock.packages[0].version == "1.0"
     assert len(lock.sha256()) == 64
 
@@ -281,6 +283,26 @@ def test_lock_rejects_direct_version_or_marker_mismatch() -> None:
                 },
                 allowed_platform_tags=PLATFORMS,
             )
+
+    package_with_marker = LockPackage.from_mapping(
+        {
+            **package.to_mapping(),
+            "marker": 'python_version < "3.13"',
+        },
+    )
+    with pytest.raises(ArtifactValidationError):
+        LockFile.from_mapping(
+            {
+                "schema_version": 1,
+                "channel_key": "fixture",
+                "python_abi": "cp313-cp313",
+                "platform_tag": "macosx_11_0_arm64",
+                "condition_set_sha256": EMPTY_CONDITION_DIGEST,
+                "direct_requirements": ["demo-package>=1"],
+                "packages": [package_with_marker.to_mapping()],
+            },
+            allowed_platform_tags=PLATFORMS,
+        )
 
 
 def test_lock_manifest_rejects_duplicate_target() -> None:
@@ -492,6 +514,62 @@ def _write_valid_archive_root(code_root: Path) -> None:
     )
 
 
+def _write_unregistered_archive_root(code_root: Path) -> None:
+    """Write metadata targeting a syntactically valid but unregistered tag."""
+    descriptor = _descriptor()
+    platform_tag = "manylinux_999_x86_64"
+    lock_files = tuple(
+        _requests_lock(condition_domain(descriptor, {"region": region})[1])
+        for region in ("asia", "eu")
+    )
+    invalid_locks = tuple(
+        LockFile(
+            channel_key=lock.channel_key,
+            python_abi=lock.python_abi,
+            platform_tag=platform_tag,
+            condition_set_sha256=lock.condition_set_sha256,
+            direct_requirements=lock.direct_requirements,
+            packages=lock.packages,
+        )
+        for lock in lock_files
+    )
+    entries = tuple(
+        LockManifestEntry(
+            python_abi=lock.python_abi,
+            platform_tag=lock.platform_tag,
+            condition_set_sha256=lock.condition_set_sha256,
+            lock_path=(
+                f"locks/{lock.python_abi}/{lock.platform_tag}/"
+                f"{lock.condition_set_sha256}.json"
+            ),
+            lock_sha256=lock.sha256(),
+        )
+        for lock in invalid_locks
+    )
+    descriptor_mapping = descriptor.to_mapping()
+    descriptor_mapping["supported_platform_tags"] = [platform_tag]
+    code_root.mkdir(parents=True)
+    write_canonical_json(code_root / "channel.json", descriptor_mapping)
+    write_canonical_json(
+        code_root / "config.schema.json",
+        {"type": "object"},
+    )
+    write_canonical_json(
+        code_root / "release-manifest.json",
+        LockManifest(channel_key="fixture", locks=entries).to_mapping(),
+    )
+    for lock in invalid_locks:
+        write_canonical_json(
+            code_root / f"locks/{lock.python_abi}/{lock.platform_tag}/"
+            f"{lock.condition_set_sha256}.json",
+            lock.to_mapping(),
+        )
+    (code_root / "fixture_runner.py").write_text(
+        "class EmptyDriver: pass\n",
+        encoding="utf-8",
+    )
+
+
 def test_reproducible_fixture_archive_and_source_revision(
     tmp_path: Path,
 ) -> None:
@@ -526,6 +604,22 @@ def test_archive_rejects_semantically_invalid_metadata(tmp_path: Path) -> None:
     (code_root / "locks" / "empty.json").write_text("{}", encoding="utf-8")
     with pytest.raises(ArtifactValidationError):
         build_reproducible_zip(code_root, tmp_path / "artifact.zip")
+
+
+def test_archive_rejects_platform_tag_outside_release_registry(
+    tmp_path: Path,
+) -> None:
+    """Archive validation must use the external release target registry."""
+    code_root = tmp_path / "code"
+    _write_unregistered_archive_root(code_root)
+    with pytest.raises(ArtifactValidationError):
+        build_reproducible_zip(code_root, tmp_path / "artifact.zip")
+
+
+def test_release_target_registry_is_versioned() -> None:
+    """The artifact registry exposes a stable v1 membership set."""
+    assert RELEASE_TARGET_REGISTRY_VERSION == 1
+    assert "manylinux_999_x86_64" not in RELEASE_TARGET_PLATFORM_TAGS
 
 
 def test_fixture_builder_emits_a_complete_parseable_artifact(

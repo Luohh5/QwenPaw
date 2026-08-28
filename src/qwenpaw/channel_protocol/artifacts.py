@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
 import itertools
@@ -25,6 +25,7 @@ from .identifiers import (
     validate_platform_tag,
     validate_python_abi,
 )
+from .release_target_registry import RELEASE_TARGET_PLATFORM_TAGS
 from .requirements import canonicalize_requirements
 
 
@@ -196,6 +197,16 @@ def _url(value: object, name: str, *, path: tuple[str | int, ...]) -> str:
     return result
 
 
+def _trusted_platform_tags(
+    value: Collection[str],
+) -> frozenset[str]:
+    """Return platform tags limited to the committed release registry."""
+    tags = frozenset(value)
+    if not tags.issubset(RELEASE_TARGET_PLATFORM_TAGS):
+        raise _error("Platform tags are not in the release registry")
+    return tags
+
+
 def _digest(value: object, name: str, *, path: tuple[str | int, ...]) -> str:
     result = _string(value, name, path=path)
     if not _HEX_DIGEST.fullmatch(result):
@@ -242,15 +253,20 @@ def _validate_direct_requirements(
                 "direct_requirements",
                 requirement_text,
             )
-        if requirement.marker is not None:
-            if package.marker is None or (
-                Marker(str(requirement.marker)) != Marker(package.marker)
-            ):
-                raise _error(
-                    "Locked package marker does not match requirement",
-                    "direct_requirements",
-                    requirement_text,
-                )
+        requirement_marker = (
+            None
+            if requirement.marker is None
+            else Marker(str(requirement.marker))
+        )
+        package_marker = (
+            None if package.marker is None else Marker(package.marker)
+        )
+        if requirement_marker != package_marker:
+            raise _error(
+                "Locked package marker does not match requirement",
+                "direct_requirements",
+                requirement_text,
+            )
 
 
 @dataclass(frozen=True)
@@ -951,6 +967,8 @@ def _parse_json(data: str | bytes, source: str) -> object:
 
 def _validate_archive_contents(
     members: list[tuple[str, bytes]],
+    *,
+    allowed_platform_tags: Collection[str],
 ) -> None:
     """Validate archive metadata and every manifest-referenced lock."""
     contents = dict(members)
@@ -959,18 +977,10 @@ def _validate_archive_contents(
         descriptor_value,
         path=("channel.json",),
     )
-    platform_values = descriptor_mapping.get("supported_platform_tags")
-    if not isinstance(platform_values, list) or not all(
-        isinstance(item, str) for item in platform_values
-    ):
-        raise _error(
-            "Descriptor supported_platform_tags must be an array",
-            "channel.json",
-        )
     try:
         descriptor = ChannelDescriptor.from_mapping(
             descriptor_mapping,
-            allowed_platform_tags=frozenset(platform_values),
+            allowed_platform_tags=allowed_platform_tags,
         )
     except DescriptorValidationError as exc:
         raise _error("Archive descriptor is invalid", "channel.json") from exc
@@ -996,7 +1006,7 @@ def _validate_archive_contents(
     )
     lock_manifest = LockManifest.from_mapping(
         manifest_value,
-        allowed_platform_tags=descriptor.supported_platform_tags,
+        allowed_platform_tags=allowed_platform_tags,
         descriptor=descriptor,
     )
     referenced_paths = {entry.lock_path for entry in lock_manifest.locks}
@@ -1012,7 +1022,7 @@ def _validate_archive_contents(
         lock_value = _parse_json(contents[entry.lock_path], entry.lock_path)
         lock_file = LockFile.from_mapping(
             lock_value,
-            allowed_platform_tags=descriptor.supported_platform_tags,
+            allowed_platform_tags=allowed_platform_tags,
         )
         if (
             lock_file.channel_key != descriptor.channel_key
@@ -1031,7 +1041,12 @@ def _validate_archive_contents(
             )
 
 
-def _archive_paths(code_root: Path) -> list[tuple[str, bytes]]:
+def _archive_paths(
+    code_root: Path,
+    *,
+    allowed_platform_tags: Collection[str] = RELEASE_TARGET_PLATFORM_TAGS,
+) -> list[tuple[str, bytes]]:
+    allowed_platform_tags = _trusted_platform_tags(allowed_platform_tags)
     root = Path(code_root).resolve()
     if not root.is_dir():
         raise _error("code_root must be a directory", "code_root")
@@ -1064,13 +1079,24 @@ def _archive_paths(code_root: Path) -> list[tuple[str, bytes]]:
         raise _error("Archive must contain release-manifest.json")
     if not any(name.startswith("locks/") for name in names):
         raise _error("Archive must contain release locks")
-    _validate_archive_contents(members)
+    _validate_archive_contents(
+        members,
+        allowed_platform_tags=allowed_platform_tags,
+    )
     return sorted(members, key=lambda item: item[0])
 
 
-def build_reproducible_zip(code_root: Path, output: Path) -> str:
+def build_reproducible_zip(
+    code_root: Path,
+    output: Path,
+    *,
+    allowed_platform_tags: Collection[str] = RELEASE_TARGET_PLATFORM_TAGS,
+) -> str:
     """Build a deterministic ZIP archive and return its SHA-256 digest."""
-    members = _archive_paths(Path(code_root))
+    members = _archive_paths(
+        Path(code_root),
+        allowed_platform_tags=_trusted_platform_tags(allowed_platform_tags),
+    )
     destination = Path(output)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(

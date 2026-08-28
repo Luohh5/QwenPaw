@@ -21,6 +21,7 @@ from qwenpaw.channel_protocol import (
     build_reproducible_zip,
     code_root_digest,
     condition_domain,
+    RELEASE_TARGET_PLATFORM_TAGS,
     write_canonical_json,
 )
 from qwenpaw.channel_protocol.identifiers import condition_set_sha256
@@ -30,11 +31,7 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _FIXTURE_ROOT = (
     _REPOSITORY_ROOT / "tests" / "fixtures" / "channel_isolation" / "ch_1_001"
 )
-_PLATFORM_TAGS = (
-    "macosx_11_0_arm64",
-    "manylinux_2_28_x86_64",
-    "win_amd64",
-)
+_PLATFORM_TAGS = tuple(sorted(RELEASE_TARGET_PLATFORM_TAGS))
 _PYTHON_ABIS = ("cp311-cp311", "cp312-cp312", "cp313-cp313")
 
 
