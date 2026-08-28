@@ -15,6 +15,27 @@ const terminal = new Set([
   "failed",
   "interrupted",
 ]);
+const ACTIVE_JOB = "qwenpaw.portability.activeImport";
+type ActiveJob = [string, string];
+
+function loadActiveJob(): ActiveJob | null {
+  try {
+    return JSON.parse(
+      sessionStorage.getItem(ACTIVE_JOB) ?? "null",
+    ) as ActiveJob | null;
+  } catch {
+    return null;
+  }
+}
+
+function saveActiveJob(value: ActiveJob | null) {
+  try {
+    if (value) sessionStorage.setItem(ACTIVE_JOB, JSON.stringify(value));
+    else sessionStorage.removeItem(ACTIVE_JOB);
+  } catch {
+    /* Storage is only a navigation recovery hint. */
+  }
+}
 
 export function useImportJob() {
   const { selectedAgent } = useAgentStore();
@@ -84,6 +105,7 @@ export function useImportJob() {
           selectedAgent,
           selected,
         );
+        saveActiveJob([selectedAgent, created.job_id]);
         latest.current = created;
         setJob(created);
         void watch(selectedAgent, created.job_id, abort.signal);
@@ -129,10 +151,36 @@ export function useImportJob() {
     controller.current = null;
     pinnedAgent.current = "";
     latest.current = null;
+    saveActiveJob(null);
     setJob(null);
     setError("");
   }, []);
 
-  useEffect(() => () => controller.current?.abort(), []);
+  useEffect(() => {
+    const active = loadActiveJob();
+    if (active) {
+      const [agentId, jobId] = active;
+      const abort = new AbortController();
+      controller.current = abort;
+      void portabilityImportApi
+        .snapshot(agentId, jobId)
+        .then((snapshot) => {
+          if (abort.signal.aborted) return;
+          pinnedAgent.current = agentId;
+          latest.current = snapshot;
+          setJob(snapshot);
+          if (!terminal.has(snapshot.state)) {
+            void watch(agentId, jobId, abort.signal);
+          }
+        })
+        .catch((reason) => {
+          if (!abort.signal.aborted) {
+            saveActiveJob(null);
+            setError(reason instanceof Error ? reason.message : String(reason));
+          }
+        });
+    }
+    return () => controller.current?.abort();
+  }, [watch]);
   return { sources, job, loading, error, detect, scan, start, reset };
 }

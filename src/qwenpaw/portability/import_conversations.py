@@ -16,7 +16,11 @@ from .import_support import (
     _session_key,
 )
 from .models import ProviderInventory, SourceSession
-from .providers.base import ProgressReporter, report_progress as _report
+from .providers.base import (
+    ProgressReporter,
+    report_progress as _report,
+    report_result,
+)
 
 
 @dataclass
@@ -64,6 +68,17 @@ async def import_conversations(
         )
 
     total = len(sessions)
+
+    async def report_session(index: int) -> None:
+        await report_result(
+            progress,
+            "sessions",
+            index,
+            total,
+            len(state.imported),
+            len(state.skipped),
+        )
+
     for index, session in enumerate(sessions, start=1):
         if _progress_milestone(index, total):
             await _report(
@@ -86,6 +101,7 @@ async def import_conversations(
                         project_dir,
                     )
             state.skipped.append(session.source_id)
+            await report_session(index)
             continue
         if not session.history:
             state.skipped.append(session.source_id)
@@ -93,6 +109,7 @@ async def import_conversations(
                 f"Session {session.source_id} contained no readable "
                 "conversation history.",
             )
+            await report_session(index)
             continue
 
         session_id = _session_key(inventory.provider_id, session.source_id)
@@ -135,6 +152,7 @@ async def import_conversations(
         existing_by_source[source_key] = spec
         state.created_chats.append(spec.id)
         state.imported.append(session.source_id)
+        await report_session(index)
 
     await _report(
         progress,

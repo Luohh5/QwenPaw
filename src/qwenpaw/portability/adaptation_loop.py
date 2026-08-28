@@ -39,7 +39,11 @@ from .compatibility_testing import (
     find_source,
 )
 from .models import ProviderInventory
-from .providers.base import ProgressReporter, report_progress as _report
+from .providers.base import (
+    ProgressReporter,
+    report_progress as _report,
+    report_result,
+)
 
 _MAX_REACT_ITERATIONS = 4_000
 _HEARTBEAT_SECONDS = 12
@@ -504,6 +508,18 @@ class ActiveAdaptationContext:
                 AssetZone.DISCARD: "语义评估完成：无需迁移。",
                 AssetZone.MIGRATE: "兼容性优化完成，已进入待迁移区。",
             }[selected]
+            if selected is AssetZone.DISCARD:
+                public_type = asset.asset_type.value.rstrip("s")
+                if public_type == "scheduled_task":
+                    public_type = "cron"
+                await report_result(
+                    self.progress,
+                    "asset",
+                    public_type,
+                    "not_needed",
+                    "-",
+                    asset.source_id,
+                )
             await self._publish(f"{self._label(self._asset(key))}{status}")
             return {
                 "ok": True,

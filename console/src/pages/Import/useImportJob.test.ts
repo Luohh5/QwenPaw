@@ -32,7 +32,9 @@ describe("useImportJob", () => {
   beforeEach(() => {
     selectedAgent = "agent-a";
     vi.clearAllMocks();
+    sessionStorage.clear();
     vi.mocked(portabilityImportApi.create).mockResolvedValue(job);
+    vi.mocked(portabilityImportApi.snapshot).mockResolvedValue(job);
     vi.mocked(portabilityImportApi.start).mockResolvedValue({
       ...job,
       state: "running",
@@ -74,5 +76,22 @@ describe("useImportJob", () => {
     await waitFor(() => expect(result.current.job?.seq).toBe(3));
 
     expect(result.current.job?.state).toBe("completed");
+  });
+
+  it("restores an import after leaving the page and switching agents", async () => {
+    const first = renderHook(() => useImportJob());
+    await act(() => first.result.current.scan(["codex"]));
+    first.unmount();
+
+    selectedAgent = "agent-b";
+    const second = renderHook(() => useImportJob());
+    await waitFor(() =>
+      expect(second.result.current.job?.job_id).toBe("import-1"),
+    );
+
+    expect(portabilityImportApi.snapshot).toHaveBeenCalledWith(
+      "agent-a",
+      "import-1",
+    );
   });
 });

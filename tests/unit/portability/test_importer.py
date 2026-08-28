@@ -342,7 +342,21 @@ async def test_migrate_zone_materializes_and_enables_assets(
         _approved,
     )
 
-    receipt = await ProviderImportService(workspace).import_from("codex")
+    progress: list[str] = []
+
+    async def record(message: str) -> None:
+        progress.append(message)
+
+    receipt = await ProviderImportService(workspace).import_from(
+        "codex",
+        progress=record,
+    )
+
+    assert {
+        "\x1easset\tskill\tsucceeded\t1\tportable-skill",
+        "\x1easset\tmcp\tsucceeded\t1\tportable-mcp",
+        "\x1easset\tcron\tsucceeded\t0\tportable-task",
+    } <= set(progress)
 
     skill_manifest = json.loads(
         (workspace.workspace_dir / "skill.json").read_text(encoding="utf-8"),
@@ -484,10 +498,18 @@ async def test_provider_import_is_additive_and_idempotent(
         ],
     )
     _bind_inventory(monkeypatch, inventory)
+    progress: list[str] = []
 
-    first = await ProviderImportService(workspace).import_from("codex")
+    async def record(message: str) -> None:
+        progress.append(message)
+
+    first = await ProviderImportService(workspace).import_from(
+        "codex",
+        progress=record,
+    )
     second = await ProviderImportService(workspace).import_from("codex")
 
+    assert "\x1esessions\t1\t1\t1\t0" in progress
     assert first.imported_sessions == ["thread-1"]
     assert second.imported_sessions == []
     assert second.skipped_sessions == ["thread-1"]

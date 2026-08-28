@@ -347,7 +347,8 @@ class PortabilityImportJobManager:
         message: str,
     ) -> None:
         self._project_progress(provider, message)
-        self._log(live, message)
+        if not message.startswith("\x1e"):
+            self._log(live, message)
         await self._emit(live)
 
     async def _persist(
@@ -400,6 +401,28 @@ class PortabilityImportJobManager:
         provider: ImportProviderSnapshot,
         message: str,
     ) -> None:
+        result = message.split("\t")
+        if len(result) == 5 and result[0] == "\x1esessions":
+            (
+                provider.sessions_processed,
+                provider.sessions_total,
+                provider.sessions_imported,
+                provider.sessions_skipped,
+            ) = map(int, result[1:])
+            return
+        if len(result) == 5 and result[0] == "\x1easset":
+            asset_type, state, enabled, source_id = result[1:]
+            for asset in provider.assets:
+                if (
+                    asset.asset_type == asset_type
+                    and asset.source_id == source_id
+                ):
+                    if asset.state is not ImportAssetState.NOT_NEEDED:
+                        asset.state = ImportAssetState(state)
+                        asset.enabled = (
+                            None if enabled == "-" else enabled == "1"
+                        )
+                    return
         match = _SESSIONS.search(message)
         if match:
             provider.sessions_processed = int(match.group(1))
@@ -410,7 +433,10 @@ class PortabilityImportJobManager:
         name = _ASSET_NAME.search(message)
         if name:
             for asset in provider.assets:
-                if asset.name == name.group(1):
+                if asset.name == name.group(1) and asset.state in {
+                    ImportAssetState.PENDING,
+                    ImportAssetState.REPAIRING,
+                }:
                     asset.state = ImportAssetState.REPAIRING
 
     @staticmethod

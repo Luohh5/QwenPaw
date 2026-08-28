@@ -60,6 +60,18 @@ describe("ImportPage", () => {
     expect(actions.scan).toHaveBeenCalledWith(["codex", "qoder"]);
   });
 
+  it("allows clearing all sources and disables continue", () => {
+    vi.mocked(useImportJob).mockReturnValue(state() as never);
+    renderPage();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Codex" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Qoder" }));
+
+    expect(
+      screen.getByRole("button", { name: "portabilityImport.continue" }),
+    ).toBeDisabled();
+  });
+
   it("shows default-selected conversations and grouped assets", () => {
     vi.mocked(useImportJob).mockReturnValue(
       state({
@@ -164,5 +176,44 @@ describe("ImportPage", () => {
     }
     expect(screen.getByText("portabilityImport.done")).toBeInTheDocument();
     expect(screen.getByRole("progressbar")).toBeInTheDocument();
+  });
+
+  it("shows conversations complete while tools are still importing", () => {
+    vi.mocked(useImportJob).mockReturnValue(
+      state({
+        job: {
+          job_id: "job",
+          agent_id: "agent",
+          state: "running",
+          phase: "import",
+          seq: 4,
+          logs: [],
+          providers: [
+            {
+              source: "codex",
+              state: "running",
+              plan_id: "plan",
+              sessions_total: 2,
+              sessions_processed: 2,
+              sessions_imported: 2,
+              sessions_skipped: 0,
+              selection: { sessions: true },
+              assets: [],
+              warnings: [],
+              error: "",
+            },
+          ],
+        },
+      }) as never,
+    );
+    renderPage();
+
+    expect(
+      screen.getByText("portabilityImport.sessionStates.succeeded"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("progressbar")).toHaveAttribute(
+      "aria-valuenow",
+      "100",
+    );
   });
 });

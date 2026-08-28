@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,11 @@ from .models import (
     ProviderInventory,
 )
 from .providers import create_migration_provider
-from .providers.base import ProgressReporter, report_progress as _report
+from .providers.base import (
+    ProgressReporter,
+    report_progress as _report,
+    report_result,
+)
 from .qoder_plugin_adapter import stage_qoder_skill_plugin
 from .scheduled_tasks import build_imported_job, imported_job_source
 from .import_conversations import ConversationState, import_conversations
@@ -58,6 +63,43 @@ _GENERATED_PLUGIN_ADAPTERS = {
     CODEX_PLUGIN_ADAPTER,
     "qoder_skill_only_v1",
 }
+
+
+async def _asset_items(
+    values: list[Any],
+    progress: ProgressReporter | None,
+    asset_type: str,
+    imported: list[str],
+    zones: dict[str, str] | None = None,
+    zone_prefix: str = "",
+    enabled: bool | None = True,
+) -> AsyncIterator[tuple[int, Any]]:
+    async def report(item: Any) -> None:
+        zone = (zones or {}).get(f"{zone_prefix}:{item.source_id}", "")
+        present = (
+            item.source_id in imported or getattr(item, "name", "") in imported
+        )
+        state = (
+            "not_needed"
+            if zone == "discard"
+            else ("succeeded" if present else "failed")
+        )
+        active = None if enabled is None else enabled and zone == "migrate"
+        await report_result(
+            progress,
+            "asset",
+            asset_type,
+            state,
+            "-" if active is None or not present else int(active),
+            item.source_id,
+        )
+
+    for index, item in enumerate(values, start=1):
+        if index > 1:
+            await report(values[index - 2])
+        yield index, item
+    if values:
+        await report(values[-1])
 
 
 class ProviderImportService(ImportPlanningMixin):
@@ -275,9 +317,13 @@ class ProviderImportService(ImportPlanningMixin):
                         exc_info=True,
                     )
             plugin_total = len(inventory.plugins)
-            for plugin_index, plugin in enumerate(
+            async for plugin_index, plugin in _asset_items(
                 inventory.plugins,
-                start=1,
+                progress,
+                "plugin",
+                installed_plugins,
+                adaptation_asset_zones,
+                "plugins",
             ):
                 if _progress_milestone(plugin_index, plugin_total):
                     await _report(
@@ -394,9 +440,12 @@ class ProviderImportService(ImportPlanningMixin):
                 )
 
             memory_total = len(inventory.memory_projects)
-            for memory_index, project in enumerate(
+            async for memory_index, project in _asset_items(
                 inventory.memory_projects,
-                start=1,
+                progress,
+                "memory",
+                imported_memory_projects,
+                enabled=None,
             ):
                 if _progress_milestone(memory_index, memory_total):
                     await _report(
@@ -424,7 +473,14 @@ class ProviderImportService(ImportPlanningMixin):
                     )
 
             skill_total = len(inventory.skills)
-            for skill_index, skill in enumerate(inventory.skills, start=1):
+            async for skill_index, skill in _asset_items(
+                inventory.skills,
+                progress,
+                "skill",
+                imported_skills,
+                adaptation_asset_zones,
+                "skills",
+            ):
                 if _progress_milestone(skill_index, skill_total):
                     await _report(
                         progress,
@@ -469,9 +525,13 @@ class ProviderImportService(ImportPlanningMixin):
                 card.name for card in await driver_config.list_cards()
             }
             mcp_total = len(inventory.mcp_servers)
-            for mcp_index, server in enumerate(
+            async for mcp_index, server in _asset_items(
                 inventory.mcp_servers,
-                start=1,
+                progress,
+                "mcp",
+                imported_mcp_servers,
+                adaptation_asset_zones,
+                "mcp",
             ):
                 if _progress_milestone(mcp_index, mcp_total):
                     await _report(
@@ -624,9 +684,14 @@ class ProviderImportService(ImportPlanningMixin):
                     )
                     cron_manager = None
             task_total = len(inventory.scheduled_tasks)
-            for task_index, task in enumerate(
+            async for task_index, task in _asset_items(
                 inventory.scheduled_tasks,
-                start=1,
+                progress,
+                "cron",
+                imported_scheduled_tasks,
+                adaptation_asset_zones,
+                "scheduled_tasks",
+                False,
             ):
                 if _progress_milestone(task_index, task_total):
                     await _report(

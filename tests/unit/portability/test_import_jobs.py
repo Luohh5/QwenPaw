@@ -14,6 +14,7 @@ from qwenpaw.portability.import_jobs import (
     PortabilityImportJobManager,
 )
 from qwenpaw.portability.models import (
+    ImportAssetResult,
     ImportAssetState,
     ImportReceipt,
     ImportSelection,
@@ -108,19 +109,44 @@ class _FakeServices:
 
 
 def test_only_materialization_milestone_updates_session_progress() -> None:
-    provider = ImportProviderSnapshot(source="qoder", sessions_total=1)
+    provider = ImportProviderSnapshot(
+        source="qoder",
+        sessions_total=2,
+        assets=[
+            ImportAssetResult(
+                asset_type="skill",
+                source_id="qoder-skill",
+                name="Qoder Skill",
+            ),
+        ],
+    )
 
     PortabilityImportJobManager._project_progress(
         provider,
         "正在扫描 Qoder 会话：2/2",
     )
-    assert (provider.sessions_processed, provider.sessions_total) == (0, 1)
+    assert (provider.sessions_processed, provider.sessions_total) == (0, 2)
 
     PortabilityImportJobManager._project_progress(
         provider,
-        "正在写入会话：1/1（聊天记录阶段）",
+        "\x1esessions\t1\t2\t1\t0",
     )
-    assert (provider.sessions_processed, provider.sessions_total) == (1, 1)
+    PortabilityImportJobManager._project_progress(
+        provider,
+        "\x1easset\tskill\tsucceeded\t0\tqoder-skill",
+    )
+    PortabilityImportJobManager._project_progress(
+        provider,
+        "正在修复 Skill「Qoder Skill」",
+    )
+    assert (
+        provider.sessions_processed,
+        provider.sessions_total,
+        provider.sessions_imported,
+        provider.sessions_skipped,
+    ) == (1, 2, 1, 0)
+    assert provider.assets[0].state is ImportAssetState.SUCCEEDED
+    assert provider.assets[0].enabled is False
 
 
 @pytest.mark.asyncio

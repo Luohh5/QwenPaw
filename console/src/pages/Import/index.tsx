@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
 import {
@@ -64,6 +64,10 @@ function AssetStatus({ asset }: { asset: ImportAssetResult }) {
   );
 }
 
+const conversationsDone = (provider: ImportProviderSnapshot) =>
+  provider.sessions_total > 0 &&
+  provider.sessions_processed >= provider.sessions_total;
+
 function ConversationStatus({
   provider,
 }: {
@@ -75,7 +79,7 @@ function ConversationStatus({
       <Tag color="error">{t("portabilityImport.sessionStates.failed")}</Tag>
     );
   }
-  if (provider.state === "completed") {
+  if (provider.state === "completed" || conversationsDone(provider)) {
     return (
       <Tag color="success">
         {t("portabilityImport.sessionStates.succeeded", {
@@ -103,8 +107,10 @@ function completion(providers: ImportProviderSnapshot[]) {
   const doneAssets = assets.filter((asset) =>
     ["not_needed", "failed", "succeeded"].includes(asset.state),
   ).length;
-  const doneSessions = sessionRows.filter((provider) =>
-    ["completed", "failed"].includes(provider.state),
+  const doneSessions = sessionRows.filter(
+    (provider) =>
+      ["completed", "failed"].includes(provider.state) ||
+      conversationsDone(provider),
   ).length;
   const total = assets.length + sessionRows.length;
   return total ? Math.round(((doneAssets + doneSessions) / total) * 100) : 0;
@@ -113,8 +119,10 @@ function completion(providers: ImportProviderSnapshot[]) {
 export default function ImportPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const { sources, job, loading, error, detect, scan, start } = useImportJob();
+  const { sources, job, loading, error, detect, scan, start, reset } =
+    useImportJob();
   const [selectedSources, setSelectedSources] = useState<ImportSource[]>([]);
+  const sourcesInitialized = useRef(false);
   const [selections, setSelections] = useState<
     Partial<Record<ImportSource, ImportSelection>>
   >({});
@@ -123,14 +131,15 @@ export default function ImportPage() {
     void detect().catch(() => undefined);
   }, [detect]);
   useEffect(() => {
-    if (!job && sources.length && !selectedSources.length) {
+    if (!job && sources.length && !sourcesInitialized.current) {
+      sourcesInitialized.current = true;
       setSelectedSources(
         sources
           .filter((source) => source.detected)
           .map((source) => source.source),
       );
     }
-  }, [job, selectedSources.length, sources]);
+  }, [job, sources]);
   useEffect(() => {
     if (job?.state !== "awaiting_selection" || Object.keys(selections).length) {
       return;
@@ -447,7 +456,10 @@ export default function ImportPage() {
               <Button
                 type="primary"
                 disabled={!isDone || isRunning}
-                onClick={() => navigate("/chat")}
+                onClick={() => {
+                  reset();
+                  navigate("/chat");
+                }}
               >
                 {t("portabilityImport.done")}
               </Button>

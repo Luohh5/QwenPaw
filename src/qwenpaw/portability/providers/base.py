@@ -26,6 +26,17 @@ async def report_progress(
         logger.debug("Migration progress reporter failed", exc_info=True)
 
 
+async def report_result(
+    progress: ProgressReporter | None,
+    kind: str,
+    *values: Any,
+) -> None:
+    await report_progress(
+        progress,
+        f"\x1e{kind}\t" + "\t".join(map(str, values)),
+    )
+
+
 def progress_milestone(index: int, total: int) -> bool:
     step = max(1, total // 20)
     return total <= 20 or index in {1, total} or index % step == 0
