@@ -724,18 +724,46 @@ def test_actual_interpreter_rejects_an_incompatible_platform_tag(
 
 
 def test_unrecorded_importable_file_requires_repair(tmp_path: Path) -> None:
-    """Files added after the immutable snapshot cannot become importable."""
+    """The install snapshot cannot bless a file absent from every RECORD."""
     environment = _installed_environment(tmp_path)
-    files = environment[-1]
+    directory, _, _, _, _, files = environment
     (files["package"].parent / "injected.py").write_text(
         "INJECTED = True\n",
         encoding="utf-8",
     )
+    _refresh_venv_tree_digest(directory)
 
     result = _validate(environment)
 
     assert result.status == "repair_required"
-    assert any("tree digest" in reason for reason in result.reasons)
+    assert any("locked RECORDs" in reason for reason in result.reasons)
+
+
+@pytest.mark.parametrize(
+    "startup_file",
+    ["unrecorded.pth", "sitecustomize.py"],
+)
+def test_unrecorded_site_code_in_install_snapshot_is_not_executed(
+    tmp_path: Path,
+    startup_file: str,
+) -> None:
+    """An install snapshot cannot authorize unowned site startup code."""
+    environment = _installed_environment(tmp_path)
+    directory, _, _, _, _, files = environment
+    site_packages = files["package"].parents[1]
+    sentinel = tmp_path / "unrecorded-site-code-executed"
+    code = (
+        f"import pathlib; pathlib.Path({str(sentinel)!r}).write_text"
+        f"('executed', encoding='utf-8')\n"
+    )
+    (site_packages / startup_file).write_text(code, encoding="utf-8")
+    _refresh_venv_tree_digest(directory)
+
+    result = _validate(environment)
+
+    assert result.status == "repair_required"
+    assert any("locked RECORDs" in reason for reason in result.reasons)
+    assert not sentinel.exists()
 
 
 @pytest.mark.parametrize(

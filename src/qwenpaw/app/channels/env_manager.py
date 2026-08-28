@@ -868,14 +868,16 @@ def _resolve_record_path(
     if not relative or "\\" in relative:
         return None, f"RECORD path is invalid: {relative}"
     try:
-        resolved = Path(distribution.locate_file(package_path)).resolve()
-    except OSError:
+        located = Path(distribution.locate_file(package_path))
+        lexical = _resolve_parent(located)
+        resolved = located.resolve()
+    except (OSError, ValueError):
         return None, f"RECORD path cannot be resolved: {relative}"
     if not _inside(resolved, environment_root):
         return None, f"RECORD path escapes environment: {relative}"
-    if not resolved.is_file():
+    if not lexical.is_file():
         return None, f"RECORD file is missing: {relative}"
-    return resolved, None
+    return lexical, None
 
 
 def _verify_record_integrity(
@@ -916,7 +918,7 @@ def _verify_record_entry(
     distribution: metadata.Distribution,
     package_path: metadata.PackagePath,
     environment_root: Path,
-) -> tuple[tuple[str, ...], bool]:
+) -> tuple[tuple[str, ...], bool, Path | None]:
     """Validate one RECORD row and report whether it is RECORD itself."""
     relative = str(package_path)
     record_entry = PurePosixPath(relative).name == "RECORD"
@@ -926,24 +928,25 @@ def _verify_record_entry(
         environment_root,
     )
     if resolved is None:
-        return (path_error or "RECORD path is invalid",), record_entry
+        return (path_error or "RECORD path is invalid",), record_entry, None
     integrity_error = _verify_record_integrity(package_path, resolved)
     reasons = () if integrity_error is None else (integrity_error,)
-    return reasons, record_entry
+    return reasons, record_entry, resolved
 
 
 def _verify_record(
     distribution: metadata.Distribution,
     environment_root: Path,
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], frozenset[Path]]:
     reasons: list[str] = []
     try:
         files = distribution.files
     except Exception as exc:
-        return (f"Distribution RECORD cannot be parsed: {exc}",)
+        return (f"Distribution RECORD cannot be parsed: {exc}",), frozenset()
     if files is None:
-        return ("Distribution RECORD is missing",)
+        return ("Distribution RECORD is missing",), frozenset()
     seen: set[str] = set()
+    recorded_paths: set[Path] = set()
     record_seen = False
     for package_path in files:
         try:
@@ -952,17 +955,59 @@ def _verify_record(
                 reasons.append(f"RECORD path is duplicated: {relative}")
                 continue
             seen.add(relative)
-            entry_reasons, is_record = _verify_record_entry(
+            entry_reasons, is_record, recorded_path = _verify_record_entry(
                 distribution,
                 package_path,
                 environment_root,
             )
             reasons.extend(entry_reasons)
             record_seen = record_seen or is_record
+            if recorded_path is not None:
+                recorded_paths.add(recorded_path)
         except Exception as exc:
             reasons.append(f"Distribution RECORD cannot be parsed: {exc}")
     if not record_seen:
         reasons.append("Distribution RECORD does not list itself")
+    return tuple(reasons), frozenset(recorded_paths)
+
+
+def _actual_site_files(
+    site_paths: tuple[Path, ...],
+) -> tuple[frozenset[Path], tuple[str, ...]]:
+    """Collect every executable or metadata-bearing site file path."""
+    files: set[Path] = set()
+    try:
+        for site_path in site_paths:
+            for path in site_path.rglob("*"):
+                if path.is_symlink() or path.is_file():
+                    files.add(_resolve_parent(path))
+    except (OSError, ValueError) as exc:
+        return frozenset(files), (
+            f"Site-packages file inventory cannot be read: {exc}",
+        )
+    return frozenset(files), ()
+
+
+def _validate_site_file_inventory(
+    *,
+    site_paths: tuple[Path, ...],
+    recorded_paths: set[Path],
+) -> tuple[str, ...]:
+    """Require actual site files to be owned by locked RECORD entries."""
+    actual_paths, scan_reasons = _actual_site_files(site_paths)
+    expected_paths = frozenset(
+        path
+        for path in recorded_paths
+        if any(_lexically_inside(path, root) for root in site_paths)
+    )
+    reasons = list(scan_reasons)
+    unrecorded = actual_paths - expected_paths
+    missing = expected_paths - actual_paths
+    if unrecorded or missing:
+        reasons.append(
+            f"Site-packages files do not match locked RECORDs: "
+            f"unrecorded={len(unrecorded)}, missing={len(missing)}",
+        )
     return tuple(reasons)
 
 
@@ -1365,6 +1410,7 @@ def _validate_distributions(
 ) -> tuple[str, ...]:
     """Validate actual distributions, direct URLs, and RECORD contents."""
     reasons: list[str] = []
+    recorded_paths: set[Path] = set()
     inventory, inventory_reasons = _distribution_inventory(site_paths)
     reasons.extend(inventory_reasons)
     if set(inventory) != set(expected_packages):
@@ -1394,10 +1440,18 @@ def _validate_distributions(
                 reasons.append(
                     f"Installed direct URL is invalid: {name}: {exc}",
                 )
-        reasons.extend(
-            f"{name}: {reason}"
-            for reason in _verify_record(distribution, venv_root)
+        record_reasons, package_paths = _verify_record(
+            distribution,
+            venv_root,
         )
+        reasons.extend(f"{name}: {reason}" for reason in record_reasons)
+        recorded_paths.update(package_paths)
+    reasons.extend(
+        _validate_site_file_inventory(
+            site_paths=site_paths,
+            recorded_paths=recorded_paths,
+        ),
+    )
     return tuple(reasons)
 
 
