@@ -944,10 +944,12 @@ Desktop bundled Python、完整安装形态以及 OS/Python ABI/架构发布矩�
 
 ### CH-1-002：Environment Spec 和严格校验
 
-- [ ] 实现 environment spec 选择和严格 manifest 校验。
-- [ ] 验证不继承主环境 `site-packages`、user site 和 `PYTHONPATH`。
-- [ ] 依赖不匹配时进入 `repair_required`，不得静默使用旧环境。
-- [ ] 校验 Python ABI、platform tag、condition set、distribution inventory、适用时的
+- 状态：[-] 实施完成，等待独立 Review 和最终验证
+
+- [x] 实现 environment spec 选择和严格 manifest 校验。
+- [x] 验证不继承主环境 `site-packages`、user site 和 `PYTHONPATH`。
+- [x] 依赖不匹配时进入 `repair_required`，不得静默使用旧环境。
+- [x] 校验 Python ABI、platform tag、condition set、distribution inventory、适用时的
   direct URL、安装时记录的 wheel provenance 和 installed files `RECORD` 完整性。
 
 验收：同一 descriptor/config 在目标平台只选择唯一合法 environment spec；不匹配时
