@@ -16,6 +16,7 @@ import subprocess
 from typing import Literal
 from urllib.parse import urlsplit
 
+from packaging import tags as packaging_tags
 from packaging.markers import Marker
 from packaging.requirements import Requirement
 from packaging.utils import InvalidName, canonicalize_name
@@ -73,12 +74,14 @@ _INSTALL_FIELDS = frozenset(
         "lock_sha256",
         "source",
         "packages",
+        "venv_tree_sha256",
     },
 )
 _INSTALL_SOURCE_FIELDS = frozenset({"kind", "base_url"})
 _PROVENANCE_FIELDS = frozenset(
     {"name", "version", "wheel_filename", "wheel_sha256"},
 )
+_VENV_TREE_DOMAIN = "qwenpaw.channel.venv-tree.v1"
 _PROBE_ENVIRONMENT_KEYS = frozenset(
     {
         "COMSPEC",
@@ -94,21 +97,27 @@ _PROBE_ENVIRONMENT_KEYS = frozenset(
         "WINDIR",
     },
 )
-_PROBE_SCRIPT = """
+_PACKAGING_ROOT = str(Path(packaging_tags.__file__).resolve().parent.parent)
+_NO_SITE_PROBE_SCRIPT = """
 import json
 import os
 import platform
-import site
 import sys
 import sysconfig
+
+venv_root = sys.argv[1]
+packaging_root = sys.argv[2]
+sys.path.insert(0, packaging_root)
+from packaging.tags import sys_tags
 
 version = platform.python_version()
 major, minor = sys.version_info[:2]
 implementation = sys.implementation.name
-abi = None
-if implementation == "cpython":
-    interpreter = f"cp{major}{minor}"
-    abi = f"{interpreter}-{interpreter}{getattr(sys, 'abiflags', '')}"
+tags = tuple(sys_tags())
+abi = next(
+    (f"{tag.interpreter}-{tag.abi}" for tag in tags if tag.abi != "none"),
+    None,
+)
 marker_environment = {
     "implementation_name": implementation,
     "implementation_version": version,
@@ -125,13 +134,40 @@ marker_environment = {
 payload = {
     "abi": abi,
     "base_prefix": sys.base_prefix,
+    "compatible_platform_tags": sorted({tag.platform for tag in tags}),
+    "executable": sys.executable,
+    "flags": {
+        "ignore_environment": bool(sys.flags.ignore_environment),
+        "isolated": bool(sys.flags.isolated),
+        "no_site": bool(sys.flags.no_site),
+        "no_user_site": bool(sys.flags.no_user_site),
+    },
+    "marker_environment": marker_environment,
+    "prefix": sys.prefix,
+    "pythonpath": os.environ.get("PYTHONPATH"),
+}
+venv_paths = sysconfig.get_paths(
+    scheme="venv",
+    vars={"base": venv_root, "platbase": venv_root},
+)
+payload["platlib"] = venv_paths["platlib"]
+payload["purelib"] = venv_paths["purelib"]
+print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+"""
+_SITE_PROBE_SCRIPT = """
+import json
+import os
+import site
+import sys
+import sysconfig
+
+payload = {
     "executable": sys.executable,
     "flags": {
         "ignore_environment": bool(sys.flags.ignore_environment),
         "isolated": bool(sys.flags.isolated),
         "no_user_site": bool(sys.flags.no_user_site),
     },
-    "marker_environment": marker_environment,
     "platlib": sysconfig.get_paths()["platlib"],
     "prefix": sys.prefix,
     "purelib": sysconfig.get_paths()["purelib"],
@@ -409,6 +445,7 @@ class InstallManifest:
     python_abi: str
     platform_tag: str
     lock_sha256: str
+    venv_tree_sha256: str
     source: InstallSource
     packages: tuple[WheelProvenance, ...]
     schema_version: int = 1
@@ -445,6 +482,11 @@ class InstallManifest:
         )
         lock_sha256 = _string(mapping["lock_sha256"], "lock_sha256")
         validate_digest(lock_sha256, name="Lock digest")
+        venv_tree_sha256 = _string(
+            mapping["venv_tree_sha256"],
+            "venv_tree_sha256",
+        )
+        validate_digest(venv_tree_sha256, name="Venv tree digest")
         source = InstallSource.from_mapping(mapping["source"])
         package_values = mapping["packages"]
         if not isinstance(package_values, list):
@@ -467,6 +509,7 @@ class InstallManifest:
             python_abi=python_abi,
             platform_tag=platform_tag,
             lock_sha256=lock_sha256,
+            venv_tree_sha256=venv_tree_sha256,
             source=source,
             packages=packages,
         )
@@ -480,6 +523,7 @@ class InstallManifest:
             "python_abi": self.python_abi,
             "platform_tag": self.platform_tag,
             "lock_sha256": self.lock_sha256,
+            "venv_tree_sha256": self.venv_tree_sha256,
             "source": self.source.to_mapping(),
             "packages": [item.to_mapping() for item in self.packages],
         }
@@ -663,24 +707,79 @@ def _inside(path: Path, root: Path) -> bool:
     return True
 
 
+def _resolve_parent(path: Path) -> Path:
+    """Resolve parent aliases while preserving the final path component."""
+    absolute = Path(os.path.abspath(path))
+    return absolute.parent.resolve() / absolute.name
+
+
 def _lexically_inside(path: Path, root: Path) -> bool:
     """Check a path location without following its final symlink target."""
-    absolute = Path(os.path.abspath(path))
     try:
-        absolute.relative_to(root.resolve())
+        _resolve_parent(path).relative_to(root.resolve())
     except ValueError:
         return False
     return True
 
 
-def _read_probe(interpreter: Path) -> Mapping[str, object]:
+def compute_venv_tree_sha256(venv_root: Path) -> str:
+    """Hash the complete lexical contents of one immutable venv."""
+    root = Path(venv_root).resolve()
+    if not root.is_dir():
+        raise EnvironmentManifestError("Environment venv directory is missing")
+    entries: list[dict[str, object]] = []
+    try:
+        paths = sorted(
+            root.rglob("*"),
+            key=lambda path: path.relative_to(root).as_posix(),
+        )
+        for path in paths:
+            relative = path.relative_to(root).as_posix()
+            if path.is_symlink():
+                entries.append(
+                    {
+                        "kind": "symlink",
+                        "path": relative,
+                        "target": os.readlink(path),
+                    },
+                )
+            elif path.is_file():
+                with path.open("rb") as file:
+                    file_digest = hashlib.file_digest(
+                        file,
+                        "sha256",
+                    ).hexdigest()
+                entries.append(
+                    {
+                        "kind": "file",
+                        "path": relative,
+                        "sha256": file_digest,
+                        "size": path.stat().st_size,
+                    },
+                )
+            elif not path.is_dir():
+                raise EnvironmentManifestError(
+                    f"Environment venv contains a special file: {relative}",
+                )
+    except (OSError, ValueError) as exc:
+        raise EnvironmentManifestError(
+            f"Environment venv tree cannot be read: {exc}",
+        ) from exc
+    return domain_sha256(_VENV_TREE_DOMAIN, entries)
+
+
+def _run_probe(
+    interpreter: Path,
+    *,
+    arguments: tuple[str, ...],
+) -> Mapping[str, object]:
     environment = {
         key: value
         for key, value in os.environ.items()
         if key in _PROBE_ENVIRONMENT_KEYS
     }
     result = subprocess.run(
-        [str(interpreter), "-I", "-c", _PROBE_SCRIPT],
+        [str(interpreter), *arguments],
         capture_output=True,
         check=False,
         env=environment,
@@ -698,6 +797,33 @@ def _read_probe(interpreter: Path) -> Mapping[str, object]:
             "Environment interpreter probe returned invalid JSON",
         ) from exc
     return _mapping(value)
+
+
+def _read_no_site_probe(
+    interpreter: Path,
+    venv_root: Path,
+) -> Mapping[str, object]:
+    """Read target facts without initializing its dependency environment."""
+    return _run_probe(
+        interpreter,
+        arguments=(
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            _NO_SITE_PROBE_SCRIPT,
+            str(venv_root),
+            _PACKAGING_ROOT,
+        ),
+    )
+
+
+def _read_site_probe(interpreter: Path) -> Mapping[str, object]:
+    """Inspect site state after the environment has passed integrity checks."""
+    return _run_probe(
+        interpreter,
+        arguments=("-I", "-B", "-c", _SITE_PROBE_SCRIPT),
+    )
 
 
 def _expected_packages(
@@ -724,8 +850,12 @@ def _direct_urls(lock: LockFile) -> dict[str, str]:
 
 
 def _record_file_is_unhashed(relative: str) -> bool:
-    name = PurePosixPath(relative).name
-    return name in {"RECORD", "RECORD.jws", "RECORD.p7s"}
+    path = PurePosixPath(relative)
+    return path.suffix == ".pyc" or path.name in {
+        "RECORD",
+        "RECORD.jws",
+        "RECORD.p7s",
+    }
 
 
 def _resolve_record_path(
@@ -757,7 +887,9 @@ def _verify_record_integrity(
     file_hash = package_path.hash
     file_size = package_path.size
     error: str | None = None
-    if file_hash is None or file_size is None:
+    if (file_hash is None) != (file_size is None):
+        error = f"RECORD entry has incomplete integrity data: {relative}"
+    elif file_hash is None:
         if not _record_file_is_unhashed(relative):
             error = f"RECORD entry lacks integrity data: {relative}"
     else:
@@ -805,24 +937,30 @@ def _verify_record(
     environment_root: Path,
 ) -> tuple[str, ...]:
     reasons: list[str] = []
-    files = distribution.files
+    try:
+        files = distribution.files
+    except Exception as exc:
+        return (f"Distribution RECORD cannot be parsed: {exc}",)
     if files is None:
         return ("Distribution RECORD is missing",)
     seen: set[str] = set()
     record_seen = False
     for package_path in files:
-        relative = str(package_path)
-        if relative in seen:
-            reasons.append(f"RECORD path is duplicated: {relative}")
-            continue
-        seen.add(relative)
-        entry_reasons, is_record = _verify_record_entry(
-            distribution,
-            package_path,
-            environment_root,
-        )
-        reasons.extend(entry_reasons)
-        record_seen = record_seen or is_record
+        try:
+            relative = str(package_path)
+            if relative in seen:
+                reasons.append(f"RECORD path is duplicated: {relative}")
+                continue
+            seen.add(relative)
+            entry_reasons, is_record = _verify_record_entry(
+                distribution,
+                package_path,
+                environment_root,
+            )
+            reasons.extend(entry_reasons)
+            record_seen = record_seen or is_record
+        except Exception as exc:
+            reasons.append(f"Distribution RECORD cannot be parsed: {exc}")
     if not record_seen:
         reasons.append("Distribution RECORD does not list itself")
     return tuple(reasons)
@@ -833,18 +971,30 @@ def _distribution_inventory(
 ) -> tuple[dict[str, metadata.Distribution], tuple[str, ...]]:
     inventory: dict[str, metadata.Distribution] = {}
     reasons: list[str] = []
-    for distribution in metadata.distributions(
-        path=[str(path) for path in site_paths],
-    ):
-        raw_name = distribution.metadata.get("Name")
-        if not raw_name:
-            reasons.append("Installed distribution has no canonical name")
-            continue
-        name = canonicalize_name(raw_name)
-        if name in inventory:
-            reasons.append(f"Installed distribution is duplicated: {name}")
-            continue
-        inventory[name] = distribution
+    try:
+        distributions = metadata.distributions(
+            path=[str(path) for path in site_paths],
+        )
+        for distribution in distributions:
+            try:
+                raw_name = distribution.metadata.get("Name")
+            except Exception as exc:
+                reasons.append(
+                    f"Installed distribution metadata cannot be parsed: {exc}",
+                )
+                continue
+            if not raw_name:
+                reasons.append("Installed distribution has no canonical name")
+                continue
+            name = canonicalize_name(raw_name)
+            if name in inventory:
+                reasons.append(f"Installed distribution is duplicated: {name}")
+                continue
+            inventory[name] = distribution
+    except Exception as exc:
+        reasons.append(
+            f"Installed distribution inventory cannot be read: {exc}",
+        )
     return inventory, tuple(reasons)
 
 
@@ -874,40 +1024,113 @@ def _read_direct_url(
     return url
 
 
-def _validate_isolation(
+def _validate_target_probe(
     *,
     probe: Mapping[str, object],
     interpreter: Path,
     venv_root: Path,
     expected_python_abi: str,
+    expected_platform_tag: str,
 ) -> tuple[tuple[Path, ...], Mapping[str, str], tuple[str, ...]]:
+    reasons: list[str] = []
+    flags = probe.get("flags")
+    if not isinstance(flags, Mapping) or any(
+        flags.get(name) is not True
+        for name in (
+            "isolated",
+            "ignore_environment",
+            "no_site",
+            "no_user_site",
+        )
+    ):
+        reasons.append(
+            "Target probe did not run without site in isolated mode",
+        )
+    if probe.get("pythonpath") is not None:
+        reasons.append("Interpreter inherited PYTHONPATH")
+    if Path(str(probe.get("executable"))).resolve() != interpreter.resolve():
+        reasons.append("Interpreter path does not match installation")
+    if probe.get("abi") != expected_python_abi:
+        reasons.append(
+            "Interpreter Python ABI does not match environment spec",
+        )
+    compatible_tags = probe.get("compatible_platform_tags")
+    if not isinstance(compatible_tags, list) or any(
+        not isinstance(value, str) for value in compatible_tags
+    ):
+        reasons.append("Interpreter compatible platform tags are invalid")
+    elif expected_platform_tag not in compatible_tags:
+        reasons.append(
+            "Interpreter platform does not match environment spec",
+        )
+    raw_purelib = probe.get("purelib")
+    raw_platlib = probe.get("platlib")
+    site_paths: tuple[Path, ...] = ()
+    if (
+        isinstance(raw_purelib, str)
+        and raw_purelib
+        and isinstance(raw_platlib, str)
+        and raw_platlib
+    ):
+        site_paths = tuple(
+            sorted(
+                {
+                    Path(raw_purelib).resolve(),
+                    Path(raw_platlib).resolve(),
+                },
+            ),
+        )
+        if any(not _inside(path, venv_root) for path in site_paths):
+            reasons.append("Target site-packages path escapes the venv")
+        if any(not path.is_dir() for path in site_paths):
+            reasons.append("Target site-packages directory is missing")
+    else:
+        reasons.append("Target site-packages paths are invalid")
+    marker_value = probe.get("marker_environment")
+    marker_environment: Mapping[str, str] = {}
+    if isinstance(marker_value, Mapping) and all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in marker_value.items()
+    ):
+        marker_environment = marker_value
+    else:
+        reasons.append("Interpreter marker environment is invalid")
+    return site_paths, marker_environment, tuple(reasons)
+
+
+def _validate_site_isolation(
+    *,
+    probe: Mapping[str, object],
+    interpreter: Path,
+    venv_root: Path,
+    expected_site_paths: tuple[Path, ...],
+) -> tuple[str, ...]:
     reasons: list[str] = []
     flags = probe.get("flags")
     if not isinstance(flags, Mapping) or any(
         flags.get(name) is not True
         for name in ("isolated", "ignore_environment", "no_user_site")
     ):
-        reasons.append("Interpreter probe did not run in isolated mode")
+        reasons.append("Site probe did not run in isolated mode")
     if probe.get("pythonpath") is not None:
         reasons.append("Interpreter inherited PYTHONPATH")
     if Path(str(probe.get("executable"))).resolve() != interpreter.resolve():
         reasons.append("Interpreter path does not match installation")
     if Path(str(probe.get("prefix"))).resolve() != venv_root.resolve():
         reasons.append("Interpreter prefix does not match venv root")
-    if probe.get("abi") != expected_python_abi:
-        reasons.append(
-            "Interpreter Python ABI does not match environment spec",
-        )
-    site_values = {
-        str(probe.get("purelib")),
-        str(probe.get("platlib")),
-    }
+    site_values = {str(probe.get("purelib")), str(probe.get("platlib"))}
     raw_site_packages = probe.get("site_packages")
-    if isinstance(raw_site_packages, list):
-        site_values.update(str(value) for value in raw_site_packages)
+    if isinstance(raw_site_packages, list) and all(
+        isinstance(value, str) for value in raw_site_packages
+    ):
+        site_values.update(raw_site_packages)
+    else:
+        reasons.append("Interpreter site-packages paths are invalid")
     site_paths = tuple(
         sorted({Path(value).resolve() for value in site_values}),
     )
+    if set(site_paths) != set(expected_site_paths):
+        reasons.append("Site paths do not match the no-site target probe")
     if any(not _inside(path, venv_root) for path in site_paths):
         reasons.append("Interpreter exposes site-packages outside the venv")
     user_site = Path(str(probe.get("user_site"))).resolve()
@@ -925,16 +1148,7 @@ def _validate_isolation(
             venv_root,
         ):
             reasons.append("Interpreter inherited an ambient site-packages")
-    marker_value = probe.get("marker_environment")
-    marker_environment: Mapping[str, str] = {}
-    if isinstance(marker_value, Mapping) and all(
-        isinstance(key, str) and isinstance(value, str)
-        for key, value in marker_value.items()
-    ):
-        marker_environment = marker_value
-    else:
-        reasons.append("Interpreter marker environment is invalid")
-    return site_paths, marker_environment, tuple(reasons)
+    return tuple(reasons)
 
 
 def _validate_pyvenv_config(venv_root: Path) -> tuple[str, ...]:
@@ -1055,27 +1269,66 @@ def _validate_expected_identity(
     return ()
 
 
-def _probe_installation(
+def _probe_target(
     *,
     interpreter: Path,
     venv_root: Path,
     expected_python_abi: str,
+    expected_platform_tag: str,
 ) -> tuple[tuple[Path, ...], Mapping[str, str], tuple[str, ...]]:
-    """Probe one interpreter without inheriting Core import settings."""
+    """Attest target facts without loading its dependency environment."""
     try:
-        probe = _read_probe(interpreter)
-        return _validate_isolation(
+        probe = _read_no_site_probe(interpreter, venv_root)
+        return _validate_target_probe(
             probe=probe,
             interpreter=interpreter,
             venv_root=venv_root,
             expected_python_abi=expected_python_abi,
+            expected_platform_tag=expected_platform_tag,
         )
     except (
         EnvironmentManifestError,
         OSError,
         subprocess.SubprocessError,
     ) as exc:
-        return (), {}, (f"Environment isolation probe failed: {exc}",)
+        return (), {}, (f"Target interpreter probe failed: {exc}",)
+
+
+def _probe_site_isolation(
+    *,
+    interpreter: Path,
+    venv_root: Path,
+    expected_site_paths: tuple[Path, ...],
+) -> tuple[str, ...]:
+    """Load site only after every persisted environment file is trusted."""
+    try:
+        probe = _read_site_probe(interpreter)
+        return _validate_site_isolation(
+            probe=probe,
+            interpreter=interpreter,
+            venv_root=venv_root,
+            expected_site_paths=expected_site_paths,
+        )
+    except (
+        EnvironmentManifestError,
+        OSError,
+        subprocess.SubprocessError,
+    ) as exc:
+        return (f"Environment site isolation probe failed: {exc}",)
+
+
+def _validate_venv_tree(
+    venv_root: Path,
+    expected_digest: str,
+) -> tuple[str, ...]:
+    """Compare current venv bytes to the immutable installation snapshot."""
+    try:
+        actual_digest = compute_venv_tree_sha256(venv_root)
+    except EnvironmentManifestError as exc:
+        return (str(exc),)
+    if actual_digest != expected_digest:
+        return ("Environment venv tree digest mismatches install manifest",)
+    return ()
 
 
 def _validate_provenance(
@@ -1121,7 +1374,14 @@ def _validate_distributions(
         distribution = inventory.get(name)
         if distribution is None:
             continue
-        if distribution.version != package.version:
+        try:
+            installed_version = distribution.version
+        except Exception as exc:
+            reasons.append(
+                f"Installed distribution metadata is invalid: {name}: {exc}",
+            )
+            continue
+        if installed_version != package.version:
             reasons.append(
                 f"Installed distribution version mismatches: {name}",
             )
@@ -1178,7 +1438,7 @@ def validate_installed_environment(
 ) -> EnvironmentValidationResult:
     """Strictly validate one immutable dependency environment."""
     environment_directory = Path(environment_directory).resolve()
-    interpreter = Path(os.path.abspath(interpreter))
+    interpreter = _resolve_parent(Path(interpreter))
     reasons = list(
         _validate_expected_identity(
             expected_environment_id,
@@ -1201,13 +1461,24 @@ def validate_installed_environment(
         reasons.append("Interpreter is not inside the environment venv")
         return _repair_required(reasons)
     reasons.extend(_validate_pyvenv_config(venv_root))
-    site_paths, marker_environment, isolation_reasons = _probe_installation(
+    if install_manifest is None or reasons:
+        return _repair_required(reasons)
+    reasons.extend(
+        _validate_venv_tree(
+            venv_root,
+            install_manifest.venv_tree_sha256,
+        ),
+    )
+    if reasons:
+        return _repair_required(reasons)
+    site_paths, marker_environment, target_reasons = _probe_target(
         interpreter=interpreter,
         venv_root=venv_root,
         expected_python_abi=expected_spec.python_abi,
+        expected_platform_tag=expected_spec.platform_tag,
     )
-    reasons.extend(isolation_reasons)
-    if install_manifest is None or not site_paths or not marker_environment:
+    reasons.extend(target_reasons)
+    if reasons or not site_paths or not marker_environment:
         return _repair_required(reasons)
     reasons.extend(
         _validate_dependency_state(
@@ -1220,4 +1491,15 @@ def validate_installed_environment(
     )
     if reasons:
         return _repair_required(reasons)
-    return EnvironmentValidationResult(status="installed")
+    reasons.extend(
+        _probe_site_isolation(
+            interpreter=interpreter,
+            venv_root=venv_root,
+            expected_site_paths=site_paths,
+        ),
+    )
+    return (
+        _repair_required(reasons)
+        if reasons
+        else EnvironmentValidationResult(status="installed")
+    )

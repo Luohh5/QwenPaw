@@ -4,17 +4,22 @@
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import venv
+import zipfile
 
 import pytest
+from packaging.tags import sys_tags
 
 from qwenpaw.app.channels.env_manager import (
+    compute_venv_tree_sha256,
     EnvironmentManifestError,
     EnvironmentSpecManifest,
     InstallManifest,
@@ -38,13 +43,23 @@ from qwenpaw.channel_protocol import (
     write_canonical_json,
 )
 
-PLATFORM_TAG = "macosx_11_0_arm64"
+CURRENT_PLATFORM_TAGS = frozenset(tag.platform for tag in sys_tags())
+PLATFORM_TAG = next(
+    tag
+    for tag in sorted(RELEASE_TARGET_PLATFORM_TAGS)
+    if tag in CURRENT_PLATFORM_TAGS
+)
+INCOMPATIBLE_PLATFORM_TAG = next(
+    tag
+    for tag in sorted(RELEASE_TARGET_PLATFORM_TAGS)
+    if tag not in CURRENT_PLATFORM_TAGS
+)
 WHEEL_FILENAME = "demo_package-1.0-py3-none-any.whl"
 WHEEL_DIGEST = "a" * 64
 DIRECT_URL = "https://example.invalid/demo-package.whl"
 
 
-def _descriptor() -> ChannelDescriptor:
+def _descriptor(platform_tag: str = PLATFORM_TAG) -> ChannelDescriptor:
     """Build a one-target descriptor with one finite condition value."""
     return ChannelDescriptor.from_mapping(
         {
@@ -85,7 +100,7 @@ def _descriptor() -> ChannelDescriptor:
             ],
             "condition_fields": ["region"],
             "supported_python_abis": [current_python_abi()],
-            "supported_platform_tags": [PLATFORM_TAG],
+            "supported_platform_tags": [platform_tag],
             "capabilities": [],
             "bot_identity_fields": [],
             "environment_passthrough_allowlist": [],
@@ -115,16 +130,18 @@ def _package() -> LockPackage:
 
 def _release(
     tmp_path: Path,
+    *,
+    platform_tag: str = PLATFORM_TAG,
 ) -> tuple[ChannelDescriptor, LockFile, LockManifest, Path]:
     """Write one exact release lock and return its validated models."""
-    descriptor = _descriptor()
+    descriptor = _descriptor(platform_tag)
     conditions = descriptor.condition_set({"region": "asia"})
     lock = LockFile.from_mapping(
         {
             "schema_version": 1,
             "channel_key": descriptor.channel_key,
             "python_abi": current_python_abi(),
-            "platform_tag": PLATFORM_TAG,
+            "platform_tag": platform_tag,
             "condition_set_sha256": condition_set_sha256(conditions),
             "direct_requirements": [f"demo-package @ {DIRECT_URL}"],
             "packages": [_package().to_mapping()],
@@ -138,15 +155,22 @@ def _release(
     return descriptor, lock, manifest, code_root
 
 
-def _selection(tmp_path: Path):
-    descriptor, lock, manifest, code_root = _release(tmp_path)
+def _selection(
+    tmp_path: Path,
+    *,
+    platform_tag: str = PLATFORM_TAG,
+):
+    descriptor, lock, manifest, code_root = _release(
+        tmp_path,
+        platform_tag=platform_tag,
+    )
     result = select_environment_spec(
         descriptor=descriptor,
         effective_config={"region": "asia"},
         manifest=manifest,
         code_root=code_root,
         python_abi=current_python_abi(),
-        platform_tag=PLATFORM_TAG,
+        platform_tag=platform_tag,
         allowed_platform_tags=RELEASE_TARGET_PLATFORM_TAGS,
     )
     assert result.selected
@@ -267,7 +291,11 @@ def test_environment_manifests_are_closed(tmp_path: Path) -> None:
         environment_spec_id=spec.environment_spec_id,
         installation=InstallationIdentity.parse(f"install1_{'1' * 32}"),
     ).environment_id
-    install = _install_manifest(spec, environment_id).to_mapping()
+    install = _install_manifest(
+        spec,
+        environment_id,
+        venv_tree_sha256="0" * 64,
+    ).to_mapping()
     del install["lock_sha256"]
     with pytest.raises(EnvironmentManifestError):
         InstallManifest.from_mapping(
@@ -275,7 +303,11 @@ def test_environment_manifests_are_closed(tmp_path: Path) -> None:
             allowed_platform_tags=RELEASE_TARGET_PLATFORM_TAGS,
         )
 
-    install = _install_manifest(spec, environment_id).to_mapping()
+    install = _install_manifest(
+        spec,
+        environment_id,
+        venv_tree_sha256="0" * 64,
+    ).to_mapping()
     install["source"]["base_url"] = "https://user:secret@example.invalid/"
     with pytest.raises(EnvironmentManifestError):
         InstallManifest.from_mapping(
@@ -288,6 +320,67 @@ def _hash(path: Path) -> tuple[str, int]:
     digest = hashlib.sha256(path.read_bytes()).digest()
     encoded = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
     return f"sha256={encoded}", path.stat().st_size
+
+
+def _hash_bytes(value: bytes) -> tuple[str, int]:
+    digest = hashlib.sha256(value).digest()
+    encoded = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    return f"sha256={encoded}", len(value)
+
+
+def _write_test_wheel(tmp_path: Path) -> Path:
+    """Build one local wheel that pip can install without network access."""
+    wheel_path = tmp_path / WHEEL_FILENAME
+    dist_info = "demo_package-1.0.dist-info"
+    contents = {
+        "demo_package/__init__.py": b"VALUE = 1\n",
+        f"{dist_info}/METADATA": (
+            b"Metadata-Version: 2.1\n"
+            b"Name: demo-package\n"
+            b"Version: 1.0\n"
+        ),
+        f"{dist_info}/WHEEL": (
+            b"Wheel-Version: 1.0\n"
+            b"Generator: qwenpaw-test\n"
+            b"Root-Is-Purelib: true\n"
+            b"Tag: py3-none-any\n"
+        ),
+    }
+    rows: list[tuple[str, str, str]] = []
+    for relative, value in contents.items():
+        digest, size = _hash_bytes(value)
+        rows.append((relative, digest, str(size)))
+    record_path = f"{dist_info}/RECORD"
+    rows.append((record_path, "", ""))
+    contents[record_path] = "".join(
+        f"{relative},{digest},{size}\n" for relative, digest, size in rows
+    ).encode()
+    with zipfile.ZipFile(
+        wheel_path,
+        mode="w",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as archive:
+        for relative, value in contents.items():
+            archive.writestr(relative, value)
+    return wheel_path
+
+
+def _rewrite_record_hash(record_path: Path, changed_path: Path) -> None:
+    """Update one pip RECORD row after normalizing test-only provenance."""
+    site_packages = changed_path.parents[1]
+    relative = changed_path.relative_to(site_packages).as_posix()
+    digest, size = _hash(changed_path)
+    with record_path.open(encoding="utf-8", newline="") as record:
+        rows = list(csv.reader(record))
+    for row in rows:
+        if row[0] == relative:
+            row[1:] = [digest, str(size)]
+            break
+    else:
+        raise AssertionError(f"RECORD does not contain {relative}")
+    with record_path.open("w", encoding="utf-8", newline="") as record:
+        writer = csv.writer(record, lineterminator="\n")
+        writer.writerows(rows)
 
 
 def _interpreter(venv_root: Path) -> Path:
@@ -355,6 +448,8 @@ def _write_distribution(site_packages: Path) -> dict[str, Path]:
 def _install_manifest(
     spec: EnvironmentSpecManifest,
     environment_id: str,
+    *,
+    venv_tree_sha256: str,
 ) -> InstallManifest:
     return InstallManifest(
         environment_id=environment_id,
@@ -362,6 +457,7 @@ def _install_manifest(
         python_abi=spec.python_abi,
         platform_tag=spec.platform_tag,
         lock_sha256=spec.lock_sha256,
+        venv_tree_sha256=venv_tree_sha256,
         source=InstallSource(
             kind="test",
             base_url="https://example.invalid/simple/",
@@ -379,6 +475,8 @@ def _install_manifest(
 
 def _installed_environment(
     tmp_path: Path,
+    *,
+    platform_tag: str = PLATFORM_TAG,
 ) -> tuple[
     Path,
     Path,
@@ -387,7 +485,7 @@ def _installed_environment(
     LockFile,
     dict[str, Path],
 ]:
-    spec, lock = _selection(tmp_path)
+    spec, lock = _selection(tmp_path, platform_tag=platform_tag)
     environment_id = EnvironmentIdentity.create(
         environment_spec_id=spec.environment_spec_id,
         installation=InstallationIdentity.parse(f"install1_{'2' * 32}"),
@@ -412,7 +510,11 @@ def _installed_environment(
     )
     write_canonical_json(
         environment_directory / "install.json",
-        _install_manifest(spec, environment_id).to_mapping(),
+        _install_manifest(
+            spec,
+            environment_id,
+            venv_tree_sha256=compute_venv_tree_sha256(venv_root),
+        ).to_mapping(),
     )
     return (
         environment_directory,
@@ -443,6 +545,16 @@ def _validate(
         expected_lock=lock,
         allowed_platform_tags=RELEASE_TARGET_PLATFORM_TAGS,
     )
+
+
+def _refresh_venv_tree_digest(environment_directory: Path) -> None:
+    """Refresh the trusted snapshot after an intentional test installation."""
+    manifest_path = environment_directory / "install.json"
+    value = json.loads(manifest_path.read_text(encoding="utf-8"))
+    value["venv_tree_sha256"] = compute_venv_tree_sha256(
+        environment_directory / "venv",
+    )
+    write_canonical_json(manifest_path, value)
 
 
 def test_strict_validation_accepts_an_exact_isolated_environment(
@@ -481,9 +593,11 @@ def test_dependency_or_isolation_mismatch_requires_repair(
 ) -> None:
     """No dependency or isolation mismatch can pass strict validation."""
     environment = _installed_environment(tmp_path)
-    directory, _, spec, environment_id, _, files = environment
+    directory, _, _, _, _, files = environment
     if mutation == "wheel_provenance":
-        value = _install_manifest(spec, environment_id).to_mapping()
+        value = json.loads(
+            (directory / "install.json").read_text(encoding="utf-8"),
+        )
         value["packages"][0]["wheel_sha256"] = "b" * 64
         write_canonical_json(directory / "install.json", value)
     elif mutation == "extra_distribution":
@@ -522,6 +636,8 @@ def test_dependency_or_isolation_mismatch_requires_repair(
             ),
             encoding="utf-8",
         )
+    if mutation != "wheel_provenance":
+        _refresh_venv_tree_digest(directory)
 
     result = _validate(environment)
 
@@ -590,3 +706,174 @@ def test_main_interpreter_cannot_replace_environment_python(
 
     assert result.status == "repair_required"
     assert any("inside" in reason for reason in result.reasons)
+
+
+def test_actual_interpreter_rejects_an_incompatible_platform_tag(
+    tmp_path: Path,
+) -> None:
+    """A registry tag must also be compatible with the target interpreter."""
+    environment = _installed_environment(
+        tmp_path,
+        platform_tag=INCOMPATIBLE_PLATFORM_TAG,
+    )
+
+    result = _validate(environment)
+
+    assert result.status == "repair_required"
+    assert any("platform" in reason for reason in result.reasons)
+
+
+def test_unrecorded_importable_file_requires_repair(tmp_path: Path) -> None:
+    """Files added after the immutable snapshot cannot become importable."""
+    environment = _installed_environment(tmp_path)
+    files = environment[-1]
+    (files["package"].parent / "injected.py").write_text(
+        "INJECTED = True\n",
+        encoding="utf-8",
+    )
+
+    result = _validate(environment)
+
+    assert result.status == "repair_required"
+    assert any("tree digest" in reason for reason in result.reasons)
+
+
+@pytest.mark.parametrize(
+    "startup_file",
+    ["side_effect.pth", "sitecustomize.py"],
+)
+def test_unverified_site_code_is_not_executed(
+    tmp_path: Path,
+    startup_file: str,
+) -> None:
+    """Integrity failure is returned before Python initializes site code."""
+    environment = _installed_environment(tmp_path)
+    directory, _, _, _, _, files = environment
+    site_packages = files["package"].parents[1]
+    sentinel = tmp_path / "site-code-executed"
+    code = (
+        f"import pathlib; pathlib.Path({str(sentinel)!r}).write_text"
+        f"('executed', encoding='utf-8')\n"
+    )
+    startup_path = site_packages / startup_file
+    startup_path.write_text(code, encoding="utf-8")
+    digest, size = _hash(startup_path)
+    relative = startup_path.relative_to(site_packages).as_posix()
+    with files["record"].open("a", encoding="utf-8") as record:
+        record.write(f"{relative},{digest},{size}\n")
+    _refresh_venv_tree_digest(directory)
+    files["package"].write_text("VALUE = 2\n", encoding="utf-8")
+    _refresh_venv_tree_digest(directory)
+
+    result = _validate(environment)
+
+    assert result.status == "repair_required"
+    assert any("RECORD hash mismatches" in reason for reason in result.reasons)
+    assert not sentinel.exists()
+
+
+@pytest.mark.parametrize("metadata_file", ["metadata", "record"])
+def test_invalid_distribution_encoding_requires_repair(
+    tmp_path: Path,
+    metadata_file: str,
+) -> None:
+    """Invalid distribution text is normalized to a repair result."""
+    environment = _installed_environment(tmp_path)
+    directory, _, _, _, _, files = environment
+    files[metadata_file].write_bytes(b"\xff\xfe")
+    _refresh_venv_tree_digest(directory)
+
+    result = _validate(environment)
+
+    assert result.status == "repair_required"
+    assert result.reasons
+
+
+def test_malformed_record_requires_repair(tmp_path: Path) -> None:
+    """A structurally invalid RECORD cannot escape as a parser exception."""
+    environment = _installed_environment(tmp_path)
+    directory, _, _, _, _, files = environment
+    files["record"].write_text("one-column-only\n", encoding="utf-8")
+    _refresh_venv_tree_digest(directory)
+
+    result = _validate(environment)
+
+    assert result.status == "repair_required"
+    assert any("RECORD" in reason for reason in result.reasons)
+
+
+def test_pep_376_unhashed_bytecode_is_protected_by_tree_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Pip-generated pyc may omit hashes but remains snapshot-protected."""
+    environment = _installed_environment(tmp_path)
+    directory, _, _, _, _, files = environment
+    shutil.rmtree(files["package"].parent)
+    shutil.rmtree(files["metadata"].parent)
+    site_packages = files["package"].parents[1]
+    wheel_path = _write_test_wheel(tmp_path)
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--no-cache-dir",
+            "--no-deps",
+            "--no-index",
+            "--target",
+            str(site_packages),
+            str(wheel_path),
+        ],
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=30,
+    )
+    files["direct_url"].write_text(
+        json.dumps({"url": DIRECT_URL}),
+        encoding="utf-8",
+    )
+    _rewrite_record_hash(files["record"], files["direct_url"])
+    bytecodes = tuple(site_packages.rglob("*.pyc"))
+    assert bytecodes
+    assert any(
+        f"{path.relative_to(site_packages).as_posix()},,"
+        in files["record"].read_text(encoding="utf-8")
+        for path in bytecodes
+    )
+    _refresh_venv_tree_digest(directory)
+
+    valid = _validate(environment)
+
+    assert valid.status == "installed"
+
+    bytecodes[0].write_bytes(b"changed")
+    changed = _validate(environment)
+    assert changed.status == "repair_required"
+    assert any("tree digest" in reason for reason in changed.reasons)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX parent symlink alias")
+def test_parent_path_alias_keeps_the_venv_interpreter_inside(
+    tmp_path: Path,
+) -> None:
+    """Resolving parent aliases must preserve the final interpreter symlink."""
+    actual_root = tmp_path / "actual"
+    environment = _installed_environment(actual_root)
+    directory, interpreter, spec, environment_id, lock, files = environment
+    alias_root = tmp_path / "alias"
+    alias_root.symlink_to(actual_root, target_is_directory=True)
+    aliased_environment = (
+        alias_root / directory.relative_to(actual_root),
+        alias_root / interpreter.relative_to(actual_root),
+        spec,
+        environment_id,
+        lock,
+        files,
+    )
+
+    result = _validate(aliased_environment)
+
+    assert result.status == "installed"
