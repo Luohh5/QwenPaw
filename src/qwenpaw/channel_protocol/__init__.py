@@ -4,6 +4,7 @@
 from .canonical import canonical_json, domain_sha256, parse_json_value
 from .descriptor import ChannelDescriptor, resolve_localized_text
 from .errors import (
+    ArtifactValidationError,
     DescriptorValidationError,
     FrameClosedError,
     FrameEOFError,
@@ -20,6 +21,23 @@ from .errors import (
     RpcTimeoutError,
     SecretHandleConsumedError,
     SecretHandleInvalidError,
+)
+from .artifacts import (
+    ArtifactManifest,
+    ArtifactRecord,
+    LockFile,
+    LockManifest,
+    LockManifestEntry,
+    LockPackage,
+    ProtocolRange,
+    VersionRange,
+    WheelFile,
+    build_reproducible_zip,
+    code_root_digest,
+    condition_domain,
+    read_json,
+    sha256_file,
+    write_canonical_json,
 )
 from .framing import FrameReader, FramedTransport, FramingLimits, encode_frame
 from .core_lifecycle import (
@@ -124,6 +142,7 @@ from .requirements import (
 
 __all__ = [
     "DescriptorValidationError",
+    "ArtifactValidationError",
     "FrameClosedError",
     "FrameEOFError",
     "FrameError",
@@ -229,4 +248,19 @@ __all__ = [
     "delivery_is_safe_to_retry",
     "delivery_updates",
     "events_for_retry",
+    "ArtifactManifest",
+    "ArtifactRecord",
+    "LockFile",
+    "LockManifest",
+    "LockManifestEntry",
+    "LockPackage",
+    "ProtocolRange",
+    "VersionRange",
+    "WheelFile",
+    "build_reproducible_zip",
+    "code_root_digest",
+    "condition_domain",
+    "read_json",
+    "sha256_file",
+    "write_canonical_json",
 ]

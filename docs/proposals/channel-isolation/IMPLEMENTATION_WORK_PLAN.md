@@ -922,20 +922,22 @@ Desktop bundled Python、完整安装形态以及 OS/Python ABI/架构发布矩�
 
 ### CH-1-001：Lock 和 Channel artifact 发布制品
 
-- [ ] 定义每个 Channel 的依赖输入和 conditional config domain。
-- [ ] 定义官方 Channel artifact record、发行版本、QwenPaw/Protocol 兼容范围、下载 URL、
+- 状态：[-] 实施完成，等待独立 Review 和最终验证
+
+- [x] 定义每个 Channel 的依赖输入和 conditional config domain。
+- [x] 定义官方 Channel artifact record、发行版本、QwenPaw/Protocol 兼容范围、下载 URL、
   `artifact_sha256`、安装后 `source_revision` 和 `descriptor_sha256` 的唯一归属；下载 metadata
   不写入 builtin descriptor。
-- [ ] 定义 Channel artifact archive 和本地 `artifact.json` schema；artifact 内容只包含
+- [x] 定义 Channel artifact archive 和本地 `artifact.json` schema；artifact 内容只包含
   descriptor、完整配置 schema、release lock manifest/lock、`ChannelDriver` 和平台代码，
   不包含第三方 wheel/venv、Core、bootstrap 或 Protocol SDK。
-- [ ] 生成目标 Python ABI、platform tag 和 condition set 的完整 lock 矩阵。
-- [ ] lock 包含精确版本、传递依赖、environment marker 和 wheel hash。
-- [ ] 生成 manifest，保证每个目标 key 唯一映射一个 lock。
-- [ ] 明确离线安装、缓存和缺失 wheel 的 `unsupported_platform` 状态。
-- [ ] 生成可重复验证的空 Runner/fixture Channel artifact；正式官方 Channel artifact 由
+- [x] 生成目标 Python ABI、platform tag 和 condition set 的完整 lock 矩阵。
+- [x] lock 包含精确版本、传递依赖、environment marker 和 wheel hash。
+- [x] 生成 manifest，保证每个目标 key 唯一映射一个 lock。
+- [x] 明确离线安装、缓存和缺失 wheel 的 `unsupported_platform` 状态。
+- [x] 生成可重复验证的空 Runner/fixture Channel artifact；正式官方 Channel artifact 由
   Phase 4 各迁移任务基于同一格式产出。
-- [ ] 不得假设当前主环境已有的库“本来就在”：`aiohttp`（OneBot 需要）和 `fastapi`
+- [x] 不得假设当前主环境已有的库“本来就在”：`aiohttp`（OneBot 需要）和 `fastapi`
   （Voice 若沿用 FastAPI 语义需要）目前都不是 `pyproject.toml` 声明的直接依赖，仅为传递
   依赖，必须在对应 Channel lock 中显式声明。盘点时逐 Channel 核实实际 import 与声明的
   差集。

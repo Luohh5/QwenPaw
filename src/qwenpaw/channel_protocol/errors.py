@@ -30,6 +30,21 @@ class DescriptorValidationError(ValueError):
         super().__init__(message)
 
 
+class ArtifactValidationError(ValueError):
+    """Report an invalid Channel artifact, lock, or release manifest."""
+
+    code = "artifact_invalid"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        path: Sequence[PathPart] = (),
+    ) -> None:
+        self.path = tuple(path)
+        super().__init__(message)
+
+
 class FrameError(Exception):
     """Base class for strict stdio framing and transport failures."""
 
