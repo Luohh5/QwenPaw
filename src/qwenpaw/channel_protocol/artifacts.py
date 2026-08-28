@@ -7,9 +7,9 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
 import itertools
-import json
 from pathlib import Path, PurePosixPath
 import re
+from urllib.parse import urlsplit
 import zipfile
 
 from packaging.requirements import Requirement
@@ -17,9 +17,9 @@ from packaging.markers import InvalidMarker, Marker
 from packaging.utils import InvalidName, canonicalize_name
 from packaging.version import InvalidVersion, Version
 
-from .canonical import canonical_json, normalize_string
+from .canonical import canonical_json, normalize_string, parse_json_value
 from .descriptor import ChannelDescriptor
-from .errors import ArtifactValidationError
+from .errors import ArtifactValidationError, DescriptorValidationError
 from .identifiers import (
     validate_channel_key,
     validate_platform_tag,
@@ -30,6 +30,8 @@ from .requirements import canonicalize_requirements
 
 _HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _WHEEL_NAME = re.compile(r"^[^/\\]+\.whl$")
+_URL_PERCENT_ESCAPE_PATTERN = re.compile(r"%[0-9A-Fa-f]{2}")
+_URL_FORBIDDEN_CHARACTERS = frozenset('<>"{}|\\^`')
 _VERSION_RANGE_FIELDS = frozenset({"min", "max"})
 _SOURCE_FIELDS = frozenset({"kind", "url"})
 _RECORD_FIELDS = frozenset(
@@ -166,12 +168,31 @@ def _version(value: object, name: str, *, path: tuple[str | int, ...]) -> str:
 
 def _url(value: object, name: str, *, path: tuple[str | int, ...]) -> str:
     result = _string(value, name, path=path)
-    if not result.startswith(("http://", "https://")):
+    if any(
+        character.isspace()
+        or ord(character) < 0x20
+        or ord(character) == 0x7F
+        or character in _URL_FORBIDDEN_CHARACTERS
+        for character in result
+    ):
+        raise _error("URL contains an invalid character", *(path + (name,)))
+    for index, character in enumerate(result):
+        if (
+            character == "%"
+            and _URL_PERCENT_ESCAPE_PATTERN.match(result, index) is None
+        ):
+            raise _error("URL percent escape is invalid", *(path + (name,)))
+    try:
+        parts = urlsplit(result)
+        port = parts.port
+    except ValueError as exc:
+        raise _error("URL is invalid", *(path + (name,))) from exc
+    if parts.scheme not in {"http", "https"} or not parts.hostname:
         raise _error("URL must be absolute HTTP(S)", *(path + (name,)))
-    if any(character.isspace() for character in result):
-        raise _error("URL must not contain whitespace", *(path + (name,)))
-    if "@" in result.split("//", 1)[-1].split("/", 1)[0]:
+    if parts.username is not None or parts.password is not None:
         raise _error("URL must not contain user info", *(path + (name,)))
+    if port is not None and not 0 < port < 65536:
+        raise _error("URL port is invalid", *(path + (name,)))
     return result
 
 
@@ -202,6 +223,34 @@ def _marker(value: object, name: str) -> str:
     except InvalidMarker as exc:
         raise _error("Environment marker is invalid", name) from exc
     return result
+
+
+def _validate_direct_requirements(
+    requirements: tuple[str, ...],
+    packages: tuple["LockPackage", ...],
+) -> None:
+    """Require each direct requirement to match its locked package."""
+    packages_by_name = {package.name: package for package in packages}
+    for requirement_text in requirements:
+        requirement = Requirement(requirement_text)
+        package = packages_by_name[canonicalize_name(requirement.name)]
+        if requirement.specifier and (
+            Version(package.version) not in requirement.specifier
+        ):
+            raise _error(
+                "Locked package version does not satisfy requirement",
+                "direct_requirements",
+                requirement_text,
+            )
+        if requirement.marker is not None:
+            if package.marker is None or (
+                Marker(str(requirement.marker)) != Marker(package.marker)
+            ):
+                raise _error(
+                    "Locked package marker does not match requirement",
+                    "direct_requirements",
+                    requirement_text,
+                )
 
 
 @dataclass(frozen=True)
@@ -570,6 +619,7 @@ class LockFile:
                 "Package direct flags do not match direct requirements",
                 "packages",
             )
+        _validate_direct_requirements(direct_requirements, packages)
         return cls(
             channel_key=channel_key,
             python_abi=python_abi,
@@ -598,6 +648,15 @@ class LockFile:
     def sha256(self) -> str:
         """Return the exact lock file digest."""
         return hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+
+def _canonical_lock_path(
+    python_abi: str,
+    platform_tag: str,
+    condition_set_sha256: str,
+) -> str:
+    """Return the canonical archive path for one lock target."""
+    return f"locks/{python_abi}/{platform_tag}/{condition_set_sha256}.json"
 
 
 @dataclass(frozen=True)
@@ -641,6 +700,16 @@ class LockManifestEntry:
             ".json",
         ):
             raise _error("lock_path must point into locks/", "lock_path")
+        expected_path = _canonical_lock_path(
+            python_abi,
+            platform_tag,
+            condition_digest,
+        )
+        if lock_path != expected_path:
+            raise _error(
+                "lock_path must use the canonical target path",
+                "lock_path",
+            )
         lock_sha256 = _digest(mapping["lock_sha256"], "lock_sha256", path=())
         return cls(
             python_abi=python_abi,
@@ -687,6 +756,7 @@ class LockManifest:
         descriptor: ChannelDescriptor | None = None,
     ) -> "LockManifest":
         mapping = _closed(value, _LOCK_MANIFEST_FIELDS)
+        allowed_platform_tags = frozenset(allowed_platform_tags)
         schema_version = _integer(mapping["schema_version"], "schema_version")
         if schema_version != 1:
             raise _error("schema_version must be integer 1", "schema_version")
@@ -754,10 +824,10 @@ class LockManifest:
             if key in seen:
                 raise _error("Each target key must map to one lock")
             seen.add(key)
-            path = (
-                f"locks/{lock_file.python_abi}/"
-                f"{lock_file.platform_tag}/"
-                f"{lock_file.condition_set_sha256}.json"
+            path = _canonical_lock_path(
+                lock_file.python_abi,
+                lock_file.platform_tag,
+                lock_file.condition_set_sha256,
             )
             entries.append(
                 LockManifestEntry(
@@ -871,6 +941,96 @@ def sha256_file(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def _parse_json(data: str | bytes, source: str) -> object:
+    """Parse strict JSON and expose artifact-scoped validation errors."""
+    try:
+        return parse_json_value(data)
+    except (DescriptorValidationError, UnicodeDecodeError, ValueError) as exc:
+        raise _error("JSON file is invalid", source) from exc
+
+
+def _validate_archive_contents(
+    members: list[tuple[str, bytes]],
+) -> None:
+    """Validate archive metadata and every manifest-referenced lock."""
+    contents = dict(members)
+    descriptor_value = _parse_json(contents["channel.json"], "channel.json")
+    descriptor_mapping = _mapping(
+        descriptor_value,
+        path=("channel.json",),
+    )
+    platform_values = descriptor_mapping.get("supported_platform_tags")
+    if not isinstance(platform_values, list) or not all(
+        isinstance(item, str) for item in platform_values
+    ):
+        raise _error(
+            "Descriptor supported_platform_tags must be an array",
+            "channel.json",
+        )
+    try:
+        descriptor = ChannelDescriptor.from_mapping(
+            descriptor_mapping,
+            allowed_platform_tags=frozenset(platform_values),
+        )
+    except DescriptorValidationError as exc:
+        raise _error("Archive descriptor is invalid", "channel.json") from exc
+
+    schema_value = _parse_json(
+        contents["config.schema.json"],
+        "config.schema.json",
+    )
+    schema = _mapping(schema_value, path=("config.schema.json",))
+    schema_type = schema.get("type")
+    if not (
+        schema_type == "object"
+        or (isinstance(schema_type, list) and "object" in schema_type)
+    ):
+        raise _error(
+            "Archive config schema must describe an object",
+            "config.schema.json",
+        )
+
+    manifest_value = _parse_json(
+        contents["release-manifest.json"],
+        "release-manifest.json",
+    )
+    lock_manifest = LockManifest.from_mapping(
+        manifest_value,
+        allowed_platform_tags=descriptor.supported_platform_tags,
+        descriptor=descriptor,
+    )
+    referenced_paths = {entry.lock_path for entry in lock_manifest.locks}
+    archive_lock_paths = {
+        name for name, _ in members if name.startswith("locks/")
+    }
+    if archive_lock_paths != referenced_paths:
+        raise _error(
+            "Archive lock files must match release manifest references",
+            "locks",
+        )
+    for entry in lock_manifest.locks:
+        lock_value = _parse_json(contents[entry.lock_path], entry.lock_path)
+        lock_file = LockFile.from_mapping(
+            lock_value,
+            allowed_platform_tags=descriptor.supported_platform_tags,
+        )
+        if (
+            lock_file.channel_key != descriptor.channel_key
+            or lock_file.python_abi != entry.python_abi
+            or lock_file.platform_tag != entry.platform_tag
+            or lock_file.condition_set_sha256 != entry.condition_set_sha256
+        ):
+            raise _error(
+                "Lock file does not match release manifest target",
+                entry.lock_path,
+            )
+        if lock_file.sha256() != entry.lock_sha256:
+            raise _error(
+                "Lock file hash does not match manifest",
+                entry.lock_path,
+            )
+
+
 def _archive_paths(code_root: Path) -> list[tuple[str, bytes]]:
     root = Path(code_root).resolve()
     if not root.is_dir():
@@ -904,6 +1064,7 @@ def _archive_paths(code_root: Path) -> list[tuple[str, bytes]]:
         raise _error("Archive must contain release-manifest.json")
     if not any(name.startswith("locks/") for name in names):
         raise _error("Archive must contain release locks")
+    _validate_archive_contents(members)
     return sorted(members, key=lambda item: item[0])
 
 
@@ -937,6 +1098,7 @@ def write_canonical_json(path: Path, value: Mapping[str, object]) -> None:
 def read_json(path: Path) -> object:
     """Read strict UTF-8 JSON for release tooling."""
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        data = Path(path).read_bytes()
+    except OSError as exc:
         raise _error("JSON file is invalid", str(path)) from exc
+    return _parse_json(data, str(path))

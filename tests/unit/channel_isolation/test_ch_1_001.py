@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 import zipfile
 
 import pytest
@@ -25,10 +26,13 @@ from qwenpaw.channel_protocol import (
     condition_domain,
     read_json,
     sha256_file,
+    write_canonical_json,
 )
 from scripts.channel_isolation.audit_channel_dependencies import (
     audit_channel,
     direct_dependencies,
+    import_roots,
+    main as audit_main,
 )
 from scripts.channel_isolation.build_fixture_artifact import build_fixture
 
@@ -100,6 +104,33 @@ def _empty_lock(condition_digest: str = EMPTY_CONDITION_DIGEST) -> LockFile:
         condition_set_sha256=condition_digest,
         direct_requirements=(),
         packages=(),
+    )
+
+
+def _requests_lock(condition_digest: str) -> LockFile:
+    """Build a lock satisfying the descriptor's direct requirement."""
+    package = LockPackage.from_mapping(
+        {
+            "name": "requests",
+            "version": "2.31.0",
+            "marker": None,
+            "direct": True,
+            "wheels": [
+                {
+                    "filename": "requests-2.31.0-py3-none-any.whl",
+                    "url": None,
+                    "sha256": "b" * 64,
+                },
+            ],
+        },
+    )
+    return LockFile(
+        channel_key="fixture",
+        python_abi="cp313-cp313",
+        platform_tag="macosx_11_0_arm64",
+        condition_set_sha256=condition_digest,
+        direct_requirements=("requests>=2",),
+        packages=(package,),
     )
 
 
@@ -216,13 +247,52 @@ def test_lock_requires_direct_flags_to_match_requirements() -> None:
         )
 
 
+def test_lock_rejects_direct_version_or_marker_mismatch() -> None:
+    """Direct requirements must match the selected package metadata."""
+    package = LockPackage.from_mapping(
+        {
+            "name": "demo-package",
+            "version": "1.0",
+            "marker": None,
+            "direct": True,
+            "wheels": [
+                {
+                    "filename": "demo_package-1.0-py3-none-any.whl",
+                    "url": None,
+                    "sha256": "a" * 64,
+                },
+            ],
+        },
+    )
+    for requirement in (
+        "demo-package>=2",
+        'demo-package>=1; python_version >= "3.11"',
+    ):
+        with pytest.raises(ArtifactValidationError):
+            LockFile.from_mapping(
+                {
+                    "schema_version": 1,
+                    "channel_key": "fixture",
+                    "python_abi": "cp313-cp313",
+                    "platform_tag": "macosx_11_0_arm64",
+                    "condition_set_sha256": EMPTY_CONDITION_DIGEST,
+                    "direct_requirements": [requirement],
+                    "packages": [package.to_mapping()],
+                },
+                allowed_platform_tags=PLATFORMS,
+            )
+
+
 def test_lock_manifest_rejects_duplicate_target() -> None:
     """One target key cannot silently select multiple lock files."""
     entry = LockManifestEntry(
         python_abi="cp313-cp313",
         platform_tag="macosx_11_0_arm64",
         condition_set_sha256=EMPTY_CONDITION_DIGEST,
-        lock_path="locks/one.json",
+        lock_path=(
+            "locks/cp313-cp313/macosx_11_0_arm64/"
+            f"{EMPTY_CONDITION_DIGEST}.json"
+        ),
         lock_sha256="a" * 64,
     )
     value = {
@@ -232,6 +302,68 @@ def test_lock_manifest_rejects_duplicate_target() -> None:
     }
     with pytest.raises(ArtifactValidationError):
         LockManifest.from_mapping(value, allowed_platform_tags=PLATFORMS)
+
+
+@pytest.mark.parametrize(
+    "lock_path",
+    [
+        (
+            "locks/./cp313-cp313/macosx_11_0_arm64/"
+            f"{EMPTY_CONDITION_DIGEST}.json"
+        ),
+        (
+            "locks//cp313-cp313/macosx_11_0_arm64/"
+            f"{EMPTY_CONDITION_DIGEST}.json"
+        ),
+        (
+            "locks/cp313-cp313/macosx_11_0_arm64/"
+            f"{EMPTY_CONDITION_DIGEST.upper()}.json"
+        ),
+    ],
+)
+def test_lock_manifest_rejects_noncanonical_lock_path(lock_path: str) -> None:
+    """Manifest paths must be the generated canonical target paths."""
+    value = {
+        "schema_version": 1,
+        "channel_key": "fixture",
+        "locks": [
+            {
+                "python_abi": "cp313-cp313",
+                "platform_tag": "macosx_11_0_arm64",
+                "condition_set_sha256": EMPTY_CONDITION_DIGEST,
+                "lock_path": lock_path,
+                "lock_sha256": "a" * 64,
+            },
+        ],
+    }
+    with pytest.raises(ArtifactValidationError):
+        LockManifest.from_mapping(value, allowed_platform_tags=PLATFORMS)
+
+
+def test_lock_manifest_materializes_platform_registry_generator() -> None:
+    """A one-shot platform iterable must support every manifest entry."""
+    value = {
+        "schema_version": 1,
+        "channel_key": "fixture",
+        "locks": [
+            {
+                "python_abi": "cp313-cp313",
+                "platform_tag": platform,
+                "condition_set_sha256": EMPTY_CONDITION_DIGEST,
+                "lock_path": (
+                    f"locks/cp313-cp313/{platform}/"
+                    f"{EMPTY_CONDITION_DIGEST}.json"
+                ),
+                "lock_sha256": "a" * 64,
+            }
+            for platform in ("macosx_11_0_arm64", "win_amd64")
+        ],
+    }
+    manifest = LockManifest.from_mapping(
+        value,
+        allowed_platform_tags=(tag for tag in PLATFORMS),
+    )
+    assert len(manifest.locks) == 2
 
 
 def test_lock_manifest_requires_every_condition_target() -> None:
@@ -275,26 +407,97 @@ def test_artifact_record_and_manifest_keep_metadata_separate() -> None:
     assert ArtifactManifest.from_mapping(manifest.to_mapping()) == manifest
 
 
+@pytest.mark.parametrize(
+    "download_url",
+    [
+        "https://",
+        "https:///x",
+        "https://host:99999/a",
+        "https://host/%zz",
+        "https://host/\x01",
+    ],
+)
+def test_artifact_rejects_invalid_download_url(download_url: str) -> None:
+    """Artifact records reject malformed absolute HTTP(S) URLs."""
+    record = ArtifactRecord(
+        channel_key="fixture",
+        source_kind="builtin",
+        release_version="1.0.0",
+        qwenpaw_compatibility=VersionRange("2.1.0", None),
+        protocol_compatibility=ProtocolRange(1, 1),
+        download_url="https://example.invalid/fixture.zip",
+        artifact_sha256="a" * 64,
+    )
+    value = record.to_mapping()
+    value["download_url"] = download_url
+    with pytest.raises(ArtifactValidationError):
+        ArtifactRecord.from_mapping(value)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"schema_version":1,"schema_version":2}',
+        '{"value":NaN}',
+    ],
+)
+def test_read_json_uses_strict_decoder(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    """Release JSON rejects duplicate keys and non-finite numbers."""
+    path = tmp_path / "metadata.json"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(ArtifactValidationError):
+        read_json(path)
+
+
+def test_read_json_rejects_invalid_utf8(tmp_path: Path) -> None:
+    """Release JSON must be valid UTF-8."""
+    path = tmp_path / "metadata.json"
+    path.write_bytes(b"\xff")
+    with pytest.raises(ArtifactValidationError):
+        read_json(path)
+
+
+def _write_valid_archive_root(code_root: Path) -> None:
+    """Write complete descriptor, manifest, and lock metadata."""
+    descriptor = _descriptor()
+    lock_files = tuple(
+        _requests_lock(condition_domain(descriptor, {"region": region})[1])
+        for region in ("asia", "eu")
+    )
+    lock_manifest = LockManifest.from_lock_files(descriptor, lock_files)
+    code_root.mkdir(parents=True)
+    write_canonical_json(code_root / "channel.json", descriptor.to_mapping())
+    write_canonical_json(
+        code_root / "config.schema.json",
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+        },
+    )
+    write_canonical_json(
+        code_root / "release-manifest.json",
+        lock_manifest.to_mapping(),
+    )
+    for lock_file, entry in zip(lock_files, lock_manifest.locks):
+        write_canonical_json(
+            code_root / entry.lock_path,
+            lock_file.to_mapping(),
+        )
+    (code_root / "fixture_runner.py").write_text(
+        "class EmptyDriver: pass\n",
+        encoding="utf-8",
+    )
+
+
 def test_reproducible_fixture_archive_and_source_revision(
     tmp_path: Path,
 ) -> None:
     """Archive bytes and source revision are stable across rebuilds."""
     code_root = tmp_path / "code"
-    (code_root / "locks").mkdir(parents=True)
-    (code_root / "channel.json").write_text("{}", encoding="utf-8")
-    (code_root / "config.schema.json").write_text(
-        '{"type":"object"}',
-        encoding="utf-8",
-    )
-    (code_root / "release-manifest.json").write_text(
-        '{"schema_version":1,"channel_key":"fixture","locks":[]}',
-        encoding="utf-8",
-    )
-    (code_root / "locks" / "empty.json").write_text("{}", encoding="utf-8")
-    (code_root / "driver.py").write_text(
-        "class EmptyDriver: pass\n",
-        encoding="utf-8",
-    )
+    _write_valid_archive_root(code_root)
 
     first = tmp_path / "first.zip"
     second = tmp_path / "second.zip"
@@ -308,6 +511,21 @@ def test_reproducible_fixture_archive_and_source_revision(
         names = archive.namelist()
     assert names == sorted(names)
     assert all(not name.endswith(".whl") for name in names)
+
+
+def test_archive_rejects_semantically_invalid_metadata(tmp_path: Path) -> None:
+    """Required archive files must contain valid release metadata."""
+    code_root = tmp_path / "code"
+    (code_root / "locks").mkdir(parents=True)
+    for relative in (
+        "channel.json",
+        "config.schema.json",
+        "release-manifest.json",
+    ):
+        (code_root / relative).write_text("{}", encoding="utf-8")
+    (code_root / "locks" / "empty.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ArtifactValidationError):
+        build_reproducible_zip(code_root, tmp_path / "artifact.zip")
 
 
 def test_fixture_builder_emits_a_complete_parseable_artifact(
@@ -384,6 +602,35 @@ def test_runner_dependency_audit_exposes_transitive_channel_imports() -> None:
     assert "aiohttp" in onebot.undeclared_distributions
     assert "aiohttp" in voice.undeclared_distributions
     assert "fastapi" in voice.undeclared_distributions
+
+
+def test_runner_dependency_audit_rejects_missing_channel_root(
+    tmp_path: Path,
+) -> None:
+    """A missing Channel source root must fail the audit."""
+    with pytest.raises(ValueError, match="not a directory"):
+        import_roots(tmp_path / "missing")
+
+
+def test_runner_dependency_audit_cli_rejects_missing_channel_root(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The audit CLI must return non-zero for a missing source root."""
+    repository_root = Path(__file__).parents[3]
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "audit_channel_dependencies.py",
+            str(repository_root / "pyproject.toml"),
+            "--channel",
+            "missing",
+            str(repository_root / "missing-channel-root"),
+        ],
+    )
+    assert audit_main() == 2
+    assert "not a directory" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

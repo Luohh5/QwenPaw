@@ -43,8 +43,11 @@ def direct_dependencies(pyproject: Path) -> frozenset[str]:
 
 def import_roots(source_root: Path) -> frozenset[str]:
     """Return top-level absolute imports under one Channel source tree."""
+    root = Path(source_root)
+    if not root.is_dir():
+        raise ValueError(f"Channel source root is not a directory: {root}")
     names: set[str] = set()
-    for path in sorted(Path(source_root).rglob("*.py")):
+    for path in sorted(root.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -117,10 +120,14 @@ def main() -> int:
     )
     args = parser.parse_args()
     declared = direct_dependencies(args.pyproject)
-    reports = [
-        audit_channel(key, Path(root), declared).to_mapping()
-        for key, root in args.channel
-    ]
+    try:
+        reports = [
+            audit_channel(key, Path(root), declared).to_mapping()
+            for key, root in args.channel
+        ]
+    except (OSError, SyntaxError, UnicodeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     print(json.dumps(reports, sort_keys=True, separators=(",", ":")))
     return 0
 
