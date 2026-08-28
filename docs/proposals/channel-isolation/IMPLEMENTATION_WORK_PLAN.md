@@ -944,7 +944,7 @@ Desktop bundled Python、完整安装形态以及 OS/Python ABI/架构发布矩�
 
 ### CH-1-002：Environment Spec 和严格校验
 
-- 状态：[-] 实施完成，等待独立 Review 和最终验证
+- 状态：[x] 独立 Review 和最终验证通过
 
 - [x] 实现 environment spec 选择和严格 manifest 校验。
 - [x] 验证不继承主环境 `site-packages`、user site 和 `PYTHONPATH`。
