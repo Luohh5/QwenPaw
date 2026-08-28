@@ -922,7 +922,7 @@ Desktop bundled Python、完整安装形态以及 OS/Python ABI/架构发布矩�
 
 ### CH-1-001：Lock 和 Channel artifact 发布制品
 
-- 状态：[-] 实施完成，等待独立 Review 和最终验证
+- 状态：[x] 独立 Review 和最终验证通过
 
 - [x] 定义每个 Channel 的依赖输入和 conditional config domain。
 - [x] 定义官方 Channel artifact record、发行版本、QwenPaw/Protocol 兼容范围、下载 URL、
