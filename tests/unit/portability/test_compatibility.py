@@ -30,7 +30,7 @@ def _skill(tmp_path: Path, name: str = "demo") -> SimpleNamespace:
     )
 
 
-def test_four_zone_workflow_requires_current_passing_test(
+def test_repair_workflow_requires_current_passing_test(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "manifest.json"
@@ -41,13 +41,8 @@ def test_four_zone_workflow_requires_current_passing_test(
         skills=[_skill(tmp_path)],
     )
 
-    with pytest.raises(RuntimeError, match="semantic triage"):
+    with pytest.raises(RuntimeError, match="latest change"):
         store.classify("demo", AssetZone.MIGRATE, "works")
-
-    store.record_inspection("demo")
-    with pytest.raises(RuntimeError, match="semantic triage"):
-        store.record_test("demo", passed=False, summary="invalid")
-    store.classify("demo", AssetZone.REPAIR, "portable and not duplicated")
     store.record_test("demo", passed=False, summary="bound to codex")
     store.mark_changed("demo", "updated SKILL.md")
     with pytest.raises(RuntimeError, match="latest change"):
@@ -58,23 +53,7 @@ def test_four_zone_workflow_requires_current_passing_test(
     assert manifest.by_zone(AssetZone.MIGRATE)[0].revision == 1
 
 
-def test_semantic_triage_can_discard_without_static_test(
-    tmp_path: Path,
-) -> None:
-    store = CompatibilityStore(tmp_path / "manifest.json")
-    store.prepare(
-        migration_id="migration-2",
-        source="qoder",
-        skills=[_skill(tmp_path)],
-    )
-    store.record_inspection("demo")
-    manifest = store.classify("demo", AssetZone.DISCARD, "QwenPaw has it")
-    assert manifest.by_zone(AssetZone.DISCARD)
-    with pytest.raises(RuntimeError, match="repair zone"):
-        store.record_test("demo", passed=True, summary="irrelevant")
-
-
-def test_hard_stop_preserves_unreviewed_staging_items(
+def test_hard_stop_preserves_repair_items(
     tmp_path: Path,
 ) -> None:
     store = CompatibilityStore(tmp_path / "manifest.json")
@@ -85,7 +64,7 @@ def test_hard_stop_preserves_unreviewed_staging_items(
     )
     manifest = store.finish(stopped=True, reason="mission limit")
     assert manifest.state is RunState.STOPPED_LIMIT
-    assert manifest.assets[0].zone is AssetZone.STAGING
+    assert manifest.assets[0].zone is AssetZone.REPAIR
     assert manifest.stop_reason == "mission limit"
 
 
@@ -99,16 +78,16 @@ def test_asset_budget_reserves_final_classification_call(
         skills=[_skill(tmp_path)],
     )
     budget = manifest.assets[0].tool_budget
-    store.record_inspection("demo")
     for _ in range(budget - 1):
         store.consume("demo", reserve=1)
     with pytest.raises(RuntimeError, match="tool-call budget"):
         store.consume("demo", reserve=1)
 
     store.consume("demo")
-    result = store.classify("demo", AssetZone.DISCARD, "equivalent")
+    store.record_test("demo", passed=True, summary="native loader passed")
+    result = store.classify("demo", AssetZone.MIGRATE, "ready")
     assert result.assets[0].tool_calls == budget
-    assert result.assets[0].zone is AssetZone.DISCARD
+    assert result.assets[0].zone is AssetZone.MIGRATE
 
 
 def test_manifest_and_summary_are_owner_only_and_secret_free(

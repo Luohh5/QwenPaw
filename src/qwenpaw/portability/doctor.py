@@ -200,17 +200,15 @@ def _adaptation_check(
     zone_counts = counts(manifest)
     migrate = zone_counts.get("migrate", 0)
     repair = zone_counts.get("repair", 0)
-    discard = zone_counts.get("discard", 0)
-    staging = zone_counts.get("staging", 0)
     status = "warning"
-    if manifest.state is RunState.COMPLETED and not repair and not staging:
+    if manifest.state is RunState.COMPLETED and not repair:
         status = "pass"
     return _check(
         "compatibility",
         status,
         "工具和设置兼容清单",
         f"已检查 {len(manifest.assets)} 项：待迁移 {migrate}，待修复 "
-        f"{repair}，丢弃 {discard}，仍在安全暂存区 {staging}；"
+        f"{repair}；"
         f"兼容流程状态为 {manifest.state.value}。",
     )
 

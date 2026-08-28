@@ -16,15 +16,6 @@ from qwenpaw.plugins.loader import PluginLoader
 from qwenpaw.portability.codex_plugin_adapter import (
     stage_codex_content_plugin,
 )
-from qwenpaw.portability.compatibility import (
-    AssetType,
-    AssetZone,
-    CompatibilityAsset,
-    CompatibilityManifest,
-    PluginDisposition,
-    RunState,
-    write_summary,
-)
 from qwenpaw.portability.models import (
     ImportReceipt,
     MigrationDoctorCheck,
@@ -196,57 +187,6 @@ def _content_plugins(
     )
 
 
-def _four_zone_manifest() -> CompatibilityManifest:
-    now = datetime(2026, 8, 20, tzinfo=timezone.utc)
-    return CompatibilityManifest(
-        migration_id="migration-fixture",
-        source="qoder",
-        created_at=now,
-        updated_at=now,
-        state=RunState.STOPPED_LIMIT,
-        stop_reason="fixture limit",
-        assets=[
-            CompatibilityAsset(
-                asset_key="skills:ready",
-                asset_type=AssetType.SKILL,
-                source_id="ready",
-                name="ready",
-                zone=AssetZone.MIGRATE,
-                reason="native test passed",
-                updated_at=now,
-            ),
-            CompatibilityAsset(
-                asset_key="mcp:repair",
-                asset_type=AssetType.MCP,
-                source_id="repair",
-                name="repair",
-                zone=AssetZone.REPAIR,
-                reason="needs a local command",
-                changes=["rewrote command"],
-                updated_at=now,
-            ),
-            CompatibilityAsset(
-                asset_key="plugins:discard",
-                asset_type=AssetType.PLUGIN,
-                source_id="discard",
-                name="discard",
-                zone=AssetZone.DISCARD,
-                reason="QwenPaw already provides it",
-                plugin_disposition=PluginDisposition.UNUSABLE,
-                updated_at=now,
-            ),
-            CompatibilityAsset(
-                asset_key="scheduled_tasks:pending",
-                asset_type=AssetType.SCHEDULED_TASK,
-                source_id="pending",
-                name="pending",
-                reason="",
-                updated_at=now,
-            ),
-        ],
-    )
-
-
 @pytest.mark.asyncio
 async def test_codex_mini_home_matches_golden_inventory(
     tmp_path: Path,
@@ -292,24 +232,6 @@ async def test_qoder_mini_home_matches_golden_inventory(
     )
 
 
-def test_four_zone_summary_matches_reviewed_contract(tmp_path: Path) -> None:
-    manifest = _four_zone_manifest()
-    summary = tmp_path / "summary.md"
-
-    write_summary(summary, manifest)
-
-    expected = _FIXTURES / "golden" / "four-zone-summary.md"
-    assert summary.read_text(encoding="utf-8") == expected.read_text(
-        encoding="utf-8",
-    )
-
-
-def test_four_zone_manifest_matches_reviewed_contract() -> None:
-    assert _four_zone_manifest().model_dump(mode="json") == _golden_json(
-        "four-zone-manifest.json",
-    )
-
-
 def test_import_receipt_matches_reviewed_contract() -> None:
     started = datetime(2026, 8, 20, tzinfo=timezone.utc)
     completed = datetime(2026, 8, 20, 0, 5, tzinfo=timezone.utc)
@@ -340,8 +262,6 @@ def test_import_receipt_matches_reviewed_contract() -> None:
         adaptation_counts={
             "migrate": 4,
             "repair": 0,
-            "discard": 0,
-            "staging": 0,
         },
         warnings=["fixture warning"],
         doctor_report=MigrationDoctorReport(

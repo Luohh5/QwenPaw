@@ -100,7 +100,7 @@
       "succeeded": "Berhasil"
     },
     "hints": {
-      "notNeeded": "Item bergantung pada aplikasi AI asal atau QwenPaw sudah memiliki fungsi yang setara.",
+      "notNeeded": "Item ini sudah ada di QwenPaw atau tidak perlu diimpor oleh rencana migrasi ini.",
       "failed": "Sesuaikan konfigurasi terkait secara manual.",
       "disabled": "Berhasil diimpor tetapi tetap nonaktif hingga Anda meninjau dan mengaktifkannya."
     },

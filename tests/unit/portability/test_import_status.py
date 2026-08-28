@@ -48,7 +48,7 @@ def _action(
         source_id=source_id,
         name=name,
         action=action,
-        fidelity="agent_decision",
+        fidelity="mission_repair",
         reason_zh=reason,
     )
 
@@ -129,9 +129,8 @@ def test_projects_five_state_lifecycle(manifest, receipt, expected) -> None:
     assert results[0].state is expected
 
 
-def test_discard_and_existing_assets_are_not_needed() -> None:
+def test_existing_assets_are_not_needed() -> None:
     plan = _plan(
-        _action("skill", "bound", "Bound"),
         _action(
             "memory",
             "memory-1",
@@ -140,26 +139,13 @@ def test_discard_and_existing_assets_are_not_needed() -> None:
             reason="QwenPaw 中已经存在",
         ),
     )
-    manifest = _manifest(
-        AssetType.SKILL,
-        "bound",
-        "Bound",
-        AssetZone.DISCARD,
-        "绑定 Codex 生态",
-    )
-
     results = project_asset_results(
         plan,
-        {"skill:bound", "memory:memory-1"},
-        manifest=manifest,
+        {"memory:memory-1"},
     )
 
-    assert [item.state for item in results] == [
-        ImportAssetState.NOT_NEEDED,
-        ImportAssetState.NOT_NEEDED,
-    ]
-    assert results[0].message == "绑定 Codex 生态"
-    assert results[1].message == "QwenPaw 中已经存在"
+    assert results[0].state is ImportAssetState.NOT_NEEDED
+    assert results[0].message == "QwenPaw 中已经存在"
 
 
 def test_succeeded_but_disabled_is_tooltip_metadata() -> None:

@@ -100,7 +100,7 @@
       "succeeded": "Concluído"
     },
     "hints": {
-      "notNeeded": "O item depende do aplicativo de IA de origem ou o QwenPaw já oferece uma função equivalente.",
+      "notNeeded": "Este item já existe no QwenPaw ou não precisa ser importado por este plano de migração.",
       "failed": "Ajuste manualmente a configuração relacionada.",
       "disabled": "Importado com sucesso, mas mantido desativado até sua revisão e ativação."
     },

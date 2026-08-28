@@ -362,12 +362,12 @@ def _asset(
 
 
 _ADAPTABLE = {
-    "skills": ("skill", "语义判断，必要时再由兼容流程修复"),
-    "mcp_servers": ("mcp", "语义判断，必要时再由兼容流程修复"),
-    "plugins": ("plugin", "判断整体可用性，必要时再启动兼容修复"),
+    "skills": ("skill", "由 Mission 进行兼容性测试与修复"),
+    "mcp_servers": ("mcp", "由 Mission 进行兼容性测试与修复"),
+    "plugins": ("plugin", "由 Mission 进行兼容性测试与修复"),
     "scheduled_tasks": (
         "scheduled_task",
-        "语义判断，必要时再由兼容流程验证",
+        "由 Mission 进行兼容性测试与修复",
     ),
 }
 
@@ -382,8 +382,8 @@ def _adaptable_actions(
             item.source_id,
             item.name,
             "agent_mission_test_and_adapt",
-            "agent_decision",
-            f"进入安全暂存区，由 Agent {_ADAPTABLE[collection][1]}。",
+            "mission_repair",
+            f"安全暂存后，{_ADAPTABLE[collection][1]}。",
         )
         for collection in collections
         for item in getattr(inventory, collection)

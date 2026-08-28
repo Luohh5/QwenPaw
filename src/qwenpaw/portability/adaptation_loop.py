@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Parallel Agent triage followed by Mission-mode testing and repair."""
+"""Mission-mode compatibility testing and repair for imported assets."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from ..modes.mission import MissionMode
 from ..schemas import AgentRequest
 from ..utils.io_utils import run_async_to_completion, run_sync_io
 from .adaptation_mission import prepare_mission, sync_mission
-from .adaptation_prompts import repair_prompt, triage_prompt
+from .adaptation_prompts import repair_prompt
 from .adaptation_staging import component_map, stage_local_assets
 from .compatibility import (
     AssetType,
@@ -42,7 +42,6 @@ from .models import ProviderInventory
 from .providers.base import (
     ProgressReporter,
     report_progress as _report,
-    report_result,
 )
 
 _MAX_REACT_ITERATIONS = 4_000
@@ -50,11 +49,6 @@ _HEARTBEAT_SECONDS = 12
 _MAX_FILE_BYTES = 256 * 1024
 _EXCERPT_BYTES = 16 * 1024
 _MAX_REPLACEMENT_BYTES = 32 * 1024
-_TRIAGE_TOOLS = (
-    "migration_compat_inspect",
-    "migration_compat_read_file",
-    "migration_compat_classify",
-)
 _REPAIR_TOOLS = (
     "migration_compat_inspect",
     "migration_compat_read_file",
@@ -78,7 +72,6 @@ class AdaptationResult:
 @dataclass(frozen=True)
 class _RequestBinding:
     context: "ActiveAdaptationContext"
-    phase: str
     asset_key: str
 
 
@@ -132,10 +125,6 @@ class ActiveAdaptationContext:
         return binding
 
     @property
-    def phase(self) -> str:
-        return self._binding().phase
-
-    @property
     def active_asset_key(self) -> str:
         return self._binding().asset_key
 
@@ -179,10 +168,6 @@ class ActiveAdaptationContext:
 
     def _asset(self, key: str) -> CompatibilityAsset:
         return load_manifest(self.store.path).get_asset(key)
-
-    def _require_repair_phase(self) -> None:
-        if self.phase != "mission_repair":
-            raise PermissionError("compatibility changes require repair phase")
 
     def _audit(self, action: str, key: str, detail: str = "") -> None:
         self.audit_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -260,10 +245,9 @@ class ActiveAdaptationContext:
             self._consume(key)
             asset = self._asset(key)
             await self._publish(
-                f"正在分析 {self._label(asset)} 的功能和来源生态依赖…",
+                f"正在检查 {self._label(asset)} 的 QwenPaw 兼容性…",
             )
             result = {"ok": True, **self.tester.inspect(asset)}
-            self.store.record_inspection(key)
             return result
 
     async def read_file(
@@ -285,12 +269,6 @@ class ActiveAdaptationContext:
                 raise FileNotFoundError(relative_path)
             size = path.stat().st_size
             if size > _MAX_FILE_BYTES:
-                self.store.record_read(
-                    key,
-                    relative_path,
-                    started=True,
-                    finished=True,
-                )
                 return {
                     "ok": True,
                     "path": relative_path,
@@ -306,12 +284,6 @@ class ActiveAdaptationContext:
             start = max(1, start_line)
             end = min(len(lines), max(start, end_line), start + 399)
             finished = end >= len(lines)
-            self.store.record_read(
-                key,
-                relative_path,
-                started=start == 1,
-                finished=finished,
-            )
             return {
                 "ok": True,
                 "path": relative_path,
@@ -330,7 +302,6 @@ class ActiveAdaptationContext:
         content: str,
     ) -> dict[str, Any]:
         async with self._lock:
-            self._require_repair_phase()
             asset = self._asset(key)
             self._consume(key)
             if asset.zone is not AssetZone.REPAIR:
@@ -375,7 +346,6 @@ class ActiveAdaptationContext:
         value_json: str,
     ) -> dict[str, Any]:
         async with self._lock:
-            self._require_repair_phase()
             self._consume(key)
             if len(value_json.encode()) > _MAX_REPLACEMENT_BYTES:
                 raise ValueError("updated value is too large")
@@ -451,7 +421,6 @@ class ActiveAdaptationContext:
 
     async def test_asset(self, key: str) -> dict[str, Any]:
         async with self._lock:
-            self._require_repair_phase()
             self._consume(key)
             asset = self._asset(key)
             await self._publish(
@@ -473,54 +442,24 @@ class ActiveAdaptationContext:
         key: str,
         zone: str,
         reason: str,
-        plugin_disposition: str = "",
-        component_assessments_json: str = "{}",
     ) -> dict[str, Any]:
         async with self._lock:
             asset = self._asset(key)
-            expected = (
-                AssetZone.STAGING
-                if self.phase == "triage"
-                else AssetZone.REPAIR
-            )
-            if asset.zone is not expected:
+            if asset.zone is not AssetZone.REPAIR:
                 raise PermissionError(
-                    f"{self.phase} phase cannot classify {asset.zone.value}",
+                    "only repair assets can be classified: "
+                    f"{asset.zone.value}",
                 )
             self._consume(
                 key,
                 final=True,
             )
             selected = AssetZone(zone)
-            assessments = json.loads(component_assessments_json)
-            if not isinstance(assessments, dict):
-                raise ValueError("component assessments must be an object")
-            manifest = self.store.classify(
-                key,
-                selected,
-                reason,
-                plugin_disposition=plugin_disposition,
-                component_assessments=assessments,
-            )
+            manifest = self.store.classify(key, selected, reason)
             self._audit("classify", key, selected.value)
-            status = {
-                AssetZone.REPAIR: "语义评估完成：可以进行兼容性修复。",
-                AssetZone.DISCARD: "语义评估完成：无需迁移。",
-                AssetZone.MIGRATE: "兼容性优化完成，已进入待迁移区。",
-            }[selected]
-            if selected is AssetZone.DISCARD:
-                public_type = asset.asset_type.value.rstrip("s")
-                if public_type == "scheduled_task":
-                    public_type = "cron"
-                await report_result(
-                    self.progress,
-                    "asset",
-                    public_type,
-                    "not_needed",
-                    "-",
-                    asset.source_id,
-                )
-            await self._publish(f"{self._label(self._asset(key))}{status}")
+            await self._publish(
+                f"{self._label(self._asset(key))}兼容性优化完成，已进入待迁移区。",
+            )
             return {
                 "ok": True,
                 "zone": selected.value,
@@ -550,7 +489,6 @@ async def _run_phase(
     *,
     session_id: str,
     asset: CompatibilityAsset,
-    phase: str,
     prompt: str,
     tools: tuple[str, ...],
     label: str,
@@ -572,7 +510,7 @@ async def _run_phase(
             "channel": "console",
             "request_context": {
                 "source": "portability_adaptation",
-                "portability_phase": phase,
+                "portability_phase": "mission_repair",
                 "max_react_iterations": _iteration_budget(
                     asset.tool_budget - asset.tool_calls,
                 ),
@@ -585,7 +523,6 @@ async def _run_phase(
     )
     _ACTIVE_CONTEXTS[session_id] = _RequestBinding(
         context,
-        phase,
         asset.asset_key,
     )
     task = asyncio.create_task(
@@ -636,77 +573,6 @@ async def _bounded_parallel(keys: list[str], worker: Any) -> None:
             raise result
 
 
-async def _triage_asset(
-    workspace: Any,
-    context: ActiveAdaptationContext,
-    key: str,
-    warnings: list[str],
-) -> None:
-    session_id = f"migration-triage:{secrets.token_urlsafe(24)}"
-    while True:
-        asset = context._asset(key)  # pylint: disable=protected-access
-        if asset.zone is not AssetZone.STAGING or asset.budget_exhausted:
-            return
-        before = asset.tool_calls
-        label = context._label(asset)  # pylint: disable=protected-access
-        try:
-            await _run_phase(
-                workspace,
-                context,
-                session_id=session_id,
-                asset=asset,
-                phase="triage",
-                prompt=triage_prompt(asset),
-                tools=_TRIAGE_TOOLS,
-                label=f"正在检查 {label}",
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            warnings.append(
-                f"{label}语义判断失败：{type(exc).__name__}: {exc}",
-            )
-            current = context._asset(key)  # pylint: disable=protected-access
-            if (
-                current.zone is AssetZone.STAGING
-                and current.tool_calls > before
-                and not current.budget_exhausted
-            ):
-                await _report(
-                    context.progress,
-                    f"{label}保留已读进度，继续完成语义判断。",
-                )
-                continue
-            return
-        current = context._asset(key)  # pylint: disable=protected-access
-        if current.zone is not AssetZone.STAGING:
-            return
-        if current.tool_calls == before:
-            warnings.append(f"{label}语义判断未产生进展")
-            return
-
-
-async def _triage_assets(
-    workspace: Any,
-    context: ActiveAdaptationContext,
-    warnings: list[str],
-) -> str:
-    keys = [
-        item.asset_key
-        for item in load_manifest(context.store.path).by_zone(
-            AssetZone.STAGING,
-        )
-    ]
-    await _bounded_parallel(
-        keys,
-        lambda key: _triage_asset(workspace, context, key, warnings),
-    )
-    remaining = load_manifest(context.store.path).by_zone(AssetZone.STAGING)
-    if not remaining:
-        return ""
-    if context.tool_calls >= context.total_tool_budget:
-        return f"第一阶段达到总工具调用上限（{context.total_tool_budget} 次）。"
-    return f"第一阶段仍有 {len(remaining)} 项未完成语义判断。"
-
-
 async def _repair_asset(
     workspace: Any,
     context: ActiveAdaptationContext,
@@ -721,7 +587,6 @@ async def _repair_asset(
             context,
             session_id=f"migration-worker:{secrets.token_urlsafe(24)}",
             asset=asset,
-            phase="mission_repair",
             prompt=repair_prompt(asset),
             tools=_REPAIR_TOOLS,
             label=f"Mission 正在修复 {label}",
@@ -819,9 +684,8 @@ async def run_adaptation_loop(
     )
     await _report(
         progress,
-        f"工具和设置已进入安全暂存区，共 {len(manifest.assets)} 项；"
-        f"正在由 {MAX_SPAWN_BATCH_CONCURRENCY} 个隔离 Agent "
-        "并行进行语义判断…",
+        f"工具和设置已安全暂存，共 {len(manifest.assets)} 项；"
+        "正在启动 QwenPaw Mission 并行进行兼容性测试与修复…",
     )
     if not manifest.assets:
         manifest = store.finish()
@@ -844,36 +708,21 @@ async def run_adaptation_loop(
     )
     await _report(
         progress,
-        f"两阶段共享 {context.total_tool_budget} 次工具调用；" + "不设总时长限制，推理上限按剩余预算动态分配。",
+        f"Mission 共享 {context.total_tool_budget} 次工具调用；"
+        "不设总时长限制，推理上限按剩余预算动态分配。",
     )
-    stopped_reason = await _triage_assets(workspace, context, warnings)
-
-    if not stopped_reason:
-        manifest = load_manifest(store.path)
-        if manifest.by_zone(AssetZone.REPAIR):
-            await _report(
-                progress,
-                "第一阶段完成，安全暂存区已清空；正在启动 QwenPaw " + "Mission 并行进行兼容性测试与修复…",
-            )
-            try:
-                stopped_reason = await _repair_with_mission(
-                    workspace,
-                    context,
-                    root,
-                    warnings,
-                )
-                if stopped_reason:
-                    warnings.append(stopped_reason)
-            except Exception as exc:  # pylint: disable=broad-except
-                stopped_reason = (
-                    f"无法完成 QwenPaw Mission：{type(exc).__name__}: {exc}"
-                )
-                warnings.append(stopped_reason)
-        else:
-            await _report(
-                progress,
-                "第一阶段完成；没有需要兼容性修复的资产，无需启动 Mission。",
-            )
+    try:
+        stopped_reason = await _repair_with_mission(
+            workspace,
+            context,
+            root,
+            warnings,
+        )
+        if stopped_reason:
+            warnings.append(stopped_reason)
+    except Exception as exc:  # pylint: disable=broad-except
+        stopped_reason = f"无法完成 QwenPaw Mission：{type(exc).__name__}: {exc}"
+        warnings.append(stopped_reason)
 
     complete, reason = store.complete()
     if not complete and not stopped_reason:
@@ -892,8 +741,7 @@ async def run_adaptation_loop(
         progress,
         "兼容性迁移已结束："
         f"待迁移 {len(manifest.by_zone(AssetZone.MIGRATE))}，"
-        f"待修复 {len(manifest.by_zone(AssetZone.REPAIR))}，"
-        f"丢弃 {len(manifest.by_zone(AssetZone.DISCARD))}。",
+        f"待修复 {len(manifest.by_zone(AssetZone.REPAIR))}。",
     )
     return AdaptationResult(
         manifest_path=manifest_path,

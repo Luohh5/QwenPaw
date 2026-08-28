@@ -80,7 +80,7 @@ def discover_components(
     asset_type: AssetType,
     value: Any,
 ) -> list[PluginComponent]:
-    """Build a reading checklist; the Agent still owns every verdict."""
+    """Build a bounded reading checklist for Mission workers."""
     if asset_type is AssetType.SKILL:
         root = Path(value.directory)
         files = _text_files(root) if root.is_dir() else []

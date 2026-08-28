@@ -145,7 +145,7 @@
       "succeeded": "导入成功"
     },
     "hints": {
-      "notNeeded": "该工具绑定来源 Harness 生态，或 QwenPaw 中已有等价功能。",
+      "notNeeded": "该工具已存在于 QwenPaw 中，或本次迁移计划无需再次导入。",
       "failed": "请手动修改相关配置。",
       "disabled": "已成功导入，但为保证安全暂未启用；请审核后手动启用。"
     },

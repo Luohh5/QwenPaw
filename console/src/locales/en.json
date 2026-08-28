@@ -145,7 +145,7 @@
       "succeeded": "Succeeded"
     },
     "hints": {
-      "notNeeded": "This item depends on its original AI application, or QwenPaw already provides an equivalent feature.",
+      "notNeeded": "This item already exists in QwenPaw or does not need to be imported by this migration plan.",
       "failed": "Please adjust the related configuration manually.",
       "disabled": "Imported successfully but kept disabled until you review and enable it."
     },

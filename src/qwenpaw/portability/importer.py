@@ -79,11 +79,7 @@ async def _asset_items(
         present = (
             item.source_id in imported or getattr(item, "name", "") in imported
         )
-        state = (
-            "not_needed"
-            if zone == "discard"
-            else ("succeeded" if present else "failed")
-        )
+        state = "succeeded" if present else "failed"
         active = None if enabled is None else enabled and zone == "migrate"
         await report_result(
             progress,

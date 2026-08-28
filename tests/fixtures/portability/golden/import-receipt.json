@@ -29,7 +29,7 @@
   "adaptation_status": "completed",
   "adaptation_manifest": "adaptation/manifest.json",
   "adaptation_summary": "adaptation/summary.md",
-  "adaptation_counts": {"migrate": 4, "repair": 0, "discard": 0, "staging": 0},
+  "adaptation_counts": {"migrate": 4, "repair": 0},
   "warnings": ["fixture warning"],
   "doctor_report": {
     "status": "pass",

@@ -72,7 +72,7 @@ class _FakeServices:
                             source_id=f"{source}-skill",
                             name=f"{source.title()} Skill",
                             action="agent_mission_test_and_adapt",
-                            fidelity="agent_decision",
+                            fidelity="mission_repair",
                         ),
                     ],
                 )

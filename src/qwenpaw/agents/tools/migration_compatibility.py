@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Private tools used by the two-stage migration compatibility workflow."""
+"""Private tools used by Mission migration compatibility work."""
 
 from __future__ import annotations
 
@@ -97,23 +97,16 @@ async def migration_compat_test(asset_key: str) -> str:
 
 @_compat_tool(
     "migration_compat_classify",
-    (
-        "Triage staging to repair/discard, or promote tested repair "
-        "to migrate."
-    ),
+    "Promote one tested repair asset to migration.",
 )
 async def migration_compat_classify(
     asset_key: str,
     zone: str,
     reason: str,
-    plugin_disposition: str = "",
-    component_assessments_json: str = "{}",
 ) -> str:
     return await _invoke(
         "classify_asset",
         asset_key,
         zone,
         reason,
-        plugin_disposition,
-        component_assessments_json,
     )

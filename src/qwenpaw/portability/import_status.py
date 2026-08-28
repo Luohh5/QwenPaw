@@ -77,11 +77,7 @@ def project_asset_results(
 
         compatibility_type = _COMPATIBILITY_KEYS.get(action.asset_type)
         asset = zones.get(f"{compatibility_type}:{action.source_id}")
-        if asset and asset.zone is AssetZone.DISCARD:
-            result.state = ImportAssetState.NOT_NEEDED
-            result.reason_code = "compatibility_discard"
-            result.message = asset.reason
-        elif receipt is None:
+        if receipt is None:
             if asset and asset.zone in {AssetZone.REPAIR, AssetZone.MIGRATE}:
                 result.state = ImportAssetState.REPAIRING
         elif _matches(

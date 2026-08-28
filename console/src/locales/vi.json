@@ -100,7 +100,7 @@
       "succeeded": "Thành công"
     },
     "hints": {
-      "notNeeded": "Mục này phụ thuộc vào ứng dụng AI nguồn hoặc QwenPaw đã có chức năng tương đương.",
+      "notNeeded": "Mục này đã có trong QwenPaw hoặc không cần được nhập lại theo kế hoạch di chuyển này.",
       "failed": "Vui lòng chỉnh sửa cấu hình liên quan theo cách thủ công.",
       "disabled": "Đã nhập thành công nhưng vẫn tắt cho đến khi bạn xem xét và bật."
     },

@@ -56,12 +56,6 @@ def _receipt(
         scheduled_tasks=[task],
     )
     if zone is not None:
-        store.record_inspection("scheduled_tasks:remote-task")
-        store.classify(
-            "scheduled_tasks:remote-task",
-            AssetZone.REPAIR,
-            "fixture",
-        )
         if zone is AssetZone.MIGRATE:
             store.record_test(
                 "scheduled_tasks:remote-task",
@@ -193,22 +187,6 @@ async def test_doctor_warns_when_source_reader_rejected_raw_definitions(
     assert check.status == "warning"
     assert "另有 1 个来源记录未进入可迁移定义" in check.detail_zh
     assert "已结束、已取消、损坏或规则无法等价转换" in check.detail_zh
-
-
-@pytest.mark.asyncio
-async def test_doctor_fails_if_imported_job_is_not_compatibility_ready(
-    doctor_case,
-) -> None:
-    case = doctor_case(zone=None)
-    report = await run_migration_doctor(
-        case.workspace,
-        case.inventory,
-        case.receipt,
-    )
-
-    check = _schedule_check(report)
-    assert check.status == "fail"
-    assert "兼容清单确认已分类 0/1" in check.detail_zh
 
 
 @pytest.mark.asyncio

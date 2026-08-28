@@ -2,8 +2,8 @@
 # pylint: disable=protected-access
 import asyncio
 import inspect
-from pathlib import Path
 import json
+from pathlib import Path
 import sys
 from textwrap import indent
 from types import SimpleNamespace
@@ -48,22 +48,6 @@ def _skill(tmp_path: Path, body: str) -> SourceSkill:
         description="demo",
         directory=root,
     )
-
-
-async def _review_plugin(context, key: str, disposition="fully_usable"):
-    inspected = await context.inspect_asset(key)
-    components = inspected["asset"]["components"]
-    assessments = {}
-    for component in components:
-        for path in component["paths"]:
-            await context.read_file(key, path, end_line=10_000)
-        assessments[component["component_id"]] = {
-            "verdict": (
-                "portable" if disposition == "fully_usable" else "adaptable"
-            ),
-            "reason": "component content is portable",
-        }
-    return json.dumps(assessments)
 
 
 class _Workspace:
@@ -451,15 +435,6 @@ async def test_mission_classifies_portable_asset_for_enabled_migration(
         progress_messages.append(message)
 
     async def action(context):
-        if context.phase == "triage":
-            await context.inspect_asset("skills:demo")
-            await context.read_file("skills:demo", "SKILL.md")
-            await context.classify_asset(
-                "skills:demo",
-                "repair",
-                "portable and not duplicated",
-            )
-            return
         tested = await context.test_asset("skills:demo")
         assert tested["passed"], tested
         await context.classify_asset("skills:demo", "migrate", "native")
@@ -492,28 +467,17 @@ async def test_mission_classifies_portable_asset_for_enabled_migration(
         ),
     )
     assert mission_prd["userStories"][0]["passes"] is True
-    assert any("正在分析 Skill「demo」" in item for item in progress_messages)
-    assert any("可以进行兼容性修复" in item for item in progress_messages)
     assert any("正在测试 Skill「demo」" in item for item in progress_messages)
     assert any("测试通过，可以迁移" in item for item in progress_messages)
     assert [
         item.request_context["portability_phase"]
         for item in workspace.requests
-    ] == ["triage", "mission_repair"]
+    ] == ["mission_repair"]
 
 
 @pytest.mark.asyncio
 async def test_mission_repairs_then_retests_skill(tmp_path: Path) -> None:
     async def action(context):
-        if context.phase == "triage":
-            await context.inspect_asset("skills:demo")
-            await context.read_file("skills:demo", "SKILL.md")
-            await context.classify_asset(
-                "skills:demo",
-                "repair",
-                "portable after replacing Codex CLI",
-            )
-            return
         await context.write_file(
             "skills:demo",
             "SKILL.md",
@@ -547,101 +511,10 @@ async def test_mission_repairs_then_retests_skill(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_triage_can_finish_without_starting_mission(
-    tmp_path: Path,
-) -> None:
-    async def action(context):
-        await context.inspect_asset("skills:demo")
-        await context.read_file("skills:demo", "SKILL.md")
-        await context.classify_asset(
-            "skills:demo",
-            "discard",
-            "QwenPaw already has an equivalent",
-        )
-
-    workspace = _Workspace(tmp_path, action)
-    workspace.plugins.modes = []
-    result = await run_adaptation_loop(
-        workspace,
-        ProviderInventory(
-            provider_id="codex",
-            provider_name="Codex",
-            detected=True,
-            skills=[_skill(tmp_path, "---\nname: demo\n---\nDuplicate.\n")],
-        ),
-        "migration-discard",
-    )
-
-    assert result.status == "completed"
-    assert result.asset_zones["skills:demo"] == "discard"
-    assert len(workspace.requests) == 1
-    assert (
-        workspace.requests[0].request_context["portability_phase"] == "triage"
-    )
-
-
-@pytest.mark.asyncio
-async def test_unfinished_triage_asset_does_not_block_later_assets(
-    tmp_path: Path,
-) -> None:
-    first = _skill(tmp_path, "---\nname: first\n---\nFirst.\n")
-    first.source_id = "first"
-    first.name = "first"
-    second_root = tmp_path / "second-triage"
-    second_root.mkdir()
-    (second_root / "SKILL.md").write_text(
-        "---\nname: second\n---\nSecond.\n",
-        encoding="utf-8",
-    )
-
-    async def action(context):
-        if context.active_asset_key == "skills:first":
-            return
-        await context.inspect_asset("skills:second")
-        await context.read_file("skills:second", "SKILL.md")
-        await context.classify_asset(
-            "skills:second",
-            "discard",
-            "equivalent capability",
-        )
-
-    result = await run_adaptation_loop(
-        _Workspace(tmp_path, action),
-        ProviderInventory(
-            provider_id="codex",
-            provider_name="Codex",
-            detected=True,
-            skills=[
-                first,
-                SourceSkill(
-                    source_id="second",
-                    name="second",
-                    directory=second_root,
-                ),
-            ],
-        ),
-        "migration-triage-continues",
-    )
-
-    assert result.asset_zones["skills:first"] == "staging"
-    assert result.asset_zones["skills:second"] == "discard"
-
-
-@pytest.mark.asyncio
 async def test_static_failure_keeps_remote_plugin_in_repair(
     tmp_path: Path,
 ) -> None:
     async def action(context):
-        if context.phase == "triage":
-            await context.inspect_asset("plugins:remote")
-            await context.classify_asset(
-                "plugins:remote",
-                "repair",
-                "not harness-bound or duplicated",
-                "fully_usable",
-                "{}",
-            )
-            return
         tested = await context.test_asset("plugins:remote")
         assert not tested["passed"]
 
@@ -687,16 +560,6 @@ async def test_qoder_marketplace_skill_plugin_reaches_migrate_zone(
     )
 
     async def action(context):
-        if context.phase == "triage":
-            reviews = await _review_plugin(context, "plugins:cangjie")
-            await context.classify_asset(
-                "plugins:cangjie",
-                "repair",
-                "portable and not duplicated",
-                "fully_usable",
-                reviews,
-            )
-            return
         tested = await context.test_asset("plugins:cangjie")
         assert tested["passed"], tested
         await context.classify_asset(
@@ -739,9 +602,7 @@ async def test_missing_mission_mode_fails_safe_into_repair(
     tmp_path: Path,
 ) -> None:
     async def action(context):
-        await context.inspect_asset("skills:demo")
-        await context.read_file("skills:demo", "SKILL.md")
-        await context.classify_asset("skills:demo", "repair", "portable")
+        await context.test_asset("skills:demo")
 
     workspace = _Workspace(tmp_path, action)
     workspace.plugins.modes = []
@@ -774,14 +635,6 @@ async def test_rejected_secret_repair_does_not_mutate_source(
     )
 
     async def action(context):
-        if context.phase == "triage":
-            await context.inspect_asset("mcp:safe-mcp")
-            await context.classify_asset(
-                "mcp:safe-mcp",
-                "repair",
-                "portable and not duplicated",
-            )
-            return
         with pytest.raises(ValueError, match="contains a secret"):
             await context.update_asset(
                 "mcp:safe-mcp",
@@ -829,50 +682,6 @@ async def test_mixed_plugin_is_one_asset_with_component_review_and_repair(
         path.write_text(content, encoding="utf-8")
 
     async def action(context):
-        if context.phase == "triage":
-            inspected = await context.inspect_asset("plugins:mixed")
-            components = inspected["asset"]["components"]
-            assert {item["kind"] for item in components} >= {
-                "manifest",
-                "skill",
-                "command",
-                "agent",
-                "hook",
-                "rule",
-                "mcp",
-            }
-            with pytest.raises(
-                RuntimeError,
-                match="every checklist component",
-            ):
-                await context.classify_asset(
-                    "plugins:mixed",
-                    "repair",
-                    "too early",
-                    "fully_usable",
-                    "{}",
-                )
-            assessments = {}
-            for component in components:
-                for path in component["paths"]:
-                    await context.read_file(
-                        "plugins:mixed",
-                        path,
-                        end_line=10_000,
-                    )
-                adaptable = component["kind"] in {"command", "agent", "hook"}
-                assessments[component["component_id"]] = {
-                    "verdict": "adaptable" if adaptable else "portable",
-                    "reason": "rewrite with the matching QwenPaw capability",
-                }
-            await context.classify_asset(
-                "plugins:mixed",
-                "repair",
-                "source-bound components have QwenPaw replacements",
-                "partially_usable",
-                json.dumps(assessments),
-            )
-            return
         await context.write_file(
             "plugins:mixed",
             "plugin.json",
@@ -922,8 +731,6 @@ async def test_mixed_plugin_is_one_asset_with_component_review_and_repair(
     assert result.asset_zones["plugins:mixed"] == "migrate"
     staged = Path(inventory.plugins[0].install_source)
     assert (staged / "hooks/start.sh").is_file()
-    manifest = load_manifest(result.manifest_path)
-    assert manifest.assets[0].plugin_disposition.value == "partially_usable"
 
 
 @pytest.mark.asyncio
@@ -947,12 +754,6 @@ async def test_mission_repairs_assets_in_parallel_with_isolated_scope(
 
     async def action(context):
         key = context.active_asset_key
-        if context.phase == "triage":
-            await context.inspect_asset(key)
-            await context.read_file(key, "SKILL.md")
-            await context.classify_asset(key, "repair", "portable")
-            return
-
         other = "skills:second" if key == "skills:first" else "skills:first"
         with pytest.raises(PermissionError, match="assigned asset"):
             await context.test_asset(other)
@@ -985,5 +786,4 @@ async def test_mission_repairs_assets_in_parallel_with_isolated_scope(
         item.request_context["portability_phase"]
         for item in workspace.requests
     ]
-    assert phases.count("triage") == 2
     assert phases.count("mission_repair") == 2

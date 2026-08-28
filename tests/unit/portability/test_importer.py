@@ -99,16 +99,6 @@ def _mock_adaptation(
             plugins=inventory.plugins,
             scheduled_tasks=inventory.scheduled_tasks,
         )
-        for key in keys:
-            store.record_inspection(key)
-            store.classify(
-                key,
-                AssetZone.REPAIR,
-                "test fixture",
-                plugin_disposition=(
-                    "fully_usable" if key.startswith("plugins:") else ""
-                ),
-            )
         if zone == "migrate":
             for key in keys:
                 store.record_test(key, passed=True, summary="test fixture")
@@ -1151,7 +1141,7 @@ async def test_provider_plugin_never_falls_back_to_installed_cache(
     receipt = await ProviderImportService(workspace).import_from("qoder")
 
     assert receipt.installed_plugins == []
-    assert receipt.skipped_plugins == ["demo@qoder-bundler"]
+    assert receipt.prepared_plugins == ["demo@qoder-bundler"]
     assert not (workspace.workspace_dir / "plugins").exists()
 
 
