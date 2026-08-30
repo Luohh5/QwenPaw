@@ -1378,6 +1378,138 @@ def _validate_venv_tree(
     return ()
 
 
+def _venv_interpreter(venv_root: Path) -> Path:
+    """Return the canonical interpreter path for one venv root."""
+    if os.name == "nt":
+        return venv_root / "Scripts" / "python.exe"
+    return venv_root / "bin" / "python"
+
+
+def _launcher_python_path(path: Path) -> str | None:
+    """Return a Python interpreter token from a launcher shebang."""
+    try:
+        content = path.read_bytes()
+        first_line = content.split(b"\n", 1)[0].rstrip(b"\r")
+        if first_line.startswith(b"\xff\xfe"):
+            line = first_line.decode("utf-16").strip()
+        elif first_line.startswith(b"#\x00!\x00"):
+            line = first_line.decode("utf-16-le").strip()
+        elif not first_line.startswith(b"#!"):
+            return None
+        else:
+            line = first_line[2:].decode("utf-8").strip()
+    except (IndexError, OSError, UnicodeError):
+        return None
+    if line.startswith("#!"):
+        line = line[2:].strip()
+    tokens = line.split()
+    if not tokens:
+        return None
+    command = tokens[0].strip('"')
+    basename = command.replace("\\", "/").rsplit("/", 1)[-1]
+    if basename.lower() == "env":
+        for token in tokens[1:]:
+            if token.startswith("-"):
+                continue
+            candidate = token.strip('"')
+            candidate_name = candidate.replace("\\", "/")
+            candidate_name = candidate_name.rsplit("/", 1)[-1]
+            if candidate_name.lower().startswith("python"):
+                return candidate
+        return None
+    if basename.lower().startswith("python"):
+        return command
+    if basename.lower() in {"sh", "bash", "zsh"}:
+        match = re.search(
+            rb"[\"']([^\"'\r\n]*python[^\"'\r\n]*)[\"']",
+            content[:1024],
+            flags=re.IGNORECASE,
+        )
+        if match is not None:
+            return match.group(1).decode("utf-8")
+    return None
+
+
+def _normalise_launcher_path(value: str) -> str:
+    """Normalize one launcher path using the host platform's path rules."""
+    return os.path.normcase(os.path.normpath(value.strip().strip('"')))
+
+
+def _validate_venv_launchers(
+    venv_root: Path,
+    expected_interpreter: Path,
+) -> tuple[str, ...]:
+    """Ensure Python launchers point at the published venv interpreter."""
+    scripts_root = venv_root / ("Scripts" if os.name == "nt" else "bin")
+    if not scripts_root.is_dir():
+        return ("Venv scripts directory is missing",)
+    expected_path = Path(expected_interpreter)
+    allowed_paths = {
+        _normalise_launcher_path(str(expected_path)),
+    }
+    try:
+        for candidate in scripts_root.iterdir():
+            if (
+                candidate.name.lower().startswith("python")
+                and (candidate.is_file() or candidate.is_symlink())
+            ):
+                allowed_paths.add(
+                    _normalise_launcher_path(
+                        str(expected_path.parent / candidate.name),
+                    ),
+                )
+    except OSError as exc:
+        return (f"Venv launchers cannot be enumerated: {exc}",)
+    reasons: list[str] = []
+    try:
+        paths = sorted(scripts_root.rglob("*"))
+    except OSError as exc:
+        return (f"Venv launchers cannot be enumerated: {exc}",)
+    for path in paths:
+        if path.is_symlink() or not path.is_file():
+            continue
+        launcher = _launcher_python_path(path)
+        if launcher is not None:
+            if _normalise_launcher_path(launcher) not in allowed_paths:
+                reasons.append(
+                    "Python launcher does not reference the canonical venv "
+                    f"interpreter: {path.name}",
+                )
+            continue
+        if os.name != "nt" or path.suffix.lower() != ".exe":
+            continue
+        if path.name.lower().startswith(("python", "venvlauncher")):
+            continue
+        if not path.with_name(f"{path.stem}-script.py").is_file():
+            continue
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            reasons.append(
+                f"Python launcher cannot be read: {path.name}: {exc}",
+            )
+            continue
+        encoded_paths: list[bytes] = []
+        for allowed in allowed_paths:
+            values = (allowed, allowed.replace(os.sep, "/"))
+            encoded_paths.extend(
+                encoded
+                for value in values
+                for encoded in (
+                    value.encode("utf-8"),
+                    value.encode("utf-16-le"),
+                    value.encode("utf-16-be"),
+                )
+            )
+        content_lower = content.lower()
+        if not any(encoded.lower() in content_lower for encoded in encoded_paths):
+            reasons.append(
+                "Python launcher does not reference the canonical venv "
+                f"interpreter: {path.name}",
+            )
+    return tuple(reasons)
+
+
 def _validate_provenance(
     install_manifest: InstallManifest,
     expected_packages: Mapping[str, LockPackage],
@@ -1492,6 +1624,7 @@ def validate_installed_environment(
     expected_lock: LockFile,
     allowed_platform_tags: Collection[str],
     allow_staging_directory: bool = False,
+    expected_launcher_interpreter: Path | None = None,
 ) -> EnvironmentValidationResult:
     """Strictly validate one immutable dependency environment."""
     environment_directory = Path(environment_directory).resolve()
@@ -1525,6 +1658,17 @@ def validate_installed_environment(
         _validate_venv_tree(
             venv_root,
             install_manifest.venv_tree_sha256,
+        ),
+    )
+    if reasons:
+        return _repair_required(reasons)
+    launcher_interpreter = expected_launcher_interpreter or _venv_interpreter(
+        venv_root,
+    )
+    reasons.extend(
+        _validate_venv_launchers(
+            venv_root,
+            launcher_interpreter,
         ),
     )
     if reasons:

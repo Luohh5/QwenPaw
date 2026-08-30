@@ -681,6 +681,9 @@ class EnvironmentInstaller:
                 expected_lock=lock,
                 allowed_platform_tags=self.allowed_platform_tags,
                 allow_staging_directory=True,
+                expected_launcher_interpreter=_venv_interpreter(
+                    final_directory / "venv",
+                ),
             )
             if not validation.valid:
                 reason = (

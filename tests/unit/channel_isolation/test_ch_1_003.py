@@ -31,6 +31,7 @@ from qwenpaw.app.channels.environment_installer import (
     _select_wheel,
 )
 from qwenpaw.app.channels.env_manager import (
+    compute_venv_tree_sha256,
     EnvironmentSpecManifest,
     validate_installed_environment,
 )
@@ -42,6 +43,7 @@ from qwenpaw.channel_protocol import (
     WheelFile,
     condition_set_sha256,
     current_python_abi,
+    write_canonical_json,
 )
 
 
@@ -533,6 +535,72 @@ def test_console_script_runs_after_atomic_publish(tmp_path: Path) -> None:
         text=True,
     )
     assert probe.stdout.strip() == "console-ok"
+
+
+def test_stale_console_script_environment_requires_repair(
+    tmp_path: Path,
+) -> None:
+    """An old staging shebang cannot make an environment reusable."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    wheel_path = cache / "demo_package-1.0-py3-none-any.whl"
+    _write_wheel(wheel_path, with_console_script=True)
+    spec, lock = _release_with_wheel(wheel_path)
+    installer = EnvironmentInstaller(
+        tmp_path / "environments",
+        wheel_cache=cache,
+    )
+
+    first = installer.install(
+        spec=spec,
+        lock=lock,
+        source=DependencySource.offline(),
+    )
+    scripts = "Scripts" if os.name == "nt" else "bin"
+    launcher_name = "demo-cli-script.py" if os.name == "nt" else "demo-cli"
+    launcher = first.environment_directory / "venv" / scripts / launcher_name
+    original = launcher.read_bytes()
+    canonical_venv = first.environment_directory / "venv"
+    stale_venv = tmp_path / "old-staging" / "venv"
+    updated = original.replace(
+        str(canonical_venv).encode(),
+        str(stale_venv).encode(),
+    )
+    assert updated != original
+    launcher.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    launcher.write_bytes(updated)
+    for record_path in (first.environment_directory / "venv").rglob("RECORD"):
+        record_path.chmod(record_path.stat().st_mode | stat.S_IWUSR)
+    installer_module._refresh_venv_records(
+        first.environment_directory / "venv",
+    )
+    manifest_path = first.environment_directory / "install.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["venv_tree_sha256"] = compute_venv_tree_sha256(
+        first.environment_directory / "venv",
+    )
+    manifest_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    write_canonical_json(manifest_path, manifest)
+    installer_module._make_read_only(first.environment_directory)
+
+    validation = validate_installed_environment(
+        environment_directory=first.environment_directory,
+        interpreter=first.interpreter,
+        expected_spec=spec,
+        expected_environment_id=first.environment_id,
+        expected_lock=lock,
+        allowed_platform_tags=RELEASE_TARGET_PLATFORM_TAGS,
+    )
+    assert validation.status == "repair_required"
+    assert any("launcher" in reason for reason in validation.reasons)
+    assert (
+        installer._find_existing(
+            first.environment_directory.parent,
+            spec,
+            lock,
+        )
+        is None
+    )
 
 
 def test_target_probe_controls_marker_and_wheel_selection() -> None:
