@@ -957,17 +957,19 @@ Desktop bundled Python、完整安装形态以及 OS/Python ABI/架构发布矩�
 
 ### CH-1-003：Environment Installer 和原子发布
 
-- [ ] 实现 staging venv、只读/不可变安装、原子 rename 和安装锁。
-- [ ] 按 lock 和 wheel hash 安装，不解析未锁定依赖或现场构建 sdist。
-- [ ] 实现“Python 依赖下载源”输入：全局默认阿里云
+- 状态：[-] 实施中或等待 Review
+
+- [x] 实现 staging venv、只读/不可变安装、原子 rename 和安装锁。
+- [x] 按 lock 和 wheel hash 安装，不解析未锁定依赖或现场构建 sdist。
+- [x] 实现“Python 依赖下载源”输入：全局默认阿里云
   `https://mirrors.aliyun.com/pypi/simple/`，可选 PyPI
   `https://pypi.org/simple/` 或自定义 PEP 503 simple index；每次 install/repair 可以覆盖。
-- [ ] 所选源缺少 hash 匹配 wheel 时明确失败并返回可诊断 reason，不静默切换源；自定义源
+- [x] 所选源缺少 hash 匹配 wheel 时明确失败并返回可诊断 reason，不静默切换源；自定义源
   凭证只通过 secret-store reference 进入下载器，日志、URL、manifest 和响应均不得回显。
-- [ ] 处理离线缓存、缺失 wheel、磁盘不足、并发安装和失败 staging 清理。
-- [ ] 安装完成后写入不可变 install manifest，并在严格校验后才发布 environment。
-- [ ] 验证已有 environment 不被原地覆盖或升级。
-- [ ] 不提供预建 venv 作为核心安装路径；Desktop/offline bundle 只可预置经 hash 校验的
+- [x] 处理离线缓存、缺失 wheel、磁盘不足、并发安装和失败 staging 清理。
+- [x] 安装完成后写入不可变 install manifest，并在严格校验后才发布 environment。
+- [x] 验证已有 environment 不被原地覆盖或升级。
+- [x] 不提供预建 venv 作为核心安装路径；Desktop/offline bundle 只可预置经 hash 校验的
   artifact/wheel cache，并继续走相同本地 environment 创建和验证流程。
 
 验收：安装失败不产生可启动 environment；并发安装只发布一个完整、严格匹配的不可变
