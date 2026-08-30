@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import stat
 import subprocess
@@ -16,11 +18,17 @@ import zipfile
 import pytest
 from packaging.tags import sys_tags
 
+import qwenpaw.app.channels.environment_installer as installer_module
+
 from qwenpaw.app.channels.environment_installer import (
     DEFAULT_ALIYUN_INDEX_URL,
     DependencySource,
     EnvironmentInstallError,
     EnvironmentInstaller,
+    _TargetPython,
+    _active_packages,
+    _cleanup_path,
+    _select_wheel,
 )
 from qwenpaw.app.channels.env_manager import (
     EnvironmentSpecManifest,
@@ -71,11 +79,15 @@ def _wheel(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _write_wheel(path: Path) -> None:
+def _write_wheel(path: Path, *, with_console_script: bool = False) -> None:
     """Write a minimal installable pure-Python wheel."""
     dist_info = "demo_package-1.0.dist-info"
     files = {
-        "demo_package/__init__.py": b"VALUE = 1\n",
+        "demo_package/__init__.py": (
+            b"VALUE = 1\n" b"\n" b"def main():\n" b"    print('console-ok')\n"
+            if with_console_script
+            else b"VALUE = 1\n"
+        ),
         f"{dist_info}/METADATA": (
             b"Metadata-Version: 2.1\n"
             b"Name: demo-package\n"
@@ -88,6 +100,10 @@ def _write_wheel(path: Path) -> None:
             b"Tag: py3-none-any\n"
         ),
     }
+    if with_console_script:
+        files[f"{dist_info}/entry_points.txt"] = (
+            b"[console_scripts]\n" b"demo-cli = demo_package:main\n"
+        )
     rows: list[tuple[str, str, str]] = []
     for relative, content in files.items():
         digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest())
@@ -341,6 +357,30 @@ def test_custom_credential_is_not_persisted_or_in_error(
     assert "top-secret" not in json.dumps(source.__dict__)
 
 
+def test_credentials_require_complete_origin_match(tmp_path: Path) -> None:
+    """Credentials are withheld for protocol and effective-port changes."""
+    source = DependencySource.custom(
+        "https://source.invalid/simple",
+        credential_ref="credential/private-index",
+    )
+    installer = EnvironmentInstaller(
+        tmp_path / "environments",
+        credential_resolver=lambda ref: "top-secret" if ref else None,
+    )
+    assert "Authorization" in installer._request_headers(
+        "https://source.invalid:443/files/demo.whl",
+        source,
+    )
+    assert "Authorization" not in installer._request_headers(
+        "https://source.invalid:444/files/demo.whl",
+        source,
+    )
+    assert "Authorization" not in installer._request_headers(
+        "http://source.invalid/files/demo.whl",
+        source,
+    )
+
+
 def test_parallel_installers_publish_one_environment(tmp_path: Path) -> None:
     """Concurrent callers serialize and the second caller reuses the result."""
     spec, lock = _empty_release()
@@ -381,3 +421,278 @@ def test_source_models_reject_embedded_credentials() -> None:
         DependencySource.custom("https://user:password@example.invalid/simple")
     with pytest.raises(ValueError):
         DependencySource.custom("https://example.invalid/simple?token=secret")
+
+
+def test_redirect_to_other_origin_drops_authorization(
+    tmp_path: Path,
+) -> None:
+    """A wheel redirect to another port never receives source credentials."""
+    wheel_path = tmp_path / "demo_package-1.0-py3-none-any.whl"
+    _write_wheel(wheel_path)
+    spec, lock = _release_with_wheel(wheel_path)
+    source_authorization: list[str | None] = []
+    target_authorization: list[str | None] = []
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        """Serve the redirected wheel and record its authorization header."""
+
+        def do_GET(self) -> None:  # noqa: N802
+            target_authorization.append(self.headers.get("Authorization"))
+            body = wheel_path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format_string: str, *args: object) -> None:
+            """Keep fixture requests out of test output."""
+
+    target_server = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+
+    class SourceHandler(BaseHTTPRequestHandler):
+        """Serve a simple index and redirect the wheel cross-origin."""
+
+        def do_GET(self) -> None:  # noqa: N802
+            source_authorization.append(self.headers.get("Authorization"))
+            if self.path == "/simple/demo-package/":
+                body = (
+                    f'<a href="/redirect/{wheel_path.name}">'
+                    f"{wheel_path.name}</a>"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(302)
+            self.send_header(
+                "Location",
+                f"http://127.0.0.1:{target_server.server_port}/wheel",
+            )
+            self.end_headers()
+
+        def log_message(self, format_string: str, *args: object) -> None:
+            """Keep fixture requests out of test output."""
+
+    source_server = ThreadingHTTPServer(("127.0.0.1", 0), SourceHandler)
+    target_thread = threading.Thread(
+        target=target_server.serve_forever,
+        daemon=True,
+    )
+    source_thread = threading.Thread(
+        target=source_server.serve_forever,
+        daemon=True,
+    )
+    target_thread.start()
+    source_thread.start()
+    try:
+        source = DependencySource.custom(
+            f"http://127.0.0.1:{source_server.server_port}/simple",
+            credential_ref="credential/private-index",
+        )
+        EnvironmentInstaller(
+            tmp_path / "environments",
+            credential_resolver=lambda ref: "top-secret" if ref else None,
+        ).install(spec=spec, lock=lock, source=source)
+    finally:
+        source_server.shutdown()
+        target_server.shutdown()
+        source_thread.join()
+        target_thread.join()
+
+    assert source_authorization == ["Bearer top-secret", "Bearer top-secret"]
+    assert target_authorization == [None]
+
+
+def test_console_script_runs_after_atomic_publish(tmp_path: Path) -> None:
+    """Entry points use the canonical post-publish interpreter."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    wheel_path = cache / "demo_package-1.0-py3-none-any.whl"
+    _write_wheel(wheel_path, with_console_script=True)
+    spec, lock = _release_with_wheel(wheel_path)
+
+    result = EnvironmentInstaller(
+        tmp_path / "environments",
+        wheel_cache=cache,
+    ).install(
+        spec=spec,
+        lock=lock,
+        source=DependencySource.offline(),
+    )
+
+    scripts = "Scripts" if os.name == "nt" else "bin"
+    suffix = ".exe" if os.name == "nt" else ""
+    entrypoint = (
+        result.environment_directory / "venv" / scripts / (f"demo-cli{suffix}")
+    )
+    probe = subprocess.run(
+        [str(entrypoint)],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    assert probe.stdout.strip() == "console-ok"
+
+
+def test_target_probe_controls_marker_and_wheel_selection() -> None:
+    """Package and wheel selection uses target probe data, not host globals."""
+    marker_package = LockPackage(
+        name="marker-package",
+        version="1.0",
+        marker='sys_platform == "target-os"',
+        direct=False,
+        wheels=(
+            WheelFile(
+                filename="marker_package-1.0-py3-none-any.whl",
+                url=None,
+                sha256="a" * 64,
+            ),
+        ),
+    )
+    skipped_package = LockPackage(
+        name="skipped-package",
+        version="1.0",
+        marker='sys_platform == "other-os"',
+        direct=False,
+        wheels=(),
+    )
+    target = _TargetPython(
+        abi="cp311-cp311",
+        platform_tags=frozenset({"any"}),
+        marker_environment={"sys_platform": "target-os"},
+        supported_tags=frozenset({"py3-none-any"}),
+    )
+    lock = LockFile(
+        channel_key="fixture",
+        python_abi="cp311-cp311",
+        platform_tag=PLATFORM_TAG,
+        condition_set_sha256=EMPTY_CONDITION_DIGEST,
+        direct_requirements=(),
+        packages=(marker_package, skipped_package),
+    )
+
+    active = _active_packages(lock, target)
+    assert set(active) == {"marker-package"}
+    assert _select_wheel(marker_package, target) == marker_package.wheels[0]
+
+
+def test_publish_freezes_staging_before_final_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The final directory is absent while staging is frozen and validated."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    wheel_path = cache / "demo_package-1.0-py3-none-any.whl"
+    _write_wheel(wheel_path)
+    spec, lock = _release_with_wheel(wheel_path)
+    final_spec = (
+        tmp_path
+        / "environments"
+        / installer_module.dir_key(
+            spec.environment_spec_id,
+        )
+    )
+    observed: list[Path] = []
+    original_make_read_only = installer_module._make_read_only
+
+    def freeze(path: Path) -> None:
+        assert not final_spec.exists()
+        observed.append(path)
+        original_make_read_only(path)
+
+    monkeypatch.setattr(installer_module, "_make_read_only", freeze)
+    EnvironmentInstaller(
+        tmp_path / "environments",
+        wheel_cache=cache,
+    ).install(
+        spec=spec,
+        lock=lock,
+        source=DependencySource.offline(),
+    )
+    assert observed
+
+
+def test_destination_race_does_not_delete_competitor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed publish only removes this install's staging directory."""
+    spec, lock = _empty_release()
+    root = tmp_path / "environments"
+    root.mkdir()
+    spec_directory = root / installer_module.dir_key(spec.environment_spec_id)
+    installer = EnvironmentInstaller(root)
+    spec_directory.mkdir()
+    installer_module._write_canonical_atomic(
+        spec_directory / "environment_spec.json",
+        spec.to_mapping(),
+    )
+    target = installer._probe_target_python(installer.base_python, spec)
+    real_replace = installer_module.os.replace
+    injected = False
+    competitor: Path | None = None
+
+    def race(
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+    ) -> None:
+        nonlocal competitor, injected
+        destination_path = Path(destination)
+        if (
+            destination_path.parent == spec_directory
+            and destination_path.name.startswith("dir1_")
+            and not injected
+        ):
+            competitor = destination_path
+            destination_path.mkdir()
+            injected = True
+            raise OSError(errno.EEXIST, "destination appeared")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(installer_module.os, "replace", race)
+    with pytest.raises(EnvironmentInstallError):
+        installer._install_staged(
+            spec_directory=spec_directory,
+            spec=spec,
+            lock=lock,
+            source=DependencySource.offline(),
+            wheel_cache=None,
+            base_python=installer.base_python,
+            target_python=target,
+        )
+    assert competitor is not None and competitor.is_dir()
+
+
+def test_cleanup_retries_and_reports_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Cleanup retries transient failures and diagnoses permanent orphans."""
+    path = tmp_path / "staging"
+    path.mkdir()
+    calls = 0
+    original_rmtree = installer_module.shutil.rmtree
+
+    def flaky(target: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls < installer_module._CLEANUP_RETRIES:
+            raise OSError(errno.EACCES, "busy")
+        original_rmtree(target)
+
+    monkeypatch.setattr(installer_module.shutil, "rmtree", flaky)
+    _cleanup_path(path)
+    assert calls == installer_module._CLEANUP_RETRIES
+    assert not path.exists()
+
+    path.mkdir()
+    monkeypatch.setattr(
+        installer_module.shutil,
+        "rmtree",
+        lambda target: (_ for _ in ()).throw(OSError(errno.EACCES, "busy")),
+    )
+    _cleanup_path(path)
+    assert "orphan_staging" in caplog.text

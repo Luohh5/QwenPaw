@@ -6,10 +6,12 @@ from __future__ import annotations
 import base64
 import csv
 from dataclasses import dataclass
+from http.client import HTTPMessage
 from html.parser import HTMLParser
 import hashlib
 from importlib import metadata
 import json
+import logging
 import os
 from pathlib import Path
 import secrets
@@ -18,14 +20,18 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Collection, Mapping
-from typing import Callable, Literal
+from typing import IO, Callable, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urljoin, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import (
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
+)
 
-from packaging.markers import default_environment
-from packaging.tags import sys_tags
+import packaging
 from packaging.utils import canonicalize_name, parse_wheel_filename
 
 from ...channel_protocol.artifacts import LockFile, LockPackage, WheelFile
@@ -54,6 +60,51 @@ from .env_manager import (
 DEFAULT_ALIYUN_INDEX_URL = "https://mirrors.aliyun.com/pypi/simple/"
 DEFAULT_PYPI_INDEX_URL = "https://pypi.org/simple/"
 DEFAULT_PYTHON_INDEX_URL = DEFAULT_ALIYUN_INDEX_URL
+_LOGGER = logging.getLogger(__name__)
+_CLEANUP_RETRIES = 3
+_CLEANUP_RETRY_DELAY_SECONDS = 0.05
+_PACKAGING_ROOT = str(Path(packaging.__file__).resolve().parent.parent)
+
+_TARGET_PROBE_SCRIPT = """
+import json
+import os
+import platform
+import sys
+
+packaging_root = sys.argv[1]
+sys.path.insert(0, packaging_root)
+from packaging.tags import sys_tags
+
+version = platform.python_version()
+major, minor = sys.version_info[:2]
+tags = tuple(sys_tags())
+payload = {
+    "abi": next(
+        (
+            f"{tag.interpreter}-{tag.abi}"
+            for tag in tags
+            if tag.abi != "none"
+        ),
+        None,
+    ),
+    "compatible_platform_tags": sorted({tag.platform for tag in tags}),
+    "marker_environment": {
+        "implementation_name": sys.implementation.name,
+        "implementation_version": version,
+        "os_name": os.name,
+        "platform_machine": platform.machine(),
+        "platform_release": platform.release(),
+        "platform_system": platform.system(),
+        "platform_version": platform.version(),
+        "platform_python_implementation": platform.python_implementation(),
+        "python_full_version": version,
+        "python_version": f"{major}.{minor}",
+        "sys_platform": sys.platform,
+    },
+    "supported_tags": sorted({str(tag) for tag in tags}),
+}
+print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+"""
 
 DependencySourceKind = Literal["aliyun", "pypi", "custom", "offline"]
 CredentialResolver = Callable[
@@ -69,6 +120,44 @@ class EnvironmentInstallError(RuntimeError):
         self.code = code
         self.reason = reason
         super().__init__(f"{code}: {reason}")
+
+
+@dataclass(frozen=True)
+class _TargetPython:
+    """Describe the selected base interpreter's packaging environment."""
+
+    abi: str
+    platform_tags: frozenset[str]
+    marker_environment: Mapping[str, str]
+    supported_tags: frozenset[str]
+
+
+class _OriginRedirectHandler(HTTPRedirectHandler):
+    """Strip authorization when urllib follows an origin-changing redirect."""
+
+    def redirect_request(
+        self,
+        req: Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> Request | None:
+        """Build a redirect request with credentials scoped to one origin."""
+        redirected = super().redirect_request(
+            req,
+            fp,
+            code,
+            msg,
+            headers,
+            newurl,
+        )
+        if redirected is None:
+            return None
+        if _url_origin(req.full_url) != _url_origin(newurl):
+            redirected.remove_header("Authorization")
+        return redirected
 
 
 @dataclass(frozen=True)
@@ -201,6 +290,7 @@ class EnvironmentInstaller:
         self.credential_resolver = credential_resolver
         self.lock_timeout = lock_timeout
         self.subprocess_timeout = subprocess_timeout
+        self._url_opener = build_opener(_OriginRedirectHandler())
 
     def install(
         self,
@@ -229,11 +319,14 @@ class EnvironmentInstaller:
                 "interpreter_missing",
                 "Base Python interpreter is not a file",
             )
+        target_python = self._probe_target_python(selected_python, spec)
 
         spec_directory = self.environments_root / dir_key(
             spec.environment_spec_id,
         )
-        lock_path = spec_directory / ".install.lock"
+        lock_path = self.environments_root / (
+            f".{spec_directory.name}.install.lock"
+        )
         with plugin_install_lock(
             lock_path,
             timeout=self.lock_timeout,
@@ -243,7 +336,8 @@ class EnvironmentInstaller:
                     "install_lock_timeout",
                     "Timed out waiting for the environment install lock",
                 )
-            self._ensure_spec_manifest(spec_directory, spec)
+            if spec_directory.exists():
+                self._ensure_spec_manifest(spec_directory, spec)
             existing = self._find_existing(spec_directory, spec, lock)
             if existing is not None:
                 return existing
@@ -254,7 +348,110 @@ class EnvironmentInstaller:
                 source=selected_source,
                 wheel_cache=selected_cache,
                 base_python=selected_python,
+                target_python=target_python,
             )
+
+    def _probe_target_python(
+        self,
+        base_python: Path,
+        spec: EnvironmentSpecManifest,
+    ) -> _TargetPython:
+        """Read marker and wheel compatibility data from the target Python."""
+        try:
+            result = subprocess.run(
+                [
+                    str(base_python),
+                    "-I",
+                    "-B",
+                    "-c",
+                    _TARGET_PROBE_SCRIPT,
+                    _PACKAGING_ROOT,
+                ],
+                capture_output=True,
+                check=False,
+                env=_clean_subprocess_env(),
+                text=True,
+                timeout=self.subprocess_timeout,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise EnvironmentInstallError(
+                "interpreter_probe_failed",
+                "Selected base Python probe failed",
+            ) from exc
+        if result.returncode != 0:
+            raise EnvironmentInstallError(
+                "interpreter_probe_failed",
+                "Selected base Python probe failed",
+            )
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise EnvironmentInstallError(
+                "interpreter_probe_failed",
+                "Selected base Python probe returned invalid data",
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise EnvironmentInstallError(
+                "interpreter_probe_failed",
+                "Selected base Python probe returned invalid data",
+            )
+        abi = payload.get("abi")
+        raw_platform_tags = payload.get("compatible_platform_tags")
+        raw_supported_tags = payload.get("supported_tags")
+        marker_environment = payload.get("marker_environment")
+        if not isinstance(abi, str):
+            raise EnvironmentInstallError(
+                "interpreter_probe_failed",
+                "Selected base Python probe returned invalid data",
+            )
+        if not isinstance(raw_platform_tags, list):
+            raise EnvironmentInstallError(
+                "interpreter_probe_failed",
+                "Selected base Python probe returned invalid data",
+            )
+        if not isinstance(raw_supported_tags, list):
+            raise EnvironmentInstallError(
+                "interpreter_probe_failed",
+                "Selected base Python probe returned invalid data",
+            )
+        if not isinstance(marker_environment, Mapping):
+            raise EnvironmentInstallError(
+                "interpreter_probe_failed",
+                "Selected base Python probe returned invalid data",
+            )
+        if any(
+            not isinstance(value, str)
+            for value in (*raw_platform_tags, *raw_supported_tags)
+        ):
+            raise EnvironmentInstallError(
+                "interpreter_probe_failed",
+                "Selected base Python probe returned invalid data",
+            )
+        if any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in marker_environment.items()
+        ):
+            raise EnvironmentInstallError(
+                "interpreter_probe_failed",
+                "Selected base Python probe returned invalid data",
+            )
+        target = _TargetPython(
+            abi=abi,
+            platform_tags=frozenset(raw_platform_tags),
+            marker_environment=dict(marker_environment),
+            supported_tags=frozenset(raw_supported_tags),
+        )
+        if target.abi != spec.python_abi:
+            raise EnvironmentInstallError(
+                "unsupported_platform",
+                "Selected base Python ABI does not match environment spec",
+            )
+        if spec.platform_tag not in target.platform_tags:
+            raise EnvironmentInstallError(
+                "unsupported_platform",
+                "Selected base Python platform does not match spec",
+            )
+        return target
 
     def _validate_selection(
         self,
@@ -293,27 +490,28 @@ class EnvironmentInstaller:
         spec_directory: Path,
         spec: EnvironmentSpecManifest,
     ) -> None:
-        """Publish the immutable spec manifest before any environment child."""
-        spec_directory.mkdir(parents=True, exist_ok=True)
+        """Validate the persisted spec manifest before adding an env."""
         manifest_path = spec_directory / "environment_spec.json"
-        if manifest_path.exists():
-            try:
-                existing = EnvironmentSpecManifest.from_mapping(
-                    _read_json(manifest_path),
-                    allowed_platform_tags=self.allowed_platform_tags,
-                )
-            except (EnvironmentManifestError, ArtifactValidationError) as exc:
-                raise EnvironmentInstallError(
-                    "spec_manifest_invalid",
-                    "Environment spec manifest is invalid",
-                ) from exc
-            if existing != spec:
-                raise EnvironmentInstallError(
-                    "spec_manifest_mismatch",
-                    "Environment spec manifest does not match selection",
-                )
-            return
-        _write_canonical_atomic(manifest_path, spec.to_mapping())
+        if not manifest_path.exists():
+            raise EnvironmentInstallError(
+                "spec_manifest_invalid",
+                "Environment spec manifest is missing",
+            )
+        try:
+            existing = EnvironmentSpecManifest.from_mapping(
+                _read_json(manifest_path),
+                allowed_platform_tags=self.allowed_platform_tags,
+            )
+        except (EnvironmentManifestError, ArtifactValidationError) as exc:
+            raise EnvironmentInstallError(
+                "spec_manifest_invalid",
+                "Environment spec manifest is invalid",
+            ) from exc
+        if existing != spec:
+            raise EnvironmentInstallError(
+                "spec_manifest_mismatch",
+                "Environment spec manifest does not match selection",
+            )
 
     def _find_existing(
         self,
@@ -381,6 +579,7 @@ class EnvironmentInstaller:
         source: DependencySource,
         wheel_cache: Path | None,
         base_python: Path,
+        target_python: _TargetPython,
     ) -> InstalledEnvironment:
         """Build, validate, freeze and publish a new installation."""
         identity = EnvironmentIdentity.create(
@@ -393,15 +592,18 @@ class EnvironmentInstaller:
                 "environment_exists",
                 "Generated environment directory already exists",
             )
+        publish_whole_spec = not spec_directory.exists()
 
-        staging_parent = self.environments_root / (
-            f".{spec_directory.name}.staging-{secrets.token_hex(12)}"
+        staging_spec_directory = (
+            self.environments_root
+            / _staging_sibling_name(
+                spec_directory.name,
+            )
         )
-        staging_spec_directory = staging_parent / spec_directory.name
+        staging_parent = staging_spec_directory
         staging_directory = staging_spec_directory / environment_name
         venv_root = staging_directory / "venv"
         wheel_directory = staging_parent / "wheels"
-        published = False
         try:
             staging_spec_directory.mkdir(parents=True, exist_ok=False)
             _write_canonical_atomic(
@@ -414,12 +616,13 @@ class EnvironmentInstaller:
                 source=source,
                 wheel_cache=wheel_cache,
                 wheel_directory=wheel_directory,
+                target_python=target_python,
             )
             self._create_venv(base_python, venv_root)
             interpreter = _venv_interpreter(venv_root)
             self._install_wheels(interpreter, wheel_paths)
             site_packages = _site_packages(interpreter)
-            active_packages = _active_packages(lock)
+            active_packages = _active_packages(lock, target_python)
             self._remove_bootstrap_distributions(
                 site_packages=site_packages,
                 expected_names=set(active_packages),
@@ -428,7 +631,17 @@ class EnvironmentInstaller:
                 site_packages=site_packages,
                 lock=lock,
             )
-            _cleanup_path(wheel_directory)
+            if not _cleanup_path(wheel_directory):
+                raise EnvironmentInstallError(
+                    "cleanup_failed",
+                    "Wheel staging cleanup failed",
+                )
+            _rewrite_venv_paths(
+                venv_root=venv_root,
+                old_root=venv_root,
+                new_root=final_directory / "venv",
+            )
+            _refresh_venv_records(venv_root)
             provenance = tuple(
                 WheelProvenance(
                     name=package.name,
@@ -459,6 +672,7 @@ class EnvironmentInstaller:
                 staging_directory / "install.json",
                 install.to_mapping(),
             )
+            _make_read_only(staging_directory)
             validation = validate_installed_environment(
                 environment_directory=staging_directory,
                 interpreter=interpreter,
@@ -466,6 +680,7 @@ class EnvironmentInstaller:
                 expected_environment_id=identity.environment_id,
                 expected_lock=lock,
                 allowed_platform_tags=self.allowed_platform_tags,
+                allow_staging_directory=True,
             )
             if not validation.valid:
                 reason = (
@@ -474,16 +689,21 @@ class EnvironmentInstaller:
                     else ("Strict environment validation failed")
                 )
                 raise EnvironmentInstallError("validation_failed", reason)
-            spec_directory.mkdir(parents=True, exist_ok=True)
             if final_directory.exists():
                 raise EnvironmentInstallError(
                     "environment_exists",
                     "Environment directory appeared during publication",
                 )
-            os.replace(staging_directory, final_directory)
+            if not publish_whole_spec:
+                os.replace(staging_directory, final_directory)
+            else:
+                if spec_directory.exists():
+                    raise EnvironmentInstallError(
+                        "environment_exists",
+                        "Environment spec directory appeared during publish",
+                    )
+                os.replace(staging_spec_directory, spec_directory)
             _fsync_directory(spec_directory)
-            _make_read_only(final_directory)
-            published = True
             return InstalledEnvironment(
                 environment_id=identity.environment_id,
                 environment_spec_id=spec.environment_spec_id,
@@ -507,12 +727,7 @@ class EnvironmentInstaller:
                 "Environment installation filesystem operation failed",
             ) from exc
         finally:
-            if not published:
-                _cleanup_path(staging_parent)
-                if final_directory.exists():
-                    _cleanup_path(final_directory)
-            else:
-                _cleanup_path(staging_parent)
+            _cleanup_path(staging_parent)
 
     def _prepare_wheels(
         self,
@@ -521,13 +736,14 @@ class EnvironmentInstaller:
         source: DependencySource,
         wheel_cache: Path | None,
         wheel_directory: Path,
+        target_python: _TargetPython,
     ) -> tuple[tuple[LockPackage, WheelFile, Path], ...]:
         """Materialize exactly one hash-matching wheel per active package."""
-        active = _active_packages(lock)
+        active = _active_packages(lock, target_python)
         wheel_directory.mkdir(parents=True, exist_ok=True)
         result: list[tuple[LockPackage, WheelFile, Path]] = []
         for package in active.values():
-            wheel = _select_wheel(package)
+            wheel = _select_wheel(package, target_python)
             destination = wheel_directory / wheel.filename
             self._materialize_wheel(
                 package=package,
@@ -599,7 +815,10 @@ class EnvironmentInstaller:
             headers=self._request_headers(index_url, source),
         )
         try:
-            with urlopen(request, timeout=self.subprocess_timeout) as response:
+            with self._url_opener.open(
+                request,
+                timeout=self.subprocess_timeout,
+            ) as response:
                 page = response.read()
         except (HTTPError, URLError, OSError) as exc:
             raise EnvironmentInstallError(
@@ -652,7 +871,7 @@ class EnvironmentInstaller:
             )
             temporary = Path(temporary_name)
             with os.fdopen(fd, "wb") as output:
-                with urlopen(
+                with self._url_opener.open(
                     request,
                     timeout=self.subprocess_timeout,
                 ) as response:
@@ -695,7 +914,7 @@ class EnvironmentInstaller:
             return headers
         if source.base_url is None:
             return headers
-        if urlsplit(url).hostname != urlsplit(source.base_url).hostname:
+        if _url_origin(url) != _url_origin(source.base_url):
             return headers
         if self.credential_resolver is None:
             raise EnvironmentInstallError(
@@ -917,9 +1136,12 @@ def install_environment(
     )
 
 
-def _active_packages(lock: LockFile) -> dict[str, LockPackage]:
-    """Return lock packages applicable to this interpreter's marker domain."""
-    environment = default_environment()
+def _active_packages(
+    lock: LockFile,
+    target_python: _TargetPython,
+) -> dict[str, LockPackage]:
+    """Return lock packages applicable to the target marker domain."""
+    environment = target_python.marker_environment
     return {
         package.name: package
         for package in lock.packages
@@ -935,15 +1157,17 @@ def _marker_matches(marker: str, environment: Mapping[str, str]) -> bool:
     return Marker(marker).evaluate(environment=environment)
 
 
-def _select_wheel(package: LockPackage):
-    """Select one wheel compatible with the current interpreter."""
-    supported = frozenset(sys_tags())
+def _select_wheel(
+    package: LockPackage,
+    target_python: _TargetPython,
+) -> WheelFile:
+    """Select one wheel compatible with the target interpreter."""
     for wheel in package.wheels:
         try:
             _, _, _, wheel_tags = parse_wheel_filename(wheel.filename)
         except (ValueError, TypeError):
             continue
-        if supported.intersection(wheel_tags):
+        if any(str(tag) in target_python.supported_tags for tag in wheel_tags):
             return wheel
     raise EnvironmentInstallError(
         "unsupported_platform",
@@ -1138,6 +1362,142 @@ def _clean_subprocess_env() -> dict[str, str]:
     return environment
 
 
+def _url_origin(url: str) -> tuple[str, str, int] | None:
+    """Return a normalized HTTP origin including its effective port."""
+    try:
+        parts = urlsplit(url)
+        if parts.scheme not in {"http", "https"} or not parts.hostname:
+            return None
+        port = parts.port
+    except ValueError:
+        return None
+    effective_port = port or (443 if parts.scheme == "https" else 80)
+    return parts.scheme.lower(), parts.hostname.lower(), effective_port
+
+
+def _path_inside(path: Path, root: Path) -> bool:
+    """Check one resolved path remains inside a resolved root."""
+    try:
+        path.relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _staging_sibling_name(spec_name: str) -> str:
+    """Return one hidden staging sibling name for a spec directory."""
+    prefix = f".{spec_name[:5]}.staging-"
+    if len(prefix) >= len(spec_name):
+        raise EnvironmentInstallError(
+            "staging_failed",
+            "Environment directory name is too short for staging",
+        )
+    suffix_length = len(spec_name) - len(prefix)
+    return prefix + secrets.token_hex((suffix_length + 1) // 2)[:suffix_length]
+
+
+def _rewrite_venv_paths(
+    *,
+    venv_root: Path,
+    old_root: Path,
+    new_root: Path,
+) -> None:
+    """Rewrite interpreter paths embedded in generated venv launchers."""
+    replacements = (
+        (str(old_root), str(new_root)),
+        (old_root.as_posix(), new_root.as_posix()),
+        (str(old_root).replace("/", "\\"), str(new_root).replace("/", "\\")),
+    )
+    if any(
+        len(old_value) != len(new_value)
+        for old_value, new_value in replacements
+    ):
+        raise EnvironmentInstallError(
+            "launcher_rewrite_failed",
+            "Staging and canonical venv paths have different lengths",
+        )
+    scripts_root = venv_root / ("Scripts" if os.name == "nt" else "bin")
+    if not scripts_root.is_dir():
+        raise EnvironmentInstallError(
+            "launcher_rewrite_failed",
+            "Generated venv scripts directory is missing",
+        )
+    for path in scripts_root.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise EnvironmentInstallError(
+                "launcher_rewrite_failed",
+                "Generated venv launcher could not be read",
+            ) from exc
+        updated = content
+        for old_value, new_value in replacements:
+            updated = updated.replace(
+                old_value.encode("utf-8"),
+                new_value.encode("utf-8"),
+            )
+            updated = updated.replace(
+                old_value.encode("utf-16-le"),
+                new_value.encode("utf-16-le"),
+            )
+        if updated == content:
+            continue
+        try:
+            path.write_bytes(updated)
+        except OSError as exc:
+            raise EnvironmentInstallError(
+                "launcher_rewrite_failed",
+                "Generated venv launcher could not be rewritten",
+            ) from exc
+
+
+def _refresh_venv_records(venv_root: Path) -> None:
+    """Refresh RECORD rows for launchers rewritten before publication."""
+    for record_path in venv_root.rglob("RECORD"):
+        try:
+            with record_path.open(encoding="utf-8", newline="") as record:
+                rows = list(csv.reader(record))
+            changed = False
+            for row in rows:
+                if not row or len(row) < 3 or not row[0] or not row[1]:
+                    continue
+                candidate = (record_path.parent.parent / row[0]).resolve()
+                if (
+                    not _path_inside(candidate, venv_root)
+                    or not candidate.is_file()
+                ):
+                    continue
+                digest = (
+                    base64.urlsafe_b64encode(
+                        hashlib.sha256(candidate.read_bytes()).digest(),
+                    )
+                    .rstrip(b"=")
+                    .decode("ascii")
+                )
+                replacement = [
+                    row[0],
+                    f"sha256={digest}",
+                    str(candidate.stat().st_size),
+                ]
+                if row != replacement:
+                    row[:] = replacement
+                    changed = True
+            if changed:
+                with record_path.open(
+                    "w",
+                    encoding="utf-8",
+                    newline="",
+                ) as record:
+                    csv.writer(record, lineterminator="\n").writerows(rows)
+        except (OSError, UnicodeError, csv.Error) as exc:
+            raise EnvironmentInstallError(
+                "launcher_rewrite_failed",
+                "Generated venv RECORD could not be refreshed",
+            ) from exc
+
+
 def _make_read_only(root: Path) -> None:
     """Make an environment tree non-writable on supported operating systems."""
     paths = sorted(
@@ -1171,10 +1531,10 @@ def _make_read_only(root: Path) -> None:
         ) from exc
 
 
-def _cleanup_path(path: Path) -> None:
-    """Best-effort removal of failed or completed staging data."""
+def _cleanup_path(path: Path) -> bool:
+    """Remove staging data with bounded retries and orphan diagnostics."""
     if not path.exists():
-        return
+        return True
     for child in sorted(path.rglob("*"), reverse=True):
         if child.is_symlink():
             continue
@@ -1183,9 +1543,23 @@ def _cleanup_path(path: Path) -> None:
         except OSError:
             pass
     try:
-        shutil.rmtree(path)
+        os.chmod(path, 0o700)
     except OSError:
         pass
+    for attempt in range(_CLEANUP_RETRIES):
+        try:
+            shutil.rmtree(path)
+            return True
+        except OSError as exc:
+            if attempt + 1 == _CLEANUP_RETRIES:
+                _LOGGER.warning(
+                    "orphan_staging path=%s error=%s",
+                    path,
+                    exc,
+                )
+                return False
+            time.sleep(_CLEANUP_RETRY_DELAY_SECONDS)
+    return False
 
 
 def _fsync_directory(path: Path) -> None:

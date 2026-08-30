@@ -1221,15 +1221,17 @@ def _load_environment_manifests(
     expected_environment_id: str,
     expected_lock: LockFile,
     allowed_platform_tags: Collection[str],
+    allow_staging_directory: bool = False,
 ) -> tuple[InstallManifest | None, tuple[str, ...]]:
     reasons: list[str] = []
     spec_directory = environment_directory.parent
     try:
-        DirectoryIdentity.validate(
-            logical_id=expected_spec.environment_spec_id,
-            directory_key=spec_directory.name,
-            manifest_logical_id=expected_spec.environment_spec_id,
-        )
+        if not allow_staging_directory:
+            DirectoryIdentity.validate(
+                logical_id=expected_spec.environment_spec_id,
+                directory_key=spec_directory.name,
+                manifest_logical_id=expected_spec.environment_spec_id,
+            )
         DirectoryIdentity.validate(
             logical_id=expected_environment_id,
             directory_key=environment_directory.name,
@@ -1489,6 +1491,7 @@ def validate_installed_environment(
     expected_environment_id: str,
     expected_lock: LockFile,
     allowed_platform_tags: Collection[str],
+    allow_staging_directory: bool = False,
 ) -> EnvironmentValidationResult:
     """Strictly validate one immutable dependency environment."""
     environment_directory = Path(environment_directory).resolve()
@@ -1505,6 +1508,7 @@ def validate_installed_environment(
         expected_environment_id=expected_environment_id,
         expected_lock=expected_lock,
         allowed_platform_tags=allowed_platform_tags,
+        allow_staging_directory=allow_staging_directory,
     )
     reasons.extend(manifest_reasons)
     venv_root = environment_directory / "venv"
