@@ -430,14 +430,18 @@ async def test_mission_classifies_portable_asset_for_enabled_migration(
     tmp_path: Path,
 ) -> None:
     progress_messages = []
+    stopped = asyncio.Event()
 
     async def progress(message: str) -> None:
         progress_messages.append(message)
 
     async def action(context):
-        tested = await context.test_asset("skills:demo")
-        assert tested["passed"], tested
-        await context.classify_asset("skills:demo", "migrate", "native")
+        finalized = await context.finalize_asset("skills:demo", "native")
+        assert finalized["passed"], finalized
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
 
     workspace = _Workspace(tmp_path, action)
     inventory = ProviderInventory(
@@ -451,11 +455,9 @@ async def test_mission_classifies_portable_asset_for_enabled_migration(
             ),
         ],
     )
-    result = await run_adaptation_loop(
-        workspace,
-        inventory,
-        "migration-1",
-        progress,
+    result = await asyncio.wait_for(
+        run_adaptation_loop(workspace, inventory, "migration-1", progress),
+        timeout=1,
     )
     manifest = load_manifest(result.manifest_path)
     assert result.status == "completed"
@@ -467,8 +469,9 @@ async def test_mission_classifies_portable_asset_for_enabled_migration(
         ),
     )
     assert mission_prd["userStories"][0]["passes"] is True
+    assert stopped.is_set()
     assert any("正在测试 Skill「demo」" in item for item in progress_messages)
-    assert any("测试通过，可以迁移" in item for item in progress_messages)
+    assert any("兼容性优化完成，已进入待迁移区" in item for item in progress_messages)
     assert [
         item.request_context["portability_phase"]
         for item in workspace.requests
@@ -489,8 +492,9 @@ async def test_mission_repairs_then_retests_skill(tmp_path: Path) -> None:
                 AssetZone.MIGRATE,
                 "not retested",
             )
-        await context.test_asset("skills:demo")
-        await context.classify_asset("skills:demo", "migrate", "retested")
+        assert (await context.finalize_asset("skills:demo", "retested"))[
+            "passed"
+        ]
 
     workspace = _Workspace(tmp_path, action)
     inventory = ProviderInventory(
@@ -514,9 +518,14 @@ async def test_mission_repairs_then_retests_skill(tmp_path: Path) -> None:
 async def test_static_failure_keeps_remote_plugin_in_repair(
     tmp_path: Path,
 ) -> None:
+    attempts = 0
+
     async def action(context):
-        tested = await context.test_asset("plugins:remote")
-        assert not tested["passed"]
+        nonlocal attempts
+        attempts += 1
+        assert not (await context.finalize_asset("plugins:remote", "native"))[
+            "passed"
+        ]
 
     workspace = _Workspace(tmp_path, action)
     inventory = ProviderInventory(
@@ -538,6 +547,7 @@ async def test_static_failure_keeps_remote_plugin_in_repair(
     assert "每项最多 4 次尝试" in result.summary_path.read_text(
         encoding="utf-8",
     )
+    assert attempts == 4
 
 
 @pytest.mark.asyncio
@@ -560,13 +570,11 @@ async def test_qoder_marketplace_skill_plugin_reaches_migrate_zone(
     )
 
     async def action(context):
-        tested = await context.test_asset("plugins:cangjie")
-        assert tested["passed"], tested
-        await context.classify_asset(
+        finalized = await context.finalize_asset(
             "plugins:cangjie",
-            "migrate",
             "native checks passed",
         )
+        assert finalized["passed"], finalized
 
     inventory = ProviderInventory(
         provider_id="qoder",
@@ -602,7 +610,7 @@ async def test_missing_mission_mode_fails_safe_into_repair(
     tmp_path: Path,
 ) -> None:
     async def action(context):
-        await context.test_asset("skills:demo")
+        await context.finalize_asset("skills:demo", "native")
 
     workspace = _Workspace(tmp_path, action)
     workspace.plugins.modes = []
@@ -642,9 +650,8 @@ async def test_rejected_secret_repair_does_not_mutate_source(
                 '["--api-key", "sk-do-not-persist"]',
             )
         assert server.args == []
-        tested = await context.test_asset("mcp:safe-mcp")
-        assert tested["passed"], tested
-        await context.classify_asset("mcp:safe-mcp", "migrate", "native")
+        finalized = await context.finalize_asset("mcp:safe-mcp", "native")
+        assert finalized["passed"], finalized
 
     workspace = _Workspace(tmp_path, action)
     inventory = ProviderInventory(
@@ -702,13 +709,11 @@ async def test_mixed_plugin_is_one_asset_with_component_review_and_repair(
             "            'pathlib').Path(__file__).parent / 'skills')\n\n"
             "plugin = MixedPlugin()\n",
         )
-        tested = await context.test_asset("plugins:mixed")
-        assert tested["passed"], tested
-        await context.classify_asset(
+        finalized = await context.finalize_asset(
             "plugins:mixed",
-            "migrate",
             "native plugin test passed",
         )
+        assert finalized["passed"], finalized
 
     inventory = ProviderInventory(
         provider_id="qoder",
@@ -756,18 +761,16 @@ async def test_mission_repairs_assets_in_parallel_with_isolated_scope(
         key = context.active_asset_key
         other = "skills:second" if key == "skills:first" else "skills:first"
         with pytest.raises(PermissionError, match="assigned asset"):
-            await context.test_asset(other)
-        tested = await context.test_asset(key)
-        if tested["passed"]:
-            await context.classify_asset(key, "migrate", "passed")
+            await context.finalize_asset(other, "passed")
+        finalized = await context.finalize_asset(key, "passed")
+        if finalized["passed"]:
             return
         await context.write_file(
             key,
             "SKILL.md",
             "---\nname: first\ndescription: repaired\n---\nValid.\n",
         )
-        assert (await context.test_asset(key))["passed"]
-        await context.classify_asset(key, "migrate", "passed")
+        assert (await context.finalize_asset(key, "passed"))["passed"]
 
     workspace = _Workspace(tmp_path, action)
     result = await run_adaptation_loop(
@@ -782,6 +785,10 @@ async def test_mission_repairs_assets_in_parallel_with_isolated_scope(
     )
     assert result.status == "completed"
     assert workspace.max_active_queries == 2
+    assert (
+        load_manifest(result.manifest_path).get_asset("skills:first").tests
+        == 2
+    )
     phases = [
         item.request_context["portability_phase"]
         for item in workspace.requests

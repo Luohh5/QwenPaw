@@ -54,8 +54,7 @@ _REPAIR_TOOLS = (
     "migration_compat_read_file",
     "migration_compat_write_file",
     "migration_compat_update",
-    "migration_compat_test",
-    "migration_compat_classify",
+    "migration_compat_finalize",
 )
 
 
@@ -73,6 +72,7 @@ class AdaptationResult:
 class _RequestBinding:
     context: "ActiveAdaptationContext"
     asset_key: str
+    completed: asyncio.Event
 
 
 _ACTIVE_CONTEXTS: dict[str, _RequestBinding] = {}
@@ -419,50 +419,46 @@ class ActiveAdaptationContext:
             )
             return {"ok": True, "zone": "repair"}
 
-    async def test_asset(self, key: str) -> dict[str, Any]:
+    async def finalize_asset(self, key: str, reason: str) -> dict[str, Any]:
         async with self._lock:
-            self._consume(key)
+            if key != self.active_asset_key:
+                raise PermissionError(
+                    "worker may access only its assigned asset",
+                )
             asset = self._asset(key)
+            if asset.zone is not AssetZone.REPAIR:
+                raise RuntimeError("assets can only be finalized in repair")
+            if not reason.strip():
+                raise ValueError(
+                    "finalization requires an evidence-based reason",
+                )
+            self._consume(key, final=True)
             await self._publish(
                 f"正在测试 {self._label(asset)} 的 QwenPaw 兼容性…",
             )
             result = self.tester.test(asset)
             self._audit("test", key, "passed" if result.passed else "failed")
-            outcome = "测试通过，可以迁移。" if result.passed else "测试未通过，需要继续兼容性修复。"
-            await self._publish(f"{self._label(asset)}{outcome}")
-            return {
-                "ok": True,
-                "passed": result.passed,
-                "summary": result.summary,
-                "evidence": result.evidence,
-            }
-
-    async def classify_asset(
-        self,
-        key: str,
-        zone: str,
-        reason: str,
-    ) -> dict[str, Any]:
-        async with self._lock:
-            asset = self._asset(key)
-            if asset.zone is not AssetZone.REPAIR:
-                raise PermissionError(
-                    "only repair assets can be classified: "
-                    f"{asset.zone.value}",
+            if not result.passed:
+                await self._publish(
+                    f"{self._label(asset)}测试未通过，需要继续兼容性修复。",
                 )
-            self._consume(
-                key,
-                final=True,
-            )
-            selected = AssetZone(zone)
-            manifest = self.store.classify(key, selected, reason)
-            self._audit("classify", key, selected.value)
+                return {
+                    "ok": True,
+                    "passed": False,
+                    "zone": AssetZone.REPAIR.value,
+                    "summary": result.summary,
+                    "evidence": result.evidence,
+                }
+            manifest = self.store.classify(key, AssetZone.MIGRATE, reason)
+            self._audit("classify", key, AssetZone.MIGRATE.value)
             await self._publish(
                 f"{self._label(self._asset(key))}兼容性优化完成，已进入待迁移区。",
             )
+            self._binding().completed.set()
             return {
                 "ok": True,
-                "zone": selected.value,
+                "passed": True,
+                "zone": AssetZone.MIGRATE.value,
                 "counts": counts(manifest),
             }
 
@@ -521,23 +517,34 @@ async def _run_phase(
             },
         },
     )
-    _ACTIVE_CONTEXTS[session_id] = _RequestBinding(
-        context,
-        asset.asset_key,
-    )
+    binding = _RequestBinding(context, asset.asset_key, asyncio.Event())
+    _ACTIVE_CONTEXTS[session_id] = binding
     task = asyncio.create_task(
         _consume_query(workspace, request),
     )
+    completed = asyncio.create_task(binding.completed.wait())
     try:
-        while not task.done():
-            done, _ = await asyncio.wait({task}, timeout=_HEARTBEAT_SECONDS)
-            if task not in done:
+        while not task.done() and not completed.done():
+            done, _ = await asyncio.wait(
+                {task, completed},
+                timeout=_HEARTBEAT_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
                 await _report(
                     context.progress,
                     f"{label}仍在运行：{context.activity(session_id)}",
                 )
-        await task
+        if task.done():
+            await task
+        else:
+            task.cancel()
+            try:
+                await run_async_to_completion(task)
+            except asyncio.CancelledError:
+                pass
     finally:
+        completed.cancel()
         if not task.done():
             task.cancel()
             try:

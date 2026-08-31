@@ -60,10 +60,9 @@ from .agent_management import (  # noqa: E402
 from .delegate_external_agent import delegate_external_agent  # noqa: E402
 from .make_skill_tools import materialize_skill  # noqa: E402
 from .migration_compatibility import (  # noqa: E402
-    migration_compat_classify,
+    migration_compat_finalize,
     migration_compat_inspect,
     migration_compat_read_file,
-    migration_compat_test,
     migration_compat_update,
     migration_compat_write_file,
 )

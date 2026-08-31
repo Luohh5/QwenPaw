@@ -33,19 +33,19 @@ capabilities.
 4. Make all related changes needed for one coherent QwenPaw adaptation. Use
    `migration_compat_write_file` for file assets and
    `migration_compat_update` for MCP servers or scheduled tasks. Finish the
-   complete repair first, review the result, and call `migration_compat_test`
-   only when you believe no known compatibility issue remains.
-5. If the test passes, immediately call `migration_compat_classify` with zone
-   `migrate` and give a concise, evidence-based summary of the adaptation.
-6. If the test fails, read every item in its summary and evidence. Fix the
+   complete repair and review the result before calling
+   `migration_compat_finalize`. This is the final acceptance check, not an
+   exploratory test.
+5. Call `migration_compat_finalize` once with a concise, evidence-based
+   summary. It tests the latest revision and promotes it on success.
+6. If finalization fails, read every item in its summary and evidence. Fix the
    underlying issue in all affected files, review the complete asset again,
-   and rerun `migration_compat_test`. Repeat this repair-and-test cycle until
-   the latest test passes or the worker budget is exhausted.
+   and finalize again until it passes or the worker budget is exhausted.
 
 ## Important Notes
 
-- The latest native test result is the only acceptance criterion. Any edit
-  invalidates an earlier passing result, so the final revision must be tested.
+- A successful finalization ends this worker. Do not make any further tool
+  calls after it succeeds.
 - Preserve the asset's useful behavior. Never delete components, invent a fake
   entry point, or replace real functionality merely to satisfy the test.
 - Replace source-Harness-specific behavior with real QwenPaw behavior; do not

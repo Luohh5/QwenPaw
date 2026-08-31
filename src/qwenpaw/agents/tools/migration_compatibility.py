@@ -88,25 +88,11 @@ async def migration_compat_update(
 
 
 @_compat_tool(
-    "migration_compat_test",
-    "Run QwenPaw's native compatibility test for one asset.",
+    "migration_compat_finalize",
+    "Run the final native test and promote the fully repaired asset on pass.",
 )
-async def migration_compat_test(asset_key: str) -> str:
-    return await _invoke("test_asset", asset_key)
-
-
-@_compat_tool(
-    "migration_compat_classify",
-    "Promote one tested repair asset to migration.",
-)
-async def migration_compat_classify(
+async def migration_compat_finalize(
     asset_key: str,
-    zone: str,
     reason: str,
 ) -> str:
-    return await _invoke(
-        "classify_asset",
-        asset_key,
-        zone,
-        reason,
-    )
+    return await _invoke("finalize_asset", asset_key, reason)
