@@ -13,12 +13,14 @@ from pathlib import Path
 import stat
 import subprocess
 import threading
+from types import SimpleNamespace
 import zipfile
 
 import pytest
 from packaging.tags import sys_tags
 
 import qwenpaw.app.channels.environment_installer as installer_module
+import qwenpaw.app.channels.env_manager as env_manager_module
 
 from qwenpaw.app.channels.environment_installer import (
     DEFAULT_ALIYUN_INDEX_URL,
@@ -33,6 +35,7 @@ from qwenpaw.app.channels.environment_installer import (
 from qwenpaw.app.channels.env_manager import (
     compute_venv_tree_sha256,
     EnvironmentSpecManifest,
+    _validate_venv_launchers,
     validate_installed_environment,
 )
 from qwenpaw.channel_protocol import (
@@ -557,7 +560,7 @@ def test_stale_console_script_environment_requires_repair(
         source=DependencySource.offline(),
     )
     scripts = "Scripts" if os.name == "nt" else "bin"
-    launcher_name = "demo-cli-script.py" if os.name == "nt" else "demo-cli"
+    launcher_name = "demo-cli.exe" if os.name == "nt" else "demo-cli"
     launcher = first.environment_directory / "venv" / scripts / launcher_name
     original = launcher.read_bytes()
     canonical_venv = first.environment_directory / "venv"
@@ -601,6 +604,37 @@ def test_stale_console_script_environment_requires_repair(
         )
         is None
     )
+
+
+def test_windows_exe_launcher_requires_canonical_interpreter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows exe launchers are checked without a companion script."""
+    monkeypatch.setattr(
+        env_manager_module,
+        "os",
+        SimpleNamespace(name="nt", path=os.path, sep=os.sep),
+    )
+    venv_root = tmp_path / "venv"
+    scripts_root = venv_root / "Scripts"
+    scripts_root.mkdir(parents=True)
+    interpreter = scripts_root / "python.exe"
+    interpreter.write_bytes(b"python")
+    launcher = scripts_root / "demo-cli.exe"
+    launcher.write_bytes(
+        b"launcher\0" + str(interpreter).encode("utf-16-le"),
+    )
+
+    assert not launcher.with_name("demo-cli-script.py").exists()
+    assert not _validate_venv_launchers(venv_root, interpreter)
+
+    stale = tmp_path / "old-staging" / "venv" / "Scripts" / "python.exe"
+    launcher.write_bytes(
+        b"launcher\0" + str(stale).encode("utf-16-le"),
+    )
+    reasons = _validate_venv_launchers(venv_root, interpreter)
+    assert any("demo-cli.exe" in reason for reason in reasons)
 
 
 def test_target_probe_controls_marker_and_wheel_selection() -> None:

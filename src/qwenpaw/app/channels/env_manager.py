@@ -1385,38 +1385,48 @@ def _venv_interpreter(venv_root: Path) -> Path:
     return venv_root / "bin" / "python"
 
 
+def _launcher_shebang(content: bytes) -> str | None:
+    """Decode one launcher shebang line from common script encodings."""
+    first_line = content.split(b"\n", 1)[0].rstrip(b"\r")
+    if first_line.startswith(b"\xff\xfe"):
+        line = first_line.decode("utf-16").strip()
+    elif first_line.startswith(b"#\x00!\x00"):
+        line = first_line.decode("utf-16-le").strip()
+    elif first_line.startswith(b"#!"):
+        line = first_line[2:].decode("utf-8").strip()
+    else:
+        return None
+    return line[2:].strip() if line.startswith("#!") else line
+
+
 def _launcher_python_path(path: Path) -> str | None:
     """Return a Python interpreter token from a launcher shebang."""
     try:
         content = path.read_bytes()
-        first_line = content.split(b"\n", 1)[0].rstrip(b"\r")
-        if first_line.startswith(b"\xff\xfe"):
-            line = first_line.decode("utf-16").strip()
-        elif first_line.startswith(b"#\x00!\x00"):
-            line = first_line.decode("utf-16-le").strip()
-        elif not first_line.startswith(b"#!"):
-            return None
-        else:
-            line = first_line[2:].decode("utf-8").strip()
-    except (IndexError, OSError, UnicodeError):
+        line = _launcher_shebang(content)
+    except (OSError, UnicodeError):
         return None
-    if line.startswith("#!"):
-        line = line[2:].strip()
+    if line is None:
+        return None
     tokens = line.split()
     if not tokens:
         return None
     command = tokens[0].strip('"')
     basename = command.replace("\\", "/").rsplit("/", 1)[-1]
     if basename.lower() == "env":
-        for token in tokens[1:]:
-            if token.startswith("-"):
-                continue
-            candidate = token.strip('"')
-            candidate_name = candidate.replace("\\", "/")
-            candidate_name = candidate_name.rsplit("/", 1)[-1]
-            if candidate_name.lower().startswith("python"):
-                return candidate
-        return None
+        return next(
+            (
+                candidate.strip('"')
+                for token in tokens[1:]
+                if not token.startswith("-")
+                for candidate in (token,)
+                if candidate.replace("\\", "/")
+                .rsplit("/", 1)[-1]
+                .lower()
+                .startswith("python")
+            ),
+            None,
+        )
     if basename.lower().startswith("python"):
         return command
     if basename.lower() in {"sh", "bash", "zsh"}:
@@ -1448,16 +1458,12 @@ def _validate_venv_launchers(
         _normalise_launcher_path(str(expected_path)),
     }
     try:
-        for candidate in scripts_root.iterdir():
-            if (
-                candidate.name.lower().startswith("python")
-                and (candidate.is_file() or candidate.is_symlink())
-            ):
-                allowed_paths.add(
-                    _normalise_launcher_path(
-                        str(expected_path.parent / candidate.name),
-                    ),
-                )
+        allowed_paths.update(
+            _normalise_launcher_path(str(expected_path.parent / candidate.name))
+            for candidate in scripts_root.iterdir()
+            if candidate.name.lower().startswith("python")
+            and (candidate.is_file() or candidate.is_symlink())
+        )
     except OSError as exc:
         return (f"Venv launchers cannot be enumerated: {exc}",)
     reasons: list[str] = []
@@ -1479,8 +1485,6 @@ def _validate_venv_launchers(
         if os.name != "nt" or path.suffix.lower() != ".exe":
             continue
         if path.name.lower().startswith(("python", "venvlauncher")):
-            continue
-        if not path.with_name(f"{path.stem}-script.py").is_file():
             continue
         try:
             content = path.read_bytes()
@@ -1660,17 +1664,16 @@ def validate_installed_environment(
             install_manifest.venv_tree_sha256,
         ),
     )
-    if reasons:
-        return _repair_required(reasons)
-    launcher_interpreter = expected_launcher_interpreter or _venv_interpreter(
-        venv_root,
-    )
-    reasons.extend(
-        _validate_venv_launchers(
-            venv_root,
-            launcher_interpreter,
-        ),
-    )
+    if not reasons:
+        launcher_interpreter = (
+            expected_launcher_interpreter or _venv_interpreter(venv_root)
+        )
+        reasons.extend(
+            _validate_venv_launchers(
+                venv_root,
+                launcher_interpreter,
+            ),
+        )
     if reasons:
         return _repair_required(reasons)
     site_paths, marker_environment, target_reasons = _probe_target(
