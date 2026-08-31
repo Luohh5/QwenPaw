@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import qwenpaw.harnesses.codex.rollout_reader as rollout_module
 from qwenpaw.harnesses.codex.rollout_reader import (
     CodexRolloutReader,
     codex_non_root_session_kind,
@@ -124,6 +125,7 @@ def test_rollout_reader_indexes_and_normalizes_visible_history(
 
 def test_rollout_reader_stitches_compacted_lineage(tmp_path: Path) -> None:
     thread_id = "019fe9ac-2e78-7a10-a196-27b001cdf1f5"
+    embedded_alias = "019ff100-0000-7000-8000-000000000000"
     root = tmp_path / ".codex/sessions/2026/08/12"
     root.mkdir(parents=True)
     first = root / f"rollout-2026-08-12T00-00-00-{thread_id}.jsonl"
@@ -137,6 +139,14 @@ def test_rollout_reader_stitches_compacted_lineage(tmp_path: Path) -> None:
                 _line(
                     "session_meta",
                     {"id": thread_id, "timestamp": "2026-08-12T00:00:00Z"},
+                    "2026-08-12T00:00:00Z",
+                ),
+                _line(
+                    "session_meta",
+                    {
+                        "id": embedded_alias,
+                        "timestamp": "2026-08-12T00:00:00Z",
+                    },
                     "2026-08-12T00:00:00Z",
                 ),
                 _line(
@@ -175,6 +185,20 @@ def test_rollout_reader_stitches_compacted_lineage(tmp_path: Path) -> None:
     assert len(threads) == 1
     assert threads[0]["rolloutLineageLength"] == 2
     assert [item.text for item in history] == ["First part", "Continued part"]
+
+
+def test_oversized_history_remains_visible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    thread_id = "019fe9ac-2e78-7a10-a196-27b001cdf1f5"
+    _rollout(tmp_path / ".codex/sessions", thread_id, {}, "hello")
+    monkeypatch.setattr(rollout_module, "_MAX_HISTORY_BYTES", 1)
+    reader = CodexRolloutReader(tmp_path / ".codex")
+
+    assert reader.list_threads()[0]["id"] == thread_id
+    with pytest.raises(ValueError, match="exceeds 128 MiB"):
+        reader.read_thread(thread_id)
 
 
 def test_rollout_reader_excludes_structured_non_root_sessions(

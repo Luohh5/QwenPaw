@@ -95,6 +95,7 @@
     "states": {
       "pending": "Aguardando",
       "repairing": "Corrigindo",
+      "ready_to_import": "Corrigido, aguardando importação",
       "not_needed": "Desnecessário",
       "failed": "Falhou",
       "succeeded": "Concluído"
@@ -113,6 +114,10 @@
     "importing": "Importação em andamento",
     "keepOpen": "Revise cada item abaixo. Não feche o QwenPaw durante a importação.",
     "details": "Detalhes da migração",
+    "targetAgent": "Agente de destino: {{agent}}",
+    "selectAllFailed": "Selecionar todas as ferramentas com falha",
+    "retrySelected": "Tentar novamente as selecionadas ({{count}})",
+    "retryConfirm": "Tentar novamente {{count}} ferramentas com falha selecionadas? Itens com o mesmo nome serão substituídos.",
     "done": "Concluir"
   },
   "nav": {

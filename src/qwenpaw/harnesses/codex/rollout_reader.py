@@ -17,7 +17,8 @@ _UUID_PATTERN = re.compile(
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
     re.IGNORECASE,
 )
-_MAX_ROLLOUT_BYTES = _MAX_LINE_BYTES = 128 * 1024 * 1024
+_MAX_HISTORY_BYTES = _MAX_LINE_BYTES = 128 * 1024 * 1024
+_MAX_HEADER_LINES = 64
 _EVENT_KINDS = {
     "user_message": HarnessHistoryKind.USER,
     "agent_message": HarnessHistoryKind.MESSAGE,
@@ -123,6 +124,7 @@ class _RolloutMetadataState:
     updated_at: str = ""
     non_root_kind: str = ""
     parent_thread_id: str = ""
+    metadata_seen: bool = False
 
     def update(self, entry: dict[str, Any]) -> None:
         """Merge metadata carried by one rollout entry."""
@@ -134,11 +136,15 @@ class _RolloutMetadataState:
             return
         entry_type = str(entry.get("type") or "")
         if entry_type == "session_meta":
-            self.thread_id = str(
+            if self.metadata_seen:
+                return
+            self.metadata_seen = True
+            thread_id = str(
                 payload.get("id")
                 or payload.get("session_id")
                 or self.thread_id,
             )
+            self.thread_id = thread_id
             self.cwd = str(payload.get("cwd") or self.cwd)
             self.created_at = str(
                 payload.get("timestamp") or self.created_at,
@@ -295,7 +301,7 @@ class CodexRolloutReader:
 
 def _read_rollout_metadata(path: Path) -> CodexRolloutRecord | None:
     try:
-        if not path.is_file() or path.stat().st_size > _MAX_ROLLOUT_BYTES:
+        if not path.is_file():
             return None
     except OSError:
         return None
@@ -303,7 +309,10 @@ def _read_rollout_metadata(path: Path) -> CodexRolloutRecord | None:
     state = _RolloutMetadataState(match.group(1) if match else "")
     try:
         with path.open("rb") as stream:
-            for _, entry in _jsonl_entries(stream):
+            for _, entry in _jsonl_entries(
+                stream,
+                limit=_MAX_HEADER_LINES,
+            ):
                 state.update(entry)
     except (OSError, ValueError):
         return None
@@ -326,7 +335,7 @@ def _read_rollout_history(path: Path) -> list[HarnessHistoryItem]:
         size = path.stat().st_size
     except OSError as exc:
         raise FileNotFoundError(path) from exc
-    if size > _MAX_ROLLOUT_BYTES:
+    if size > _MAX_HISTORY_BYTES:
         raise ValueError(f"Codex rollout exceeds 128 MiB: {path.name}")
     history: list[HarnessHistoryItem] = []
     with path.open("rb") as stream:
@@ -345,9 +354,13 @@ def _read_rollout_history(path: Path) -> list[HarnessHistoryItem]:
 
 def _jsonl_entries(
     stream: Any,
+    *,
+    limit: int | None = None,
 ) -> Iterator[tuple[int, dict[str, Any]]]:
     """Yield valid, bounded JSON objects from a rollout stream."""
     for index, raw_line in enumerate(stream, start=1):
+        if limit is not None and index > limit:
+            break
         if len(raw_line) > _MAX_LINE_BYTES:
             raise ValueError(f"Codex rollout line {index} exceeds 128 MiB")
         try:

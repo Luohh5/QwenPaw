@@ -1,4 +1,5 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
+import { createElement, StrictMode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { portabilityImportApi } from "../../api/modules/import";
 import { useImportJob } from "./useImportJob";
@@ -14,60 +15,194 @@ vi.mock("../../api/modules/import", () => ({
     create: vi.fn(),
     snapshot: vi.fn(),
     start: vi.fn(),
+    retry: vi.fn(),
+    cancel: vi.fn(),
     streamEvents: vi.fn(),
   },
 }));
 
-const job = {
-  job_id: "import-1",
-  agent_id: "agent-a",
+const job = (agentId: string, jobId = `import-${agentId}`) => ({
+  job_id: jobId,
+  agent_id: agentId,
   state: "awaiting_selection" as const,
   phase: "select",
   seq: 1,
   providers: [],
   logs: [],
-};
+});
 
 describe("useImportJob", () => {
   beforeEach(() => {
     selectedAgent = "agent-a";
     vi.clearAllMocks();
     sessionStorage.clear();
-    vi.mocked(portabilityImportApi.create).mockResolvedValue(job);
-    vi.mocked(portabilityImportApi.snapshot).mockResolvedValue(job);
-    vi.mocked(portabilityImportApi.start).mockResolvedValue({
-      ...job,
-      state: "running",
-      seq: 2,
-    });
+    vi.mocked(portabilityImportApi.create).mockImplementation(async (agentId) =>
+      job(agentId),
+    );
+    vi.mocked(portabilityImportApi.snapshot).mockImplementation(
+      async (agentId, jobId) => job(agentId, jobId),
+    );
+    vi.mocked(portabilityImportApi.start).mockImplementation(
+      async (agentId, jobId) => ({ ...job(agentId, jobId), state: "running" }),
+    );
+    vi.mocked(portabilityImportApi.cancel).mockImplementation(
+      async (agentId, jobId) => ({ ...job(agentId, jobId), state: "interrupted" }),
+    );
     vi.mocked(portabilityImportApi.streamEvents).mockReturnValue(
       new Promise(() => undefined),
     );
   });
 
-  it("keeps the job pinned when the selected agent changes", async () => {
+  it("keeps one recoverable import per agent while switching", async () => {
     const { result, rerender } = renderHook(() => useImportJob());
     await act(() => result.current.scan(["codex"]));
 
     selectedAgent = "agent-b";
     rerender();
-    await act(() => result.current.start({ codex: { sessions: true } }));
+    await waitFor(() => expect(result.current.job).toBeNull());
+    await act(() => result.current.scan(["qoder"]));
 
-    expect(portabilityImportApi.create).toHaveBeenCalledWith("agent-a", [
+    expect(portabilityImportApi.create).toHaveBeenNthCalledWith(1, "agent-a", [
       "codex",
     ]);
-    expect(portabilityImportApi.start).toHaveBeenCalledWith(
-      "agent-a",
-      "import-1",
-      { codex: { sessions: true } },
+    expect(portabilityImportApi.create).toHaveBeenNthCalledWith(2, "agent-b", [
+      "qoder",
+    ]);
+
+    selectedAgent = "agent-a";
+    rerender();
+    await waitFor(() => expect(result.current.job?.agent_id).toBe("agent-a"));
+
+    selectedAgent = "agent-b";
+    rerender();
+    await waitFor(() => expect(result.current.job?.agent_id).toBe("agent-b"));
+  });
+
+  it("ignores a stale snapshot after switching agents", async () => {
+    sessionStorage.setItem(
+      "qwenpaw.portability.activeImports",
+      JSON.stringify({ "agent-a": "import-a", "agent-b": "import-b" }),
+    );
+    let resolveA: (value: ReturnType<typeof job>) => void;
+    vi.mocked(portabilityImportApi.snapshot).mockImplementation(
+      (agentId, jobId) =>
+        agentId === "agent-a"
+          ? new Promise((resolve) => {
+              resolveA = resolve;
+            })
+          : Promise.resolve(job(agentId, jobId)),
+    );
+    const { result, rerender } = renderHook(() => useImportJob());
+
+    selectedAgent = "agent-b";
+    rerender();
+    await waitFor(() => expect(result.current.job?.agent_id).toBe("agent-b"));
+    await act(async () => resolveA!(job("agent-a", "import-a")));
+
+    expect(result.current.job?.agent_id).toBe("agent-b");
+  });
+
+  it("stops only the previous page subscription when switching", async () => {
+    let signalA: AbortSignal | undefined;
+    vi.mocked(portabilityImportApi.streamEvents).mockImplementation(
+      async (agentId, _jobId, _after, _onEvent, signal) => {
+        if (agentId === "agent-a") signalA = signal;
+        return new Promise(() => undefined);
+      },
+    );
+    const { result, rerender } = renderHook(() => useImportJob());
+    await act(() => result.current.scan(["codex"]));
+    await waitFor(() => expect(signalA).toBeDefined());
+
+    selectedAgent = "agent-b";
+    rerender();
+
+    expect(signalA?.aborted).toBe(true);
+  });
+
+  it("removes only the current agent's active job", async () => {
+    sessionStorage.setItem(
+      "qwenpaw.portability.activeImports",
+      JSON.stringify({ "agent-a": "import-a", "agent-b": "import-b" }),
+    );
+    const { result, rerender } = renderHook(() => useImportJob());
+    await waitFor(() => expect(result.current.job?.job_id).toBe("import-a"));
+    act(() => result.current.reset());
+
+    selectedAgent = "agent-b";
+    rerender();
+    await waitFor(() => expect(result.current.job?.job_id).toBe("import-b"));
+  });
+
+  it("preserves a legacy active import during the storage upgrade", async () => {
+    sessionStorage.setItem(
+      "qwenpaw.portability.activeImport",
+      JSON.stringify(["agent-a", "import-a"]),
+    );
+    const { result } = renderHook(() => useImportJob());
+
+    await waitFor(() => expect(result.current.job?.job_id).toBe("import-a"));
+    expect(sessionStorage.getItem("qwenpaw.portability.activeImports")).toBe(
+      JSON.stringify({ "agent-a": "import-a" }),
     );
   });
 
-  it("accepts only newer server snapshots", async () => {
+  it("clears an unavailable saved job so a new import can take over", async () => {
+    sessionStorage.setItem(
+      "qwenpaw.portability.activeImports",
+      JSON.stringify({ "agent-a": "missing-job" }),
+    );
+    vi.mocked(portabilityImportApi.snapshot).mockRejectedValueOnce(
+      new Error("import job not found"),
+    );
+    const { result } = renderHook(() => useImportJob());
+
+    await waitFor(() =>
+      expect(result.current.error).toBe("import job not found"),
+    );
+    await act(() => result.current.scan(["codex"]));
+
+    expect(result.current.job?.job_id).toBe("import-agent-a");
+  });
+
+  it("does not subscribe after an unmounted scan resolves", async () => {
+    let resolveCreate: (value: ReturnType<typeof job>) => void;
+    vi.mocked(portabilityImportApi.create).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveCreate = resolve;
+        }),
+    );
+    const { result, unmount } = renderHook(() => useImportJob());
+    const pending = result.current.scan(["codex"]);
+    unmount();
+    await act(async () => resolveCreate!(job("agent-a")));
+    await pending;
+
+    expect(portabilityImportApi.streamEvents).not.toHaveBeenCalled();
+  });
+
+  it("remains usable under Strict Mode", async () => {
+    const { result } = renderHook(() => useImportJob(), {
+      wrapper: ({ children }) => createElement(StrictMode, null, children),
+    });
+
+    await act(() => result.current.scan(["codex"]));
+
+    expect(result.current.job?.job_id).toBe("import-agent-a");
+  });
+
+  it("accepts only newer snapshots for the visible job", async () => {
     vi.mocked(portabilityImportApi.streamEvents).mockImplementation(
       async (_agent, _jobId, _after, onEvent) => {
-        onEvent({ seq: 3, snapshot: { ...job, seq: 3, state: "completed" } });
-        onEvent({ seq: 2, snapshot: { ...job, seq: 2, state: "running" } });
+        onEvent({
+          seq: 3,
+          snapshot: { ...job("agent-a"), seq: 3, state: "completed" },
+        });
+        onEvent({
+          seq: 2,
+          snapshot: { ...job("agent-a"), seq: 2, state: "running" },
+        });
       },
     );
     const { result } = renderHook(() => useImportJob());
@@ -78,20 +213,42 @@ describe("useImportJob", () => {
     expect(result.current.job?.state).toBe("completed");
   });
 
-  it("restores an import after leaving the page and switching agents", async () => {
-    const first = renderHook(() => useImportJob());
-    await act(() => first.result.current.scan(["codex"]));
-    first.unmount();
-
-    selectedAgent = "agent-b";
-    const second = renderHook(() => useImportJob());
-    await waitFor(() =>
-      expect(second.result.current.job?.job_id).toBe("import-1"),
+  it("starts and retries only the currently selected agent's job", async () => {
+    vi.mocked(portabilityImportApi.retry).mockImplementation(
+      async (agentId) => ({
+        ...job(agentId, `retry-${agentId}`),
+        state: "running",
+      }),
+    );
+    const { result } = renderHook(() => useImportJob());
+    await act(() => result.current.scan(["codex"]));
+    await act(() => result.current.start({ codex: { sessions: true } }));
+    await act(() =>
+      result.current.retry({ codex: { sessions: false, skills: ["skill-1"] } }),
     );
 
-    expect(portabilityImportApi.snapshot).toHaveBeenCalledWith(
+    expect(portabilityImportApi.start).toHaveBeenCalledWith(
       "agent-a",
-      "import-1",
+      "import-agent-a",
+      { codex: { sessions: true } },
     );
+    expect(portabilityImportApi.retry).toHaveBeenCalledWith(
+      "agent-a",
+      "import-agent-a",
+      { codex: { sessions: false, skills: ["skill-1"] } },
+    );
+    expect(result.current.job?.job_id).toBe("retry-agent-a");
+  });
+
+  it("cancels only the visible agent's job", async () => {
+    const { result } = renderHook(() => useImportJob());
+    await act(() => result.current.scan(["codex"]));
+    await act(() => result.current.cancel());
+
+    expect(portabilityImportApi.cancel).toHaveBeenCalledWith(
+      "agent-a",
+      "import-agent-a",
+    );
+    expect(result.current.job?.state).toBe("interrupted");
   });
 });

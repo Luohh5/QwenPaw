@@ -24,6 +24,10 @@ describe("portabilityImportApi", () => {
     await portabilityImportApi.start("agent one", "import-1", {
       codex: selection,
     });
+    await portabilityImportApi.retry("agent one", "import-1", {
+      codex: { sessions: false, skills: ["skill-1"] },
+    });
+    await portabilityImportApi.cancel("agent one", "import-1");
 
     const base = "/agents/agent%20one/portability/imports";
     expect(request).toHaveBeenNthCalledWith(1, `${base}/sources`);
@@ -42,6 +46,21 @@ describe("portabilityImportApi", () => {
       expect.objectContaining({
         body: JSON.stringify({ selections: { codex: selection } }),
       }),
+    );
+    expect(request).toHaveBeenNthCalledWith(
+      5,
+      `${base}/jobs/import-1/retry`,
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          selections: { codex: { sessions: false, skills: ["skill-1"] } },
+        }),
+      }),
+    );
+    expect(request).toHaveBeenNthCalledWith(
+      6,
+      `${base}/jobs/import-1/cancel`,
+      { method: "POST" },
     );
   });
 
@@ -62,6 +81,7 @@ describe("portabilityImportApi", () => {
       vi.fn().mockResolvedValue(new Response(stream, { status: 200 })),
     );
     const events: number[] = [];
+    const onOpen = vi.fn();
 
     await portabilityImportApi.streamEvents(
       "agent one",
@@ -69,6 +89,7 @@ describe("portabilityImportApi", () => {
       2,
       (event) => events.push(event.seq),
       new AbortController().signal,
+      onOpen,
     );
 
     expect(fetch).toHaveBeenCalledWith(
@@ -76,5 +97,6 @@ describe("portabilityImportApi", () => {
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
     expect(events).toEqual([3]);
+    expect(onOpen).toHaveBeenCalledOnce();
   });
 });

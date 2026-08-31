@@ -15,27 +15,52 @@ const terminal = new Set([
   "failed",
   "interrupted",
 ]);
-const ACTIVE_JOB = "qwenpaw.portability.activeImport";
-type ActiveJob = [string, string];
+const ACTIVE_JOBS = "qwenpaw.portability.activeImports";
+const LEGACY_ACTIVE_JOB = "qwenpaw.portability.activeImport";
+const RECONNECT_INITIAL_MS = 750;
+const RECONNECT_MAX_MS = 15_000;
 
-function loadActiveJob(): ActiveJob | null {
+function activeJobs(): Record<string, string> {
   try {
-    return JSON.parse(
-      sessionStorage.getItem(ACTIVE_JOB) ?? "null",
-    ) as ActiveJob | null;
+    const saved = sessionStorage.getItem(ACTIVE_JOBS);
+    if (saved) {
+      const value = JSON.parse(saved);
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        return Object.fromEntries(
+          Object.entries(value).filter(
+            ([agentId, jobId]) =>
+              typeof agentId === "string" && typeof jobId === "string",
+          ),
+        ) as Record<string, string>;
+      }
+    }
+    const legacy = JSON.parse(
+      sessionStorage.getItem(LEGACY_ACTIVE_JOB) ?? "null",
+    );
+    return Array.isArray(legacy) &&
+      legacy.length === 2 &&
+      legacy.every((item) => typeof item === "string")
+      ? { [legacy[0]]: legacy[1] }
+      : {};
   } catch {
-    return null;
+    return {};
   }
 }
 
-function saveActiveJob(value: ActiveJob | null) {
+function saveActiveJob(agentId: string, jobId = "") {
   try {
-    if (value) sessionStorage.setItem(ACTIVE_JOB, JSON.stringify(value));
-    else sessionStorage.removeItem(ACTIVE_JOB);
+    const jobs = activeJobs();
+    if (jobId) jobs[agentId] = jobId;
+    else delete jobs[agentId];
+    sessionStorage.setItem(ACTIVE_JOBS, JSON.stringify(jobs));
+    sessionStorage.removeItem(LEGACY_ACTIVE_JOB);
   } catch {
     /* Storage is only a navigation recovery hint. */
   }
 }
+
+const message = (reason: unknown) =>
+  reason instanceof Error ? reason.message : String(reason);
 
 export function useImportJob() {
   const { selectedAgent } = useAgentStore();
@@ -43,144 +68,312 @@ export function useImportJob() {
   const [job, setJob] = useState<ImportJobSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const pinnedAgent = useRef("");
+  const [streamError, setStreamError] = useState("");
+  const selectedRef = useRef(selectedAgent);
+  const mounted = useRef(true);
   const latest = useRef<ImportJobSnapshot | null>(null);
+  const view = useRef({ agentId: selectedAgent, jobId: "" });
   const controller = useRef<AbortController | null>(null);
+  selectedRef.current = selectedAgent;
 
-  const accept = useCallback((event: ImportJobEvent) => {
-    if (event.seq <= (latest.current?.seq ?? -1)) return;
-    latest.current = event.snapshot;
-    setJob(event.snapshot);
-  }, []);
+  const isCurrent = useCallback(
+    (agentId: string, jobId: string) =>
+      mounted.current &&
+      selectedRef.current === agentId &&
+      view.current.agentId === agentId &&
+      view.current.jobId === jobId,
+    [],
+  );
+
+  const accept = useCallback(
+    (agentId: string, jobId: string, event: ImportJobEvent) => {
+      if (
+        !isCurrent(agentId, jobId) ||
+        event.snapshot.job_id !== jobId ||
+        event.seq <= (latest.current?.seq ?? -1)
+      ) {
+        return;
+      }
+      latest.current = event.snapshot;
+      setJob(event.snapshot);
+    },
+    [isCurrent],
+  );
 
   const watch = useCallback(
     async (agentId: string, jobId: string, signal: AbortSignal) => {
-      while (!signal.aborted && !terminal.has(latest.current?.state ?? "")) {
+      let delay = RECONNECT_INITIAL_MS;
+      while (
+        !signal.aborted &&
+        isCurrent(agentId, jobId) &&
+        !terminal.has(latest.current?.state ?? "")
+      ) {
         try {
           await portabilityImportApi.streamEvents(
             agentId,
             jobId,
             latest.current?.seq ?? 0,
-            accept,
+            (event) => accept(agentId, jobId, event),
             signal,
+            () => {
+              delay = RECONNECT_INITIAL_MS;
+              if (isCurrent(agentId, jobId)) setStreamError("");
+            },
           );
+          if (signal.aborted || !isCurrent(agentId, jobId)) return;
           if (terminal.has(latest.current?.state ?? "")) return;
           const snapshot = await portabilityImportApi.snapshot(agentId, jobId);
-          accept({ seq: snapshot.seq, snapshot });
+          accept(agentId, jobId, { seq: snapshot.seq, snapshot });
         } catch (reason) {
-          if (signal.aborted) return;
-          setError(reason instanceof Error ? reason.message : String(reason));
+          if (signal.aborted || !isCurrent(agentId, jobId)) return;
+          setStreamError(message(reason));
         }
-        await new Promise((resolve) => setTimeout(resolve, 750));
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        delay = Math.min(delay * 2, RECONNECT_MAX_MS);
       }
     },
-    [accept],
+    [accept, isCurrent],
+  );
+
+  const show = useCallback(
+    (snapshot: ImportJobSnapshot) => {
+      controller.current?.abort();
+      const abort = new AbortController();
+      controller.current = abort;
+      view.current = { agentId: snapshot.agent_id, jobId: snapshot.job_id };
+      latest.current = snapshot;
+      setStreamError("");
+      setJob(snapshot);
+      if (!terminal.has(snapshot.state)) {
+        void watch(snapshot.agent_id, snapshot.job_id, abort.signal);
+      }
+    },
+    [watch],
   );
 
   const detect = useCallback(async () => {
-    setLoading(true);
-    setError("");
+    const agentId = selectedAgent;
+    const idle = !view.current.jobId;
+    if (idle) {
+      setLoading(true);
+      setError("");
+    }
     try {
-      const result = await portabilityImportApi.sources(selectedAgent);
-      setSources(result);
+      const result = await portabilityImportApi.sources(agentId);
+      if (mounted.current && selectedRef.current === agentId) {
+        setSources(result);
+      }
       return result;
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (
+        mounted.current &&
+        idle &&
+        selectedRef.current === agentId &&
+        !view.current.jobId
+      ) {
+        setError(message(reason));
+      }
       throw reason;
     } finally {
-      setLoading(false);
+      if (
+        mounted.current &&
+        idle &&
+        selectedRef.current === agentId &&
+        !view.current.jobId
+      ) {
+        setLoading(false);
+      }
     }
   }, [selectedAgent]);
 
   const scan = useCallback(
     async (selected: ImportSource[]) => {
-      controller.current?.abort();
-      const abort = new AbortController();
-      controller.current = abort;
-      pinnedAgent.current = selectedAgent;
+      const agentId = selectedAgent;
       setLoading(true);
       setError("");
       try {
-        const created = await portabilityImportApi.create(
-          selectedAgent,
-          selected,
-        );
-        saveActiveJob([selectedAgent, created.job_id]);
-        latest.current = created;
-        setJob(created);
-        void watch(selectedAgent, created.job_id, abort.signal);
+        const created = await portabilityImportApi.create(agentId, selected);
+        saveActiveJob(agentId, created.job_id);
+        if (isCurrent(agentId, "")) {
+          show(created);
+        }
         return created;
       } catch (reason) {
-        setError(reason instanceof Error ? reason.message : String(reason));
+        if (mounted.current && selectedRef.current === agentId) {
+          setError(message(reason));
+        }
         throw reason;
       } finally {
-        setLoading(false);
+        if (mounted.current && selectedRef.current === agentId) {
+          setLoading(false);
+        }
       }
     },
-    [selectedAgent, watch],
+    [isCurrent, selectedAgent, show],
   );
 
   const start = useCallback(
     async (selections: Partial<Record<ImportSource, ImportSelection>>) => {
-      if (!latest.current || !pinnedAgent.current) {
+      const snapshot = latest.current;
+      if (!snapshot || !isCurrent(selectedAgent, snapshot.job_id)) {
         throw new Error("Import job has not been created");
       }
       setLoading(true);
       setError("");
       try {
         const started = await portabilityImportApi.start(
-          pinnedAgent.current,
-          latest.current.job_id,
+          selectedAgent,
+          snapshot.job_id,
           selections,
         );
-        latest.current = started;
-        setJob(started);
+        accept(selectedAgent, snapshot.job_id, {
+          seq: started.seq,
+          snapshot: started,
+        });
         return started;
       } catch (reason) {
-        setError(reason instanceof Error ? reason.message : String(reason));
+        if (isCurrent(selectedAgent, snapshot.job_id))
+          setError(message(reason));
         throw reason;
       } finally {
-        setLoading(false);
+        if (isCurrent(selectedAgent, snapshot.job_id)) setLoading(false);
       }
     },
-    [],
+    [accept, isCurrent, selectedAgent],
   );
 
+  const retry = useCallback(
+    async (selections: Partial<Record<ImportSource, ImportSelection>>) => {
+      const snapshot = latest.current;
+      if (!snapshot || !isCurrent(selectedAgent, snapshot.job_id)) {
+        throw new Error("Import job has not been created");
+      }
+      setLoading(true);
+      setError("");
+      try {
+        const retried = await portabilityImportApi.retry(
+          selectedAgent,
+          snapshot.job_id,
+          selections,
+        );
+        saveActiveJob(selectedAgent, retried.job_id);
+        if (isCurrent(selectedAgent, snapshot.job_id)) show(retried);
+        return retried;
+      } catch (reason) {
+        if (isCurrent(selectedAgent, snapshot.job_id))
+          setError(message(reason));
+        throw reason;
+      } finally {
+        if (mounted.current && selectedRef.current === selectedAgent) {
+          setLoading(false);
+        }
+      }
+    },
+    [isCurrent, selectedAgent, show],
+  );
+
+  const cancel = useCallback(async () => {
+    const snapshot = latest.current;
+    if (!snapshot || !isCurrent(selectedAgent, snapshot.job_id)) {
+      throw new Error("Import job has not been created");
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const interrupted = await portabilityImportApi.cancel(
+        selectedAgent,
+        snapshot.job_id,
+      );
+      accept(selectedAgent, snapshot.job_id, {
+        seq: interrupted.seq,
+        snapshot: interrupted,
+      });
+      return interrupted;
+    } catch (reason) {
+      if (isCurrent(selectedAgent, snapshot.job_id)) setError(message(reason));
+      throw reason;
+    } finally {
+      if (isCurrent(selectedAgent, snapshot.job_id)) setLoading(false);
+    }
+  }, [accept, isCurrent, selectedAgent]);
+
   const reset = useCallback(() => {
+    const agentId = selectedAgent;
     controller.current?.abort();
     controller.current = null;
-    pinnedAgent.current = "";
+    view.current = { agentId, jobId: "" };
     latest.current = null;
-    saveActiveJob(null);
+    saveActiveJob(agentId);
     setJob(null);
     setError("");
-  }, []);
+    setStreamError("");
+  }, [selectedAgent]);
 
   useEffect(() => {
-    const active = loadActiveJob();
-    if (active) {
-      const [agentId, jobId] = active;
-      const abort = new AbortController();
-      controller.current = abort;
-      void portabilityImportApi
-        .snapshot(agentId, jobId)
-        .then((snapshot) => {
-          if (abort.signal.aborted) return;
-          pinnedAgent.current = agentId;
-          latest.current = snapshot;
-          setJob(snapshot);
-          if (!terminal.has(snapshot.state)) {
-            void watch(agentId, jobId, abort.signal);
-          }
-        })
-        .catch((reason) => {
-          if (!abort.signal.aborted) {
-            saveActiveJob(null);
-            setError(reason instanceof Error ? reason.message : String(reason));
-          }
-        });
+    controller.current?.abort();
+    controller.current = null;
+    latest.current = null;
+    setJob(null);
+    setError("");
+    setStreamError("");
+    const jobId = activeJobs()[selectedAgent];
+    view.current = { agentId: selectedAgent, jobId: jobId ?? "" };
+    if (!jobId) {
+      setLoading(false);
+      return undefined;
     }
-    return () => controller.current?.abort();
-  }, [watch]);
-  return { sources, job, loading, error, detect, scan, start, reset };
+    saveActiveJob(selectedAgent, jobId);
+    const abort = new AbortController();
+    controller.current = abort;
+    setLoading(true);
+    void portabilityImportApi
+      .snapshot(selectedAgent, jobId)
+      .then((snapshot) => {
+        if (!isCurrent(selectedAgent, jobId) || abort.signal.aborted) return;
+        latest.current = snapshot;
+        setJob(snapshot);
+        if (!terminal.has(snapshot.state)) {
+          void watch(selectedAgent, jobId, abort.signal);
+        }
+      })
+      .catch((reason) => {
+        if (!isCurrent(selectedAgent, jobId) || abort.signal.aborted) return;
+        view.current = { agentId: selectedAgent, jobId: "" };
+        latest.current = null;
+        saveActiveJob(selectedAgent);
+        setError(message(reason));
+        setLoading(false);
+      })
+      .finally(() => {
+        if (isCurrent(selectedAgent, jobId) && !abort.signal.aborted) {
+          setLoading(false);
+        }
+      });
+    return () => {
+      controller.current?.abort();
+      controller.current = null;
+    };
+  }, [isCurrent, selectedAgent, watch]);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      controller.current?.abort();
+    };
+  }, []);
+
+  return {
+    sources,
+    job,
+    selectedAgent,
+    loading,
+    error: error || streamError,
+    detect,
+    scan,
+    start,
+    retry,
+    cancel,
+    reset,
+  };
 }

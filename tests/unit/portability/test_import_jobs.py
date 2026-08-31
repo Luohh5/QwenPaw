@@ -37,6 +37,7 @@ class _FakeServices:
         self.block_apply = asyncio.Event()
         self.block_apply.set()
         self.fail_apply: set[str] = set()
+        self.retries: list[tuple[str, ImportSelection]] = []
 
     def factory(self, workspace):
         owner = self
@@ -105,6 +106,32 @@ class _FakeServices:
                     imported_skills=[f"{source.title()} Skill"],
                 )
 
+            async def retry_selection(
+                self,
+                plan_id,
+                selection,
+                *,
+                progress=None,
+            ):
+                owner.retries.append((plan_id, selection))
+                source = "codex" if plan_id.endswith("c" * 32) else "qoder"
+                if progress:
+                    await progress(f"正在修复 Skill「{source.title()} Skill」")
+                now = datetime.now(timezone.utc)
+                return (
+                    await self.plan_from(source),
+                    ImportReceipt(
+                        migration_id=f"migration-retry-{source}",
+                        plan_id=f"plan-{source[0] * 32}",
+                        source=source,
+                        agent_id=workspace.agent_id,
+                        started_at=now,
+                        completed_at=now,
+                        imported_skills=[f"{source.title()} Skill"],
+                        retry_of_migration_id=f"migration-{source}",
+                    ),
+                )
+
         return Service()
 
 
@@ -147,6 +174,12 @@ def test_only_materialization_milestone_updates_session_progress() -> None:
     ) == (1, 2, 1, 0)
     assert provider.assets[0].state is ImportAssetState.SUCCEEDED
     assert provider.assets[0].enabled is False
+    provider.assets[0].state = ImportAssetState.REPAIRING
+    PortabilityImportJobManager._project_progress(
+        provider,
+        "Skill「Qoder Skill」兼容性优化完成，已进入待迁移区。",
+    )
+    assert provider.assets[0].reason_code == "ready_to_import"
 
 
 @pytest.mark.asyncio
@@ -247,6 +280,39 @@ async def test_only_one_apply_runs_per_agent(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_empty_selection_is_rejected_and_active_job_can_cancel(
+    tmp_path: Path,
+) -> None:
+    services = _FakeServices()
+    workspace = _workspace(tmp_path)
+    manager = PortabilityImportJobManager(service_factory=services.factory)
+    created = await manager.create(workspace, ["codex"])
+    await manager.wait(created.job_id)
+
+    with pytest.raises(ValueError, match="select at least"):
+        await manager.start(
+            workspace,
+            created.job_id,
+            {"codex": ImportSelection(sessions=False)},
+        )
+    assert (await manager.snapshot(workspace, created.job_id)).state == (
+        "awaiting_selection"
+    )
+
+    services.block_apply.clear()
+    await manager.start(
+        workspace,
+        created.job_id,
+        {"codex": ImportSelection(skills=["codex-skill"])},
+    )
+    await asyncio.sleep(0)
+
+    assert (await manager.cancel(workspace, created.job_id)).state == (
+        "interrupted"
+    )
+
+
+@pytest.mark.asyncio
 async def test_provider_failure_does_not_discard_other_result(
     tmp_path: Path,
 ) -> None:
@@ -272,3 +338,63 @@ async def test_provider_failure_does_not_discard_other_result(
     assert snapshot.providers[0].assets[0].state is ImportAssetState.SUCCEEDED
     assert snapshot.providers[1].assets[0].state is ImportAssetState.FAILED
     assert "qoder failed" in snapshot.providers[1].error
+
+
+@pytest.mark.asyncio
+async def test_retry_creates_a_new_job_for_selected_failed_tools(
+    tmp_path: Path,
+) -> None:
+    services = _FakeServices()
+    services.fail_apply.update({"codex", "qoder"})
+    workspace = _workspace(tmp_path)
+    manager = PortabilityImportJobManager(service_factory=services.factory)
+    original = await manager.create(workspace, ["codex", "qoder"])
+    await manager.wait(original.job_id)
+    await manager.start(
+        workspace,
+        original.job_id,
+        {
+            source: ImportSelection(sessions=False, skills=[f"{source}-skill"])
+            for source in ("codex", "qoder")
+        },
+    )
+    await manager.wait(original.job_id)
+
+    retry = await manager.retry(
+        workspace,
+        original.job_id,
+        {"codex": ImportSelection(sessions=False, skills=["codex-skill"])},
+    )
+    await manager.wait(retry.job_id)
+    snapshot = await manager.snapshot(workspace, retry.job_id)
+
+    assert retry.job_id != original.job_id
+    assert (retry.mode, retry.retry_of_job_id) == ("retry", original.job_id)
+    assert snapshot.state == "completed_with_issues"
+    assert len(snapshot.providers) == 2
+    assert snapshot.providers[0].assets[0].state is ImportAssetState.SUCCEEDED
+    assert snapshot.providers[1].assets[0].state is ImportAssetState.FAILED
+
+    second_retry = await manager.retry(
+        workspace,
+        retry.job_id,
+        {"qoder": ImportSelection(sessions=False, skills=["qoder-skill"])},
+    )
+    await manager.wait(second_retry.job_id)
+    final = await manager.snapshot(workspace, second_retry.job_id)
+
+    assert final.state == "completed"
+    assert all(
+        provider.assets[0].state is ImportAssetState.SUCCEEDED
+        for provider in final.providers
+    )
+    assert services.retries == [
+        (
+            "plan-" + "c" * 32,
+            ImportSelection(sessions=False, skills=["codex-skill"]),
+        ),
+        (
+            "plan-" + "q" * 32,
+            ImportSelection(sessions=False, skills=["qoder-skill"]),
+        ),
+    ]

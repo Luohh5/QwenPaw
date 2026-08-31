@@ -38,6 +38,18 @@ class _Jobs:
             state="running",
         )
 
+    async def retry(self, workspace, job_id, selections):
+        self.calls.append(("retry", workspace, job_id, selections))
+        return ImportJobSnapshot(job_id="import-" + "b" * 32, agent_id="paw")
+
+    async def cancel(self, workspace, job_id):
+        self.calls.append(("cancel", workspace, job_id))
+        return ImportJobSnapshot(
+            job_id=job_id,
+            agent_id="paw",
+            state="interrupted",
+        )
+
     async def subscribe(self, workspace, job_id, after=0):
         self.calls.append(("subscribe", workspace, job_id, after))
         yield {"seq": 2, "snapshot": {"state": "completed"}}
@@ -91,6 +103,16 @@ async def test_job_routes_pin_workspace_and_submit_selection(api):
         ),
         _request(),
     )
+    await routes.retry_import_job(
+        job_id,
+        routes.StartImportJobRequest(
+            selections={
+                "codex": ImportSelection(sessions=False, skills=["skill-1"]),
+            },
+        ),
+        _request(),
+    )
+    await routes.cancel_import_job(job_id, _request())
 
     assert jobs.calls == [
         ("create", workspace, ["codex"]),
@@ -101,6 +123,13 @@ async def test_job_routes_pin_workspace_and_submit_selection(api):
             job_id,
             {"codex": ImportSelection(skills=["skill-1"])},
         ),
+        (
+            "retry",
+            workspace,
+            job_id,
+            {"codex": ImportSelection(sessions=False, skills=["skill-1"])},
+        ),
+        ("cancel", workspace, job_id),
     ]
 
 

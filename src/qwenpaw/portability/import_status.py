@@ -50,6 +50,7 @@ def project_asset_results(
     *,
     manifest: CompatibilityManifest | None = None,
     receipt: ImportReceipt | None = None,
+    force_retry: bool = False,
 ) -> list[ImportAssetResult]:
     """Return selected visible assets without mutating migration artifacts."""
     zones = (
@@ -68,7 +69,7 @@ def project_asset_results(
             source_id=action.source_id,
             name=action.name,
         )
-        if action.action in _NOT_NEEDED_ACTIONS:
+        if action.action in _NOT_NEEDED_ACTIONS and not force_retry:
             result.state = ImportAssetState.NOT_NEEDED
             result.reason_code = action.action
             result.message = action.reason_zh

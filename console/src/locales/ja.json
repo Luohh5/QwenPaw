@@ -93,6 +93,7 @@
     "states": {
       "pending": "待機中",
       "repairing": "修復中",
+      "ready_to_import": "修復済み、インポート待ち",
       "not_needed": "不要",
       "failed": "失敗",
       "succeeded": "成功"
@@ -111,6 +112,10 @@
     "importing": "インポート中",
     "keepOpen": "各項目の状態を確認できます。処理中は QwenPaw を閉じないでください。",
     "details": "移行の詳細",
+    "targetAgent": "インポート先エージェント：{{agent}}",
+    "selectAllFailed": "失敗したツールをすべて選択",
+    "retrySelected": "選択項目を再試行 ({{count}})",
+    "retryConfirm": "選択した {{count}} 件の失敗したツールを再試行しますか？同名の項目は上書きされます。",
     "done": "完了"
   },
   "nav": {

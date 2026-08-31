@@ -77,6 +77,7 @@ class ImportPlanningMixin:
         *,
         started_at: datetime,
         progress: ProgressReporter | None,
+        retry_of_migration_id: str = "",
     ) -> ImportReceipt:
         """Mark plan lifecycle around the rollback-capable data write."""
         plan.state = "applying"
@@ -87,6 +88,7 @@ class ImportPlanningMixin:
                 started_at=started_at,
                 plan_id=plan.plan_id,
                 progress=progress,
+                retry_of_migration_id=retry_of_migration_id,
             )
         except BaseException:
             plan.state = "ready"
@@ -171,6 +173,59 @@ class ImportPlanningMixin:
             selection=selection,
         )
 
+    async def retry_selection(
+        self,
+        parent_plan_id: str,
+        selection: ImportSelection,
+        *,
+        progress: ProgressReporter | None = None,
+    ) -> tuple[MigrationPlan, ImportReceipt]:
+        """Re-import selected failed tools with explicit replacement."""
+        if selection.sessions or not any(
+            getattr(selection, field)
+            for field in ("memory", "cron", "skills", "mcp", "plugins")
+        ):
+            raise ValueError(
+                "retry requires at least one tool and no sessions",
+            )
+        if not _PLAN_ID_PATTERN.fullmatch(parent_plan_id):
+            raise ValueError("迁移计划编号格式无效。")
+        lock_path = (
+            Path(self._workspace.workspace_dir) / ".qwenpaw" / "imports"
+        )
+        async with get_path_lock(lock_path):
+            parent = await self._read_plan(parent_plan_id)
+            if parent.agent_id != self._workspace.agent_id:
+                raise ValueError(
+                    "该迁移计划属于另一个智能体，不能在这里执行。",
+                )
+            if parent.state != "applied":
+                raise ValueError("只能重试已完成迁移中的失败工具。")
+            source_home = (
+                Path(parent.source_home) if parent.source_home else None
+            )
+            await _report(progress, "正在重新读取来源并准备失败工具重试…")
+            inventory = await self._inventory(
+                parent.source,
+                source_home=source_home,
+                progress=progress,
+            )
+            plan = await build_migration_plan(
+                self._workspace,
+                inventory,
+                source_home=str(source_home or ""),
+            )
+            await self._write_plan(plan)
+            inventory = select_inventory(inventory, selection)
+            receipt = await self._execute_plan(
+                plan,
+                inventory,
+                started_at=datetime.now(timezone.utc),
+                progress=progress,
+                retry_of_migration_id=parent.migration_id,
+            )
+        return plan, receipt
+
     async def _apply_stored_plan(
         self,
         plan_id: str,
@@ -200,8 +255,10 @@ class ImportPlanningMixin:
                 source_home=source_home,
                 progress=progress,
             )
-            if inventory_fingerprint(inventory) != plan.inventory_fingerprint:
-                message = "来源数据在预演后发生了变化。请重新运行 --dry-run，"
+            if selection is None and inventory_fingerprint(inventory) != (
+                plan.inventory_fingerprint
+            ):
+                message = "来源数据在预演后发生了变化。请重新扫描，"
                 message += "确认新计划后再执行。"
                 raise ValueError(message)
             if selection is not None:

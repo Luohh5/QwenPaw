@@ -265,6 +265,7 @@ class ImportReceipt(BaseModel):
     adaptation_manifest: str = ""
     adaptation_summary: str = ""
     adaptation_counts: dict[str, int] = Field(default_factory=dict)
+    retry_of_migration_id: str = ""
     warnings: list[str] = Field(default_factory=list)
     doctor_report: MigrationDoctorReport | None = None
 

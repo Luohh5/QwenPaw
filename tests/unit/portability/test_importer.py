@@ -20,7 +20,9 @@ from qwenpaw.portability.importer import ProviderImportService
 from qwenpaw.portability.adaptation_loop import AdaptationResult
 from qwenpaw.portability.compatibility import AssetZone, CompatibilityStore
 from qwenpaw.portability.models import (
+    ImportSelection,
     ProviderInventory,
+    SourceLocation,
     SourceMarketplace,
     SourceMCPServer,
     SourceMemoryFile,
@@ -55,7 +57,7 @@ class _Provider:
 def _bind_inventory(monkeypatch, inventory: ProviderInventory) -> None:
     monkeypatch.setattr(
         "qwenpaw.portability.importer.create_migration_provider",
-        lambda _source, _workspace: _Provider(inventory),
+        lambda _source, _workspace, **_kwargs: _Provider(inventory),
     )
 
 
@@ -533,6 +535,11 @@ async def test_dry_run_plan_can_be_revalidated_and_applied(
         provider_id="codex",
         provider_name="Codex",
         detected=True,
+        source_location=SourceLocation(
+            provider_id="codex",
+            data_home=str(tmp_path / ".codex"),
+            data_home_source="platform_default",
+        ),
         sessions=[
             SourceSession(
                 source_id="planned-thread",
@@ -552,6 +559,7 @@ async def test_dry_run_plan_can_be_revalidated_and_applied(
     plan = await service.plan_from("codex")
 
     assert plan.state == "ready"
+    assert plan.source_home == ""
     assert plan.inventory_counts["sessions"] == 1
     assert plan.actions[0].action == "import_history"
     assert await workspace.chat_manager.list_chats(archived=None) == []
@@ -1033,6 +1041,58 @@ async def test_provider_memory_is_scoped_exact_and_idempotent(
     assert scope["cwd"] == "/source/project-a"
     assert scope["trust"] == "source_material_not_instructions"
     assert not (workspace.workspace_dir / "MEMORY.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_retry_selection_replaces_an_existing_skill(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "source-skill"
+    source.mkdir()
+    skill_file = source / "SKILL.md"
+    skill_file.write_text(
+        "---\nname: portable-skill\ndescription: test\n---\n\nbefore\n",
+        encoding="utf-8",
+    )
+    inventory = ProviderInventory(
+        provider_id="codex",
+        provider_name="Codex",
+        detected=True,
+        skills=[
+            SourceSkill(
+                source_id="portable-skill",
+                name="portable-skill",
+                directory=source,
+            ),
+        ],
+    )
+    _bind_inventory(monkeypatch, inventory)
+    _mock_adaptation(monkeypatch, workspace, inventory, zone="migrate")
+    service = ProviderImportService(workspace)
+    plan = await service.plan_from("codex")
+    await service.apply_selection(
+        plan.plan_id,
+        ImportSelection(sessions=False, skills=["portable-skill"]),
+    )
+    skill_file.write_text(
+        "---\nname: portable-skill\ndescription: test\n---\n\nafter\n",
+        encoding="utf-8",
+    )
+
+    retry_plan, retry = await service.retry_selection(
+        plan.plan_id,
+        ImportSelection(sessions=False, skills=["portable-skill"]),
+    )
+
+    assert retry.plan_id == retry_plan.plan_id
+    assert retry.retry_of_migration_id
+    assert (
+        (workspace.workspace_dir / "skills/portable-skill/SKILL.md")
+        .read_text(encoding="utf-8")
+        .endswith("after\n")
+    )
 
 
 @pytest.mark.asyncio

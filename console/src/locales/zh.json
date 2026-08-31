@@ -112,7 +112,7 @@
   },
   "portabilityImport": {
     "title": "导入",
-    "description": "将其他 AI 应用中的会话和工具设置迁移到 QwenPaw。",
+    "description": "将其他 AI 应用中的最近聊天记录和工具&设置迁移到 QwenPaw，开启 Loop 模式对所有工具&设置进行针对于 QwenPaw 环境的兼容性修复。",
     "steps": {
       "sources": "选择应用",
       "inventory": "选择内容",
@@ -140,6 +140,7 @@
     "states": {
       "pending": "等待中",
       "repairing": "兼容性修复中",
+      "ready_to_import": "修复成功待迁移",
       "not_needed": "无需导入",
       "failed": "导入失败",
       "succeeded": "导入成功"
@@ -158,6 +159,10 @@
     "importing": "正在导入",
     "keepOpen": "可在下方查看每一项的状态。导入期间请勿关闭 QwenPaw。",
     "details": "迁移详情",
+    "targetAgent": "导入目标智能体：{{agent}}",
+    "selectAllFailed": "选择所有导入失败的工具",
+    "retrySelected": "重试已选项（{{count}}）",
+    "retryConfirm": "确认重新导入已选的 {{count}} 个失败工具吗？QwenPaw 中同名工具将被覆盖。",
     "done": "完成"
   },
   "nav": {

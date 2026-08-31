@@ -40,12 +40,32 @@ export const portabilityImportApi = {
       },
     ),
 
+  retry: (
+    agentId: string,
+    jobId: string,
+    selections: Partial<Record<ImportSource, ImportSelection>>,
+  ) =>
+    request<ImportJobSnapshot>(
+      `${base(agentId)}/jobs/${encodeURIComponent(jobId)}/retry`,
+      {
+        method: "POST",
+        body: JSON.stringify({ selections }),
+      },
+    ),
+
+  cancel: (agentId: string, jobId: string) =>
+    request<ImportJobSnapshot>(
+      `${base(agentId)}/jobs/${encodeURIComponent(jobId)}/cancel`,
+      { method: "POST" },
+    ),
+
   streamEvents: async (
     agentId: string,
     jobId: string,
     after: number,
     onEvent: (event: ImportJobEvent) => void,
     signal: AbortSignal,
+    onOpen?: () => void,
   ): Promise<void> => {
     const path = `${base(agentId)}/jobs/${encodeURIComponent(jobId)}/events`;
     const response = await fetch(getApiUrl(`${path}?after=${after}`), {
@@ -55,6 +75,7 @@ export const portabilityImportApi = {
     if (!response.ok || !response.body) {
       throw new Error(`Import event stream failed: ${response.status}`);
     }
+    onOpen?.();
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";

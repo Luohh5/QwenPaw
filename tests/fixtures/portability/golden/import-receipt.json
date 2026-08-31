@@ -30,6 +30,7 @@
   "adaptation_manifest": "adaptation/manifest.json",
   "adaptation_summary": "adaptation/summary.md",
   "adaptation_counts": {"migrate": 4, "repair": 0},
+  "retry_of_migration_id": "",
   "warnings": ["fixture warning"],
   "doctor_report": {
     "status": "pass",

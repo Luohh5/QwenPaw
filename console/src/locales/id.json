@@ -95,6 +95,7 @@
     "states": {
       "pending": "Menunggu",
       "repairing": "Memperbaiki",
+      "ready_to_import": "Berhasil diperbaiki, menunggu impor",
       "not_needed": "Tidak diperlukan",
       "failed": "Gagal",
       "succeeded": "Berhasil"
@@ -113,6 +114,10 @@
     "importing": "Impor sedang berjalan",
     "keepOpen": "Tinjau status setiap item di bawah. Jangan tutup QwenPaw selama impor.",
     "details": "Detail migrasi",
+    "targetAgent": "Agent tujuan: {{agent}}",
+    "selectAllFailed": "Pilih semua alat yang gagal",
+    "retrySelected": "Coba lagi yang dipilih ({{count}})",
+    "retryConfirm": "Coba lagi {{count}} alat gagal yang dipilih? Item dengan nama yang sama akan ditimpa.",
     "done": "Selesai"
   },
   "nav": {

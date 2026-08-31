@@ -115,6 +115,36 @@ async def start_import_job(
         raise _api_error(exc) from exc
 
 
+@portability_import_router.post("/jobs/{job_id}/retry", status_code=202)
+async def retry_import_job(
+    job_id: str,
+    body: StartImportJobRequest,
+    request: Request,
+):
+    """Retry failed tools in a fresh overwrite-capable import job."""
+    _local_only(request)
+    workspace = await get_agent_for_request(request)
+    try:
+        return await PORTABILITY_IMPORT_JOBS.retry(
+            workspace,
+            job_id,
+            body.selections,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise _api_error(exc) from exc
+
+
+@portability_import_router.post("/jobs/{job_id}/cancel")
+async def cancel_import_job(job_id: str, request: Request):
+    """Stop an active import or abandon an unstarted plan."""
+    _local_only(request)
+    workspace = await get_agent_for_request(request)
+    try:
+        return await PORTABILITY_IMPORT_JOBS.cancel(workspace, job_id)
+    except (ValueError, RuntimeError) as exc:
+        raise _api_error(exc) from exc
+
+
 @portability_import_router.get("/jobs/{job_id}/events")
 async def stream_import_events(
     job_id: str,

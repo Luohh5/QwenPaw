@@ -95,6 +95,7 @@
     "states": {
       "pending": "Đang chờ",
       "repairing": "Đang sửa",
+      "ready_to_import": "Đã sửa xong, chờ nhập",
       "not_needed": "Không cần",
       "failed": "Thất bại",
       "succeeded": "Thành công"
@@ -113,6 +114,10 @@
     "importing": "Đang nhập dữ liệu",
     "keepOpen": "Bạn có thể xem trạng thái từng mục bên dưới. Không đóng QwenPaw trong khi nhập.",
     "details": "Chi tiết di chuyển",
+    "targetAgent": "Agent đích: {{agent}}",
+    "selectAllFailed": "Chọn tất cả công cụ thất bại",
+    "retrySelected": "Thử lại mục đã chọn ({{count}})",
+    "retryConfirm": "Thử lại {{count}} công cụ thất bại đã chọn? Mục cùng tên sẽ bị ghi đè.",
     "done": "Hoàn tất"
   },
   "nav": {

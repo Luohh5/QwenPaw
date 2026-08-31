@@ -33,6 +33,7 @@ _SESSIONS = re.compile(
     r"^正在写入会话[：:]\s*(\d+)\s*/\s*(\d+)[（(]聊天记录阶段[）)]$",
 )
 _ASSET_NAME = re.compile(r"[「『](.+?)[」』]")
+_READY_TO_IMPORT = "兼容性优化完成，已进入待迁移区。"
 _TYPE_FIELDS = {
     "memory": "memory",
     "scheduled_task": "cron",
@@ -65,6 +66,8 @@ class ImportJobSnapshot(BaseModel):
     agent_id: str
     state: str = "scanning"
     phase: str = "scan"
+    mode: str = "import"
+    retry_of_job_id: str = ""
     seq: int = 0
     providers: list[ImportProviderSnapshot] = Field(default_factory=list)
     logs: list[str] = Field(default_factory=list)
@@ -79,6 +82,9 @@ class _LiveJob:
         default_factory=lambda: deque(maxlen=64),
     )
     subscribers: set[asyncio.Queue] = dataclass_field(default_factory=set)
+    retry_selections: dict[str, ImportSelection] = dataclass_field(
+        default_factory=dict,
+    )
     task: asyncio.Task | None = None
 
 
@@ -141,6 +147,14 @@ class PortabilityImportJobManager:
         }
         if set(selections) != ready:
             raise ValueError("selection must cover every detected source")
+        if not any(
+            selection.sessions
+            or any(
+                getattr(selection, field) for field in _TYPE_FIELDS.values()
+            )
+            for selection in selections.values()
+        ):
+            raise ValueError("select at least one conversation or tool")
         for provider in live.snapshot.providers:
             if provider.source not in selections:
                 continue
@@ -154,6 +168,98 @@ class PortabilityImportJobManager:
         live.snapshot.phase = "import"
         await self._emit(live, persist=True)
         live.task = asyncio.create_task(self._apply(live))
+        return live.snapshot.model_copy(deep=True)
+
+    async def retry(
+        self,
+        workspace: Any,
+        job_id: str,
+        selections: dict[str, ImportSelection],
+    ) -> ImportJobSnapshot:
+        """Retry explicitly selected failed tools in a fresh import job."""
+        previous = await self._live(workspace, job_id)
+        if previous.snapshot.state not in _TERMINAL:
+            raise RuntimeError("import job has not finished")
+        if any(
+            item.snapshot.agent_id == workspace.agent_id
+            and item.snapshot.state == "running"
+            for item in self._jobs.values()
+        ):
+            raise RuntimeError("an import is already running for this agent")
+        selected_sources = {
+            source
+            for source, selection in selections.items()
+            if self._tool_ids(selection)
+        }
+        if not selected_sources or selected_sources != set(selections):
+            raise ValueError("retry requires at least one selected tool")
+        providers = {item.source: item for item in previous.snapshot.providers}
+        if not selected_sources <= set(providers):
+            raise ValueError("retry source is not part of the original import")
+        for source, selection in selections.items():
+            self._validate_retry_selection(providers[source], selection)
+        retry_id = f"import-{uuid4().hex}"
+        snapshot = previous.snapshot.model_copy(deep=True)
+        snapshot = snapshot.model_copy(
+            update={
+                "job_id": retry_id,
+                "state": "running",
+                "phase": "retry",
+                "mode": "retry",
+                "retry_of_job_id": job_id,
+                "seq": 0,
+            },
+        )
+        for provider in snapshot.providers:
+            selection = selections.get(provider.source)
+            if selection is None:
+                continue
+            pending = {
+                (item.asset_type, item.source_id): item
+                for item in self._selected_assets(
+                    previous.plans[provider.source],
+                    selection,
+                    force_retry=True,
+                )
+            }
+            provider.assets = [
+                pending.get((item.asset_type, item.source_id), item)
+                for item in provider.assets
+            ]
+            provider.state = "pending"
+            provider.error = ""
+        live = _LiveJob(
+            workspace=workspace,
+            snapshot=snapshot,
+            plans=dict(previous.plans),
+            retry_selections=selections,
+        )
+        self._jobs[(workspace.agent_id, retry_id)] = live
+        await self._emit(live, persist=True)
+        live.task = asyncio.create_task(self._apply(live, retry_from=previous))
+        return snapshot.model_copy(deep=True)
+
+    async def cancel(
+        self,
+        workspace: Any,
+        job_id: str,
+    ) -> ImportJobSnapshot:
+        """Stop one active import and persist its interrupted state."""
+        live = await self._live(workspace, job_id)
+        if live.snapshot.state in _TERMINAL:
+            return live.snapshot.model_copy(deep=True)
+        if live.task is not None and not live.task.done():
+            live.task.cancel()
+            try:
+                await live.task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # pylint: disable=broad-except
+                pass
+        if live.snapshot.state not in _TERMINAL:
+            live.snapshot.state = "interrupted"
+            live.snapshot.phase = "done"
+            await self._emit(live, persist=True)
         return live.snapshot.model_copy(deep=True)
 
     async def wait(self, job_id: str) -> None:
@@ -258,34 +364,77 @@ class PortabilityImportJobManager:
         )
         await self._emit(live, persist=True)
 
-    async def _apply(self, live: _LiveJob) -> None:
+    async def _apply(
+        self,
+        live: _LiveJob,
+        *,
+        retry_from: _LiveJob | None = None,
+    ) -> None:
         for provider in live.snapshot.providers:
-            if provider.source not in live.plans:
+            if retry_from is None and provider.source not in live.plans:
+                continue
+            retry_selection = live.retry_selections.get(provider.source)
+            if retry_from is not None and retry_selection is None:
                 continue
             provider.state = "running"
             await self._emit(live, persist=True)
 
             try:
                 service = self._service_factory(live.workspace)
-                receipt = await service.apply_selection(
-                    provider.plan_id,
-                    provider.selection,
-                    progress=partial(self._apply_progress, live, provider),
-                )
+                if retry_from is None:
+                    plan = live.plans[provider.source]
+                    receipt = await service.apply_selection(
+                        provider.plan_id,
+                        provider.selection,
+                        progress=partial(
+                            self._apply_progress,
+                            live,
+                            provider,
+                        ),
+                    )
+                else:
+                    plan, receipt = await service.retry_selection(
+                        retry_from.plans[provider.source].plan_id,
+                        retry_selection,
+                        progress=partial(
+                            self._apply_progress,
+                            live,
+                            provider,
+                        ),
+                    )
+                    live.plans[provider.source] = plan
+                    provider.plan_id = plan.plan_id
                 manifest = self._manifest(live.workspace, receipt)
-                keys = {
-                    f"{item.asset_type}:{item.source_id}"
-                    for item in provider.assets
-                }
-                provider.assets = project_asset_results(
-                    live.plans[provider.source],
+                keys = (
+                    self._tool_ids(retry_selection)
+                    if retry_selection is not None
+                    else {
+                        f"{item.asset_type}:{item.source_id}"
+                        for item in provider.assets
+                    }
+                )
+                results = project_asset_results(
+                    plan,
                     keys,
                     manifest=manifest,
                     receipt=receipt,
+                    force_retry=retry_from is not None,
                 )
-                provider.sessions_processed = provider.sessions_total
-                provider.sessions_imported = len(receipt.imported_sessions)
-                provider.sessions_skipped = len(receipt.skipped_sessions)
+                if retry_from is None:
+                    provider.assets = results
+                else:
+                    updates = {
+                        (item.asset_type, item.source_id): item
+                        for item in results
+                    }
+                    provider.assets = [
+                        updates.get((item.asset_type, item.source_id), item)
+                        for item in provider.assets
+                    ]
+                if retry_from is None:
+                    provider.sessions_processed = provider.sessions_total
+                    provider.sessions_imported = len(receipt.imported_sessions)
+                    provider.sessions_skipped = len(receipt.skipped_sessions)
                 provider.warnings = (
                     provider.warnings
                     + [
@@ -297,14 +446,33 @@ class PortabilityImportJobManager:
             except Exception as exc:  # pylint: disable=broad-except
                 provider.error = redact_sensitive_text(exc, limit=500)
                 provider.state = "failed"
+                retry_keys = (
+                    self._tool_ids(retry_selection)
+                    if retry_selection is not None
+                    else None
+                )
                 for asset in provider.assets:
-                    if asset.state is not ImportAssetState.NOT_NEEDED:
+                    if (
+                        retry_keys is None
+                        and asset.state is not ImportAssetState.NOT_NEEDED
+                    ) or (
+                        retry_keys is not None
+                        and f"{asset.asset_type}:{asset.source_id}"
+                        in retry_keys
+                    ):
                         asset.state = ImportAssetState.FAILED
                         asset.message = "请手动修改相关配置后重试。"
             await self._emit(live, persist=True)
         live.snapshot.state = (
             "completed_with_issues"
-            if any(item.state == "failed" for item in live.snapshot.providers)
+            if any(
+                item.state == "failed"
+                or any(
+                    asset.state is ImportAssetState.FAILED
+                    for asset in item.assets
+                )
+                for item in live.snapshot.providers
+            )
             else "completed"
         )
         live.snapshot.phase = "done"
@@ -387,6 +555,8 @@ class PortabilityImportJobManager:
     def _selected_assets(
         plan: MigrationPlan,
         selection: ImportSelection,
+        *,
+        force_retry: bool = False,
     ) -> list[ImportAssetResult]:
         keys = {
             f"{'cron' if action_type == 'scheduled_task' else action_type}:"
@@ -394,7 +564,33 @@ class PortabilityImportJobManager:
             for action_type, selection_field in _TYPE_FIELDS.items()
             for source_id in getattr(selection, selection_field)
         }
-        return project_asset_results(plan, keys)
+        return project_asset_results(plan, keys, force_retry=force_retry)
+
+    @staticmethod
+    def _tool_ids(selection: ImportSelection) -> set[str]:
+        if selection.sessions:
+            raise ValueError("retry does not support sessions")
+        return {
+            f"{'cron' if asset_type == 'scheduled_task' else asset_type}:"
+            f"{source_id}"
+            for asset_type, field in _TYPE_FIELDS.items()
+            for source_id in getattr(selection, field)
+        }
+
+    @classmethod
+    def _validate_retry_selection(
+        cls,
+        provider: ImportProviderSnapshot,
+        selection: ImportSelection,
+    ) -> None:
+        failed = {
+            f"{item.asset_type}:{item.source_id}"
+            for item in provider.assets
+            if item.state is ImportAssetState.FAILED
+        }
+        requested = cls._tool_ids(selection)
+        if not requested <= failed:
+            raise ValueError("retry only accepts tools that previously failed")
 
     @staticmethod
     def _project_progress(
@@ -438,6 +634,11 @@ class PortabilityImportJobManager:
                     ImportAssetState.REPAIRING,
                 }:
                     asset.state = ImportAssetState.REPAIRING
+                    asset.reason_code = (
+                        "ready_to_import"
+                        if message.endswith(_READY_TO_IMPORT)
+                        else ""
+                    )
 
     @staticmethod
     def _log(live: _LiveJob, message: str) -> None:

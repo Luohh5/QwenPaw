@@ -397,9 +397,6 @@ async def build_migration_plan(
     source_home: str = "",
 ) -> MigrationPlan:
     """Build a reviewable plan without changing runtime assets."""
-    resolved_source_home = source_home
-    if not resolved_source_home and inventory.source_location is not None:
-        resolved_source_home = inventory.source_location.data_home
     chats = await workspace.chat_manager.list_chats(archived=None)
     existing_sessions = {
         (
@@ -507,7 +504,7 @@ async def build_migration_plan(
     return MigrationPlan(
         plan_id=f"plan-{uuid4().hex}",
         source=inventory.provider_id,
-        source_home=resolved_source_home,
+        source_home=source_home,
         source_location=inventory.source_location,
         agent_id=workspace.agent_id,
         created_at=datetime.now(timezone.utc),

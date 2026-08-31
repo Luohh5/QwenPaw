@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
 import {
@@ -8,6 +8,7 @@ import {
   Checkbox,
   Collapse,
   Empty,
+  Modal,
   Progress,
   Spin,
   Steps,
@@ -42,8 +43,30 @@ const COLORS: Record<ImportAssetState, string> = {
   succeeded: "success",
 };
 
+type RetryAsset = {
+  provider: ImportProviderSnapshot;
+  asset: ImportAssetResult;
+};
+
+const retryKey = ({ provider, asset }: RetryAsset) =>
+  `${provider.source}:${asset.asset_type}:${asset.source_id}`;
+
+function retrySelection(items: RetryAsset[]) {
+  return items.reduce<Partial<Record<ImportSource, ImportSelection>>>(
+    (selection, { provider, asset }) => {
+      const source = (selection[provider.source] ??= { sessions: false });
+      const field = FIELDS[asset.asset_type];
+      source[field] = [...(source[field] ?? []), asset.source_id];
+      return selection;
+    },
+    {},
+  );
+}
+
 function AssetStatus({ asset }: { asset: ImportAssetResult }) {
   const { t } = useTranslation();
+  const readyToImport = asset.reason_code === "ready_to_import";
+  const state = readyToImport ? "ready_to_import" : asset.state;
   const fallback =
     asset.state === "not_needed"
       ? t("portabilityImport.hints.notNeeded")
@@ -53,8 +76,8 @@ function AssetStatus({ asset }: { asset: ImportAssetResult }) {
       ? t("portabilityImport.hints.disabled")
       : "";
   const tag = (
-    <Tag color={COLORS[asset.state]}>
-      {t(`portabilityImport.states.${asset.state}`)}
+    <Tag color={readyToImport ? "success" : COLORS[asset.state]}>
+      {t(`portabilityImport.states.${state}`)}
     </Tag>
   );
   return asset.message || fallback ? (
@@ -104,9 +127,16 @@ function completion(providers: ImportProviderSnapshot[]) {
   const sessionRows = providers.filter(
     (provider) => provider.selection.sessions && provider.sessions_total,
   );
-  const doneAssets = assets.filter((asset) =>
-    ["not_needed", "failed", "succeeded"].includes(asset.state),
-  ).length;
+  const doneAssets = assets.reduce(
+    (total, asset) =>
+      total +
+      (["not_needed", "failed", "succeeded"].includes(asset.state)
+        ? 1
+        : asset.reason_code === "ready_to_import"
+          ? 0.5
+          : 0),
+    0,
+  );
   const doneSessions = sessionRows.filter(
     (provider) =>
       ["completed", "failed"].includes(provider.state) ||
@@ -119,39 +149,73 @@ function completion(providers: ImportProviderSnapshot[]) {
 export default function ImportPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const { sources, job, loading, error, detect, scan, start, reset } =
-    useImportJob();
-  const [selectedSources, setSelectedSources] = useState<ImportSource[]>([]);
-  const sourcesInitialized = useRef(false);
-  const [selections, setSelections] = useState<
-    Partial<Record<ImportSource, ImportSelection>>
+  const {
+    sources,
+    job,
+    selectedAgent,
+    loading,
+    error,
+    detect,
+    scan,
+    start,
+    retry,
+    cancel,
+    reset,
+  } = useImportJob();
+  const [sourceSelections, setSourceSelections] = useState<
+    Record<string, ImportSource[]>
   >({});
+  const selectedSources = sourceSelections[selectedAgent] ?? [];
+  const [selections, setSelections] = useState<
+    Record<string, Partial<Record<ImportSource, ImportSelection>>>
+  >({});
+  const [retryKeys, setRetryKeys] = useState<Record<string, string[]>>({});
+  const [confirmRetry, setConfirmRetry] = useState(false);
+  const selectionKey = job?.job_id ?? "";
+  const currentSelections = useMemo(
+    () => selections[selectionKey] ?? {},
+    [selectionKey, selections],
+  );
+
+  const updateSources = useCallback(
+    (update: (sources: ImportSource[]) => ImportSource[]) =>
+      setSourceSelections((current) => ({
+        ...current,
+        [selectedAgent]: update(current[selectedAgent] ?? []),
+      })),
+    [selectedAgent],
+  );
 
   useEffect(() => {
     void detect().catch(() => undefined);
   }, [detect]);
   useEffect(() => {
-    if (!job && sources.length && !sourcesInitialized.current) {
-      sourcesInitialized.current = true;
-      setSelectedSources(
+    if (!job && sources.length && !sourceSelections[selectedAgent]) {
+      updateSources(() =>
         sources
           .filter((source) => source.detected)
           .map((source) => source.source),
       );
     }
-  }, [job, sources]);
+  }, [job, selectedAgent, sourceSelections, sources, updateSources]);
   useEffect(() => {
-    if (job?.state !== "awaiting_selection" || Object.keys(selections).length) {
+    if (
+      job?.state !== "awaiting_selection" ||
+      !selectionKey ||
+      Object.keys(currentSelections).length
+    ) {
       return;
     }
-    setSelections(
-      Object.fromEntries(
+    setSelections((current) => ({
+      ...current,
+      [selectionKey]: Object.fromEntries(
         job.providers
           .filter((provider) => provider.state === "ready")
           .map((provider) => [provider.source, provider.selection]),
       ),
-    );
-  }, [job, selections]);
+    }));
+  }, [currentSelections, job, selectionKey]);
+  useEffect(() => setConfirmRetry(false), [selectionKey]);
 
   const current = !job ? 0 : job.state === "awaiting_selection" ? 1 : 2;
   const isRunning = job?.state === "running" || job?.state === "scanning";
@@ -167,10 +231,65 @@ export default function ImportPage() {
     source: ImportSource,
     update: (selection: ImportSelection) => ImportSelection,
   ) => {
-    setSelections((currentSelections) => ({
-      ...currentSelections,
-      [source]: update(currentSelections[source] ?? {}),
+    if (!selectionKey) return;
+    setSelections((current) => ({
+      ...current,
+      [selectionKey]: {
+        ...current[selectionKey],
+        [source]: update(current[selectionKey]?.[source] ?? {}),
+      },
     }));
+  };
+
+  const failedAssets = useMemo<RetryAsset[]>(
+    () =>
+      job?.providers.flatMap((provider) =>
+        provider.assets
+          .filter((asset) => asset.state === "failed")
+          .map((asset) => ({ provider, asset })),
+      ) ?? [],
+    [job],
+  );
+  const selectedRetryKeys = retryKeys[selectionKey] ?? [];
+  const selectedRetryAssets = failedAssets.filter(({ provider, asset }) =>
+    selectedRetryKeys.includes(retryKey({ provider, asset })),
+  );
+  const hasSelection = Object.values(currentSelections).some(
+    (selection) =>
+      selection.sessions ||
+      GROUPS.some((type) => Boolean(selection[FIELDS[type]]?.length)),
+  );
+  const toggleRetry = (item: RetryAsset, checked: boolean) => {
+    if (!selectionKey) return;
+    const key = retryKey(item);
+    setRetryKeys((current) => {
+      const keys = new Set(current[selectionKey]);
+      if (checked) keys.add(key);
+      else keys.delete(key);
+      return { ...current, [selectionKey]: [...keys] };
+    });
+  };
+  const toggleAllRetries = (checked: boolean) =>
+    setRetryKeys((current) => ({
+      ...current,
+      [selectionKey]: checked ? failedAssets.map(retryKey) : [],
+    }));
+  const runRetry = async () => {
+    const key = selectionKey;
+    if (!selectedRetryAssets.length) return;
+    await retry(retrySelection(selectedRetryAssets));
+    setRetryKeys((current) =>
+      Object.fromEntries(Object.entries(current).filter(([id]) => id !== key)),
+    );
+    setConfirmRetry(false);
+  };
+  const abandon = async () => {
+    try {
+      await cancel();
+      reset();
+    } catch {
+      // The hook keeps the error visible.
+    }
   };
 
   const toggleAsset = (
@@ -216,6 +335,15 @@ export default function ImportPage() {
             <p>{t("portabilityImport.description")}</p>
           </div>
         </div>
+        {job && (
+          <Alert
+            type={job.agent_id === selectedAgent ? "info" : "warning"}
+            showIcon
+            message={t("portabilityImport.targetAgent", {
+              agent: job.agent_id,
+            })}
+          />
+        )}
         <Steps
           current={current}
           items={[
@@ -225,6 +353,13 @@ export default function ImportPage() {
           ]}
         />
         {error && <Alert type="error" showIcon message={error} />}
+        {job && !isDone && (
+          <div className={styles.actions}>
+            <Button danger loading={loading} onClick={() => void abandon()}>
+              {t("common.cancel")}
+            </Button>
+          </div>
+        )}
 
         {!job && (
           <section className={styles.section}>
@@ -244,7 +379,7 @@ export default function ImportPage() {
                       checked={selectedSources.includes(source.source)}
                       disabled={!source.detected}
                       onChange={(event) =>
-                        setSelectedSources((selected) =>
+                        updateSources((selected) =>
                           event.target.checked
                             ? [...selected, source.source]
                             : selected.filter((item) => item !== source.source),
@@ -301,7 +436,9 @@ export default function ImportPage() {
                   <>
                     <div className={styles.row}>
                       <Checkbox
-                        checked={selections[provider.source]?.sessions ?? false}
+                        checked={
+                          currentSelections[provider.source]?.sessions ?? false
+                        }
                         disabled={!provider.sessions_total}
                         onChange={(event) =>
                           updateSelection(provider.source, (selection) => ({
@@ -328,7 +465,7 @@ export default function ImportPage() {
                         if (!assets.length) return [];
                         const field = FIELDS[type];
                         const selected =
-                          selections[provider.source]?.[field] ?? [];
+                          currentSelections[provider.source]?.[field] ?? [];
                         return [
                           {
                             key: type,
@@ -382,8 +519,9 @@ export default function ImportPage() {
             <div className={styles.actions}>
               <Button
                 type="primary"
+                disabled={!hasSelection}
                 loading={loading}
-                onClick={() => void start(selections)}
+                onClick={() => void start(currentSelections)}
               >
                 {t("portabilityImport.start")}
               </Button>
@@ -427,6 +565,18 @@ export default function ImportPage() {
                   >
                     <span>{asset.name}</span>
                     <AssetStatus asset={asset} />
+                    {asset.state === "failed" && (
+                      <Checkbox
+                        aria-label={asset.name}
+                        checked={selectedRetryKeys.includes(
+                          retryKey({ provider, asset }),
+                        )}
+                        disabled={!isDone}
+                        onChange={(event) =>
+                          toggleRetry({ provider, asset }, event.target.checked)
+                        }
+                      />
+                    )}
                   </div>
                 ))}
                 {provider.error && (
@@ -453,6 +603,29 @@ export default function ImportPage() {
               />
             )}
             <div className={styles.actions}>
+              {isDone && failedAssets.length > 0 && (
+                <>
+                  <Checkbox
+                    checked={selectedRetryAssets.length === failedAssets.length}
+                    indeterminate={Boolean(
+                      selectedRetryAssets.length &&
+                        selectedRetryAssets.length < failedAssets.length,
+                    )}
+                    onChange={(event) => toggleAllRetries(event.target.checked)}
+                  >
+                    {t("portabilityImport.selectAllFailed")}
+                  </Checkbox>
+                  <Button
+                    disabled={!selectedRetryAssets.length || loading}
+                    loading={loading}
+                    onClick={() => setConfirmRetry(true)}
+                  >
+                    {t("portabilityImport.retrySelected", {
+                      count: selectedRetryAssets.length,
+                    })}
+                  </Button>
+                </>
+              )}
               <Button
                 type="primary"
                 disabled={!isDone || isRunning}
@@ -466,6 +639,18 @@ export default function ImportPage() {
             </div>
           </section>
         )}
+        <Modal
+          open={confirmRetry}
+          title={t("common.retry")}
+          okText={t("common.retry")}
+          cancelText={t("common.cancel")}
+          onCancel={() => setConfirmRetry(false)}
+          onOk={() => void runRetry()}
+        >
+          {t("portabilityImport.retryConfirm", {
+            count: selectedRetryAssets.length,
+          })}
+        </Modal>
       </main>
     </div>
   );

@@ -117,9 +117,11 @@ class ProviderImportService(ImportPlanningMixin):
         started_at: datetime,
         plan_id: str = "",
         progress: ProgressReporter | None = None,
+        retry_of_migration_id: str = "",
     ) -> ImportReceipt:
         """Apply one fully inventoried source as a rollback-capable batch."""
         migration_id = f"migration-{uuid4().hex}"
+        replace_existing = bool(retry_of_migration_id)
         warnings = list(inventory.warnings)
         sessions = [_bounded_session(item) for item in inventory.sessions]
         _bounded_memory(inventory.memory_projects)
@@ -396,7 +398,7 @@ class ProviderImportService(ImportPlanningMixin):
                     record = await install_plugin_source(
                         install_source,
                         app=plugin_app,
-                        force=False,
+                        force=replace_existing,
                         reload_agents=False,
                     )
                     installed_plugins.append(record.manifest.id)
@@ -456,7 +458,7 @@ class ProviderImportService(ImportPlanningMixin):
                         inventory.provider_id,
                         project,
                     )
-                    if changed:
+                    if changed or replace_existing:
                         memory_changes.append((target, previous))
                         imported_memory_projects.append(project.source_id)
                     else:
@@ -502,6 +504,24 @@ class ProviderImportService(ImportPlanningMixin):
                         compatibility_zone == "migrate",
                     )
                     names = [str(name) for name in result.get("imported", [])]
+                    if (
+                        not names
+                        and result.get("conflicts")
+                        and replace_existing
+                    ):
+                        skill_service.disable_skill(skill.name)
+                        await run_sync_io(
+                            skill_service.delete_skill,
+                            skill.name,
+                        )
+                        result = await run_sync_io(
+                            skill_service.import_from_zip,
+                            data,
+                            compatibility_zone == "migrate",
+                        )
+                        names = [
+                            str(name) for name in result.get("imported", [])
+                        ]
                     if names:
                         imported_skills.extend(names)
                     else:
@@ -546,7 +566,10 @@ class ProviderImportService(ImportPlanningMixin):
                         "后重试。",
                     )
                     continue
-                if server.name in existing_driver_names:
+                if (
+                    server.name in existing_driver_names
+                    and not replace_existing
+                ):
                     skipped_mcp_servers.append(server.name)
                     warnings.append(
                         f"MCP {server.name!r} conflicts with an existing "
@@ -709,7 +732,9 @@ class ProviderImportService(ImportPlanningMixin):
                 key = (inventory.provider_id, task.source_id)
                 existing_task = existing_task_jobs.get(key)
                 repairing_invalid_task = False
-                if existing_task is not None:
+                if existing_task is not None and replace_existing:
+                    repairing_invalid_task = True
+                if existing_task is not None and not replace_existing:
                     validator = getattr(
                         cron_manager,
                         "validate_job_spec",
@@ -876,6 +901,7 @@ class ProviderImportService(ImportPlanningMixin):
                 adaptation_manifest=adaptation_manifest,
                 adaptation_summary=adaptation_summary,
                 adaptation_counts=adaptation_counts,
+                retry_of_migration_id=retry_of_migration_id,
                 warnings=warnings,
             )
             receipt_dir = Path(self._workspace.workspace_dir) / ".qwenpaw"
