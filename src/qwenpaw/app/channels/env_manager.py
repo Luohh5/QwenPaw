@@ -8,6 +8,7 @@ import base64
 from dataclasses import dataclass
 import hashlib
 from importlib import metadata
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -15,6 +16,7 @@ import re
 import subprocess
 from typing import Literal
 from urllib.parse import urlsplit
+import zipfile
 
 from packaging import tags as packaging_tags
 from packaging.markers import Marker
@@ -1413,8 +1415,9 @@ def _launcher_python_path(path: Path) -> str | None:
         return None
     command = tokens[0].strip('"')
     basename = command.replace("\\", "/").rsplit("/", 1)[-1]
+    interpreter_path = None
     if basename.lower() == "env":
-        return next(
+        interpreter_path = next(
             (
                 candidate.strip('"')
                 for token in tokens[1:]
@@ -1427,17 +1430,60 @@ def _launcher_python_path(path: Path) -> str | None:
             ),
             None,
         )
-    if basename.lower().startswith("python"):
-        return command
-    if basename.lower() in {"sh", "bash", "zsh"}:
+    elif basename.lower().startswith("python"):
+        interpreter_path = command
+    elif basename.lower() in {"sh", "bash", "zsh"}:
         match = re.search(
             rb"[\"']([^\"'\r\n]*python[^\"'\r\n]*)[\"']",
             content[:1024],
             flags=re.IGNORECASE,
         )
         if match is not None:
-            return match.group(1).decode("utf-8")
-    return None
+            interpreter_path = match.group(1).decode("utf-8")
+    return interpreter_path
+
+
+def _is_distlib_windows_launcher(content: bytes) -> bool:
+    """Identify a Windows executable containing a distlib script archive."""
+    if not content.startswith(b"MZ") or b"#!" not in content:
+        return False
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            return "__main__.py" in archive.namelist()
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
+def _windows_launcher_validation_reason(
+    path: Path,
+    allowed_paths: Collection[str],
+) -> str | None:
+    """Return a validation error for one embedded Windows launcher."""
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        return f"Python launcher cannot be read: {path.name}: {exc}"
+    if not _is_distlib_windows_launcher(content):
+        return None
+    encoded_paths: list[bytes] = []
+    for allowed in allowed_paths:
+        values = (allowed, allowed.replace(os.sep, "/"))
+        encoded_paths.extend(
+            encoded
+            for value in values
+            for encoded in (
+                value.encode("utf-8"),
+                value.encode("utf-16-le"),
+                value.encode("utf-16-be"),
+            )
+        )
+    content_lower = content.lower()
+    if any(encoded.lower() in content_lower for encoded in encoded_paths):
+        return None
+    return (
+        "Python launcher does not reference the canonical venv "
+        f"interpreter: {path.name}"
+    )
 
 
 def _normalise_launcher_path(value: str) -> str:
@@ -1459,7 +1505,9 @@ def _validate_venv_launchers(
     }
     try:
         allowed_paths.update(
-            _normalise_launcher_path(str(expected_path.parent / candidate.name))
+            _normalise_launcher_path(
+                str(expected_path.parent / candidate.name),
+            )
             for candidate in scripts_root.iterdir()
             if candidate.name.lower().startswith("python")
             and (candidate.is_file() or candidate.is_symlink())
@@ -1486,31 +1534,9 @@ def _validate_venv_launchers(
             continue
         if path.name.lower().startswith(("python", "venvlauncher")):
             continue
-        try:
-            content = path.read_bytes()
-        except OSError as exc:
-            reasons.append(
-                f"Python launcher cannot be read: {path.name}: {exc}",
-            )
-            continue
-        encoded_paths: list[bytes] = []
-        for allowed in allowed_paths:
-            values = (allowed, allowed.replace(os.sep, "/"))
-            encoded_paths.extend(
-                encoded
-                for value in values
-                for encoded in (
-                    value.encode("utf-8"),
-                    value.encode("utf-16-le"),
-                    value.encode("utf-16-be"),
-                )
-            )
-        content_lower = content.lower()
-        if not any(encoded.lower() in content_lower for encoded in encoded_paths):
-            reasons.append(
-                "Python launcher does not reference the canonical venv "
-                f"interpreter: {path.name}",
-            )
+        reason = _windows_launcher_validation_reason(path, allowed_paths)
+        if reason is not None:
+            reasons.append(reason)
     return tuple(reasons)
 
 

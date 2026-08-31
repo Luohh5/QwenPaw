@@ -691,7 +691,7 @@ def test_runner_dependency_audit_exposes_transitive_channel_imports() -> None:
         declared,
     )
 
-    assert feishu.undeclared_distributions == ()
+    assert not feishu.undeclared_distributions
     assert feishu.optional_compat_imports == ("pkg_resources",)
     assert "aiohttp" in onebot.undeclared_distributions
     assert "aiohttp" in voice.undeclared_distributions

@@ -7,6 +7,7 @@ import base64
 import errno
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 import os
 from pathlib import Path
@@ -622,16 +623,32 @@ def test_windows_exe_launcher_requires_canonical_interpreter(
     interpreter = scripts_root / "python.exe"
     interpreter.write_bytes(b"python")
     launcher = scripts_root / "demo-cli.exe"
+    archive_data = io.BytesIO()
+    with zipfile.ZipFile(archive_data, "w") as archive:
+        archive.writestr("__main__.py", "print('console-ok')")
     launcher.write_bytes(
-        b"launcher\0" + str(interpreter).encode("utf-16-le"),
+        b"MZ"
+        + b"\0" * 64
+        + b"#!"
+        + str(interpreter).encode()
+        + b"\r\n"
+        + archive_data.getvalue(),
     )
 
     assert not launcher.with_name("demo-cli-script.py").exists()
     assert not _validate_venv_launchers(venv_root, interpreter)
 
+    (scripts_root / "native-tool.exe").write_bytes(b"MZ" + b"native-tool")
+    assert not _validate_venv_launchers(venv_root, interpreter)
+
     stale = tmp_path / "old-staging" / "venv" / "Scripts" / "python.exe"
     launcher.write_bytes(
-        b"launcher\0" + str(stale).encode("utf-16-le"),
+        b"MZ"
+        + b"\0" * 64
+        + b"#!"
+        + str(stale).encode()
+        + b"\r\n"
+        + archive_data.getvalue(),
     )
     reasons = _validate_venv_launchers(venv_root, interpreter)
     assert any("demo-cli.exe" in reason for reason in reasons)
