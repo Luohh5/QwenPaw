@@ -504,14 +504,20 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
                     if len(jobs_for_key) != 1 or asset is None:
                         return False
                     job = jobs_for_key[0]
-                    pending = (
-                        _job_portability(job).get("requires_review") is True
-                    )
+                    portability = _job_portability(job)
+                    pending = portability.get("requires_review") is True
                     marker = _job_request_context(job).get(
                         "portability_review_required",
                     )
                     if asset.zone is AssetZone.MIGRATE:
-                        return job.enabled and not pending and marker is False
+                        return (
+                            not job.enabled
+                            and job.runtime.tool_safety
+                            and not pending
+                            and marker is False
+                            and portability.get("safety")
+                            == "reviewed_disabled"
+                        )
                     return (
                         asset.zone is AssetZone.REPAIR
                         and not job.enabled
@@ -616,8 +622,8 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
                         status,
                         "定时任务安全状态",
                         discovery_detail
-                        + f" 唯一落盘 {unique}/{len(expected)} 个，启用或禁用"
-                        f"状态与兼容分区一致 {activation_safe}/"
+                        + f" 唯一落盘 {unique}/{len(expected)} 个，审核门禁和"
+                        f"禁用状态与兼容分区一致 {activation_safe}/"
                         f"{len(expected)} 个；远程或未验证工作区"
                         f"未绑定本机目录 {remote_unmapped}/"
                         f"{len(remote_expected)} 个。"

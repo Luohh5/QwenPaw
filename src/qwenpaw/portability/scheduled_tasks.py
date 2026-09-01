@@ -151,7 +151,7 @@ def build_imported_job(
     *,
     target_user_id: str = "cron",
     target_session_id: str = "",
-    enabled: bool = False,
+    reviewed: bool = False,
 ) -> CronJobSpec:
     """Build an isolated and provenance-rich QwenPaw job.
 
@@ -178,7 +178,7 @@ def build_imported_job(
     )
     request_context: dict[str, Any] = {
         "source": "cron",
-        "portability_review_required": not enabled,
+        "portability_review_required": not reviewed,
     }
     if cwd_available:
         request_context["project_dir"] = str(
@@ -205,16 +205,16 @@ def build_imported_job(
             "run_at": task.run_at.isoformat() if task.run_at else None,
             "timezone": task.timezone,
         },
-        "requires_review": not enabled,
+        "requires_review": not reviewed,
         "safety": (
             "reviewed_disabled"
-            if enabled
+            if reviewed
             else "disabled_until_explicit_promotion"
         ),
         "fidelity": str(task.metadata.get("fidelity") or "converted"),
         "source_metadata": source_metadata,
     }
-    if enabled:
+    if reviewed:
         portability.update(
             promoted_at=datetime.now(timezone.utc).isoformat(),
             promoted_by="compatibility_mission",
@@ -223,7 +223,10 @@ def build_imported_job(
         {
             "id": imported_job_id(provider_id, task.source_id),
             "name": task.name.strip() or f"Imported {provider_id} task",
-            "enabled": enabled,
+            # Imported schedules never start automatically.  Mission approval
+            # only clears the portability review gate; the user must resume
+            # the task explicitly after reviewing its final configuration.
+            "enabled": False,
             "schedule": _schedule_payload(task),
             "task_type": "agent",
             "request": {

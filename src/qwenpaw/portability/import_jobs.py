@@ -18,7 +18,7 @@ from ..utils.io_utils import read_json_async, write_json_atomic_async
 from .compatibility import load_manifest
 from .compatibility_safety import redact_sensitive_text
 from .import_status import project_asset_results
-from .importer import ProviderImportService
+from .importer import ImportRollbackError, ProviderImportService
 from .models import (
     ImportAssetResult,
     ImportAssetState,
@@ -244,21 +244,28 @@ class PortabilityImportJobManager:
         workspace: Any,
         job_id: str,
     ) -> ImportJobSnapshot:
-        """Stop one active import and persist its interrupted state."""
+        """Stop one active import and persist its terminal state."""
         live = await self._live(workspace, job_id)
         if live.snapshot.state in _TERMINAL:
             return live.snapshot.model_copy(deep=True)
+        cancel_error = ""
         if live.task is not None and not live.task.done():
             live.task.cancel()
             try:
                 await live.task
             except asyncio.CancelledError:
                 pass
-            except Exception:  # pylint: disable=broad-except
-                pass
+            except Exception as exc:  # pylint: disable=broad-except
+                cancel_error = redact_sensitive_text(exc, limit=500)
         if live.snapshot.state not in _TERMINAL:
-            live.snapshot.state = "interrupted"
+            live.snapshot.state = "failed" if cancel_error else "interrupted"
             live.snapshot.phase = "done"
+            if cancel_error:
+                self._log(live, cancel_error)
+                for provider in live.snapshot.providers:
+                    if provider.state == "running":
+                        provider.state = "failed"
+                        provider.error = cancel_error
             await self._emit(live, persist=True)
         return live.snapshot.model_copy(deep=True)
 
@@ -364,7 +371,7 @@ class PortabilityImportJobManager:
         )
         await self._emit(live, persist=True)
 
-    async def _apply(
+    async def _apply(  # pylint: disable=too-many-branches
         self,
         live: _LiveJob,
         *,
@@ -462,6 +469,12 @@ class PortabilityImportJobManager:
                     ):
                         asset.state = ImportAssetState.FAILED
                         asset.message = "请手动修改相关配置后重试。"
+                if isinstance(exc, ImportRollbackError) and exc.cancelled:
+                    for asset in provider.assets:
+                        if asset.state is ImportAssetState.FAILED:
+                            asset.message = "回滚未完成，请根据错误信息人工检查。"
+                    await self._emit(live, persist=True)
+                    raise
             await self._emit(live, persist=True)
         live.snapshot.state = (
             "completed_with_issues"

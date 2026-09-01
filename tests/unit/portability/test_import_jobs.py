@@ -13,6 +13,7 @@ from qwenpaw.portability.import_jobs import (
     ImportProviderSnapshot,
     PortabilityImportJobManager,
 )
+from qwenpaw.portability.importer import ImportRollbackError
 from qwenpaw.portability.models import (
     ImportAssetResult,
     ImportAssetState,
@@ -36,7 +37,9 @@ class _FakeServices:
         self.max_active_scans = 0
         self.block_apply = asyncio.Event()
         self.block_apply.set()
+        self.apply_started = asyncio.Event()
         self.fail_apply: set[str] = set()
+        self.fail_rollback = False
         self.retries: list[tuple[str, ImportSelection]] = []
 
     def factory(self, workspace):
@@ -87,7 +90,19 @@ class _FakeServices:
             ):
                 source = "codex" if _plan_id.endswith("c" * 32) else "qoder"
                 assert isinstance(selection, ImportSelection)
-                await owner.block_apply.wait()
+                owner.apply_started.set()
+                try:
+                    await owner.block_apply.wait()
+                except asyncio.CancelledError as exc:
+                    if owner.fail_rollback:
+                        raise ImportRollbackError(
+                            [
+                                "Skill codex-skill: OSError: "
+                                "cleanup unavailable",
+                            ],
+                            cancelled=True,
+                        ) from exc
+                    raise
                 if progress:
                     await progress("正在写入会话：1/2（聊天记录阶段）")
                     await progress(f"正在修复 Skill「{source.title()} Skill」")
@@ -305,11 +320,38 @@ async def test_empty_selection_is_rejected_and_active_job_can_cancel(
         created.job_id,
         {"codex": ImportSelection(skills=["codex-skill"])},
     )
-    await asyncio.sleep(0)
+    await services.apply_started.wait()
 
     assert (await manager.cancel(workspace, created.job_id)).state == (
         "interrupted"
     )
+
+
+@pytest.mark.asyncio
+async def test_cancel_with_rollback_failure_marks_job_failed(
+    tmp_path: Path,
+) -> None:
+    services = _FakeServices()
+    services.fail_rollback = True
+    workspace = _workspace(tmp_path)
+    manager = PortabilityImportJobManager(service_factory=services.factory)
+    created = await manager.create(workspace, ["codex"])
+    await manager.wait(created.job_id)
+
+    services.block_apply.clear()
+    await manager.start(
+        workspace,
+        created.job_id,
+        {"codex": ImportSelection(skills=["codex-skill"])},
+    )
+    await services.apply_started.wait()
+
+    snapshot = await manager.cancel(workspace, created.job_id)
+
+    assert snapshot.state == "failed"
+    assert snapshot.providers[0].state == "failed"
+    assert "cleanup unavailable" in snapshot.providers[0].error
+    assert snapshot.providers[0].assets[0].message == ("回滚未完成，请根据错误信息人工检查。")
 
 
 @pytest.mark.asyncio

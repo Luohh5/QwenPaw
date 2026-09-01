@@ -18,7 +18,11 @@ from ..agents.acp.meta import ACP_EPHEMERAL_META_KEY
 from ..agents.tools.agent_management import MAX_SPAWN_BATCH_CONCURRENCY
 from ..modes.mission import MissionMode
 from ..schemas import AgentRequest
-from ..utils.io_utils import run_async_to_completion, run_sync_io
+from ..utils.io_utils import (
+    get_sync_path_lock,
+    run_async_to_completion,
+    run_sync_io,
+)
 from .adaptation_mission import prepare_mission, sync_mission
 from .adaptation_prompts import repair_prompt
 from .adaptation_staging import component_map, stage_local_assets
@@ -26,6 +30,7 @@ from .compatibility import (
     AssetType,
     AssetZone,
     CompatibilityAsset,
+    CompatibilityManifest,
     CompatibilityStore,
     counts,
     load_manifest,
@@ -102,6 +107,7 @@ class ActiveAdaptationContext:
         tester: CompatibilityTester,
         staging_root: Path,
         audit_path: Path,
+        manifest: CompatibilityManifest,
         progress: ProgressReporter | None = None,
     ) -> None:
         self.inventory = inventory
@@ -112,11 +118,12 @@ class ActiveAdaptationContext:
         self.progress = progress
         self._activities: dict[str, str] = {}
         self.tool_calls = 0
-        manifest = load_manifest(store.path)
         self.total_tool_budget = sum(
             item.tool_budget for item in manifest.assets
         )
-        self._lock = asyncio.Lock()
+        self._asset_locks = {
+            item.asset_key: asyncio.Lock() for item in manifest.assets
+        }
 
     def _binding(self) -> _RequestBinding:
         binding = _active_binding()
@@ -127,6 +134,14 @@ class ActiveAdaptationContext:
     @property
     def active_asset_key(self) -> str:
         return self._binding().asset_key
+
+    def _asset_lock(self, key: str) -> asyncio.Lock:
+        if key != self.active_asset_key:
+            raise PermissionError("worker may access only its assigned asset")
+        try:
+            return self._asset_locks[key]
+        except KeyError as exc:
+            raise KeyError(f"unknown compatibility asset: {key}") from exc
 
     def activity(self, session_id: str) -> str:
         return self._activities.get(session_id, "等待 Agent 开始处理。")
@@ -152,43 +167,51 @@ class ActiveAdaptationContext:
         name = redact_sensitive_text(asset.name, limit=120).replace("\n", " ")
         return f"{kind}「{name}」"
 
-    def _consume(
+    async def _consume(
         self,
-        key: str = "",
+        key: str,
         *,
         final: bool = False,
-    ) -> None:
-        if key and key != self.active_asset_key:
+    ) -> CompatibilityAsset:
+        if key != self.active_asset_key:
             raise PermissionError("worker may access only its assigned asset")
+
+        asset = await run_sync_io(
+            self.store.consume,
+            key,
+            reserve=0 if final else 1,
+        )
         self.tool_calls += 1
-        if self.tool_calls > self.total_tool_budget:
-            raise RuntimeError("migration tool-call budget exhausted")
-        if key:
-            self.store.consume(key, reserve=0 if final else 1)
+        return asset
 
     def _asset(self, key: str) -> CompatibilityAsset:
         return load_manifest(self.store.path).get_asset(key)
 
     def _audit(self, action: str, key: str, detail: str = "") -> None:
-        self.audit_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-        record = {
-            "at": datetime.now().astimezone().isoformat(),
-            "action": action,
-            "asset_key": key,
-            "detail": detail[:200],
-        }
-        descriptor = os.open(
-            self.audit_path,
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-            0o600,
-        )
-        try:
-            os.write(
-                descriptor,
-                (json.dumps(record, ensure_ascii=False) + "\n").encode(),
+        with get_sync_path_lock(self.audit_path):
+            self.audit_path.parent.mkdir(
+                parents=True,
+                mode=0o700,
+                exist_ok=True,
             )
-        finally:
-            os.close(descriptor)
+            record = {
+                "at": datetime.now().astimezone().isoformat(),
+                "action": action,
+                "asset_key": key,
+                "detail": detail[:200],
+            }
+            descriptor = os.open(
+                self.audit_path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o600,
+            )
+            try:
+                os.write(
+                    descriptor,
+                    (json.dumps(record, ensure_ascii=False) + "\n").encode(),
+                )
+            finally:
+                os.close(descriptor)
 
     def _asset_root(self, asset: CompatibilityAsset) -> Path:
         source = find_source(self.inventory, asset)
@@ -240,14 +263,76 @@ class ActiveAdaptationContext:
             excerpt += tail.decode("utf-8", errors="replace")
         return redact_sensitive_text(excerpt)
 
+    def _read_file_payload(
+        self,
+        asset: CompatibilityAsset,
+        relative_path: str,
+        start_line: int,
+        end_line: int,
+    ) -> dict[str, Any]:
+        path = self._asset_file(self._asset_root(asset), relative_path)
+        if not path.is_file():
+            raise FileNotFoundError(relative_path)
+        size = path.stat().st_size
+        if size > _MAX_FILE_BYTES:
+            return {
+                "ok": True,
+                "path": relative_path,
+                "read_mode": "bounded_excerpt",
+                "size_bytes": size,
+                "text": self._excerpt(path, size),
+                "has_more": False,
+                "next_line": None,
+            }
+        lines = redact_sensitive_text(
+            path.read_text(encoding="utf-8"),
+        ).splitlines()
+        start = max(1, start_line)
+        end = min(len(lines), max(start, end_line), start + 399)
+        finished = end >= len(lines)
+        return {
+            "ok": True,
+            "path": relative_path,
+            "text": "\n".join(
+                f"{number}: {lines[number - 1]}"
+                for number in range(start, end + 1)
+            ),
+            "has_more": not finished,
+            "next_line": end + 1 if not finished else None,
+        }
+
+    def _write_file_atomic(
+        self,
+        asset: CompatibilityAsset,
+        relative_path: str,
+        content: str,
+    ) -> None:
+        path = self._asset_file(self._asset_root(asset), relative_path)
+        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(
+                temporary,
+                stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600,
+            )
+            os.replace(temporary, path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
     async def inspect_asset(self, key: str) -> dict[str, Any]:
-        async with self._lock:
-            self._consume(key)
-            asset = self._asset(key)
+        async with self._asset_lock(key):
+            asset = await self._consume(key)
             await self._publish(
                 f"正在检查 {self._label(asset)} 的 QwenPaw 兼容性…",
             )
-            result = {"ok": True, **self.tester.inspect(asset)}
+            result = {
+                "ok": True,
+                **await run_sync_io(self.tester.inspect, asset),
+            }
             return result
 
     async def read_file(
@@ -258,42 +343,18 @@ class ActiveAdaptationContext:
         start_line: int = 1,
         end_line: int = 240,
     ) -> dict[str, Any]:
-        async with self._lock:
-            asset = self._asset(key)
-            self._consume(key)
+        async with self._asset_lock(key):
+            asset = await self._consume(key)
             await self._publish(
                 f"正在阅读 {self._label(asset)}：{relative_path}",
             )
-            path = self._asset_file(self._asset_root(asset), relative_path)
-            if not path.is_file():
-                raise FileNotFoundError(relative_path)
-            size = path.stat().st_size
-            if size > _MAX_FILE_BYTES:
-                return {
-                    "ok": True,
-                    "path": relative_path,
-                    "read_mode": "bounded_excerpt",
-                    "size_bytes": size,
-                    "text": self._excerpt(path, size),
-                    "has_more": False,
-                    "next_line": None,
-                }
-            lines = redact_sensitive_text(
-                path.read_text(encoding="utf-8"),
-            ).splitlines()
-            start = max(1, start_line)
-            end = min(len(lines), max(start, end_line), start + 399)
-            finished = end >= len(lines)
-            return {
-                "ok": True,
-                "path": relative_path,
-                "text": "\n".join(
-                    f"{number}: {lines[number - 1]}"
-                    for number in range(start, end + 1)
-                ),
-                "has_more": not finished,
-                "next_line": end + 1 if not finished else None,
-            }
+            return await run_sync_io(
+                self._read_file_payload,
+                asset,
+                relative_path,
+                start_line,
+                end_line,
+            )
 
     async def write_file(
         self,
@@ -301,9 +362,8 @@ class ActiveAdaptationContext:
         relative_path: str,
         content: str,
     ) -> dict[str, Any]:
-        async with self._lock:
-            asset = self._asset(key)
-            self._consume(key)
+        async with self._asset_lock(key):
+            asset = await self._consume(key)
             if asset.zone is not AssetZone.REPAIR:
                 raise RuntimeError("files can only be changed in repair")
             if len(content.encode()) > _MAX_FILE_BYTES:
@@ -313,27 +373,18 @@ class ActiveAdaptationContext:
             await self._publish(
                 f"正在兼容性优化 {self._label(asset)}：{relative_path}",
             )
-            path = self._asset_file(self._asset_root(asset), relative_path)
-            path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-            descriptor, temporary = tempfile.mkstemp(dir=path.parent)
-            try:
-                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                    stream.write(content)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.chmod(
-                    temporary,
-                    (
-                        stat.S_IMODE(path.stat().st_mode)
-                        if path.exists()
-                        else 0o600
-                    ),
-                )
-                os.replace(temporary, path)
-            finally:
-                Path(temporary).unlink(missing_ok=True)
-            self.store.mark_changed(key, f"写入 {relative_path}")
-            self._audit("write_file", key, relative_path)
+            await run_sync_io(
+                self._write_file_atomic,
+                asset,
+                relative_path,
+                content,
+            )
+            await run_sync_io(
+                self.store.mark_changed,
+                key,
+                f"写入 {relative_path}",
+            )
+            await run_sync_io(self._audit, "write_file", key, relative_path)
             await self._publish(
                 f"已修改 {self._label(asset)}，等待重新兼容性测试。",
             )
@@ -345,11 +396,10 @@ class ActiveAdaptationContext:
         field_name: str,
         value_json: str,
     ) -> dict[str, Any]:
-        async with self._lock:
-            self._consume(key)
+        async with self._asset_lock(key):
+            asset = await self._consume(key)
             if len(value_json.encode()) > _MAX_REPLACEMENT_BYTES:
                 raise ValueError("updated value is too large")
-            asset = self._asset(key)
             if asset.zone is not AssetZone.REPAIR:
                 raise RuntimeError("assets can only be changed in repair")
             await self._publish(
@@ -401,7 +451,7 @@ class ActiveAdaptationContext:
                 asset.asset_type is AssetType.SCHEDULED_TASK
                 and field_name == "cwd"
                 and value
-                and Path(value).expanduser().is_dir()
+                and await run_sync_io(Path(value).expanduser().is_dir)
             ):
                 source.metadata.update(
                     {
@@ -412,32 +462,37 @@ class ActiveAdaptationContext:
                         "target_remote_authority": "",
                     },
                 )
-            self.store.mark_changed(key, f"更新字段 {field_name}")
-            self._audit("update_asset", key, field_name)
+            await run_sync_io(
+                self.store.mark_changed,
+                key,
+                f"更新字段 {field_name}",
+            )
+            await run_sync_io(self._audit, "update_asset", key, field_name)
             await self._publish(
                 f"已更新 {self._label(asset)}，等待重新兼容性测试。",
             )
             return {"ok": True, "zone": "repair"}
 
     async def finalize_asset(self, key: str, reason: str) -> dict[str, Any]:
-        async with self._lock:
-            if key != self.active_asset_key:
-                raise PermissionError(
-                    "worker may access only its assigned asset",
-                )
-            asset = self._asset(key)
+        async with self._asset_lock(key):
+            asset = await run_sync_io(self._asset, key)
             if asset.zone is not AssetZone.REPAIR:
                 raise RuntimeError("assets can only be finalized in repair")
             if not reason.strip():
                 raise ValueError(
                     "finalization requires an evidence-based reason",
                 )
-            self._consume(key, final=True)
+            asset = await self._consume(key, final=True)
             await self._publish(
                 f"正在测试 {self._label(asset)} 的 QwenPaw 兼容性…",
             )
-            result = self.tester.test(asset)
-            self._audit("test", key, "passed" if result.passed else "failed")
+            result = await run_sync_io(self.tester.test, asset)
+            await run_sync_io(
+                self._audit,
+                "test",
+                key,
+                "passed" if result.passed else "failed",
+            )
             if not result.passed:
                 await self._publish(
                     f"{self._label(asset)}测试未通过，需要继续兼容性修复。",
@@ -449,10 +504,20 @@ class ActiveAdaptationContext:
                     "summary": result.summary,
                     "evidence": result.evidence,
                 }
-            manifest = self.store.classify(key, AssetZone.MIGRATE, reason)
-            self._audit("classify", key, AssetZone.MIGRATE.value)
+            manifest = await run_sync_io(
+                self.store.classify,
+                key,
+                AssetZone.MIGRATE,
+                reason,
+            )
+            await run_sync_io(
+                self._audit,
+                "classify",
+                key,
+                AssetZone.MIGRATE.value,
+            )
             await self._publish(
-                f"{self._label(self._asset(key))}兼容性优化完成，已进入待迁移区。",
+                f"{self._label(manifest.get_asset(key))}兼容性优化完成，已进入待迁移区。",
             )
             self._binding().completed.set()
             return {
@@ -586,7 +651,10 @@ async def _repair_asset(
     key: str,
     warnings: list[str],
 ) -> None:
-    asset = context._asset(key)  # pylint: disable=protected-access
+    asset = await run_sync_io(
+        context._asset,  # pylint: disable=protected-access
+        key,
+    )
     label = context._label(asset)  # pylint: disable=protected-access
     try:
         await _run_phase(
@@ -611,7 +679,7 @@ async def _repair_with_mission(
     mode = _mission_mode(workspace)
     max_attempts = mode.max_retries_per_story + 1
     session_id = f"migration-mission:{secrets.token_urlsafe(24)}"
-    manifest = load_manifest(context.store.path)
+    manifest = await run_sync_io(load_manifest, context.store.path)
     loop_dir = await run_sync_io(
         prepare_mission,
         root,
@@ -623,7 +691,7 @@ async def _repair_with_mission(
     mode.start_internal_mission(session_id, loop_dir)
     try:
         for round_number in range(1, max_attempts + 1):
-            manifest = load_manifest(context.store.path)
+            manifest = await run_sync_io(load_manifest, context.store.path)
             pending = [
                 item.asset_key
                 for item in manifest.by_zone(AssetZone.REPAIR)
@@ -644,11 +712,11 @@ async def _repair_with_mission(
                 pending,
                 lambda key: _repair_asset(workspace, context, key, warnings),
             )
-            manifest = load_manifest(context.store.path)
+            manifest = await run_sync_io(load_manifest, context.store.path)
             await run_sync_io(sync_mission, loop_dir, manifest)
             if await mode.check_internal_mission(session_id):
                 return ""
-        manifest = load_manifest(context.store.path)
+        manifest = await run_sync_io(load_manifest, context.store.path)
         await run_sync_io(sync_mission, loop_dir, manifest, stopped=True)
         await mode.check_internal_mission(session_id)
         remaining = len(manifest.by_zone(AssetZone.REPAIR))
@@ -680,7 +748,8 @@ async def run_adaptation_loop(
     warnings = await run_sync_io(stage_local_assets, inventory, staging_root)
     store = CompatibilityStore(manifest_path)
     components = await run_sync_io(component_map, inventory)
-    manifest = store.prepare(
+    manifest = await run_sync_io(
+        store.prepare,
         migration_id=migration_id,
         source=inventory.provider_id,
         skills=inventory.skills,
@@ -695,8 +764,8 @@ async def run_adaptation_loop(
         "正在启动 QwenPaw Mission 并行进行兼容性测试与修复…",
     )
     if not manifest.assets:
-        manifest = store.finish()
-        write_summary(summary_path, manifest)
+        manifest = await run_sync_io(store.finish)
+        await run_sync_io(write_summary, summary_path, manifest)
         return AdaptationResult(
             manifest_path,
             summary_path,
@@ -711,12 +780,12 @@ async def run_adaptation_loop(
         tester=tester,
         staging_root=staging_root,
         audit_path=root / "progress.jsonl",
+        manifest=manifest,
         progress=progress,
     )
     await _report(
         progress,
-        f"Mission 共享 {context.total_tool_budget} 次工具调用；"
-        "不设总时长限制，推理上限按剩余预算动态分配。",
+        f"各资产工具调用预算合计 {context.total_tool_budget} 次；" "不设总时长限制，推理上限按剩余预算动态分配。",
     )
     try:
         stopped_reason = await _repair_with_mission(
@@ -731,19 +800,15 @@ async def run_adaptation_loop(
         stopped_reason = f"无法完成 QwenPaw Mission：{type(exc).__name__}: {exc}"
         warnings.append(stopped_reason)
 
-    complete, reason = store.complete()
+    complete, reason = await run_sync_io(store.complete)
     if not complete and not stopped_reason:
-        if context.tool_calls >= context.total_tool_budget:
-            stopped_reason = (
-                "兼容性迁移达到总工具调用上限（" + f"{context.total_tool_budget} 次）。"
-            )
-        else:
-            stopped_reason = reason
-    manifest = store.finish(
+        stopped_reason = reason
+    manifest = await run_sync_io(
+        store.finish,
         stopped=not complete,
         reason="" if complete else stopped_reason,
     )
-    write_summary(summary_path, manifest)
+    await run_sync_io(write_summary, summary_path, manifest)
     await _report(
         progress,
         "兼容性迁移已结束："

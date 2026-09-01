@@ -214,7 +214,7 @@ async def test_apply_selection_filters_before_execution(
 
 
 @pytest.mark.asyncio
-async def test_apply_selection_uses_latest_selected_assets(
+async def test_apply_selection_rejects_changed_source(
     tmp_path: Path,
 ) -> None:
     source = _inventory(tmp_path)
@@ -226,10 +226,10 @@ async def test_apply_selection_uses_latest_selected_assets(
     service = _PlanningService(tmp_path, source)
     memory.write_text("after", encoding="utf-8")
 
-    await service.apply_selection(
-        service.plan.plan_id,
-        ImportSelection(sessions=False, memory=["memory-1"]),
-    )
+    with pytest.raises(ValueError, match="来源数据在预演后发生了变化"):
+        await service.apply_selection(
+            service.plan.plan_id,
+            ImportSelection(sessions=False, memory=["memory-1"]),
+        )
 
-    assert service.executed is not None
-    assert service.executed.memory_projects[0].files[0].source_path == memory
+    assert service.executed is None

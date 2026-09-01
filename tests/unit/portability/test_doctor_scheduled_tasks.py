@@ -57,13 +57,14 @@ def _receipt(
     )
     if zone is not None:
         if zone is AssetZone.MIGRATE:
+            asset_key = f"scheduled_tasks:{task.source_id}"
             store.record_test(
-                "scheduled_tasks:remote-task",
+                asset_key,
                 passed=True,
                 summary="fixture",
             )
             store.classify(
-                "scheduled_tasks:remote-task",
+                asset_key,
                 AssetZone.MIGRATE,
                 "fixture",
             )
@@ -204,3 +205,44 @@ async def test_doctor_fails_if_imported_job_loses_review_gate(
     check = _schedule_check(report)
     assert check.status == "fail"
     assert "状态与兼容分区一致 0/1" in check.detail_zh
+
+
+@pytest.mark.asyncio
+async def test_doctor_accepts_reviewed_migrate_job_while_disabled(
+    tmp_path: Path,
+) -> None:
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir()
+    task = SourceScheduledTask(
+        source_id="reviewed-task",
+        name="Reviewed task",
+        schedule_type="cron",
+        cron="0 9 * * *",
+        prompt="Review the local workspace",
+        cwd=str(tmp_path),
+    )
+    job = build_imported_job("qoder", task, reviewed=True)
+    receipt = _receipt(workspace_dir, task, zone=AssetZone.MIGRATE)
+    workspace = SimpleNamespace(
+        workspace_dir=workspace_dir,
+        cron_manager=_CronManager([job]),
+    )
+    inventory = ProviderInventory(
+        provider_id="qoder",
+        provider_name="Qoder",
+        detected=True,
+        scheduled_tasks=[task],
+    )
+
+    report = await run_migration_doctor(workspace, inventory, receipt)
+
+    check = _schedule_check(report)
+    assert check.status == "pass"
+    assert "状态与兼容分区一致 1/1" in check.detail_zh
+
+    workspace.cron_manager.jobs[0] = job.model_copy(
+        update={"enabled": True},
+    )
+    report = await run_migration_doctor(workspace, inventory, receipt)
+
+    assert _schedule_check(report).status == "fail"

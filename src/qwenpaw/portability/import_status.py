@@ -40,8 +40,13 @@ _NOT_NEEDED_ACTIONS = {
 }
 
 
-def _matches(values: list[str], source_id: str, name: str) -> bool:
-    return source_id in values or name in values
+def _matches(
+    values: list[str],
+    source_id: str,
+    name: str,
+    canonical_id: str = "",
+) -> bool:
+    return source_id in values or name in values or canonical_id in values
 
 
 def project_asset_results(
@@ -53,9 +58,8 @@ def project_asset_results(
     force_retry: bool = False,
 ) -> list[ImportAssetResult]:
     """Return selected visible assets without mutating migration artifacts."""
-    zones = (
-        {item.asset_key: item for item in manifest.assets} if manifest else {}
-    )
+    assets = manifest.assets if manifest else ()
+    zones = {item.asset_key: item for item in assets}
     results: list[ImportAssetResult] = []
     for action in plan.actions:
         mapping = _TYPES.get(action.asset_type)
@@ -69,6 +73,9 @@ def project_asset_results(
             source_id=action.source_id,
             name=action.name,
         )
+        canonical_id = ""
+        if public_type == "plugin":
+            canonical_id = action.source_id.partition("@")[0]
         if action.action in _NOT_NEEDED_ACTIONS and not force_retry:
             result.state = ImportAssetState.NOT_NEEDED
             result.reason_code = action.action
@@ -85,6 +92,7 @@ def project_asset_results(
             getattr(receipt, imported_field),
             action.source_id,
             action.name,
+            canonical_id,
         ):
             result.state = ImportAssetState.SUCCEEDED
             result.enabled = (
@@ -95,7 +103,7 @@ def project_asset_results(
             )
             if result.enabled is False:
                 result.reason_code = "imported_disabled"
-                result.message = "已导入但保持禁用，需要人工审核后启用。"
+                result.message = "已导入且保持禁用，请确认后手动启用。"
         else:
             result.state = ImportAssetState.FAILED
             result.reason_code = "not_materialized"
@@ -104,6 +112,7 @@ def project_asset_results(
                 getattr(receipt, skipped_field),
                 action.source_id,
                 action.name,
+                canonical_id,
             ):
                 result.reason_code = "missing_result"
         results.append(result)

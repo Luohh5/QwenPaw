@@ -23,7 +23,7 @@ async def _invoke(method: str, *args: Any, **kwargs: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
-_COMMON = {
+_COMMON: dict[str, Any] = {
     "enabled_by_default": False,
     "tool_type": "internal",
     "default_policy": "allow",

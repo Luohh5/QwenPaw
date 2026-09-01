@@ -167,6 +167,28 @@ def test_succeeded_but_disabled_is_tooltip_metadata() -> None:
     assert "保持禁用" in result.message
 
 
+def test_plugin_matches_its_qwenpaw_canonical_id() -> None:
+    result = project_asset_results(
+        _plan(
+            _action(
+                "plugin",
+                "cloudflare@openai-curated-remote",
+                "Cloudflare",
+            ),
+        ),
+        {"plugin:cloudflare@openai-curated-remote"},
+        manifest=_manifest(
+            AssetType.PLUGIN,
+            "cloudflare@openai-curated-remote",
+            "Cloudflare",
+            AssetZone.MIGRATE,
+        ),
+        receipt=_receipt(installed_plugins=["cloudflare"]),
+    )[0]
+
+    assert result.state is ImportAssetState.SUCCEEDED
+
+
 def test_migrated_asset_is_enabled_except_review_gated_cron() -> None:
     skill = project_asset_results(
         _plan(_action("skill", "skill-1", "Skill")),

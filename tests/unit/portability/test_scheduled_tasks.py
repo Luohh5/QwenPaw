@@ -45,7 +45,9 @@ def test_build_imported_job_is_stable_disabled_and_safe(tmp_path) -> None:
     assert first.meta["portability"]["requires_review"] is True
 
 
-def test_mission_approved_job_is_enabled_without_review_gate(tmp_path) -> None:
+def test_mission_reviewed_job_is_disabled_without_review_gate(
+    tmp_path,
+) -> None:
     task = SourceScheduledTask(
         source_id="approved",
         name="Approved",
@@ -55,11 +57,12 @@ def test_mission_approved_job_is_enabled_without_review_gate(tmp_path) -> None:
         cwd=str(tmp_path),
     )
 
-    job = build_imported_job("codex", task, enabled=True)
+    job = build_imported_job("codex", task, reviewed=True)
 
-    assert job.enabled is True
+    assert job.enabled is False
     assert job.runtime.tool_safety is True
     assert job.meta["portability"]["requires_review"] is False
+    assert job.meta["portability"]["safety"] == "reviewed_disabled"
     assert job.request.request_context["portability_review_required"] is False
     assert CronManager.requires_portability_review(job) is False
 

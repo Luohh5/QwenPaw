@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 # pylint: disable=protected-access
 import asyncio
+from datetime import datetime, timezone
 import inspect
 import json
 from pathlib import Path
 import sys
+import threading
 from textwrap import indent
 from types import SimpleNamespace
 
@@ -24,7 +26,9 @@ from qwenpaw.portability.adaptation_staging import (
 from qwenpaw.portability.compatibility import (
     AssetType,
     AssetZone,
+    CompatibilityStore,
     load_manifest,
+    save_manifest,
 )
 from qwenpaw.portability.compatibility_testing import (
     CompatibilityTester,
@@ -34,6 +38,7 @@ from qwenpaw.portability.models import (
     ProviderInventory,
     SourceMCPServer,
     SourcePlugin,
+    SourceScheduledTask,
     SourceSkill,
 )
 
@@ -342,6 +347,59 @@ def test_inspect_returns_exact_live_plugin_api_signatures(tmp_path: Path):
     assert contract["callbacks"]["register_uninstall_hook.callback"] == (
         "sync or async callable (*, plugin_id, delete_files)"
     )
+
+
+def test_schedule_inspect_returns_current_values_not_manifest_snapshot(
+    tmp_path: Path,
+) -> None:
+    original = SourceScheduledTask(
+        source_id="daily",
+        name="Daily report",
+        schedule_type="cron",
+        cron="0 9 * * *",
+        timezone="UTC",
+        prompt="Create the original report",
+        cwd="/old/workspace",
+    )
+    current = original.model_copy(
+        update={
+            "schedule_type": "once",
+            "cron": "",
+            "run_at": datetime(2026, 9, 2, 9, 50, tzinfo=timezone.utc),
+            "timezone": "Asia/Shanghai",
+            "prompt": "Create the updated report",
+            "cwd": str(tmp_path),
+        },
+    )
+    store = CompatibilityStore(tmp_path / "compatibility.json")
+    manifest = store.prepare(
+        migration_id="migration-1",
+        source="codex",
+        scheduled_tasks=[original],
+    )
+    asset = manifest.get_asset("scheduled_tasks:daily")
+    tester = CompatibilityTester(
+        _Workspace(tmp_path, lambda _context: None),
+        ProviderInventory(
+            provider_id="codex",
+            provider_name="Codex",
+            detected=True,
+            scheduled_tasks=[current],
+        ),
+        store,
+    )
+
+    inspected = tester.inspect(asset)
+
+    assert inspected["asset"]["snapshot"]["cron"] == "0 9 * * *"
+    assert inspected["detail"] == {
+        "schedule_type": "once",
+        "cron": "",
+        "run_at": "2026-09-02T09:50:00+00:00",
+        "timezone": "Asia/Shanghai",
+        "prompt": "Create the updated report",
+        "cwd": str(tmp_path),
+    }
 
 
 def test_large_plugin_checklist_uses_behavioral_entries_not_doc_corpus(
@@ -794,3 +852,103 @@ async def test_mission_repairs_assets_in_parallel_with_isolated_scope(
         for item in workspace.requests
     ]
     assert phases.count("mission_repair") == 2
+
+
+@pytest.mark.asyncio
+async def test_rejected_tool_call_does_not_consume_mission_budget(
+    tmp_path: Path,
+) -> None:
+    observed_calls: list[int] = []
+
+    async def action(context):
+        manifest = load_manifest(context.store.path)
+        manifest.assets[0].tool_budget = 2
+        save_manifest(context.store.path, manifest)
+
+        await context.inspect_asset("skills:demo")
+        observed_calls.append(context.tool_calls)
+        with pytest.raises(
+            RuntimeError,
+            match="tool-call budget is exhausted",
+        ):
+            await context.inspect_asset("skills:demo")
+        observed_calls.append(context.tool_calls)
+
+        finalized = await context.finalize_asset("skills:demo", "native")
+        assert finalized["passed"], finalized
+
+    result = await run_adaptation_loop(
+        _Workspace(tmp_path, action),
+        ProviderInventory(
+            provider_id="codex",
+            provider_name="Codex",
+            detected=True,
+            skills=[
+                _skill(
+                    tmp_path,
+                    "---\nname: demo\ndescription: demo\n---\nUse QwenPaw.\n",
+                ),
+            ],
+        ),
+        "migration-budget",
+    )
+
+    assert observed_calls == [1, 1]
+    assert load_manifest(result.manifest_path).assets[0].tool_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_mission_tools_run_concurrently_for_distinct_assets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    barrier = threading.Barrier(2)
+    entered: list[str] = []
+
+    def blocking_inspect(_tester, asset):
+        entered.append(asset.asset_key)
+        barrier.wait(timeout=2)
+        return {"asset_key": asset.asset_key}
+
+    monkeypatch.setattr(CompatibilityTester, "inspect", blocking_inspect)
+
+    first = _skill(
+        tmp_path,
+        "---\nname: first\ndescription: valid\n---\nUse QwenPaw.\n",
+    )
+    first.source_id = "first"
+    first.name = "first"
+    second_root = tmp_path / "second-skill"
+    second_root.mkdir()
+    (second_root / "SKILL.md").write_text(
+        "---\nname: second\ndescription: valid\n---\nUse QwenPaw.\n",
+        encoding="utf-8",
+    )
+    second = SourceSkill(
+        source_id="second",
+        name="second",
+        directory=second_root,
+    )
+
+    async def action(context):
+        key = context.active_asset_key
+        assert (await context.inspect_asset(key))["ok"]
+        finalized = await context.finalize_asset(key, "native")
+        assert finalized["passed"], finalized
+
+    result = await asyncio.wait_for(
+        run_adaptation_loop(
+            _Workspace(tmp_path, action),
+            ProviderInventory(
+                provider_id="codex",
+                provider_name="Codex",
+                detected=True,
+                skills=[first, second],
+            ),
+            "migration-tool-concurrency",
+        ),
+        timeout=5,
+    )
+
+    assert result.status == "completed"
+    assert set(entered) == {"skills:first", "skills:second"}

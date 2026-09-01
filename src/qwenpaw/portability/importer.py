@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
 from collections.abc import AsyncIterator
@@ -63,6 +64,22 @@ _GENERATED_PLUGIN_ADAPTERS = {
     CODEX_PLUGIN_ADAPTER,
     "qoder_skill_only_v1",
 }
+
+
+class ImportRollbackError(RuntimeError):
+    """An import failed and one or more rollback actions also failed."""
+
+    def __init__(
+        self,
+        failures: list[str],
+        *,
+        cancelled: bool,
+    ) -> None:
+        self.failures = tuple(failures)
+        self.cancelled = cancelled
+        super().__init__(
+            "迁移回滚未完成，请人工检查并清理以下内容：" + "；".join(failures),
+        )
 
 
 async def _asset_items(
@@ -841,7 +858,7 @@ class ProviderImportService(ImportPlanningMixin):
                         task,
                         target_user_id=target_user_id,
                         target_session_id=target_session_id,
-                        enabled=compatibility_zone == "migrate",
+                        reviewed=compatibility_zone == "migrate",
                     )
                     if source_kind == "heartbeat":
                         job.runtime = job.runtime.model_copy(
@@ -941,46 +958,86 @@ class ProviderImportService(ImportPlanningMixin):
             )
             await _report(progress, "迁移事务已安全提交。")
             return receipt
-        except BaseException:
+        except BaseException as original:
+            rollback_failures: list[str] = []
+
+            def record_rollback_failure(label: str, exc: Exception) -> None:
+                logger.exception("Failed to roll back %s", label)
+                rollback_failures.append(
+                    f"{label}: {type(exc).__name__}: {exc}",
+                )
+
             if receipt_path is not None:
-                await unlink_async(receipt_path, missing_ok=True)
+                try:
+                    await unlink_async(receipt_path, missing_ok=True)
+                except Exception as exc:  # pylint: disable=broad-except
+                    record_rollback_failure(f"receipt {receipt_path}", exc)
             if created_chats:
-                await self._workspace.chat_manager.delete_chats(created_chats)
+                try:
+                    await self._workspace.chat_manager.delete_chats(
+                        created_chats,
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    record_rollback_failure(
+                        "chats " + ",".join(created_chats),
+                        exc,
+                    )
             for session_id, user_id, channel in created_states:
-                await _remove_session_state(
-                    self._workspace,
-                    session_id=session_id,
-                    user_id=user_id,
-                    channel=channel,
-                )
+                try:
+                    await _remove_session_state(
+                        self._workspace,
+                        session_id=session_id,
+                        user_id=user_id,
+                        channel=channel,
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    record_rollback_failure(
+                        f"session state {session_id}",
+                        exc,
+                    )
             for chat_id, previous in reversed(patched_project_dirs):
-                await self._workspace.chat_manager.set_project_dir(
-                    chat_id,
-                    previous,
-                )
+                try:
+                    await self._workspace.chat_manager.set_project_dir(
+                        chat_id,
+                        previous,
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    record_rollback_failure(
+                        f"project directory {chat_id}",
+                        exc,
+                    )
             for chat_id in reversed(archived_chats):
-                await self._workspace.chat_manager.unarchive_chat(chat_id)
+                try:
+                    await self._workspace.chat_manager.unarchive_chat(chat_id)
+                except Exception as exc:  # pylint: disable=broad-except
+                    record_rollback_failure(f"archived chat {chat_id}", exc)
             for card_name, credential_ref in reversed(created_mcp):
                 try:
                     await driver_config.card_store.delete(card_name)
-                    if credential_ref:
+                except Exception as exc:  # pylint: disable=broad-except
+                    record_rollback_failure(
+                        f"MCP card {card_name}",
+                        exc,
+                    )
+                if credential_ref:
+                    try:
                         await driver_config.credential_store.delete(
                             credential_ref,
                         )
-                except Exception:  # pylint: disable=broad-except
-                    logger.exception(
-                        "Failed to roll back imported MCP %s",
-                        card_name,
-                    )
+                    except Exception as exc:  # pylint: disable=broad-except
+                        record_rollback_failure(
+                            f"MCP credential {credential_ref}",
+                            exc,
+                        )
             cron_manager = getattr(self._workspace, "cron_manager", None)
             if cron_manager is not None:
                 for job_id in reversed(created_scheduled_tasks):
                     try:
                         await cron_manager.delete_job(job_id)
-                    except Exception:  # pylint: disable=broad-except
-                        logger.exception(
-                            "Failed to roll back imported scheduled task %s",
-                            job_id,
+                    except Exception as exc:  # pylint: disable=broad-except
+                        record_rollback_failure(
+                            f"scheduled task {job_id}",
+                            exc,
                         )
                 for previous_job in reversed(replaced_scheduled_tasks):
                     try:
@@ -995,23 +1052,24 @@ class ProviderImportService(ImportPlanningMixin):
                             await cron_manager.create_or_replace_job(
                                 previous_job,
                             )
-                    except Exception:  # pylint: disable=broad-except
-                        logger.exception(
-                            "Failed to restore replaced scheduled task %s",
-                            getattr(previous_job, "id", ""),
+                    except Exception as exc:  # pylint: disable=broad-except
+                        record_rollback_failure(
+                            "replaced scheduled task "
+                            + getattr(previous_job, "id", ""),
+                            exc,
                         )
             for skill_name in reversed(imported_skills):
                 try:
                     skill_service.disable_skill(skill_name)
+                except Exception as exc:  # pylint: disable=broad-except
+                    record_rollback_failure(f"Skill disable {skill_name}", exc)
+                try:
                     await run_sync_io(
                         skill_service.delete_skill,
                         skill_name,
                     )
-                except Exception:  # pylint: disable=broad-except
-                    logger.exception(
-                        "Failed to roll back imported Skill %s",
-                        skill_name,
-                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    record_rollback_failure(f"Skill {skill_name}", exc)
             if plugin_app is not None:
                 for plugin_id in reversed(installed_plugins):
                     try:
@@ -1025,11 +1083,8 @@ class ProviderImportService(ImportPlanningMixin):
                             app=plugin_app,
                             reload_agents=False,
                         )
-                    except Exception:  # pylint: disable=broad-except
-                        logger.exception(
-                            "Failed to roll back imported plugin %s",
-                            plugin_id,
-                        )
+                    except Exception as exc:  # pylint: disable=broad-except
+                        record_rollback_failure(f"plugin {plugin_id}", exc)
             for target, previous in reversed(memory_changes):
                 try:
                     await run_sync_io(
@@ -1037,11 +1092,8 @@ class ProviderImportService(ImportPlanningMixin):
                         target,
                         previous,
                     )
-                except Exception:  # pylint: disable=broad-except
-                    logger.exception(
-                        "Failed to roll back imported Memory %s",
-                        target,
-                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    record_rollback_failure(f"Memory {target}", exc)
             if (
                 marketplace_registry_touched
                 and marketplace_registry_snapshot is not None
@@ -1055,20 +1107,28 @@ class ProviderImportService(ImportPlanningMixin):
                             registry_file,
                             previous_registry,
                         )
-                except Exception:  # pylint: disable=broad-except
-                    logger.exception(
-                        "Failed to roll back Marketplace registry %s",
-                        registry_file,
+                except Exception as exc:  # pylint: disable=broad-except
+                    record_rollback_failure(
+                        f"Marketplace registry {registry_file}",
+                        exc,
                     )
             if adaptation_root.is_dir() and not adaptation_root.is_symlink():
                 try:
                     await run_sync_io(shutil.rmtree, adaptation_root)
-                except Exception:  # pylint: disable=broad-except
-                    logger.exception(
-                        "Failed to roll back compatibility staging %s",
-                        adaptation_root,
+                except Exception as exc:  # pylint: disable=broad-except
+                    record_rollback_failure(
+                        f"compatibility staging {adaptation_root}",
+                        exc,
                     )
+            if rollback_failures and isinstance(
+                original,
+                (Exception, asyncio.CancelledError),
+            ):
+                raise ImportRollbackError(
+                    rollback_failures,
+                    cancelled=isinstance(original, asyncio.CancelledError),
+                ) from original
             raise
 
 
-__all__ = ["ProviderImportService"]
+__all__ = ["ImportRollbackError", "ProviderImportService"]

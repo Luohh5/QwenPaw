@@ -650,7 +650,21 @@ class CompatibilityTester:
                     url=redact_sensitive_text(source.url),
                 )
         elif asset.asset_type is AssetType.SCHEDULED_TASK:
-            detail["prompt"] = redact_sensitive_text(source.prompt)
+            # Keep the immutable manifest snapshot as provenance, while
+            # returning the current mutable schedule to the Agent.  Otherwise
+            # a successful update looks unchanged and triggers redundant
+            # writes on the next inspect call.
+            detail.update(
+                schedule_type=redact_sensitive_text(
+                    source.schedule_type,
+                    limit=30,
+                ),
+                cron=redact_sensitive_text(source.cron, limit=200),
+                run_at=source.run_at.isoformat() if source.run_at else "",
+                timezone=redact_sensitive_text(source.timezone, limit=100),
+                prompt=redact_sensitive_text(source.prompt),
+                cwd=redact_sensitive_text(source.cwd),
+            )
         return {
             "asset": asset.model_dump(mode="json"),
             "detail": detail,

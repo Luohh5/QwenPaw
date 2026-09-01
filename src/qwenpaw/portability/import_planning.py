@@ -255,9 +255,7 @@ class ImportPlanningMixin:
                 source_home=source_home,
                 progress=progress,
             )
-            if selection is None and inventory_fingerprint(inventory) != (
-                plan.inventory_fingerprint
-            ):
+            if inventory_fingerprint(inventory) != plan.inventory_fingerprint:
                 message = "来源数据在预演后发生了变化。请重新扫描，"
                 message += "确认新计划后再执行。"
                 raise ValueError(message)

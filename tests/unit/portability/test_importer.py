@@ -16,7 +16,10 @@ from qwenpaw.app.chats.session import SafeJSONSession
 from qwenpaw.app.crons.manager import CronManager
 from qwenpaw.app.driver_config_service import DriverConfigService
 from qwenpaw.harnesses.events import HarnessHistoryItem, HarnessHistoryKind
-from qwenpaw.portability.importer import ProviderImportService
+from qwenpaw.portability.importer import (
+    ImportRollbackError,
+    ProviderImportService,
+)
 from qwenpaw.portability.adaptation_loop import AdaptationResult
 from qwenpaw.portability.compatibility import AssetZone, CompatibilityStore
 from qwenpaw.portability.models import (
@@ -357,8 +360,9 @@ async def test_migrate_zone_materializes_and_enables_assets(
     cards = await DriverConfigService(workspace).list_cards()
     assert len(cards) == 1 and cards[0].enabled is True
     job = next(iter(workspace.cron_manager.jobs.values()))
-    assert job.enabled is True
+    assert job.enabled is False
     assert job.meta["portability"]["requires_review"] is False
+    assert job.meta["portability"]["safety"] == "reviewed_disabled"
     assert receipt.adaptation_summary == "compatibility-summary.md"
 
 
@@ -1624,3 +1628,71 @@ async def test_failed_receipt_rolls_back_all_core_asset_writers(
     assert workspace.cron_manager.jobs == {}
     imports = workspace.workspace_dir / ".qwenpaw/imports"
     assert not list(imports.glob("migration-*.json"))
+
+
+@pytest.mark.asyncio
+async def test_rollback_failure_continues_later_cleanup(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    skill_source = tmp_path / "rollback-after-chat-failure"
+    skill_source.mkdir()
+    (skill_source / "SKILL.md").write_text(
+        "---\n"
+        "name: rollback-after-chat-failure\n"
+        "description: Rollback fixture\n"
+        "---\n\n"
+        "Use ordinary QwenPaw tools.\n",
+        encoding="utf-8",
+    )
+    inventory = ProviderInventory(
+        provider_id="codex",
+        provider_name="Codex",
+        detected=True,
+        sessions=[
+            SourceSession(
+                source_id="rollback-session",
+                title="Rollback session",
+                history=[
+                    HarnessHistoryItem(
+                        kind=HarnessHistoryKind.USER,
+                        text="Do rollback work",
+                        item_id="rollback-message",
+                    ),
+                ],
+            ),
+        ],
+        skills=[
+            SourceSkill(
+                source_id="rollback-after-chat-failure",
+                name="rollback-after-chat-failure",
+                directory=skill_source,
+            ),
+        ],
+    )
+    _bind_inventory(monkeypatch, inventory)
+    _mock_adaptation(monkeypatch, workspace, inventory, zone="migrate")
+
+    async def _fail_receipt(*_args, **_kwargs):
+        raise OSError("receipt storage unavailable")
+
+    async def _fail_delete_chats(_chat_ids):
+        raise OSError("chat cleanup unavailable")
+
+    monkeypatch.setattr(
+        "qwenpaw.portability.importer.write_json_atomic_async",
+        _fail_receipt,
+    )
+    monkeypatch.setattr(
+        workspace.chat_manager,
+        "delete_chats",
+        _fail_delete_chats,
+    )
+
+    with pytest.raises(ImportRollbackError, match="chat cleanup unavailable"):
+        await ProviderImportService(workspace).import_from("codex")
+
+    assert not (
+        workspace.workspace_dir / "skills/rollback-after-chat-failure"
+    ).exists()
