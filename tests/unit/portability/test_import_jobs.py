@@ -328,6 +328,32 @@ async def test_empty_selection_is_rejected_and_active_job_can_cancel(
 
 
 @pytest.mark.asyncio
+async def test_shutdown_cancels_active_jobs_and_rejects_new_ones(
+    tmp_path: Path,
+) -> None:
+    services = _FakeServices()
+    services.block_apply.clear()
+    workspace = _workspace(tmp_path)
+    manager = PortabilityImportJobManager(service_factory=services.factory)
+    created = await manager.create(workspace, ["codex"])
+    await manager.wait(created.job_id)
+    await manager.start(
+        workspace,
+        created.job_id,
+        {"codex": ImportSelection(skills=["codex-skill"])},
+    )
+    await services.apply_started.wait()
+
+    await manager.shutdown()
+
+    assert (
+        await manager.snapshot(workspace, created.job_id)
+    ).state == "interrupted"
+    with pytest.raises(RuntimeError, match="shutting down"):
+        await manager.create(workspace, ["qoder"])
+
+
+@pytest.mark.asyncio
 async def test_cancel_with_rollback_failure_marks_job_failed(
     tmp_path: Path,
 ) -> None:

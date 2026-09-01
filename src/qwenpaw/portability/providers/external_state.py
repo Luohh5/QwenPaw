@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from heapq import nlargest
 import sqlite3
 import tomllib
 from pathlib import Path
@@ -19,6 +20,7 @@ from ..models import (
     SourceSkill,
 )
 from ..qoder_plugin_adapter import discover_qoder_custom_skill_adapter
+from ..skill_transfer import read_bounded_tree, read_regular_file
 from ._utils import find_nested_value
 
 _CODEX_BUILTIN_MARKETPLACES = {
@@ -29,6 +31,7 @@ _CODEX_BUILTIN_MARKETPLACES = {
 }
 _CWD_KEYS = ("cwd", "directory", "project_path", "projectPath")
 _MAX_TRANSCRIPT_PROBE_BYTES = 1024 * 1024
+_MAX_CONFIG_BYTES = 4 * 1024 * 1024
 _CODEX_CURATED_MEMORY_FILES = ("MEMORY.md", "memory_summary.md")
 _CODEX_INTERNAL_MEMORY_FILES = (
     "raw_memories.md",
@@ -38,9 +41,8 @@ _CODEX_INTERNAL_MEMORY_FILES = (
 
 def _read_json(path: Path) -> Any:
     try:
-        with path.open(encoding="utf-8") as stream:
-            return json.load(stream)
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        return json.loads(read_regular_file(path, max_bytes=_MAX_CONFIG_BYTES))
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
         return None
 
 
@@ -49,23 +51,24 @@ def _markdown_files(root: Path) -> list[SourceMemoryFile]:
     if not root.is_dir() or root.is_symlink():
         return files
     resolved_root = root.resolve()
-    for path in sorted(root.rglob("*")):
-        if path.is_symlink() or not path.is_file():
-            continue
-        if path.suffix.lower() != ".md":
-            continue
-        try:
-            resolved = path.resolve(strict=True)
-            relative = resolved.relative_to(resolved_root)
-        except (OSError, ValueError):
-            continue
-        files.append(
-            SourceMemoryFile(
-                source_path=resolved,
-                relative_path=relative,
-            ),
-        )
-    return files
+    try:
+        for entry in read_bounded_tree(
+            root,
+            reject_unsafe=False,
+            read_data=False,
+        ):
+            if entry.is_dir or entry.relative.suffix.lower() != ".md":
+                continue
+            resolved = (resolved_root / entry.relative).resolve(strict=True)
+            files.append(
+                SourceMemoryFile(
+                    source_path=resolved,
+                    relative_path=entry.relative,
+                ),
+            )
+    except (OSError, ValueError):
+        pass
+    return sorted(files, key=lambda item: str(item.relative_path))
 
 
 def _codex_stage1_count(codex_home: Path) -> int:
@@ -162,9 +165,7 @@ def discover_codex_memory(codex_home: Path) -> list[SourceMemoryProject]:
             ),
         )
 
-    # Explicit user notes are useful source material when Codex has not yet
-    # produced its curated Phase-2 artifacts. Once consolidated, importing
-    # both would duplicate the same facts.
+    # Avoid duplicating notes after Codex has consolidated them.
     if not global_files:
         notes_root = memories_root / "extensions" / "ad_hoc" / "notes"
         note_files = _markdown_files(notes_root)
@@ -228,12 +229,23 @@ def _cwd_in_value(value: Any) -> str:
 
 
 def _project_cwd_from_transcripts(project_root: Path) -> str:
-    candidates = sorted(
-        project_root.rglob("*.jsonl"),
-        key=lambda path: path.stat().st_mtime if path.is_file() else 0,
-        reverse=True,
-    )
-    for path in candidates[:20]:
+    try:
+        candidates = nlargest(
+            20,
+            (
+                project_root / entry.relative
+                for entry in read_bounded_tree(
+                    project_root,
+                    reject_unsafe=False,
+                    read_data=False,
+                )
+                if not entry.is_dir and entry.relative.suffix == ".jsonl"
+            ),
+            key=lambda path: path.stat().st_mtime,
+        )
+    except (OSError, ValueError):
+        return ""
+    for path in candidates:
         if path.is_symlink() or not path.is_file():
             continue
         consumed = 0
@@ -402,7 +414,6 @@ def discover_qoder_memory(qoder_home: Path) -> list[SourceMemoryProject]:
                     },
                 ),
             )
-    # Older Qoder/Claude-style project-local memory remains a valid fallback.
     projects.extend(discover_project_memory(qoder_home))
     return projects
 
@@ -770,9 +781,9 @@ def discover_codex_plugins(
     codex_home = codex_home.expanduser()
     config_path = codex_home / "config.toml"
     try:
-        with config_path.open("rb") as stream:
-            config = tomllib.load(stream)
-    except (OSError, tomllib.TOMLDecodeError):
+        data = read_regular_file(config_path, max_bytes=_MAX_CONFIG_BYTES)
+        config = tomllib.loads(data.decode())
+    except (OSError, UnicodeError, ValueError, tomllib.TOMLDecodeError):
         config = {}
     plugin_config = config.get("plugins")
     if not isinstance(plugin_config, dict):

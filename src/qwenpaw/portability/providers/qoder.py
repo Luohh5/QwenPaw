@@ -7,6 +7,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from ...utils.io_utils import run_sync_io
 from ..models import ProviderInventory, SourceLocation, SourceSession
 from .base import ProgressReporter, make_inventory, progress_milestone
 from .external_state import (
@@ -20,13 +21,14 @@ from .qoder_sessions import (
     default_qoder_user_data,
     discover_qoder_transcripts,
     load_qoder_index,
+    MAX_DISCOVERED_TRANSCRIPTS,
     read_qoder_transcript,
 )
 from .qoder_schedules import discover_qoder_scheduled_tasks
 from .locator import resolve_source_location
 
-_SESSION_TIMEOUT_SECONDS = 60
 _READ_CONCURRENCY = 4
+_READ_BATCH_SIZE = 32
 
 
 class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
@@ -73,13 +75,13 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
     ) -> ProviderInventory:
         """Discover and normalize local Qoder JSONL sessions."""
         discovery: Any = await asyncio.gather(
-            asyncio.to_thread(discover_qoder_memory, self._qoder_home),
-            asyncio.to_thread(discover_qoder_plugins, self._qoder_home),
-            asyncio.to_thread(discover_qoder_skills, self._qoder_home),
-            asyncio.to_thread(discover_qoder_mcp, self._qoder_home),
-            asyncio.to_thread(discover_qoder_transcripts, self._qoder_home),
-            asyncio.to_thread(load_qoder_index, self._qoder_user_data),
-            asyncio.to_thread(
+            run_sync_io(discover_qoder_memory, self._qoder_home),
+            run_sync_io(discover_qoder_plugins, self._qoder_home),
+            run_sync_io(discover_qoder_skills, self._qoder_home),
+            run_sync_io(discover_qoder_mcp, self._qoder_home),
+            run_sync_io(discover_qoder_transcripts, self._qoder_home),
+            run_sync_io(load_qoder_index, self._qoder_user_data),
+            run_sync_io(
                 discover_qoder_scheduled_tasks,
                 self._qoder_user_data,
             ),
@@ -99,7 +101,7 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
             plugin_mcp_servers,
             plugin_mcp_warnings,
             plugin_mcp_count,
-        ) = await asyncio.to_thread(discover_qoder_plugin_mcp, plugins)
+        ) = await run_sync_io(discover_qoder_plugin_mcp, plugins)
         mcp_servers.extend(plugin_mcp_servers)
         mcp_warnings.extend(plugin_mcp_warnings)
         discovered_mcp_count += plugin_mcp_count
@@ -117,6 +119,11 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
             *mcp_warnings,
             *scheduled_task_warnings,
         ]
+        if total_records >= MAX_DISCOVERED_TRANSCRIPTS:
+            warnings.append(
+                "Qoder transcript discovery reached its safety limit; older "
+                "candidate files were not scanned.",
+            )
         warnings.append(
             "Qoder built-in IDE runtime, credentials and tool policies are "
             "not copied. Components of enabled third-party plugins enter "
@@ -138,23 +145,11 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
             nonlocal completed
             try:
                 async with semaphore:
-                    result = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            read_qoder_transcript,
-                            record,
-                            qoder_index,
-                        ),
-                        timeout=_SESSION_TIMEOUT_SECONDS,
+                    result = await run_sync_io(
+                        read_qoder_transcript,
+                        record,
+                        qoder_index,
                     )
-            except asyncio.TimeoutError:
-                result = (
-                    None,
-                    [
-                        f"Could not read Qoder session {record.source_id}: "
-                        "timed out after 60s.",
-                    ],
-                    False,
-                )
             except Exception as exc:  # pylint: disable=broad-except
                 warning = "Could not read Qoder session "
                 warning += f"{record.source_id}: {exc}"
@@ -174,17 +169,21 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
                     )
             return result
 
-        results = await asyncio.gather(
-            *(_read_one(record) for record in records),
-        )
         ignored_session_ids: list[str] = []
-        for record, result in zip(records, results):
-            session, session_warnings, internal_trace = result
-            if session is not None:
-                sessions.append(session)
-            if internal_trace:
-                ignored_session_ids.append(record.source_id)
-            warnings.extend(session_warnings)
+        for start in range(0, len(records), _READ_BATCH_SIZE):
+            batch = records[slice(start, start + _READ_BATCH_SIZE)]
+            results = await asyncio.gather(
+                *(_read_one(record) for record in batch),
+            )
+            for record, result in zip(batch, results):
+                session, session_warnings, internal_trace = result
+                if session is not None:
+                    sessions.append(session)
+                if internal_trace:
+                    ignored_session_ids.append(record.source_id)
+                warnings.extend(session_warnings)
+            if len({session.source_id for session in sessions}) >= limit:
+                break
 
         # The filename is normally the session id. De-duplicate once more by
         # the authoritative id stored inside JSONL for copied/renamed files.

@@ -86,6 +86,7 @@ def read_bounded_tree(  # pylint: disable=too-many-branches
     required_file: str = "",
     excluded_dirs: frozenset[str] = frozenset(),
     reject_unsafe: bool = True,
+    read_data: bool = True,
 ) -> Iterator[SkillTreeEntry]:
     """Yield one link-free tree with stable, bounded file snapshots."""
     source = source.expanduser()
@@ -136,7 +137,11 @@ def read_bounded_tree(  # pylint: disable=too-many-branches
                 yield SkillTreeEntry(
                     relative,
                     before.st_mode,
-                    read_regular_file(path, expected=before),
+                    (
+                        read_regular_file(path, expected=before)
+                        if read_data
+                        else b""
+                    ),
                 )
 
 

@@ -271,9 +271,11 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
 
         factory_kwargs = WorkspaceBootstrapFactory.build_bootstrap_kwargs(
             app_services,
-            extra_command_specs=_api_action_command_specs
-            if _api_action_command_specs
-            else None,
+            extra_command_specs=(
+                _api_action_command_specs
+                if _api_action_command_specs
+                else None
+            ),
         )
         # Merge factory output into workspace_registry._bootstrap_kwargs
         for key, value in factory_kwargs.items():
@@ -584,6 +586,12 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
             _bg_task.cancel()
             with suppress(asyncio.CancelledError):
                 await _bg_task
+
+        # Import jobs can write workspaces and install plugins. Stop them
+        # before closing the services they depend on.
+        from .routers.portability_imports import PORTABILITY_IMPORT_JOBS
+
+        await PORTABILITY_IMPORT_JOBS.shutdown()
 
         await _stop_browser_runtime(app)
         from ..agents.tools import shutdown_browser_runtime

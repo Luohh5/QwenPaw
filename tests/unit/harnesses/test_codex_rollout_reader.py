@@ -197,8 +197,23 @@ def test_oversized_history_remains_visible(
     reader = CodexRolloutReader(tmp_path / ".codex")
 
     assert reader.list_threads()[0]["id"] == thread_id
-    with pytest.raises(ValueError, match="exceeds 128 MiB"):
+    with pytest.raises(ValueError, match="exceeds its safety limit"):
         reader.read_thread(thread_id)
+
+
+def test_rollout_index_stops_at_its_safety_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / ".codex/sessions"
+    _rollout(root, "019fe9ac-2e78-7a10-a196-27b001cdf1f5", {}, "first")
+    _rollout(root, "019fe9ac-2e78-7a10-a196-27b001cdf1f6", {}, "second")
+    monkeypatch.setattr(rollout_module, "_MAX_INDEX_FILES", 1)
+
+    reader = CodexRolloutReader(tmp_path / ".codex")
+
+    reader.list_threads()
+    assert reader.index_truncated is True
 
 
 def test_rollout_reader_excludes_structured_non_root_sessions(

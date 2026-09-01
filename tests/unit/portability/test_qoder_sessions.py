@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,7 +14,10 @@ import pytest
 from qwenpaw.harnesses.events import HarnessHistoryKind
 from qwenpaw.portability.providers.qoder import QoderMigrationProvider
 from qwenpaw.portability.providers.qoder_sessions import (
+    QoderIndex,
+    QoderTranscript,
     discover_qoder_transcripts,
+    read_qoder_transcript,
 )
 
 
@@ -271,6 +275,26 @@ def test_discovery_prefers_ide_layout_over_legacy_sdk_copy(
     assert len(records) == 1
     assert records[0].layout == "ide"
     assert records[0].path.parent.name == "transcript"
+
+
+def test_transcript_reader_rejects_oversized_jsonl_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qwenpaw.portability.providers import qoder_sessions
+
+    path = tmp_path / "session.jsonl"
+    path.write_text('{"message":"too long"}\n', encoding="utf-8")
+    monkeypatch.setattr(qoder_sessions, "_MAX_TRANSCRIPT_LINE_BYTES", 8)
+
+    session, warnings, internal = read_qoder_transcript(
+        QoderTranscript("session", path, "ide", datetime.now().astimezone()),
+        QoderIndex(),
+    )
+
+    assert session is None
+    assert internal is False
+    assert "line 1 is too large" in warnings[0]
 
 
 @pytest.mark.asyncio

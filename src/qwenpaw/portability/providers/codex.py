@@ -11,6 +11,7 @@ from ...harnesses.codex.rollout_reader import (
     CodexRolloutReader,
     codex_non_root_session_kind,
 )
+from ...utils.io_utils import run_sync_io
 from ..codex_plugin_adapter import ADAPTER as CODEX_PLUGIN_ADAPTER
 from ..models import (
     ProviderInventory,
@@ -87,13 +88,20 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
                 settings,
             )
         rollout_reader = self._rollout_reader
-        offline_threads = await asyncio.to_thread(
+        offline_threads = await run_sync_io(
             rollout_reader.list_threads,
             limit=limit,
         )
-        ignored_session_ids = await asyncio.to_thread(
+        ignored_session_ids = await run_sync_io(
             rollout_reader.list_non_root_thread_ids,
         )
+        if rollout_reader.index_truncated:
+            warnings = [
+                "Codex rollout discovery reached its safety limit; older "
+                "candidate files were not scanned.",
+            ]
+        else:
+            warnings = []
 
         if adapter is not None:
             try:
@@ -104,7 +112,6 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             except asyncio.TimeoutError:
                 status = None
         installed = bool(status is not None and status.installed)
-        warnings: list[str] = []
         if local_only:
             warnings.append(
                 "Explicit Codex source-home is local-only; the live "
@@ -133,19 +140,19 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             memory_state,
             scheduled_task_state,
         ) = await asyncio.gather(
-            asyncio.to_thread(
+            run_sync_io(
                 discover_codex_memory,
                 rollout_reader.codex_home,
             ),
-            asyncio.to_thread(
+            run_sync_io(
                 discover_codex_plugins,
                 rollout_reader.codex_home,
             ),
-            asyncio.to_thread(
+            run_sync_io(
                 codex_memory_status,
                 rollout_reader.codex_home,
             ),
-            asyncio.to_thread(
+            run_sync_io(
                 discover_codex_scheduled_tasks,
                 rollout_reader.codex_home,
             ),
@@ -167,7 +174,7 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             # removed, so internal runs cannot consume the user's session
             # import quota merely because an older rollout lacks the newer
             # structured thread_source marker.
-            offline_threads = await asyncio.to_thread(
+            offline_threads = await run_sync_io(
                 rollout_reader.list_threads,
                 limit=limit + min(len(automation_run_thread_ids), 5000),
             )
@@ -394,7 +401,7 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
                     f"folders were scanned instead: {_error_detail(exc)}",
                 )
         if not records:
-            records = await asyncio.to_thread(rollout_reader.skill_records)
+            records = await run_sync_io(rollout_reader.skill_records)
 
         workspace_skills = self._workspace.workspace_dir.resolve() / "skills"
         plugin_roots = []
@@ -510,25 +517,25 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             used_fallback = False
             failure: BaseException | None = None
             history = []
-            if source_id and installed and not raw.get("offlineOnly"):
-                try:
-                    async with semaphore:
+            async with semaphore:
+                if source_id and installed and not raw.get("offlineOnly"):
+                    try:
                         history = await asyncio.wait_for(
                             adapter.read_external_thread(source_id),
                             timeout=_SESSION_TIMEOUT_SECONDS,
                         )
-                except Exception as exc:  # pylint: disable=broad-except
-                    failure = exc
-            if source_id and (failure is not None or not history):
-                try:
-                    history = await asyncio.to_thread(
-                        rollout_reader.read_thread,
-                        source_id,
-                    )
-                    used_fallback = bool(history)
-                except Exception as exc:  # pylint: disable=broad-except
-                    if failure is None:
+                    except Exception as exc:  # pylint: disable=broad-except
                         failure = exc
+                if source_id and (failure is not None or not history):
+                    try:
+                        history = await run_sync_io(
+                            rollout_reader.read_thread,
+                            source_id,
+                        )
+                        used_fallback = bool(history)
+                    except Exception as exc:  # pylint: disable=broad-except
+                        if failure is None:
+                            failure = exc
 
             if not source_id:
                 result: tuple[SourceSession | None, str | None, bool] = (

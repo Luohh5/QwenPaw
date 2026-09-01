@@ -98,6 +98,7 @@ class PortabilityImportJobManager:
     ) -> None:
         self._service_factory = service_factory
         self._jobs: dict[tuple[str, str], _LiveJob] = {}
+        self._closing = False
 
     async def create(
         self,
@@ -105,6 +106,7 @@ class PortabilityImportJobManager:
         sources: list[str],
     ) -> ImportJobSnapshot:
         """Create a job and start source discovery in the background."""
+        self._ensure_open()
         normalized = list(dict.fromkeys(sources))
         if not normalized or any(
             item not in _SUPPORTED_SOURCES for item in normalized
@@ -121,7 +123,7 @@ class PortabilityImportJobManager:
         live = _LiveJob(workspace=workspace, snapshot=snapshot)
         self._jobs[(workspace.agent_id, job_id)] = live
         await self._emit(live, persist=True)
-        live.task = asyncio.create_task(self._scan(live))
+        self._spawn(live, self._scan(live))
         return snapshot.model_copy(deep=True)
 
     async def start(
@@ -131,6 +133,7 @@ class PortabilityImportJobManager:
         selections: dict[str, ImportSelection],
     ) -> ImportJobSnapshot:
         """Apply the user selection for every successfully scanned source."""
+        self._ensure_open()
         live = await self._live(workspace, job_id)
         if live.snapshot.state != "awaiting_selection":
             raise RuntimeError("import job is not awaiting selection")
@@ -167,7 +170,7 @@ class PortabilityImportJobManager:
         live.snapshot.state = "running"
         live.snapshot.phase = "import"
         await self._emit(live, persist=True)
-        live.task = asyncio.create_task(self._apply(live))
+        self._spawn(live, self._apply(live))
         return live.snapshot.model_copy(deep=True)
 
     async def retry(
@@ -177,6 +180,7 @@ class PortabilityImportJobManager:
         selections: dict[str, ImportSelection],
     ) -> ImportJobSnapshot:
         """Retry explicitly selected failed tools in a fresh import job."""
+        self._ensure_open()
         previous = await self._live(workspace, job_id)
         if previous.snapshot.state not in _TERMINAL:
             raise RuntimeError("import job has not finished")
@@ -236,8 +240,20 @@ class PortabilityImportJobManager:
         )
         self._jobs[(workspace.agent_id, retry_id)] = live
         await self._emit(live, persist=True)
-        live.task = asyncio.create_task(self._apply(live, retry_from=previous))
+        self._spawn(live, self._apply(live, retry_from=previous))
         return snapshot.model_copy(deep=True)
+
+    async def shutdown(self) -> None:
+        """Stop active jobs before their workspace services close."""
+        self._closing = True
+        await asyncio.gather(
+            *(
+                self.cancel(live.workspace, live.snapshot.job_id)
+                for live in tuple(self._jobs.values())
+                if live.snapshot.state not in _TERMINAL
+            ),
+            return_exceptions=True,
+        )
 
     async def cancel(
         self,
@@ -280,6 +296,30 @@ class PortabilityImportJobManager:
             raise ValueError("import job not found")
         if matches[0].task:
             await matches[0].task
+
+    def _ensure_open(self) -> None:
+        if self._closing:
+            raise RuntimeError("import service is shutting down")
+
+    def _spawn(self, live: _LiveJob, operation: Any) -> None:
+        async def run() -> None:
+            try:
+                await operation
+            except Exception as exc:  # pylint: disable=broad-except
+                if live.snapshot.state not in _TERMINAL:
+                    live.snapshot.state = "failed"
+                    live.snapshot.phase = "done"
+                    self._log(live, redact_sensitive_text(exc, limit=500))
+                    for provider in live.snapshot.providers:
+                        if provider.state == "running":
+                            provider.state = "failed"
+                            provider.error = redact_sensitive_text(
+                                exc,
+                                limit=500,
+                            )
+                    await self._emit(live, persist=True)
+
+        live.task = asyncio.create_task(run())
 
     async def snapshot(self, workspace: Any, job_id: str) -> ImportJobSnapshot:
         """Return current state, restoring a persisted job when needed."""
@@ -469,12 +509,13 @@ class PortabilityImportJobManager:
                     ):
                         asset.state = ImportAssetState.FAILED
                         asset.message = "请手动修改相关配置后重试。"
-                if isinstance(exc, ImportRollbackError) and exc.cancelled:
-                    for asset in provider.assets:
-                        if asset.state is ImportAssetState.FAILED:
-                            asset.message = "回滚未完成，请根据错误信息人工检查。"
-                    await self._emit(live, persist=True)
-                    raise
+                if isinstance(exc, ImportRollbackError):
+                    if exc.cancelled:
+                        for asset in provider.assets:
+                            if asset.state is ImportAssetState.FAILED:
+                                asset.message = "回滚未完成，请根据错误信息人工检查。"
+                        await self._emit(live, persist=True)
+                        raise
             await self._emit(live, persist=True)
         live.snapshot.state = (
             "completed_with_issues"

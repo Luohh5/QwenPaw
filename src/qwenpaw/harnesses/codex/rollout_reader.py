@@ -17,8 +17,11 @@ _UUID_PATTERN = re.compile(
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
     re.IGNORECASE,
 )
-_MAX_HISTORY_BYTES = _MAX_LINE_BYTES = 128 * 1024 * 1024
+_MAX_HISTORY_BYTES = 64 * 1024 * 1024
+_MAX_LINE_BYTES = 4 * 1024 * 1024
+_MAX_HEADER_LINE_BYTES = 1024 * 1024
 _MAX_HEADER_LINES = 64
+_MAX_INDEX_FILES = 10_000
 _EVENT_KINDS = {
     "user_message": HarnessHistoryKind.USER,
     "agent_message": HarnessHistoryKind.MESSAGE,
@@ -178,6 +181,7 @@ class CodexRolloutReader:
             or (Path.home() / ".codex")
         )
         self._records: dict[str, CodexRolloutRecord] | None = None
+        self.index_truncated = False
 
     def list_threads(self, *, limit: int = 500) -> list[dict[str, Any]]:
         """Return newest user-facing root rollout metadata records."""
@@ -260,6 +264,7 @@ class CodexRolloutReader:
     def _index(self) -> dict[str, CodexRolloutRecord]:
         if self._records is None:
             self._records = {}
+            indexed = 0
             for root in (
                 self.codex_home / "sessions",
                 self.codex_home / "archived_sessions",
@@ -267,6 +272,10 @@ class CodexRolloutReader:
                 if not root.is_dir():
                     continue
                 for path in root.rglob("*.jsonl"):
+                    indexed += 1
+                    if indexed > _MAX_INDEX_FILES:
+                        self.index_truncated = True
+                        break
                     record = _read_rollout_metadata(path)
                     if record is None:
                         continue
@@ -296,6 +305,8 @@ class CodexRolloutReader:
                         ),
                         lineage_paths=lineage,
                     )
+                if self.index_truncated:
+                    break
         return self._records
 
 
@@ -312,6 +323,7 @@ def _read_rollout_metadata(path: Path) -> CodexRolloutRecord | None:
             for _, entry in _jsonl_entries(
                 stream,
                 limit=_MAX_HEADER_LINES,
+                max_line_bytes=_MAX_HEADER_LINE_BYTES,
             ):
                 state.update(entry)
     except (OSError, ValueError):
@@ -336,7 +348,9 @@ def _read_rollout_history(path: Path) -> list[HarnessHistoryItem]:
     except OSError as exc:
         raise FileNotFoundError(path) from exc
     if size > _MAX_HISTORY_BYTES:
-        raise ValueError(f"Codex rollout exceeds 128 MiB: {path.name}")
+        raise ValueError(
+            f"Codex rollout exceeds its safety limit: {path.name}",
+        )
     history: list[HarnessHistoryItem] = []
     with path.open("rb") as stream:
         for _, entry in _jsonl_entries(stream):
@@ -356,13 +370,16 @@ def _jsonl_entries(
     stream: Any,
     *,
     limit: int | None = None,
+    max_line_bytes: int = _MAX_LINE_BYTES,
 ) -> Iterator[tuple[int, dict[str, Any]]]:
     """Yield valid, bounded JSON objects from a rollout stream."""
     for index, raw_line in enumerate(stream, start=1):
         if limit is not None and index > limit:
             break
-        if len(raw_line) > _MAX_LINE_BYTES:
-            raise ValueError(f"Codex rollout line {index} exceeds 128 MiB")
+        if len(raw_line) > max_line_bytes:
+            raise ValueError(
+                f"Codex rollout line {index} exceeds its safety limit",
+            )
         try:
             entry = json.loads(raw_line)
         except (UnicodeDecodeError, json.JSONDecodeError):

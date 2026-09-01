@@ -33,6 +33,12 @@ _CWD_KEYS = (
     "folderUri",
     "folder",
 )
+_MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024
+_MAX_TRANSCRIPT_LINE_BYTES = 4 * 1024 * 1024
+_MAX_TRANSCRIPT_LINES = 100_000
+_MAX_HISTORY_ITEMS = 50_000
+MAX_DISCOVERED_TRANSCRIPTS = 5_000
+_MAX_SCANNED_TRANSCRIPTS = 10_000
 
 
 @dataclass(frozen=True)
@@ -107,6 +113,7 @@ def discover_qoder_transcripts(qoder_home: Path) -> list[QoderTranscript]:
     if not projects.is_dir() or projects.is_symlink():
         return []
     candidates: list[QoderTranscript] = []
+    scanned = 0
     try:
         project_dirs = sorted(projects.iterdir())
     except OSError:
@@ -114,8 +121,19 @@ def discover_qoder_transcripts(qoder_home: Path) -> list[QoderTranscript]:
     for project in project_dirs:
         if project.is_symlink() or not project.is_dir():
             continue
-        candidates.extend(_transcripts_in(project / "transcript", "ide"))
-        candidates.extend(_transcripts_in(project, "sdk"))
+        for directory, layout in (
+            (project / "transcript", "ide"),
+            (project, "sdk"),
+        ):
+            for candidate in _transcripts_in(directory, layout):
+                scanned += 1
+                if scanned > _MAX_SCANNED_TRANSCRIPTS:
+                    break
+                candidates.append(candidate)
+            if scanned > _MAX_SCANNED_TRANSCRIPTS:
+                break
+        if scanned > _MAX_SCANNED_TRANSCRIPTS:
+            break
 
     # A copied/renamed project can contain the same session. Prefer the IDE
     # layout and then the newest copy, matching Qoder SDK's id de-duplication.
@@ -130,35 +148,30 @@ def discover_qoder_transcripts(qoder_home: Path) -> list[QoderTranscript]:
         by_id.values(),
         key=lambda item: item.modified_at,
         reverse=True,
-    )
+    )[:MAX_DISCOVERED_TRANSCRIPTS]
 
 
-def _transcripts_in(directory: Path, layout: str) -> list[QoderTranscript]:
+def _transcripts_in(directory: Path, layout: str) -> Iterator[QoderTranscript]:
     if not directory.is_dir() or directory.is_symlink():
-        return []
-    transcripts: list[QoderTranscript] = []
+        return
     try:
-        entries = sorted(directory.glob("*.jsonl"))
-    except OSError:
-        return []
-    for path in entries:
-        if path.is_symlink() or not path.is_file():
-            continue
-        try:
-            modified_at = datetime.fromtimestamp(
-                path.stat().st_mtime,
-            ).astimezone()
-        except OSError:
-            continue
-        transcripts.append(
-            QoderTranscript(
+        for path in directory.glob("*.jsonl"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                modified_at = datetime.fromtimestamp(
+                    path.stat().st_mtime,
+                ).astimezone()
+            except OSError:
+                continue
+            yield QoderTranscript(
                 source_id=path.name[: -len(".jsonl")],
                 path=path,
                 layout=layout,
                 modified_at=modified_at,
-            ),
-        )
-    return transcripts
+            )
+    except OSError:
+        return
 
 
 def _candidate_rank(candidate: QoderTranscript) -> tuple[int, datetime]:
@@ -299,6 +312,14 @@ def _parse_timestamp(value: Any) -> datetime | None:
     return parse_datetime(value)
 
 
+def _skip_transcript(
+    source_id: str,
+    reason: str,
+) -> tuple[None, list[str], bool]:
+    return None, [f"Skipped Qoder session {source_id}: {reason}."], False
+
+
+# pylint: disable=too-many-return-statements
 # pylint: disable-next=too-many-locals,too-many-branches,too-many-statements
 def read_qoder_transcript(
     transcript: QoderTranscript,
@@ -316,8 +337,18 @@ def read_qoder_transcript(
     malformed = 0
     try:
         source_path = transcript.path
-        with source_path.open(encoding="utf-8", errors="replace") as stream:
-            for line in stream:
+        if source_path.stat().st_size > _MAX_TRANSCRIPT_BYTES:
+            return _skip_transcript(source_id, "file is too large")
+        with source_path.open("rb") as stream:
+            for line_number in range(1, _MAX_TRANSCRIPT_LINES + 1):
+                line = stream.readline(_MAX_TRANSCRIPT_LINE_BYTES + 1)
+                if not line:
+                    break
+                if len(line) > _MAX_TRANSCRIPT_LINE_BYTES:
+                    return _skip_transcript(
+                        source_id,
+                        f"line {line_number} is too large",
+                    )
                 try:
                     raw = json.loads(line)
                 except json.JSONDecodeError:
@@ -341,8 +372,13 @@ def read_qoder_transcript(
                         )
                 items = _raw_history_items(raw)
                 history.extend(items)
+                if len(history) > _MAX_HISTORY_ITEMS:
+                    return _skip_transcript(source_id, "history is too large")
                 if not first_user_text and raw.get("type") == "user":
                     first_user_text = _message_text(raw.get("message"))
+            else:
+                if stream.read(1):
+                    return _skip_transcript(source_id, "too many JSONL lines")
     except OSError as exc:
         warning = f"Could not read Qoder session {source_id}: {exc}"
         return None, [warning], False
