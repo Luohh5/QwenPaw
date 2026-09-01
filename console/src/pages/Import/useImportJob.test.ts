@@ -17,6 +17,7 @@ vi.mock("../../api/modules/import", () => ({
     start: vi.fn(),
     retry: vi.fn(),
     cancel: vi.fn(),
+    current: vi.fn(),
     streamEvents: vi.fn(),
   },
 }));
@@ -36,6 +37,7 @@ describe("useImportJob", () => {
     selectedAgent = "agent-a";
     vi.clearAllMocks();
     sessionStorage.clear();
+    localStorage.clear();
     vi.mocked(portabilityImportApi.create).mockImplementation(async (agentId) =>
       job(agentId),
     );
@@ -46,8 +48,13 @@ describe("useImportJob", () => {
       async (agentId, jobId) => ({ ...job(agentId, jobId), state: "running" }),
     );
     vi.mocked(portabilityImportApi.cancel).mockImplementation(
-      async (agentId, jobId) => ({ ...job(agentId, jobId), state: "interrupted" }),
+      async (agentId, jobId) => ({
+        ...job(agentId, jobId),
+        seq: 2,
+        state: "interrupted",
+      }),
     );
+    vi.mocked(portabilityImportApi.current).mockResolvedValue(null);
     vi.mocked(portabilityImportApi.streamEvents).mockReturnValue(
       new Promise(() => undefined),
     );
@@ -142,8 +149,19 @@ describe("useImportJob", () => {
     const { result } = renderHook(() => useImportJob());
 
     await waitFor(() => expect(result.current.job?.job_id).toBe("import-a"));
-    expect(sessionStorage.getItem("qwenpaw.portability.activeImports")).toBe(
+    expect(localStorage.getItem("qwenpaw.portability.activeImports")).toBe(
       JSON.stringify({ "agent-a": "import-a" }),
+    );
+  });
+
+  it("recovers the current job when browser storage is empty", async () => {
+    vi.mocked(portabilityImportApi.current).mockResolvedValue(
+      job("agent-a", "import-current"),
+    );
+    const { result } = renderHook(() => useImportJob());
+
+    await waitFor(() =>
+      expect(result.current.job?.job_id).toBe("import-current"),
     );
   });
 

@@ -107,6 +107,8 @@ class PortabilityImportJobManager:
     ) -> ImportJobSnapshot:
         """Create a job and start source discovery in the background."""
         self._ensure_open()
+        if await self.current(workspace):
+            raise RuntimeError("an import is already active for this agent")
         normalized = list(dict.fromkeys(sources))
         if not normalized or any(
             item not in _SUPPORTED_SOURCES for item in normalized
@@ -123,7 +125,7 @@ class PortabilityImportJobManager:
         live = _LiveJob(workspace=workspace, snapshot=snapshot)
         self._jobs[(workspace.agent_id, job_id)] = live
         await self._emit(live, persist=True)
-        self._spawn(live, self._scan(live))
+        self._spawn(live, lambda: self._scan(live))
         return snapshot.model_copy(deep=True)
 
     async def start(
@@ -170,7 +172,7 @@ class PortabilityImportJobManager:
         live.snapshot.state = "running"
         live.snapshot.phase = "import"
         await self._emit(live, persist=True)
-        self._spawn(live, self._apply(live))
+        self._spawn(live, lambda: self._apply(live))
         return live.snapshot.model_copy(deep=True)
 
     async def retry(
@@ -240,7 +242,10 @@ class PortabilityImportJobManager:
         )
         self._jobs[(workspace.agent_id, retry_id)] = live
         await self._emit(live, persist=True)
-        self._spawn(live, self._apply(live, retry_from=previous))
+        self._spawn(
+            live,
+            lambda: self._apply(live, retry_from=previous),
+        )
         return snapshot.model_copy(deep=True)
 
     async def shutdown(self) -> None:
@@ -301,10 +306,10 @@ class PortabilityImportJobManager:
         if self._closing:
             raise RuntimeError("import service is shutting down")
 
-    def _spawn(self, live: _LiveJob, operation: Any) -> None:
+    def _spawn(self, live: _LiveJob, operation: Callable[[], Any]) -> None:
         async def run() -> None:
             try:
-                await operation
+                await operation()
             except Exception as exc:  # pylint: disable=broad-except
                 if live.snapshot.state not in _TERMINAL:
                     live.snapshot.state = "failed"
@@ -340,6 +345,40 @@ class PortabilityImportJobManager:
             await self._persist(workspace, snapshot)
         self._jobs[key] = _LiveJob(workspace=workspace, snapshot=snapshot)
         return snapshot.model_copy(deep=True)
+
+    async def current(self, workspace: Any) -> ImportJobSnapshot | None:
+        """Return this agent's active or resumable import job."""
+        active = [
+            live
+            for (agent_id, _), live in self._jobs.items()
+            if agent_id == workspace.agent_id
+            and live.snapshot.state not in _TERMINAL
+        ]
+        if active:
+            return active[-1].snapshot.model_copy(deep=True)
+        directory = Path(workspace.workspace_dir) / ".qwenpaw/imports/jobs"
+        try:
+            paths = sorted(
+                directory.glob("import-*.json"),
+                key=lambda path: path.stat().st_mtime_ns,
+                reverse=True,
+            )[:64]
+        except OSError:
+            return None
+        for path in paths:
+            try:
+                value = await read_json_async(path)
+                snapshot = ImportJobSnapshot.model_validate(value)
+            except (OSError, ValueError, TypeError):
+                continue
+            if (
+                snapshot.agent_id == workspace.agent_id
+                and snapshot.state not in _TERMINAL
+            ):
+                snapshot = await self.snapshot(workspace, snapshot.job_id)
+                if snapshot.state not in _TERMINAL:
+                    return snapshot
+        return None
 
     async def subscribe(
         self,

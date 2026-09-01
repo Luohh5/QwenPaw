@@ -27,6 +27,9 @@ export const portabilityImportApi = {
       `${base(agentId)}/jobs/${encodeURIComponent(jobId)}`,
     ),
 
+  current: (agentId: string) =>
+    request<ImportJobSnapshot | null>(`${base(agentId)}/jobs/current`),
+
   start: (
     agentId: string,
     jobId: string,

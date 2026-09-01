@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from ...portability.import_jobs import PortabilityImportJobManager
 from ...portability.models import ImportSelection
 from ...portability.providers import provider_names, resolve_source_location
+from ..auth import is_loopback_ip, is_trusted_proxy, resolve_client_ip
 from ..agent_context import get_agent_for_request
 
 portability_import_router = APIRouter(
@@ -19,7 +20,7 @@ portability_import_router = APIRouter(
     tags=["portability-imports"],
 )
 PORTABILITY_IMPORT_JOBS = PortabilityImportJobManager()
-_LOCALHOST = {"127.0.0.1", "::1", "localhost", "testclient"}
+_LOCALHOST = {"testclient"}
 
 
 class CreateImportJobRequest(BaseModel):
@@ -35,8 +36,21 @@ class StartImportJobRequest(BaseModel):
 
 
 def _local_only(request: Request) -> None:
-    client = request.client
-    if client and client.host not in _LOCALHOST:
+    peer = request.client.host if request.client else ""
+    if peer in _LOCALHOST:
+        return
+    headers = request.headers
+    forwarded = headers.get("x-forwarded-for") or headers.get("x-real-ip")
+    trusted_proxy = is_trusted_proxy(request)
+    if forwarded and not trusted_proxy:
+        raise HTTPException(
+            status_code=403,
+            detail="Import proxy must be trusted",
+        )
+    if not is_loopback_ip(resolve_client_ip(request)) or (
+        not is_loopback_ip(peer)
+        and (not trusted_proxy or not getattr(request.state, "user", None))
+    ):
         raise HTTPException(
             status_code=403,
             detail="Import endpoints are localhost-only",
@@ -83,6 +97,14 @@ async def create_import_job(
         return await PORTABILITY_IMPORT_JOBS.create(workspace, body.sources)
     except (ValueError, RuntimeError) as exc:
         raise _api_error(exc) from exc
+
+
+@portability_import_router.get("/jobs/current")
+async def get_current_import_job(request: Request):
+    """Return this agent's resumable import job, if any."""
+    _local_only(request)
+    workspace = await get_agent_for_request(request)
+    return await PORTABILITY_IMPORT_JOBS.current(workspace)
 
 
 @portability_import_router.get("/jobs/{job_id}")

@@ -22,18 +22,29 @@ const RECONNECT_MAX_MS = 15_000;
 
 function activeJobs(): Record<string, string> {
   try {
-    const saved = sessionStorage.getItem(ACTIVE_JOBS);
-    if (saved) {
-      const value = JSON.parse(saved);
-      if (value && typeof value === "object" && !Array.isArray(value)) {
-        return Object.fromEntries(
-          Object.entries(value).filter(
-            ([agentId, jobId]) =>
-              typeof agentId === "string" && typeof jobId === "string",
-          ),
-        ) as Record<string, string>;
+    const parse = (value: string | null) => {
+      const parsed = JSON.parse(value ?? "null");
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? Object.fromEntries(
+            Object.entries(parsed).filter(
+              ([agentId, jobId]) =>
+                typeof agentId === "string" && typeof jobId === "string",
+            ),
+          )
+        : {};
+    };
+    const get = (storage: Storage) => {
+      try {
+        return storage.getItem(ACTIVE_JOBS);
+      } catch {
+        return null;
       }
-    }
+    };
+    const saved = {
+      ...parse(get(localStorage)),
+      ...parse(get(sessionStorage)),
+    } as Record<string, string>;
+    if (Object.keys(saved).length) return saved;
     const legacy = JSON.parse(
       sessionStorage.getItem(LEGACY_ACTIVE_JOB) ?? "null",
     );
@@ -48,14 +59,19 @@ function activeJobs(): Record<string, string> {
 }
 
 function saveActiveJob(agentId: string, jobId = "") {
+  const jobs = activeJobs();
+  if (jobId) jobs[agentId] = jobId;
+  else delete jobs[agentId];
   try {
-    const jobs = activeJobs();
-    if (jobId) jobs[agentId] = jobId;
-    else delete jobs[agentId];
-    sessionStorage.setItem(ACTIVE_JOBS, JSON.stringify(jobs));
+    localStorage.setItem(ACTIVE_JOBS, JSON.stringify(jobs));
+    sessionStorage.removeItem(ACTIVE_JOBS);
     sessionStorage.removeItem(LEGACY_ACTIVE_JOB);
   } catch {
-    /* Storage is only a navigation recovery hint. */
+    try {
+      sessionStorage.setItem(ACTIVE_JOBS, JSON.stringify(jobs));
+    } catch {
+      /* Storage is only a navigation recovery hint. */
+    }
   }
 }
 
@@ -316,28 +332,40 @@ export function useImportJob() {
     setJob(null);
     setError("");
     setStreamError("");
-    const jobId = activeJobs()[selectedAgent];
-    view.current = { agentId: selectedAgent, jobId: jobId ?? "" };
-    if (!jobId) {
-      setLoading(false);
-      return undefined;
-    }
-    saveActiveJob(selectedAgent, jobId);
+    const jobId = activeJobs()[selectedAgent] ?? "";
+    view.current = { agentId: selectedAgent, jobId };
     const abort = new AbortController();
     controller.current = abort;
     setLoading(true);
-    void portabilityImportApi
-      .snapshot(selectedAgent, jobId)
+    const restore = jobId
+      ? portabilityImportApi
+          .snapshot(selectedAgent, jobId)
+          .catch(async (reason) => {
+            const current = await portabilityImportApi.current(selectedAgent);
+            if (current) return current;
+            throw reason;
+          })
+      : portabilityImportApi.current(selectedAgent);
+    void restore
       .then((snapshot) => {
-        if (!isCurrent(selectedAgent, jobId) || abort.signal.aborted) return;
+        if (
+          !snapshot ||
+          abort.signal.aborted ||
+          selectedRef.current !== selectedAgent
+        )
+          return;
+        const restoredId = snapshot.job_id;
+        view.current = { agentId: selectedAgent, jobId: restoredId };
         latest.current = snapshot;
         setJob(snapshot);
+        saveActiveJob(selectedAgent, restoredId);
         if (!terminal.has(snapshot.state)) {
-          void watch(selectedAgent, jobId, abort.signal);
+          void watch(selectedAgent, restoredId, abort.signal);
         }
       })
       .catch((reason) => {
-        if (!isCurrent(selectedAgent, jobId) || abort.signal.aborted) return;
+        if (abort.signal.aborted || selectedRef.current !== selectedAgent)
+          return;
         view.current = { agentId: selectedAgent, jobId: "" };
         latest.current = null;
         saveActiveJob(selectedAgent);
@@ -345,7 +373,7 @@ export function useImportJob() {
         setLoading(false);
       })
       .finally(() => {
-        if (isCurrent(selectedAgent, jobId) && !abort.signal.aborted) {
+        if (selectedRef.current === selectedAgent && !abort.signal.aborted) {
           setLoading(false);
         }
       });

@@ -225,6 +225,7 @@ async def test_scan_is_concurrent_and_persisted(tmp_path: Path) -> None:
     assert (
         await restored.snapshot(workspace, created.job_id)
     ).state == "awaiting_selection"
+    assert (await restored.current(workspace)).job_id == created.job_id
 
 
 @pytest.mark.asyncio
@@ -266,32 +267,15 @@ async def test_apply_projects_progress_and_replays_terminal_event(
 
 
 @pytest.mark.asyncio
-async def test_only_one_apply_runs_per_agent(tmp_path: Path) -> None:
+async def test_only_one_active_import_runs_per_agent(tmp_path: Path) -> None:
     services = _FakeServices()
     services.block_apply.clear()
     workspace = _workspace(tmp_path)
     manager = PortabilityImportJobManager(service_factory=services.factory)
     first = await manager.create(workspace, ["codex"])
-    second = await manager.create(workspace, ["qoder"])
-    await asyncio.gather(
-        manager.wait(first.job_id),
-        manager.wait(second.job_id),
-    )
-    await manager.start(
-        workspace,
-        first.job_id,
-        {"codex": ImportSelection(skills=["codex-skill"])},
-    )
-
-    with pytest.raises(RuntimeError, match="already running"):
-        await manager.start(
-            workspace,
-            second.job_id,
-            {"qoder": ImportSelection(skills=["qoder-skill"])},
-        )
-
-    services.block_apply.set()
-    await manager.wait(first.job_id)
+    with pytest.raises(RuntimeError, match="already active"):
+        await manager.create(workspace, ["qoder"])
+    await manager.cancel(workspace, first.job_id)
 
 
 @pytest.mark.asyncio

@@ -10,8 +10,12 @@ from qwenpaw.portability.import_jobs import ImportJobSnapshot
 from qwenpaw.portability.models import ImportSelection, SourceLocation
 
 
-def _request(host: str = "127.0.0.1"):
-    return SimpleNamespace(client=SimpleNamespace(host=host))
+def _request(host: str = "127.0.0.1", headers=None):
+    return SimpleNamespace(
+        client=SimpleNamespace(host=host),
+        headers=headers or {},
+        state=SimpleNamespace(),
+    )
 
 
 class _Jobs:
@@ -29,6 +33,10 @@ class _Jobs:
             agent_id="paw",
             state="completed",
         )
+
+    async def current(self, workspace):
+        self.calls.append(("current", workspace))
+        return None
 
     async def start(self, workspace, job_id, selections):
         self.calls.append(("start", workspace, job_id, selections))
@@ -146,6 +154,14 @@ async def test_events_are_sse_and_replay_sequence(api):
 
 
 @pytest.mark.asyncio
+async def test_current_job_is_agent_scoped(api):
+    workspace, jobs = api
+
+    assert await routes.get_current_import_job(_request()) is None
+    assert jobs.calls == [("current", workspace)]
+
+
+@pytest.mark.asyncio
 async def test_router_is_agent_scoped_and_localhost_only():
     scoped = agent_scoped.create_agent_scoped_router()
     mounted = [item.original_router for item in scoped.routes]
@@ -154,4 +170,9 @@ async def test_router_is_agent_scoped_and_localhost_only():
 
     with pytest.raises(HTTPException) as error:
         await routes.list_import_sources(_request("203.0.113.9"))
+    assert error.value.status_code == 403
+    with pytest.raises(HTTPException) as error:
+        await routes.list_import_sources(
+            _request(headers={"x-forwarded-for": "203.0.113.9"}),
+        )
     assert error.value.status_code == 403

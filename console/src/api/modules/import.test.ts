@@ -21,6 +21,7 @@ describe("portabilityImportApi", () => {
     await portabilityImportApi.sources("agent one");
     await portabilityImportApi.create("agent one", ["codex", "qoder"]);
     await portabilityImportApi.snapshot("agent one", "import-1");
+    await portabilityImportApi.current("agent one");
     await portabilityImportApi.start("agent one", "import-1", {
       codex: selection,
     });
@@ -40,15 +41,16 @@ describe("portabilityImportApi", () => {
       }),
     );
     expect(request).toHaveBeenNthCalledWith(3, `${base}/jobs/import-1`);
+    expect(request).toHaveBeenNthCalledWith(4, `${base}/jobs/current`);
     expect(request).toHaveBeenNthCalledWith(
-      4,
+      5,
       `${base}/jobs/import-1/start`,
       expect.objectContaining({
         body: JSON.stringify({ selections: { codex: selection } }),
       }),
     );
     expect(request).toHaveBeenNthCalledWith(
-      5,
+      6,
       `${base}/jobs/import-1/retry`,
       expect.objectContaining({
         method: "POST",
@@ -57,11 +59,9 @@ describe("portabilityImportApi", () => {
         }),
       }),
     );
-    expect(request).toHaveBeenNthCalledWith(
-      6,
-      `${base}/jobs/import-1/cancel`,
-      { method: "POST" },
-    );
+    expect(request).toHaveBeenNthCalledWith(7, `${base}/jobs/import-1/cancel`, {
+      method: "POST",
+    });
   });
 
   it("parses reconnectable SSE snapshots", async () => {
