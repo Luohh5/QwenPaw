@@ -16,6 +16,8 @@ from qwenpaw.app.agent_context import scoped_session_id
 from qwenpaw.modes.mission import MissionMode
 from qwenpaw.plugins.api import PluginApi
 from qwenpaw.portability.adaptation_loop import (
+    _ORPHANED_WORKERS,
+    _stop_worker,
     get_active_adaptation_context,
     run_adaptation_loop,
 )
@@ -87,6 +89,32 @@ class _Workspace:
             self.active_queries -= 1
         if self.request is None:
             yield None
+
+
+@pytest.mark.asyncio
+async def test_stopping_an_uncooperative_worker_does_not_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+
+    async def worker() -> None:
+        while not release.is_set():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                continue
+
+    monkeypatch.setattr(
+        "qwenpaw.portability.adaptation_loop._CANCEL_GRACE_SECONDS",
+        0.01,
+    )
+    task = asyncio.create_task(worker())
+    await asyncio.sleep(0)
+    await _stop_worker(task)
+    assert task in _ORPHANED_WORKERS
+    release.set()
+    task.cancel()
+    await task
 
 
 def test_native_plugin_test_rejects_manifest_without_entry(

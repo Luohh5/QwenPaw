@@ -20,7 +20,6 @@ from ..modes.mission import MissionMode
 from ..schemas import AgentRequest
 from ..utils.io_utils import (
     get_sync_path_lock,
-    run_async_to_completion,
     run_sync_io,
 )
 from .adaptation_mission import prepare_mission, sync_mission
@@ -51,6 +50,8 @@ from .providers.base import (
 
 _MAX_REACT_ITERATIONS = 4_000
 _HEARTBEAT_SECONDS = 12
+_IDLE_SECONDS = 300
+_CANCEL_GRACE_SECONDS = 3
 _MAX_FILE_BYTES = 256 * 1024
 _EXCERPT_BYTES = 16 * 1024
 _MAX_REPLACEMENT_BYTES = 32 * 1024
@@ -81,6 +82,37 @@ class _RequestBinding:
 
 
 _ACTIVE_CONTEXTS: dict[str, _RequestBinding] = {}
+_ORPHANED_WORKERS: set[asyncio.Task] = set()
+
+
+def _release_orphan(task: asyncio.Task) -> None:
+    _ORPHANED_WORKERS.discard(task)
+    try:
+        task.exception()
+    except (
+        asyncio.CancelledError,
+        Exception,
+    ):  # pylint: disable=broad-exception-caught
+        pass
+
+
+async def _stop_worker(task: asyncio.Task) -> None:
+    """Cancel one worker without letting a broken stream block the import."""
+    if task.done() or task in _ORPHANED_WORKERS:
+        return
+    task.cancel()
+    done, _ = await asyncio.wait({task}, timeout=_CANCEL_GRACE_SECONDS)
+    if not done:
+        _ORPHANED_WORKERS.add(task)
+        task.add_done_callback(_release_orphan)
+        return
+    try:
+        await task
+    except (
+        asyncio.CancelledError,
+        Exception,
+    ):  # pylint: disable=broad-exception-caught
+        pass
 
 
 def _active_binding() -> _RequestBinding:
@@ -584,10 +616,12 @@ async def _run_phase(
     )
     binding = _RequestBinding(context, asset.asset_key, asyncio.Event())
     _ACTIVE_CONTEXTS[session_id] = binding
+    activity = asyncio.Event()
     task = asyncio.create_task(
-        _consume_query(workspace, request),
+        _consume_query(workspace, request, activity.set),
     )
     completed = asyncio.create_task(binding.completed.wait())
+    last_activity = asyncio.get_running_loop().time()
     try:
         while not task.done() and not completed.done():
             done, _ = await asyncio.wait(
@@ -600,32 +634,35 @@ async def _run_phase(
                     context.progress,
                     f"{label}仍在运行：{context.activity(session_id)}",
                 )
+            if activity.is_set():
+                activity.clear()
+                last_activity = asyncio.get_running_loop().time()
+            if (
+                not task.done()
+                and asyncio.get_running_loop().time() - last_activity
+                >= _IDLE_SECONDS
+            ):
+                raise TimeoutError(
+                    f"compatibility worker was idle for {_IDLE_SECONDS}s",
+                )
         if task.done():
             await task
         else:
-            task.cancel()
-            try:
-                await run_async_to_completion(task)
-            except asyncio.CancelledError:
-                pass
+            await _stop_worker(task)
     finally:
-        completed.cancel()
-        if not task.done():
-            task.cancel()
-            try:
-                await run_async_to_completion(task)
-            except (
-                asyncio.CancelledError,
-                Exception,
-            ):
-                pass
         _ACTIVE_CONTEXTS.pop(session_id, None)
         context.clear_activity(session_id)
+        completed.cancel()
+        await _stop_worker(task)
 
 
-async def _consume_query(workspace: Any, request: AgentRequest) -> None:
+async def _consume_query(
+    workspace: Any,
+    request: AgentRequest,
+    mark_activity: Any,
+) -> None:
     async for _event in workspace.stream_query(request):
-        pass
+        mark_activity()
 
 
 async def _bounded_parallel(keys: list[str], worker: Any) -> None:

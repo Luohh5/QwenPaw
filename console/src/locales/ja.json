@@ -81,6 +81,7 @@
     "chooseContent": "インポートする内容を選択",
     "defaultSelected": "初期状態ではすべて選択されています。不要な項目は解除できます。",
     "conversations": "会話履歴",
+    "toolsSetup": "ツールと設定",
     "items": "{{count}} 件",
     "start": "インポート開始",
     "groups": {

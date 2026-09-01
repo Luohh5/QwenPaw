@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from qwenpaw.agents.skill_system import SkillService
 from qwenpaw.app.chats.manager import ChatManager
 from qwenpaw.app.chats.repo import JsonChatRepository
 from qwenpaw.app.chats.session import SafeJSONSession
@@ -1096,6 +1097,62 @@ async def test_retry_selection_replaces_an_existing_skill(
         (workspace.workspace_dir / "skills/portable-skill/SKILL.md")
         .read_text(encoding="utf-8")
         .endswith("after\n")
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_skill_retry_restores_the_existing_skill(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "source-skill"
+    source.mkdir()
+    skill_file = source / "SKILL.md"
+    skill_file.write_text(
+        "---\nname: portable-skill\ndescription: test\n---\n\nbefore\n",
+        encoding="utf-8",
+    )
+    inventory = ProviderInventory(
+        provider_id="codex",
+        provider_name="Codex",
+        detected=True,
+        skills=[
+            SourceSkill(
+                source_id="portable-skill",
+                name="portable-skill",
+                directory=source,
+            ),
+        ],
+    )
+    _bind_inventory(monkeypatch, inventory)
+    _mock_adaptation(monkeypatch, workspace, inventory, zone="migrate")
+    service = ProviderImportService(workspace)
+    plan = await service.plan_from("codex")
+    selection = ImportSelection(sessions=False, skills=["portable-skill"])
+    await service.apply_selection(plan.plan_id, selection)
+    skill_file.write_text(
+        "---\nname: portable-skill\ndescription: test\n---\n\nafter\n",
+        encoding="utf-8",
+    )
+    original = SkillService.import_from_zip
+    calls = 0
+
+    def fail_second_import(self, data, enable=False):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated retry failure")
+        return original(self, data, enable)
+
+    monkeypatch.setattr(SkillService, "import_from_zip", fail_second_import)
+    _plan, receipt = await service.retry_selection(plan.plan_id, selection)
+
+    assert receipt.skipped_skills == ["portable-skill"]
+    assert (
+        (workspace.workspace_dir / "skills/portable-skill/SKILL.md")
+        .read_text(encoding="utf-8")
+        .endswith("before\n")
     )
 
 

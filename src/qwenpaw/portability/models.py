@@ -206,6 +206,7 @@ class MigrationPlan(BaseModel):
     agent_id: str
     created_at: datetime
     inventory_fingerprint: str
+    asset_fingerprints: dict[str, str] = Field(default_factory=dict)
     inventory_counts: dict[str, int] = Field(default_factory=dict)
     actions: list[MigrationAssetPlan] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)

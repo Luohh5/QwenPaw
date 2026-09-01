@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Select a dependency-complete subset of a provider inventory."""
+"""Select the user-approved subset of a provider inventory."""
 
 from __future__ import annotations
 
@@ -28,18 +28,18 @@ def select_inventory(
     inventory: ProviderInventory,
     selection: ImportSelection,
 ) -> ProviderInventory:
-    """Return a deep copy containing only selected assets and dependencies."""
+    """Return a deep copy containing only selected assets."""
     chosen = {key: set(getattr(selection, key)) for key in _FIELDS}
-    plugins = {item.source_id: item for item in inventory.plugins}
     for server in inventory.mcp_servers:
         parent = str(server.metadata.get("source_plugin") or "")
-        if server.source_id in chosen["mcp"] and parent:
-            if parent not in plugins:
-                raise ValueError(f"unknown parent plugin selection: {parent}")
-            chosen["plugins"].add(parent)
-    for server in inventory.mcp_servers:
-        if server.metadata.get("source_plugin") in chosen["plugins"]:
-            chosen["mcp"].add(server.source_id)
+        if (
+            server.source_id in chosen["mcp"]
+            and server.metadata.get("source_plugin_relative_cwd")
+            and parent not in chosen["plugins"]
+        ):
+            raise ValueError(
+                f"plugin-owned MCP {server.source_id} requires {parent}",
+            )
 
     tasks = _selected(
         inventory.scheduled_tasks,

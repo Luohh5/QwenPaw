@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 from collections.abc import AsyncIterator
@@ -13,8 +14,15 @@ from typing import Any
 from uuid import uuid4
 
 from ..agents.skill_system import SkillService
+from ..agents.skill_system.store import (
+    get_workspace_skill_manifest_path,
+    get_workspace_skills_dir,
+)
 from ..app.driver_config_service import DriverConfigService
 from ..drivers.adapters.mcp_legacy_config import legacy_mcp_client_to_driver
+from ..drivers.contracts import iter_credential_refs
+from ..config.utils import get_plugins_dir
+from ..plugins.loader import resolved_plugin_manifest_path
 from ..plugins.marketplace_registry import ExternalMarketplaceRegistry
 from ..utils.io_utils import (
     get_path_lock,
@@ -64,6 +72,39 @@ _GENERATED_PLUGIN_ADAPTERS = {
     CODEX_PLUGIN_ADAPTER,
     "qoder_skill_only_v1",
 }
+
+
+def _copy_tree(source: Path, target: Path) -> None:
+    """Copy one rollback tree, replacing a stale snapshot if present."""
+    shutil.rmtree(target, ignore_errors=True)
+    shutil.copytree(source, target)
+
+
+def _restore_skill(
+    workspace_dir: Path,
+    name: str,
+    backup: Path,
+    manifest_backup: Path | None,
+) -> None:
+    skill_dir = get_workspace_skills_dir(workspace_dir) / name
+    shutil.rmtree(skill_dir, ignore_errors=True)
+    shutil.copytree(backup, skill_dir)
+    manifest = get_workspace_skill_manifest_path(workspace_dir)
+    if manifest_backup is None:
+        manifest.unlink(missing_ok=True)
+    else:
+        shutil.copy2(manifest_backup, manifest)
+
+
+def _plugin_id(source: Path) -> str:
+    """Read the only field needed to snapshot a force-installed plugin."""
+    payload = json.loads(
+        resolved_plugin_manifest_path(source).read_text(encoding="utf-8"),
+    )
+    plugin_id = str(payload.get("id") or "")
+    if not plugin_id:
+        raise ValueError("plugin.json has no id")
+    return plugin_id
 
 
 class ImportRollbackError(RuntimeError):
@@ -182,6 +223,9 @@ class ProviderImportService(ImportPlanningMixin):
         patched_project_dirs = conversations.patched_project_dirs
         archived_chats = conversations.archived_chats
         created_mcp: list[tuple[str, str]] = []
+        replaced_mcp: list[tuple[Any, list[Any], str]] = []
+        replaced_skills: dict[str, tuple[Path, Path | None]] = {}
+        replaced_plugins: dict[str, Path] = {}
         created_scheduled_tasks: list[str] = []
         replaced_scheduled_tasks: list[Any] = []
         memory_changes: list[tuple[Path, dict[Path, bytes] | None]] = []
@@ -194,8 +238,48 @@ class ProviderImportService(ImportPlanningMixin):
             / "imports"
             / migration_id
         )
+        rollback_root = adaptation_root / ".rollback"
         skill_service = SkillService(self._workspace.workspace_dir)
         driver_config = DriverConfigService(self._workspace)
+
+        async def restore_mcp(
+            card: Any,
+            credentials: list[Any],
+            replacement_ref: str,
+        ) -> None:
+            await driver_config.card_store.delete(card.name)
+            if replacement_ref:
+                await driver_config.credential_store.delete(replacement_ref)
+            for credential in credentials:
+                await driver_config.credential_store.put(credential)
+            await driver_config.save_card(card, reload_driver=card.enabled)
+
+        async def restore_plugin(plugin_id: str, backup: Path) -> None:
+            # pylint: disable-next=C0415
+            from ..app.routers.plugins import (
+                install_plugin_source,
+                uninstall_plugin_source,
+            )
+
+            loader = plugin_app.state.plugin_loader
+            if loader.get_loaded_plugin(plugin_id) is not None:
+                await uninstall_plugin_source(
+                    plugin_id,
+                    app=plugin_app,
+                    reload_agents=False,
+                )
+            else:
+                await run_sync_io(
+                    shutil.rmtree,
+                    get_plugins_dir() / plugin_id,
+                    True,
+                )
+            await install_plugin_source(
+                str(backup),
+                app=plugin_app,
+                force=True,
+                reload_agents=False,
+            )
 
         try:
             await import_conversations(
@@ -389,6 +473,7 @@ class ProviderImportService(ImportPlanningMixin):
                     )
                     continue
                 staged_plugin: Path | None = None
+                plugin_backup: tuple[str, Path] | None = None
                 try:
                     # pylint: disable-next=C0415
                     from ..app.routers.plugins import (
@@ -412,6 +497,13 @@ class ProviderImportService(ImportPlanningMixin):
                             enabled=compatibility_zone == "migrate",
                         )
                         install_source = str(staged_plugin)
+                    source_path = Path(install_source).resolve()
+                    plugin_id = _plugin_id(source_path)
+                    existing_path = get_plugins_dir() / plugin_id
+                    if replace_existing and existing_path.is_dir():
+                        backup = rollback_root / "plugins" / plugin_id
+                        await run_sync_io(_copy_tree, existing_path, backup)
+                        plugin_backup = (plugin_id, backup)
                     record = await install_plugin_source(
                         install_source,
                         app=plugin_app,
@@ -419,6 +511,8 @@ class ProviderImportService(ImportPlanningMixin):
                         reload_agents=False,
                     )
                     installed_plugins.append(record.manifest.id)
+                    if plugin_backup is not None:
+                        replaced_plugins.setdefault(*plugin_backup)
                     source_path = getattr(record, "source_path", None)
                     if source_path is not None:
                         installed_plugin_paths[plugin.source_id] = Path(
@@ -435,6 +529,16 @@ class ProviderImportService(ImportPlanningMixin):
                             ),
                         )
                 except Exception as exc:  # pylint: disable=broad-except
+                    if plugin_backup is not None:
+                        try:
+                            await restore_plugin(*plugin_backup)
+                        except (
+                            Exception
+                        ) as restore_exc:  # pylint: disable=broad-except
+                            raise RuntimeError(
+                                "plugin replacement failed; "
+                                "restoration failed",
+                            ) from restore_exc
                     skipped_plugins.append(plugin.source_id)
                     warnings.append(
                         f"Plugin {plugin.source_id!r} failed native "
@@ -513,6 +617,7 @@ class ProviderImportService(ImportPlanningMixin):
                         "隔离暂存区，可修复后重试。",
                     )
                     continue
+                skill_backup: tuple[Path, Path | None] | None = None
                 try:
                     data = await run_sync_io(_skill_zip, skill)
                     result = await run_sync_io(
@@ -526,6 +631,33 @@ class ProviderImportService(ImportPlanningMixin):
                         and result.get("conflicts")
                         and replace_existing
                     ):
+                        skill_dir = (
+                            get_workspace_skills_dir(
+                                self._workspace.workspace_dir,
+                            )
+                            / skill.name
+                        )
+                        if not skill_dir.is_dir():
+                            raise RuntimeError(
+                                "conflicting Skill files are missing",
+                            )
+                        backup = rollback_root / "skills" / skill.name
+                        await run_sync_io(_copy_tree, skill_dir, backup)
+                        manifest = get_workspace_skill_manifest_path(
+                            self._workspace.workspace_dir,
+                        )
+                        manifest_backup = (
+                            rollback_root / "skill.json"
+                            if manifest.is_file()
+                            else None
+                        )
+                        if manifest_backup is not None:
+                            await run_sync_io(
+                                shutil.copy2,
+                                manifest,
+                                manifest_backup,
+                            )
+                        skill_backup = (backup, manifest_backup)
                         skill_service.disable_skill(skill.name)
                         await run_sync_io(
                             skill_service.delete_skill,
@@ -539,6 +671,19 @@ class ProviderImportService(ImportPlanningMixin):
                         names = [
                             str(name) for name in result.get("imported", [])
                         ]
+                        if not names:
+                            await run_sync_io(
+                                _restore_skill,
+                                self._workspace.workspace_dir,
+                                skill.name,
+                                *skill_backup,
+                            )
+                            skill_backup = None
+                        else:
+                            replaced_skills.setdefault(
+                                skill.name,
+                                skill_backup,
+                            )
                     if names:
                         imported_skills.extend(names)
                     else:
@@ -549,14 +694,29 @@ class ProviderImportService(ImportPlanningMixin):
                                 "the QwenPaw copy.",
                             )
                 except Exception as exc:  # pylint: disable=broad-except
+                    if skill_backup is not None:
+                        try:
+                            await run_sync_io(
+                                _restore_skill,
+                                self._workspace.workspace_dir,
+                                skill.name,
+                                *skill_backup,
+                            )
+                        except (
+                            Exception
+                        ) as restore_exc:  # pylint: disable=broad-except
+                            raise RuntimeError(
+                                "Skill replacement failed; restoration failed",
+                            ) from restore_exc
                     skipped_skills.append(skill.name)
                     warnings.append(
                         f"Skill {skill.name!r} was quarantined/skipped: {exc}",
                     )
 
-            existing_driver_names = {
-                card.name for card in await driver_config.list_cards()
+            existing_cards = {
+                card.name: card for card in await driver_config.list_cards()
             }
+            existing_driver_names = set(existing_cards)
             mcp_total = len(inventory.mcp_servers)
             async for mcp_index, server in _asset_items(
                 inventory.mcp_servers,
@@ -621,7 +781,29 @@ class ProviderImportService(ImportPlanningMixin):
                     )
                     continue
                 credential_ref = ""
+                replacement: tuple[Any, list[Any]] | None = None
+                card_written = False
                 try:
+                    if (
+                        replace_existing
+                        and (previous_card := existing_cards.get(server.name))
+                        is not None
+                    ):
+                        previous_credentials = []
+                        for reference in iter_credential_refs(
+                            previous_card,
+                        ).values():
+                            credential = (
+                                await driver_config.load_optional_credential(
+                                    reference.ref,
+                                )
+                            )
+                            if (
+                                credential is not None
+                                and not credential.ref.startswith("env:")
+                            ):
+                                previous_credentials.append(credential)
+                        replacement = (previous_card, previous_credentials)
                     translated_server = server
                     relative_cwd = str(
                         server.metadata.get("source_plugin_relative_cwd")
@@ -671,19 +853,17 @@ class ProviderImportService(ImportPlanningMixin):
                     if credential is not None:
                         await driver_config.credential_store.put(credential)
                         credential_ref = credential.ref
-                    try:
-                        await driver_config.save_card(
-                            card,
-                            reload_driver=compatibility_zone == "migrate",
-                        )
-                    except BaseException:
-                        if credential_ref:
-                            await driver_config.credential_store.delete(
-                                credential_ref,
-                            )
-                        raise
-                    created_mcp.append((card.name, credential_ref))
+                    await driver_config.save_card(
+                        card,
+                        reload_driver=compatibility_zone == "migrate",
+                    )
+                    card_written = True
+                    if replacement is None:
+                        created_mcp.append((card.name, credential_ref))
+                    else:
+                        replaced_mcp.append((*replacement, credential_ref))
                     existing_driver_names.add(card.name)
+                    existing_cards[card.name] = card
                     imported_mcp_servers.append(card.name)
                     if server.metadata.get("source_runtime_bound"):
                         warnings.append(
@@ -698,6 +878,27 @@ class ProviderImportService(ImportPlanningMixin):
                             "not copied; authorize it again before enabling.",
                         )
                 except Exception as exc:  # pylint: disable=broad-except
+                    try:
+                        if replacement is not None:
+                            await restore_mcp(
+                                *replacement,
+                                credential_ref,
+                            )
+                        else:
+                            if card_written:
+                                await driver_config.card_store.delete(
+                                    server.name,
+                                )
+                            if credential_ref:
+                                await driver_config.credential_store.delete(
+                                    credential_ref,
+                                )
+                    except (
+                        Exception
+                    ) as restore_exc:  # pylint: disable=broad-except
+                        raise RuntimeError(
+                            "MCP replacement failed and could not be restored",
+                        ) from restore_exc
                     skipped_mcp_servers.append(server.name)
                     warnings.append(
                         f"MCP {server.name!r} could not be translated and "
@@ -957,6 +1158,7 @@ class ProviderImportService(ImportPlanningMixin):
                 new_file_mode=0o600,
             )
             await _report(progress, "迁移事务已安全提交。")
+            await run_sync_io(shutil.rmtree, rollback_root, True)
             return receipt
         except BaseException as original:
             rollback_failures: list[str] = []
@@ -1029,6 +1231,11 @@ class ProviderImportService(ImportPlanningMixin):
                             f"MCP credential {credential_ref}",
                             exc,
                         )
+            for card, credentials, replacement_ref in reversed(replaced_mcp):
+                try:
+                    await restore_mcp(card, credentials, replacement_ref)
+                except Exception as exc:  # pylint: disable=broad-except
+                    record_rollback_failure(f"replaced MCP {card.name}", exc)
             cron_manager = getattr(self._workspace, "cron_manager", None)
             if cron_manager is not None:
                 for job_id in reversed(created_scheduled_tasks):
@@ -1059,6 +1266,20 @@ class ProviderImportService(ImportPlanningMixin):
                             exc,
                         )
             for skill_name in reversed(imported_skills):
+                if (snapshot := replaced_skills.get(skill_name)) is not None:
+                    try:
+                        await run_sync_io(
+                            _restore_skill,
+                            self._workspace.workspace_dir,
+                            skill_name,
+                            *snapshot,
+                        )
+                    except Exception as exc:  # pylint: disable=broad-except
+                        record_rollback_failure(
+                            f"replaced Skill {skill_name}",
+                            exc,
+                        )
+                    continue
                 try:
                     skill_service.disable_skill(skill_name)
                 except Exception as exc:  # pylint: disable=broad-except
@@ -1078,11 +1299,14 @@ class ProviderImportService(ImportPlanningMixin):
                             uninstall_plugin_source,
                         )
 
-                        await uninstall_plugin_source(
-                            plugin_id,
-                            app=plugin_app,
-                            reload_agents=False,
-                        )
+                        if (backup := replaced_plugins.get(plugin_id)) is None:
+                            await uninstall_plugin_source(
+                                plugin_id,
+                                app=plugin_app,
+                                reload_agents=False,
+                            )
+                        else:
+                            await restore_plugin(plugin_id, backup)
                     except Exception as exc:  # pylint: disable=broad-except
                         record_rollback_failure(f"plugin {plugin_id}", exc)
             for target, previous in reversed(memory_changes):

@@ -15,7 +15,7 @@ from .models import (
     MigrationPlan,
     ProviderInventory,
 )
-from .planner import build_migration_plan, inventory_fingerprint
+from .planner import build_migration_plan, tool_asset_fingerprints
 from .providers.base import ProgressReporter, report_progress as _report
 from .selection import select_inventory
 
@@ -255,12 +255,16 @@ class ImportPlanningMixin:
                 source_home=source_home,
                 progress=progress,
             )
-            if inventory_fingerprint(inventory) != plan.inventory_fingerprint:
+            if selection is not None:
+                inventory = select_inventory(inventory, selection)
+            current = tool_asset_fingerprints(inventory)
+            expected = {
+                key: plan.asset_fingerprints.get(key) for key in current
+            }
+            if current != expected:
                 message = "来源数据在预演后发生了变化。请重新扫描，"
                 message += "确认新计划后再执行。"
                 raise ValueError(message)
-            if selection is not None:
-                inventory = select_inventory(inventory, selection)
             return await self._execute_plan(
                 plan,
                 inventory,

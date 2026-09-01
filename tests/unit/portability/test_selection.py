@@ -23,7 +23,10 @@ from qwenpaw.portability.models import (
     SourceSession,
     SourceSkill,
 )
-from qwenpaw.portability.planner import inventory_fingerprint
+from qwenpaw.portability.planner import (
+    inventory_fingerprint,
+    tool_asset_fingerprints,
+)
 from qwenpaw.portability.selection import select_inventory
 
 
@@ -76,7 +79,7 @@ def _inventory(tmp_path: Path) -> ProviderInventory:
     )
 
 
-def test_select_plugin_includes_owned_mcp_and_marketplace(
+def test_select_plugin_keeps_owned_mcp_unselected_and_marketplace(
     tmp_path: Path,
 ) -> None:
     source = _inventory(tmp_path)
@@ -87,14 +90,14 @@ def test_select_plugin_includes_owned_mcp_and_marketplace(
     )
 
     assert [item.source_id for item in selected.plugins] == ["plugin-1"]
-    assert [item.source_id for item in selected.mcp_servers] == ["plugin-mcp"]
+    assert selected.mcp_servers == []
     assert [item.source_id for item in selected.marketplaces] == ["market-1"]
     assert selected.sessions == []
     assert selected.ignored_session_ids == []
     assert len(source.mcp_servers) == 2
 
 
-def test_select_plugin_owned_mcp_includes_parent_plugin(
+def test_select_plugin_owned_mcp_does_not_include_parent_plugin(
     tmp_path: Path,
 ) -> None:
     selected = select_inventory(
@@ -102,8 +105,19 @@ def test_select_plugin_owned_mcp_includes_parent_plugin(
         ImportSelection(sessions=False, mcp=["plugin-mcp"]),
     )
 
-    assert [item.source_id for item in selected.plugins] == ["plugin-1"]
+    assert selected.plugins == []
     assert [item.source_id for item in selected.mcp_servers] == ["plugin-mcp"]
+
+
+def test_plugin_relative_mcp_requires_selected_plugin(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path)
+    inventory.mcp_servers[1].metadata["source_plugin_relative_cwd"] = "."
+
+    with pytest.raises(ValueError, match="plugin-mcp.*plugin-1"):
+        select_inventory(
+            inventory,
+            ImportSelection(sessions=False, mcp=["plugin-mcp"]),
+        )
 
 
 def test_select_individual_asset_groups(tmp_path: Path) -> None:
@@ -181,6 +195,7 @@ class _PlanningService(ImportPlanningMixin):
             agent_id="agent-1",
             created_at=datetime.now(timezone.utc),
             inventory_fingerprint=inventory_fingerprint(inventory),
+            asset_fingerprints=tool_asset_fingerprints(inventory),
         )
 
     async def _read_plan(self, _plan_id: str) -> MigrationPlan:
@@ -233,3 +248,44 @@ async def test_apply_selection_rejects_changed_source(
         )
 
     assert service.executed is None
+
+
+@pytest.mark.asyncio
+async def test_apply_selection_ignores_changed_conversations(
+    tmp_path: Path,
+) -> None:
+    source = _inventory(tmp_path)
+    service = _PlanningService(tmp_path, source)
+    source.sessions[0].title = "Updated while the plan was open"
+
+    await service.apply_selection(
+        service.plan.plan_id,
+        ImportSelection(sessions=True, skills=["skill-1"]),
+    )
+
+    assert service.executed is not None
+    assert service.executed.sessions[0].title.startswith("Updated")
+
+
+@pytest.mark.asyncio
+async def test_apply_selection_ignores_unselected_tool_changes(
+    tmp_path: Path,
+) -> None:
+    source = _inventory(tmp_path)
+    memory = tmp_path / "memory.md"
+    skill = source.skills[0].directory / "SKILL.md"
+    memory.write_text("memory", encoding="utf-8")
+    skill.parent.mkdir()
+    skill.write_text("before", encoding="utf-8")
+    source.memory_projects[0].files = [
+        SourceMemoryFile(source_path=memory, relative_path=Path("memory.md")),
+    ]
+    service = _PlanningService(tmp_path, source)
+    skill.write_text("after", encoding="utf-8")
+
+    await service.apply_selection(
+        service.plan.plan_id,
+        ImportSelection(sessions=False, memory=["memory-1"]),
+    )
+
+    assert service.executed is not None

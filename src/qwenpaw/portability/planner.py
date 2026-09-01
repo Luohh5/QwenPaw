@@ -23,6 +23,13 @@ from .skill_transfer import read_regular_file
 _MAX_FINGERPRINT_ENTRIES = 6_000
 _MAX_FINGERPRINT_FILES = 5_000
 _MAX_FINGERPRINT_BYTES = 64 * 1024 * 1024
+_TOOL_FIELDS = (
+    ("memory", "memory_projects"),
+    ("cron", "scheduled_tasks"),
+    ("skills", "skills"),
+    ("mcp", "mcp_servers"),
+    ("plugins", "plugins"),
+)
 
 
 @dataclass
@@ -327,6 +334,34 @@ def inventory_fingerprint(inventory: ProviderInventory) -> str:
     return hasher.hexdigest()
 
 
+def tool_asset_fingerprints(inventory: ProviderInventory) -> dict[str, str]:
+    """Fingerprint each importable tool without volatile conversations."""
+    updates = {field: [] for _kind, field in _TOOL_FIELDS} | {
+        "sessions": [],
+        "ignored_session_ids": [],
+        "marketplaces": [],
+        "warnings": [],
+        "metadata": {},
+        "discovered_mcp_count": 0,
+        "discovered_scheduled_task_count": 0,
+    }
+    result = {}
+    for kind, field in _TOOL_FIELDS:
+        for item in getattr(inventory, field):
+            scoped = inventory.model_copy(
+                update={**updates, field: [item]},
+                deep=True,
+            )
+            if kind == "plugins":
+                scoped.marketplaces = [
+                    market
+                    for market in inventory.marketplaces
+                    if item.marketplace in (market.source_id, market.name)
+                ]
+            result[f"{kind}:{item.source_id}"] = inventory_fingerprint(scoped)
+    return result
+
+
 def _imported_memory_ids(workspace: Any, provider_id: str) -> set[str]:
     root = Path(workspace.workspace_dir)
     source_ids: set[str] = set()
@@ -509,10 +544,15 @@ async def build_migration_plan(
         agent_id=workspace.agent_id,
         created_at=datetime.now(timezone.utc),
         inventory_fingerprint=inventory_fingerprint(inventory),
+        asset_fingerprints=tool_asset_fingerprints(inventory),
         inventory_counts=counts,
         actions=actions,
         warnings=list(inventory.warnings),
     )
 
 
-__all__ = ["build_migration_plan", "inventory_fingerprint"]
+__all__ = [
+    "build_migration_plan",
+    "inventory_fingerprint",
+    "tool_asset_fingerprints",
+]

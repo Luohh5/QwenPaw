@@ -126,6 +126,9 @@ describe("ImportPage", () => {
     expect(
       screen.getByText("portabilityImport.conversations"),
     ).toBeInTheDocument();
+    expect(
+      screen.getByText("portabilityImport.toolsSetup"),
+    ).toBeInTheDocument();
     expect(screen.getByText("Review Skill")).toBeInTheDocument();
     expect(
       screen.getByText("portabilityImport.targetAgent:agent"),

@@ -133,8 +133,8 @@ function completion(providers: ImportProviderSnapshot[]) {
       (["not_needed", "failed", "succeeded"].includes(asset.state)
         ? 1
         : asset.reason_code === "ready_to_import"
-          ? 0.5
-          : 0),
+        ? 0.5
+        : 0),
     0,
   );
   const doneSessions = sessionRows.filter(
@@ -321,6 +321,21 @@ export default function ImportPage() {
     }));
   };
 
+  const toggleTools = (provider: ImportProviderSnapshot, checked: boolean) =>
+    updateSelection(provider.source, (selection) => ({
+      ...selection,
+      ...Object.fromEntries(
+        GROUPS.map((type) => [
+          FIELDS[type],
+          checked
+            ? provider.assets
+                .filter((asset) => asset.asset_type === type)
+                .map((asset) => asset.source_id)
+            : [],
+        ]),
+      ),
+    }));
+
   return (
     <div className={styles.page}>
       <PageHeader
@@ -455,6 +470,36 @@ export default function ImportPage() {
                         })}
                       </span>
                     </div>
+                    {provider.assets.length > 0 &&
+                      (() => {
+                        const selected = provider.assets.filter((asset) =>
+                          (
+                            currentSelections[provider.source]?.[
+                              FIELDS[asset.asset_type]
+                            ] ?? []
+                          ).includes(asset.source_id),
+                        ).length;
+                        return (
+                          <div className={styles.row}>
+                            <Checkbox
+                              checked={selected === provider.assets.length}
+                              indeterminate={Boolean(
+                                selected && selected < provider.assets.length,
+                              )}
+                              onChange={(event) =>
+                                toggleTools(provider, event.target.checked)
+                              }
+                            >
+                              {t("portabilityImport.toolsSetup")}
+                            </Checkbox>
+                            <span>
+                              {t("portabilityImport.items", {
+                                count: provider.assets.length,
+                              })}
+                            </span>
+                          </div>
+                        );
+                      })()}
                     <Collapse
                       className={styles.groups}
                       defaultActiveKey={[...GROUPS]}

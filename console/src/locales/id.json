@@ -83,6 +83,7 @@
     "chooseContent": "Pilih yang akan diimpor",
     "defaultSelected": "Semua dipilih secara default. Hapus pilihan yang tidak diperlukan.",
     "conversations": "Percakapan",
+    "toolsSetup": "Alat & pengaturan",
     "items": "{{count}} item",
     "start": "Mulai impor",
     "groups": {
