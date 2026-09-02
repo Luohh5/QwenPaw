@@ -411,14 +411,14 @@ async def test_runtime_handles_qwenpaw_control_before_provider_routing(
         input=[
             Message(
                 role=Role.USER,
-                content=[TextContent(text="/import inspect")],
+                content=[TextContent(text="/skills")],
             ),
         ],
     )
 
     with patch(
         "qwenpaw.runtime.commands.control.handle_control_command",
-        return_value="Import ready",
+        return_value="Control ready",
     ) as control:
         output = [
             item
@@ -432,7 +432,7 @@ async def test_runtime_handles_qwenpaw_control_before_provider_routing(
     control.assert_awaited_once()
     assert not runtime._adapters
     assert output[-1].status == "completed"
-    assert output[-1].output[-1].content[0].text == "Import ready"
+    assert output[-1].output[-1].content[0].text == "Control ready"
 
 
 @pytest.mark.asyncio
@@ -446,7 +446,7 @@ async def test_runtime_streams_qwenpaw_control_progress(
         input=[
             Message(
                 role=Role.USER,
-                content=[TextContent(text="/import from codex")],
+                content=[TextContent(text="/skills")],
             ),
         ],
     )
@@ -455,7 +455,7 @@ async def test_runtime_streams_qwenpaw_control_progress(
         await context.report_progress("读取会话 1/2")
         await asyncio.sleep(0)
         await context.report_progress("读取会话 2/2")
-        return "Import complete"
+        return "Control complete"
 
     with patch(
         "qwenpaw.runtime.commands.control.handle_control_command",
@@ -480,4 +480,4 @@ async def test_runtime_streams_qwenpaw_control_progress(
     assert any("读取会话 2/2" in item for item in deltas)
     final_text = output[-1].output[-1].content[0].text
     assert "读取会话 1/2" in final_text
-    assert final_text.endswith("Import complete")
+    assert final_text.endswith("Control complete")

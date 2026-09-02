@@ -224,7 +224,7 @@ qwenpaw cron create --agent-id <agent_id> -f job_spec.json
 
 ### Reviewing Imported Jobs
 
-Jobs created by `/import` are disabled and protected by a non-bypassable review gate.
+Jobs imported by PawPort are disabled and protected by a non-bypassable review gate.
 
 1. Use `get` to inspect the prompt, timezone, cadence, model semantics, tool permissions, and project directory.
 2. For a remote/container source workspace, first update `project_dir` to an explicitly confirmed local project.

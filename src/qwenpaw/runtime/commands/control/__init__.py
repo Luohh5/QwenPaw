@@ -30,7 +30,6 @@ from .approval_handler import (
     DenyCommandHandler,
 )
 from .model_handler import ModelCommandHandler
-from .portability_handler import ImportCommandHandler
 from .skills_handler import SkillsCommandHandler
 from .stop_handler import StopCommandHandler
 
@@ -49,7 +48,6 @@ def _register_defaults() -> None:
     register_command(ModelCommandHandler())
     register_command(SkillsCommandHandler())
     register_command(CheckpointCommandHandler())
-    register_command(ImportCommandHandler())
 
 
 def register_command(handler: BaseControlCommandHandler) -> None:
@@ -261,7 +259,6 @@ __all__ = [
     "CheckpointCommandHandler",
     "ControlContext",
     "DenyCommandHandler",
-    "ImportCommandHandler",
     "ModelCommandHandler",
     "SkillsCommandHandler",
     "StopCommandHandler",

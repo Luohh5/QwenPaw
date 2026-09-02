@@ -223,7 +223,7 @@ qwenpaw cron create --agent-id <agent_id> -f job_spec.json
 
 ### 迁入任务的复核流程
 
-`/import` 导入的定时任务默认禁用，并带有不可绕过的审核门。
+通过 PawPort 导入的定时任务默认禁用，并带有不可绕过的审核门。
 
 1. 先用 `get` 检查 prompt、时区、频率、模型语义、工具权限和项目目录。
 2. 如果来源是远程/容器工作区，先把 `project_dir` 显式更新为已确认的本地项目。

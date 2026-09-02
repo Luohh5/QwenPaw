@@ -544,7 +544,7 @@ class ProviderImportService(ImportPlanningMixin):
                     warnings.append(
                         f"Plugin {plugin.source_id!r} is compatible, but the "
                         "QwenPaw native plugin loader is not ready. Retry "
-                        "/import after startup completes.",
+                        "from the Import page after startup completes.",
                     )
                     continue
                 staged_plugin: Path | None = None

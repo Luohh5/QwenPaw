@@ -88,9 +88,6 @@ class CommandRegistry:
         # Approval commands (control commands, not daemon commands)
         self.register_command("/approval", priority_level=10)
 
-        # Keep local migration I/O ahead of long-running agent turns.
-        self.register_command("/import", priority_level=10)
-
         # Note: Conversation commands (/compact, /new) remain at
         # default level (20) and do not need explicit registration
 

@@ -34,7 +34,6 @@ _EXPECTED_DEFAULTS = {
     "/approval",
     "/approve",
     "/deny",
-    "/import",
     "/model",
     "/skills",
     "/stop",

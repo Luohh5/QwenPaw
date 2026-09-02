@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Registry for Marketplace sources restored by ``/import``."""
+"""Registry for Marketplace sources restored by PawPort."""
 
 from __future__ import annotations
 

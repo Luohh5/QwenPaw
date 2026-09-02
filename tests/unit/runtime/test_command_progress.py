@@ -26,12 +26,12 @@ async def test_native_runtime_streams_command_progress(tmp_path) -> None:
         return Msg(
             name="assistant",
             role="assistant",
-            content=[TextBlock(type="text", text="Import complete")],
+            content=[TextBlock(type="text", text="Command complete")],
         )
 
     command_registry = SlashCommandRegistry()
     command_registry.register(
-        CommandSpec(name="import", handler=_handler, category="control"),
+        CommandSpec(name="progress", handler=_handler, category="control"),
     )
     workspace = SimpleNamespace(
         workspace_dir=tmp_path,
@@ -48,7 +48,7 @@ async def test_native_runtime_streams_command_progress(tmp_path) -> None:
         input=[
             Message(
                 role=Role.USER,
-                content=[TextContent(text="/import from codex")],
+                content=[TextContent(text="/progress")],
             ),
         ],
     )
@@ -67,4 +67,4 @@ async def test_native_runtime_streams_command_progress(tmp_path) -> None:
     assert final_response.status == "completed"
     final_text = final_response.output[-1].content[0].text
     assert "读取会话 1/2" in final_text
-    assert final_text.endswith("Import complete")
+    assert final_text.endswith("Command complete")
