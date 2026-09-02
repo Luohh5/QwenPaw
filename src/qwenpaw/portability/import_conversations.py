@@ -25,19 +25,14 @@ from .providers.base import (
 
 @dataclass
 class ConversationState:
-    """Imported chat changes retained for receipt generation and rollback."""
+    """Per-session receipt counters."""
 
     imported: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     archived_internal: list[str] = field(default_factory=list)
-    created_chats: list[str] = field(default_factory=list)
-    created_states: list[tuple[str, str, str]] = field(default_factory=list)
-    patched_project_dirs: list[tuple[str, str | None]] = field(
-        default_factory=list,
-    )
-    archived_chats: list[str] = field(default_factory=list)
 
 
+# pylint: disable-next=too-many-branches,too-many-statements
 async def import_conversations(
     workspace: Any,
     inventory: ProviderInventory,
@@ -58,7 +53,6 @@ async def import_conversations(
             continue
         archived = await workspace.chat_manager.archive_chat(chat.id)
         if archived is not None:
-            state.archived_chats.append(chat.id)
             state.archived_internal.append(source_id)
     if state.archived_internal:
         warnings.append(
@@ -93,9 +87,6 @@ async def import_conversations(
                 runtime = existing.meta.get("runtime_context") or {}
                 current = str(runtime.get("project_dir") or "")
                 if current != project_dir:
-                    state.patched_project_dirs.append(
-                        (existing.id, current or None),
-                    )
                     await workspace.chat_manager.set_project_dir(
                         existing.id,
                         project_dir,
@@ -114,14 +105,22 @@ async def import_conversations(
 
         session_id = _session_key(inventory.provider_id, session.source_id)
         user_id, channel = session_id, "console"
-        await bridge.hydrate(
-            session_id=session_id,
-            user_id=user_id,
-            channel=channel,
-            backend=inventory.provider_id,
-            history=session.history,
-        )
-        state.created_states.append((session_id, user_id, channel))
+        try:
+            await bridge.hydrate(
+                session_id=session_id,
+                user_id=user_id,
+                channel=channel,
+                backend=inventory.provider_id,
+                history=session.history,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            state.skipped.append(session.source_id)
+            warnings.append(
+                f"Session {session.source_id} could not be materialized: "
+                f"{exc}",
+            )
+            await report_session(index)
+            continue
         portability = {
             "schema_version": "1",
             "source": inventory.provider_id,
@@ -148,9 +147,24 @@ async def import_conversations(
             updated_at=session.updated_at or session.created_at or started_at,
             meta=meta,
         )
-        await workspace.chat_manager.create_chat(spec)
+        try:
+            await workspace.chat_manager.create_chat(spec)
+        except Exception as exc:  # pylint: disable=broad-except
+            try:
+                await bridge.clear(
+                    session_id=session_id,
+                    user_id=user_id,
+                    channel=channel,
+                )
+            except Exception:  # pylint: disable=broad-except
+                pass
+            state.skipped.append(session.source_id)
+            warnings.append(
+                f"Session {session.source_id} could not be registered: {exc}",
+            )
+            await report_session(index)
+            continue
         existing_by_source[source_key] = spec
-        state.created_chats.append(spec.id)
         state.imported.append(session.source_id)
         await report_session(index)
 

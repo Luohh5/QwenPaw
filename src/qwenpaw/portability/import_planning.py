@@ -80,7 +80,7 @@ class ImportPlanningMixin:
         progress: ProgressReporter | None,
         retry_of_migration_id: str = "",
     ) -> ImportReceipt:
-        """Mark plan lifecycle around the rollback-capable data write."""
+        """Mark plan lifecycle around independent asset writes."""
         plan.state = "applying"
         await self._write_plan(plan)
         try:

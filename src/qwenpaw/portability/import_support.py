@@ -12,7 +12,6 @@ import re
 import shutil
 import tempfile
 import zipfile
-from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -35,48 +34,7 @@ _MAX_HISTORY_ITEMS = 20_000
 _MAX_SESSION_TEXT_BYTES = 64 * 1024 * 1024
 _MAX_MEMORY_FILES = 5000
 _MAX_MEMORY_BYTES = 64 * 1024 * 1024
-_MAX_MARKETPLACE_REGISTRY_BYTES = 16 * 1024 * 1024
 _PLAN_ID_PATTERN = re.compile(r"^plan-[0-9a-f]{32}$")
-
-
-@dataclass(frozen=True)
-class _RegistrySnapshot:
-    """Exact pre-migration Marketplace state used for rollback."""
-
-    path: Path
-    content: bytes | None
-
-
-def _snapshot_registry_file(path: Path) -> bytes | None:
-    """Snapshot a small regular registry file for transaction rollback."""
-    if not path.exists():
-        return None
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("Marketplace registry is not a safe regular file")
-    if path.stat().st_size > _MAX_MARKETPLACE_REGISTRY_BYTES:
-        raise ValueError("Marketplace registry exceeds the 16 MiB limit")
-    return path.read_bytes()
-
-
-def _restore_registry_file(path: Path, content: bytes | None) -> None:
-    """Atomically restore a prior registry snapshot, or remove a new file."""
-    if content is None:
-        path.unlink(missing_ok=True)
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.rollback-",
-        dir=path.parent,
-    )
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(temp_name, 0o600)
-        os.replace(temp_name, path)
-    finally:
-        Path(temp_name).unlink(missing_ok=True)
 
 
 def _session_key(provider_id: str, source_id: str) -> str:
@@ -188,26 +146,6 @@ def _memory_import_root(workspace: Any, provider_id: str) -> Path:
     return target
 
 
-def _snapshot_tree(root: Path) -> dict[Path, bytes] | None:
-    if not root.exists():
-        return None
-    if root.is_symlink() or not root.is_dir():
-        raise ValueError(f"Memory target is not a safe directory: {root}")
-    snapshot: dict[Path, bytes] = {}
-    total = 0
-    for path in sorted(root.rglob("*")):
-        if path.is_symlink():
-            raise ValueError(f"Memory target contains a symbolic link: {path}")
-        if not path.is_file():
-            continue
-        data = path.read_bytes()
-        total += len(data)
-        if total > _MAX_MEMORY_BYTES:
-            raise ValueError("Existing imported memory exceeds 64 MiB")
-        snapshot[path.relative_to(root)] = data
-    return snapshot
-
-
 def _memory_payload(
     provider_id: str,
     project: SourceMemoryProject,
@@ -241,19 +179,35 @@ def _memory_payload(
     return payload
 
 
+# pylint: disable-next=too-many-branches
 def _replace_memory_project(
     workspace: Any,
     provider_id: str,
     project: SourceMemoryProject,
-) -> tuple[Path, dict[Path, bytes] | None, bool]:
+) -> tuple[Path, bool]:
     target = _memory_import_root(workspace, provider_id) / _safe_memory_key(
         project,
     )
     payload = _memory_payload(provider_id, project)
-    previous = _snapshot_tree(target)
-    if previous == payload:
-        return target, previous, False
-
+    existing_files: dict[Path, bytes] = {}
+    existing: dict[Path, bytes] | None = existing_files
+    if target.is_dir():
+        total = 0
+        for path in target.rglob("*"):
+            if path.is_symlink():
+                existing = None
+                break
+            if path.is_file():
+                data = path.read_bytes()
+                total += len(data)
+                if total > _MAX_MEMORY_BYTES:
+                    existing = None
+                    break
+                existing_files[path.relative_to(target)] = data
+    else:
+        existing = None
+    if existing == payload:
+        return target, False
     target.parent.mkdir(parents=True, exist_ok=True)
     temp_root = Path(
         tempfile.mkdtemp(prefix=f".{target.name}.new-", dir=target.parent),
@@ -280,21 +234,7 @@ def _replace_memory_project(
             shutil.rmtree(temp_root)
         if old_root.exists():
             shutil.rmtree(old_root)
-    return target, previous, True
-
-
-def _restore_memory_project(
-    target: Path,
-    previous: dict[Path, bytes] | None,
-) -> None:
-    if target.exists():
-        shutil.rmtree(target)
-    if previous is None:
-        return
-    for relative, data in previous.items():
-        output = target / relative
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(data)
+    return target, True
 
 
 def _skill_zip(skill: SourceSkill) -> bytes:

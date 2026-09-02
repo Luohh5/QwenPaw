@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 
 from ..utils.io_utils import read_json_async, write_json_atomic_async
 from .compatibility_safety import redact_sensitive_text
-from .importer import ImportRollbackError, ProviderImportService
+from .importer import ProviderImportService
 from .models import (
     ImportAssetResult,
     ImportAssetState,
@@ -499,9 +499,13 @@ class PortabilityImportJobManager:
                         ImportAssetState.REPAIRING,
                         ImportAssetState.READY,
                     }:
-                        asset.state = ImportAssetState.FAILED
-                        asset.reason_code = "missing_result"
-                        asset.message = "未收到资产导入结果，请重试。"
+                        if asset.state not in {
+                            ImportAssetState.SUCCEEDED,
+                            ImportAssetState.FAILED,
+                        }:
+                            asset.state = ImportAssetState.FAILED
+                            asset.reason_code = "missing_result"
+                            asset.message = "未收到资产导入结果，请重试。"
                 if retry_from is None:
                     provider.sessions_processed = provider.sessions_total
                     provider.sessions_imported = len(receipt.imported_sessions)
@@ -528,15 +532,12 @@ class PortabilityImportJobManager:
                         and f"{asset.asset_type}:{asset.source_id}"
                         in retry_keys
                     ):
-                        asset.state = ImportAssetState.FAILED
-                        asset.message = "请手动修改相关配置后重试。"
-                if isinstance(exc, ImportRollbackError):
-                    if exc.cancelled:
-                        for asset in provider.assets:
-                            if asset.state is ImportAssetState.FAILED:
-                                asset.message = "回滚未完成，请根据错误信息人工检查。"
-                        await self._emit(live, persist=True)
-                        raise
+                        if asset.state not in {
+                            ImportAssetState.SUCCEEDED,
+                            ImportAssetState.FAILED,
+                        }:
+                            asset.state = ImportAssetState.FAILED
+                            asset.message = "请手动修改相关配置后重试。"
             await self._emit(live, persist=True)
         live.snapshot.state = (
             "completed_with_issues"
@@ -592,7 +593,7 @@ class PortabilityImportJobManager:
         self._project_progress(provider, message)
         if not message.startswith("\x1e"):
             self._log(live, message)
-        await self._emit(live)
+        await self._emit(live, persist=message.startswith("\x1e"))
 
     async def _persist(
         self,

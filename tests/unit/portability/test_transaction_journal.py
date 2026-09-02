@@ -19,19 +19,20 @@ async def _plan(workspace: Path, plan_id: str, state: str) -> Path:
 
 
 @pytest.mark.asyncio
-async def test_recovery_restores_uncommitted_workspace_files(tmp_path: Path):
+async def test_recovery_resets_plan_without_restoring_live_files(
+    tmp_path: Path,
+):
     plan_id = "plan-" + "a" * 32
     target = tmp_path / "skills/example.txt"
     target.parent.mkdir(parents=True)
     target.write_text("before")
     journal = ImportTransactionJournal(tmp_path, plan_id)
     await journal.begin()
-    await journal.watch(target)
     plan_path = await _plan(tmp_path, plan_id, "applying")
     target.write_text("after")
 
     assert await recover_import_transactions([tmp_path]) == [plan_id]
-    assert target.read_text() == "before"
+    assert target.read_text() == "after"
     assert (await read_json_async(plan_path))["state"] == "ready"
     assert not journal.path.exists()
 
@@ -44,7 +45,6 @@ async def test_recovery_keeps_a_committed_transaction(tmp_path: Path):
     target.write_text("before")
     journal = ImportTransactionJournal(tmp_path, plan_id)
     await journal.begin()
-    await journal.watch(target)
     await _plan(tmp_path, plan_id, "applied")
     target.write_text("after")
 

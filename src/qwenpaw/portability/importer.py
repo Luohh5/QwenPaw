@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 # pylint: disable=cell-var-from-loop
-"""Additive, idempotent provider-to-QwenPaw import transaction."""
+"""Additive provider-to-QwenPaw import with independent asset writes."""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import shutil
@@ -22,14 +21,11 @@ from ..agents.skill_system.store import (
 from ..app.driver_config_service import DriverConfigService
 from ..drivers.adapters.mcp_legacy_config import legacy_mcp_client_to_driver
 from ..drivers.contracts import iter_credential_refs
-from ..config.utils import get_plugins_dir
 from ..plugins.loader import resolved_plugin_manifest_path
 from ..plugins.marketplace_registry import ExternalMarketplaceRegistry
 from ..utils.io_utils import (
-    get_path_lock,
     run_async_to_completion,
     run_sync_io,
-    unlink_async,
     write_json_atomic_async,
 )
 from .adaptation_loop import run_adaptation_loop
@@ -55,18 +51,12 @@ from .scheduled_tasks import build_imported_job, imported_job_source
 from .transaction_journal import ImportTransactionJournal
 from .import_conversations import ConversationState, import_conversations
 from .import_support import (
-    _RegistrySnapshot,
     _bounded_memory,
     _bounded_session,
-    _memory_import_root,
     _mcp_client_data,
     _progress_milestone,
-    _remove_session_state,
     _replace_memory_project,
-    _restore_memory_project,
-    _restore_registry_file,
     _skill_zip,
-    _snapshot_registry_file,
 )
 from .import_planning import ImportPlanningMixin
 
@@ -79,7 +69,6 @@ _GENERATED_PLUGIN_ADAPTERS = {
 
 
 def _copy_tree(source: Path, target: Path) -> None:
-    """Copy one rollback tree, replacing a stale snapshot if present."""
     shutil.rmtree(target, ignore_errors=True)
     shutil.copytree(source, target)
 
@@ -90,9 +79,9 @@ def _restore_skill(
     backup: Path,
     manifest_backup: Path | None,
 ) -> None:
-    skill_dir = get_workspace_skills_dir(workspace_dir) / name
-    shutil.rmtree(skill_dir, ignore_errors=True)
-    shutil.copytree(backup, skill_dir)
+    target = get_workspace_skills_dir(workspace_dir) / name
+    shutil.rmtree(target, ignore_errors=True)
+    shutil.copytree(backup, target)
     manifest = get_workspace_skill_manifest_path(workspace_dir)
     if manifest_backup is None:
         manifest.unlink(missing_ok=True)
@@ -101,7 +90,7 @@ def _restore_skill(
 
 
 def _plugin_id(source: Path) -> str:
-    """Read the only field needed to snapshot a force-installed plugin."""
+    """Read the plugin id from its manifest."""
     payload = json.loads(
         resolved_plugin_manifest_path(source).read_text(encoding="utf-8"),
     )
@@ -109,22 +98,6 @@ def _plugin_id(source: Path) -> str:
     if not plugin_id:
         raise ValueError("plugin.json has no id")
     return plugin_id
-
-
-class ImportRollbackError(RuntimeError):
-    """An import failed and one or more rollback actions also failed."""
-
-    def __init__(
-        self,
-        failures: list[str],
-        *,
-        cancelled: bool,
-    ) -> None:
-        self.failures = tuple(failures)
-        self.cancelled = cancelled
-        super().__init__(
-            "迁移回滚未完成，请人工检查并清理以下内容：" + "；".join(failures),
-        )
 
 
 async def _asset_items(
@@ -168,11 +141,12 @@ async def _asset_items(
 
 async def _commit_mutation(
     operation: Awaitable[Any],
-    commit: Callable[[Any], None],
+    commit: Callable[[Any], None] | None = None,
 ) -> Any:
     async def run() -> Any:
         result = await operation
-        commit(result)
+        if commit is not None:
+            commit(result)
         return result
 
     return await run_async_to_completion(run())
@@ -199,7 +173,7 @@ class ProviderImportService(ImportPlanningMixin):
         progress: ProgressReporter | None = None,
         retry_of_migration_id: str = "",
     ) -> ImportReceipt:
-        """Apply one fully inventoried source as a rollback-capable batch."""
+        """Apply assets independently; a failed asset does not undo others."""
         migration_id = f"migration-{uuid4().hex}"
         replace_existing = bool(retry_of_migration_id)
         warnings = list(inventory.warnings)
@@ -244,27 +218,13 @@ class ProviderImportService(ImportPlanningMixin):
         adaptation_counts: dict[str, int] = {}
         adaptation_asset_zones: dict[str, str] = {}
         plugin_app = None
-        created_chats = conversations.created_chats
-        created_states = conversations.created_states
-        patched_project_dirs = conversations.patched_project_dirs
-        archived_chats = conversations.archived_chats
-        created_mcp: list[tuple[str, str]] = []
-        replaced_mcp: list[tuple[Any, list[Any], str]] = []
-        replaced_skills: dict[str, tuple[Path, Path | None]] = {}
-        replaced_plugins: dict[str, Path] = {}
-        created_scheduled_tasks: list[str] = []
-        replaced_scheduled_tasks: list[Any] = []
-        memory_changes: list[tuple[Path, dict[Path, bytes] | None]] = []
-        receipt_path: Path | None = None
-        marketplace_registry_snapshot: _RegistrySnapshot | None = None
-        marketplace_registry_touched = False
         adaptation_root = (
             Path(self._workspace.workspace_dir)
             / ".qwenpaw"
             / "imports"
             / migration_id
         )
-        rollback_root = adaptation_root / ".rollback"
+        asset_backup_root = adaptation_root / ".asset-backups"
         skill_service = SkillService(self._workspace.workspace_dir)
         driver_config = DriverConfigService(self._workspace)
         transaction = (
@@ -275,10 +235,6 @@ class ProviderImportService(ImportPlanningMixin):
             if plan_id
             else None
         )
-
-        async def watch(target: Path) -> None:
-            if transaction is not None:
-                await transaction.watch(target)
 
         async def restore_mcp(
             card: Any,
@@ -292,72 +248,9 @@ class ProviderImportService(ImportPlanningMixin):
                 await driver_config.credential_store.put(credential)
             await driver_config.save_card(card, reload_driver=card.enabled)
 
-        async def restore_plugin(plugin_id: str, backup: Path) -> None:
-            # pylint: disable-next=C0415
-            from ..app.routers.plugins import (
-                install_plugin_source,
-                uninstall_plugin_source,
-            )
-
-            loader = plugin_app.state.plugin_loader
-            if loader.get_loaded_plugin(plugin_id) is not None:
-                await uninstall_plugin_source(
-                    plugin_id,
-                    app=plugin_app,
-                    reload_agents=False,
-                )
-            else:
-                await run_sync_io(
-                    shutil.rmtree,
-                    get_plugins_dir() / plugin_id,
-                    True,
-                )
-            await install_plugin_source(
-                str(backup),
-                app=plugin_app,
-                force=True,
-                reload_agents=False,
-            )
-
         try:
             if transaction is not None:
                 await transaction.begin()
-            targets: list[Path] = []
-            workspace_root = Path(self._workspace.workspace_dir)
-            if inventory.sessions:
-                targets += [
-                    workspace_root / "chats.json",
-                    workspace_root / "sessions",
-                ]
-            if inventory.skills:
-                targets += [
-                    workspace_root / "skills",
-                    workspace_root / "skill.json",
-                ]
-            if inventory.mcp_servers:
-                targets += [
-                    driver_config.cards_dir,
-                    getattr(
-                        driver_config.credential_store,
-                        "_path",
-                        workspace_root / "credentials.yaml",
-                    ),
-                ]
-            if inventory.memory_projects:
-                targets.append(
-                    _memory_import_root(
-                        self._workspace,
-                        inventory.provider_id,
-                    ),
-                )
-            if inventory.scheduled_tasks:
-                targets += [
-                    workspace_root / "jobs.json",
-                    workspace_root / "jobs_history",
-                ]
-            for target in targets:
-                await watch(target)
-
             await run_async_to_completion(
                 import_conversations(
                     self._workspace,
@@ -413,16 +306,6 @@ class ProviderImportService(ImportPlanningMixin):
                 None,
             )
             marketplace_registry = ExternalMarketplaceRegistry(registry_path)
-            if inventory.marketplaces:
-                await watch(marketplace_registry.path)
-                registry_file = marketplace_registry.path
-                marketplace_registry_snapshot = _RegistrySnapshot(
-                    path=registry_file,
-                    content=await run_sync_io(
-                        _snapshot_registry_file,
-                        registry_file,
-                    ),
-                )
             marketplace_total = len(inventory.marketplaces)
             for marketplace_index, marketplace in enumerate(
                 inventory.marketplaces,
@@ -435,24 +318,23 @@ class ProviderImportService(ImportPlanningMixin):
                         f"{marketplace_index}/{marketplace_total}",
                     )
 
-                def record_marketplace(result: Any) -> None:
-                    nonlocal marketplace_registry_touched
-                    marketplace_registry_touched |= bool(result[0])
-
-                (
-                    changed,
-                    credentials_removed,
-                ) = await _commit_mutation(
-                    marketplace_registry.register(
-                        provider=inventory.provider_id,
-                        source_id=marketplace.source_id,
-                        name=marketplace.name,
-                        source=marketplace.source,
-                        source_type=marketplace.source_type,
-                        ref_name=marketplace.ref_name,
-                    ),
-                    record_marketplace,
-                )
+                try:
+                    changed, credentials_removed = await _commit_mutation(
+                        marketplace_registry.register(
+                            provider=inventory.provider_id,
+                            source_id=marketplace.source_id,
+                            name=marketplace.name,
+                            source=marketplace.source,
+                            source_type=marketplace.source_type,
+                            ref_name=marketplace.ref_name,
+                        ),
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    skipped_marketplaces.append(marketplace.name)
+                    warnings.append(
+                        f"Marketplace {marketplace.name!r} failed: {exc}",
+                    )
+                    continue
                 if credentials_removed:
                     warnings.append(
                         f"Marketplace {marketplace.name!r} contained URL "
@@ -558,7 +440,6 @@ class ProviderImportService(ImportPlanningMixin):
                     )
                     continue
                 staged_plugin: Path | None = None
-                plugin_backup: tuple[str, Path] | None = None
                 try:
                     # pylint: disable-next=C0415
                     from ..app.routers.plugins import (
@@ -584,13 +465,6 @@ class ProviderImportService(ImportPlanningMixin):
                         install_source = str(staged_plugin)
                     source_path = Path(install_source).resolve()
                     plugin_id = _plugin_id(source_path)
-                    existing_path = get_plugins_dir() / plugin_id
-                    await watch(existing_path)
-                    if replace_existing and existing_path.is_dir():
-                        backup = rollback_root / "plugins" / plugin_id
-                        await run_sync_io(_copy_tree, existing_path, backup)
-                        plugin_backup = (plugin_id, backup)
-                        replaced_plugins.setdefault(*plugin_backup)
                     record = await _commit_mutation(
                         install_plugin_source(
                             install_source,
@@ -618,17 +492,6 @@ class ProviderImportService(ImportPlanningMixin):
                             ),
                         )
                 except Exception as exc:  # pylint: disable=broad-except
-                    if plugin_backup is not None:
-                        try:
-                            await restore_plugin(*plugin_backup)
-                            replaced_plugins.pop(plugin_backup[0], None)
-                        except (
-                            Exception
-                        ) as restore_exc:  # pylint: disable=broad-except
-                            raise RuntimeError(
-                                "plugin replacement failed; "
-                                "restoration failed",
-                            ) from restore_exc
                     skipped_plugins.append(plugin.source_id)
                     warnings.append(
                         f"Plugin {plugin.source_id!r} failed native "
@@ -666,9 +529,8 @@ class ProviderImportService(ImportPlanningMixin):
                 try:
 
                     def record_memory(result: Any) -> None:
-                        target, previous, changed = result
+                        _target, changed = result
                         if changed or replace_existing:
-                            memory_changes.append((target, previous))
                             imported_memory_projects.append(project.source_id)
                         else:
                             completed_memory_projects.append(project.source_id)
@@ -746,13 +608,13 @@ class ProviderImportService(ImportPlanningMixin):
                             raise RuntimeError(
                                 "conflicting Skill files are missing",
                             )
-                        backup = rollback_root / "skills" / skill.name
+                        backup = asset_backup_root / "skills" / skill.name
                         await run_sync_io(_copy_tree, skill_dir, backup)
                         manifest = get_workspace_skill_manifest_path(
                             self._workspace.workspace_dir,
                         )
                         manifest_backup = (
-                            rollback_root / "skill.json"
+                            asset_backup_root / "skill.json"
                             if manifest.is_file()
                             else None
                         )
@@ -763,7 +625,6 @@ class ProviderImportService(ImportPlanningMixin):
                                 manifest_backup,
                             )
                         skill_backup = (backup, manifest_backup)
-                        replaced_skills.setdefault(skill.name, skill_backup)
                         skill_service.disable_skill(skill.name)
                         await run_sync_io(
                             skill_service.delete_skill,
@@ -790,7 +651,6 @@ class ProviderImportService(ImportPlanningMixin):
                                 *skill_backup,
                             )
                             skill_backup = None
-                            replaced_skills.pop(skill.name, None)
                     if not names:
                         if result.get("conflicts") and not replace_existing:
                             completed_skills.append(skill.name)
@@ -809,7 +669,6 @@ class ProviderImportService(ImportPlanningMixin):
                                 skill.name,
                                 *skill_backup,
                             )
-                            replaced_skills.pop(skill.name, None)
                         except (
                             Exception
                         ) as restore_exc:  # pylint: disable=broad-except
@@ -973,12 +832,6 @@ class ProviderImportService(ImportPlanningMixin):
                             reload_driver=False,
                         )
                         card_written = True
-                        if replacement is None:
-                            created_mcp.append((card.name, credential_ref))
-                        else:
-                            replaced_mcp.append(
-                                (*replacement, credential_ref),
-                            )
 
                     await run_async_to_completion(save_mcp())
                     existing_driver_names.add(card.name)
@@ -1142,9 +995,6 @@ class ProviderImportService(ImportPlanningMixin):
                                     await cron_manager.create_or_replace_job(
                                         normalized_existing,
                                     )
-                                    replaced_scheduled_tasks.append(
-                                        existing_task,
-                                    )
                                     existing_task_jobs[
                                         key
                                     ] = normalized_existing
@@ -1184,20 +1034,13 @@ class ProviderImportService(ImportPlanningMixin):
                             )
                             target_user_id = target_session_id
                             chat = self._workspace.chat_manager
-                            chat_id = await chat.get_chat_id_by_session(
-                                target_session_id,
-                                "console",
-                                target_user_id,
-                            )
-                            fallback_chat = await chat.get_or_create_chat(
+                            await chat.get_or_create_chat(
                                 session_id=target_session_id,
                                 user_id=target_user_id,
                                 channel="console",
                                 name=f"{task.name}（迁移定时任务）",
                                 source="cron",
                             )
-                            if chat_id is None:
-                                created_chats.append(fallback_chat.id)
                             warnings.append(
                                 f"Codex heartbeat {task.name!r} 的目标会话不可"
                                 "迁移；已新建独立 QwenPaw 会话，不保留原历史上下文。",
@@ -1221,14 +1064,9 @@ class ProviderImportService(ImportPlanningMixin):
                         if existing_id:
                             job = job.model_copy(update={"id": existing_id})
                     assert job.id is not None
-                    job_id = job.id
 
                     async def save_task() -> None:
                         await cron_manager.create_or_replace_job(job)
-                        if repairing_invalid_task:
-                            replaced_scheduled_tasks.append(existing_task)
-                        else:
-                            created_scheduled_tasks.append(job_id)
                         imported_scheduled_tasks.append(task.source_id)
                         existing_task_jobs[key] = job
 
@@ -1314,215 +1152,13 @@ class ProviderImportService(ImportPlanningMixin):
                 new_file_mode=0o600,
             )
             await _report(progress, "迁移事务已安全提交。")
-            await run_sync_io(shutil.rmtree, rollback_root, True)
+            await run_sync_io(shutil.rmtree, asset_backup_root, True)
+            if transaction is not None:
+                await transaction.discard()
             return receipt
-        except BaseException as original:
-            rollback_failures: list[str] = []
-
-            def record_rollback_failure(label: str, exc: Exception) -> None:
-                logger.exception("Failed to roll back %s", label)
-                rollback_failures.append(
-                    f"{label}: {type(exc).__name__}: {exc}",
-                )
-
-            if receipt_path is not None:
-                try:
-                    await unlink_async(receipt_path, missing_ok=True)
-                except Exception as exc:  # pylint: disable=broad-except
-                    record_rollback_failure(f"receipt {receipt_path}", exc)
-            if created_chats:
-                try:
-                    await self._workspace.chat_manager.delete_chats(
-                        created_chats,
-                    )
-                except Exception as exc:  # pylint: disable=broad-except
-                    record_rollback_failure(
-                        "chats " + ",".join(created_chats),
-                        exc,
-                    )
-            for session_id, user_id, channel in created_states:
-                try:
-                    await _remove_session_state(
-                        self._workspace,
-                        session_id=session_id,
-                        user_id=user_id,
-                        channel=channel,
-                    )
-                except Exception as exc:  # pylint: disable=broad-except
-                    record_rollback_failure(
-                        f"session state {session_id}",
-                        exc,
-                    )
-            for chat_id, previous in reversed(patched_project_dirs):
-                try:
-                    await self._workspace.chat_manager.set_project_dir(
-                        chat_id,
-                        previous,
-                    )
-                except Exception as exc:  # pylint: disable=broad-except
-                    record_rollback_failure(
-                        f"project directory {chat_id}",
-                        exc,
-                    )
-            for chat_id in reversed(archived_chats):
-                try:
-                    await self._workspace.chat_manager.unarchive_chat(chat_id)
-                except Exception as exc:  # pylint: disable=broad-except
-                    record_rollback_failure(f"archived chat {chat_id}", exc)
-            for card_name, credential_ref in reversed(created_mcp):
-                try:
-                    await driver_config.card_store.delete(card_name)
-                except Exception as exc:  # pylint: disable=broad-except
-                    record_rollback_failure(
-                        f"MCP card {card_name}",
-                        exc,
-                    )
-                if credential_ref:
-                    try:
-                        await driver_config.credential_store.delete(
-                            credential_ref,
-                        )
-                    except Exception as exc:  # pylint: disable=broad-except
-                        record_rollback_failure(
-                            f"MCP credential {credential_ref}",
-                            exc,
-                        )
-            for card, credentials, replacement_ref in reversed(replaced_mcp):
-                try:
-                    await restore_mcp(card, credentials, replacement_ref)
-                except Exception as exc:  # pylint: disable=broad-except
-                    record_rollback_failure(f"replaced MCP {card.name}", exc)
-            cron_manager = getattr(self._workspace, "cron_manager", None)
-            if cron_manager is not None:
-                for job_id in reversed(created_scheduled_tasks):
-                    try:
-                        await cron_manager.delete_job(job_id)
-                    except Exception as exc:  # pylint: disable=broad-except
-                        record_rollback_failure(
-                            f"scheduled task {job_id}",
-                            exc,
-                        )
-                for previous_job in reversed(replaced_scheduled_tasks):
-                    try:
-                        restore = getattr(
-                            cron_manager,
-                            "restore_imported_job_snapshot",
-                            None,
-                        )
-                        if callable(restore):
-                            await restore(previous_job)
-                        else:
-                            await cron_manager.create_or_replace_job(
-                                previous_job,
-                            )
-                    except Exception as exc:  # pylint: disable=broad-except
-                        record_rollback_failure(
-                            "replaced scheduled task "
-                            + getattr(previous_job, "id", ""),
-                            exc,
-                        )
-            for skill_name, snapshot in reversed(
-                tuple(replaced_skills.items()),
-            ):
-                try:
-                    await run_sync_io(
-                        _restore_skill,
-                        self._workspace.workspace_dir,
-                        skill_name,
-                        *snapshot,
-                    )
-                except Exception as exc:  # pylint: disable=broad-except
-                    record_rollback_failure(
-                        f"replaced Skill {skill_name}",
-                        exc,
-                    )
-            for skill_name in reversed(imported_skills):
-                if skill_name in replaced_skills:
-                    continue
-                try:
-                    skill_service.disable_skill(skill_name)
-                except Exception as exc:  # pylint: disable=broad-except
-                    record_rollback_failure(f"Skill disable {skill_name}", exc)
-                try:
-                    await run_sync_io(
-                        skill_service.delete_skill,
-                        skill_name,
-                    )
-                except Exception as exc:  # pylint: disable=broad-except
-                    record_rollback_failure(f"Skill {skill_name}", exc)
-            if plugin_app is not None:
-                for plugin_id, backup in reversed(
-                    tuple(replaced_plugins.items()),
-                ):
-                    try:
-                        await restore_plugin(plugin_id, backup)
-                    except Exception as exc:  # pylint: disable=broad-except
-                        record_rollback_failure(f"plugin {plugin_id}", exc)
-                for plugin_id in reversed(installed_plugins):
-                    if plugin_id in replaced_plugins:
-                        continue
-                    try:
-                        # pylint: disable-next=C0415
-                        from ..app.routers.plugins import (
-                            uninstall_plugin_source,
-                        )
-
-                        await uninstall_plugin_source(
-                            plugin_id,
-                            app=plugin_app,
-                            reload_agents=False,
-                        )
-                    except Exception as exc:  # pylint: disable=broad-except
-                        record_rollback_failure(f"plugin {plugin_id}", exc)
-            for target, memory_previous in reversed(memory_changes):
-                try:
-                    await run_sync_io(
-                        _restore_memory_project,
-                        target,
-                        memory_previous,
-                    )
-                except Exception as exc:  # pylint: disable=broad-except
-                    record_rollback_failure(f"Memory {target}", exc)
-            if (
-                marketplace_registry_touched
-                and marketplace_registry_snapshot is not None
-            ):
-                registry_file = marketplace_registry_snapshot.path
-                previous_registry = marketplace_registry_snapshot.content
-                try:
-                    async with get_path_lock(registry_file):
-                        await run_sync_io(
-                            _restore_registry_file,
-                            registry_file,
-                            previous_registry,
-                        )
-                except Exception as exc:  # pylint: disable=broad-except
-                    record_rollback_failure(
-                        f"Marketplace registry {registry_file}",
-                        exc,
-                    )
-            if adaptation_root.is_dir() and not adaptation_root.is_symlink():
-                try:
-                    await run_sync_io(shutil.rmtree, adaptation_root)
-                except Exception as exc:  # pylint: disable=broad-except
-                    record_rollback_failure(
-                        f"compatibility staging {adaptation_root}",
-                        exc,
-                    )
-            if not rollback_failures and transaction is not None:
-                try:
-                    await transaction.discard()
-                except Exception as exc:  # pylint: disable=broad-except
-                    record_rollback_failure("transaction journal", exc)
-            if rollback_failures and isinstance(
-                original,
-                (Exception, asyncio.CancelledError),
-            ):
-                raise ImportRollbackError(
-                    rollback_failures,
-                    cancelled=isinstance(original, asyncio.CancelledError),
-                ) from original
+        except BaseException:
+            logger.exception("Import stopped after committed assets were kept")
             raise
 
 
-__all__ = ["ImportRollbackError", "ProviderImportService"]
+__all__ = ["ProviderImportService"]
