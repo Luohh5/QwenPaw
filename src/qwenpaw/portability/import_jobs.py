@@ -15,25 +15,17 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 from ..utils.io_utils import read_json_async, write_json_atomic_async
-from .compatibility import load_manifest
 from .compatibility_safety import redact_sensitive_text
-from .import_status import project_asset_results
 from .importer import ImportRollbackError, ProviderImportService
 from .models import (
     ImportAssetResult,
     ImportAssetState,
-    ImportReceipt,
     ImportSelection,
     MigrationPlan,
 )
 
 _SUPPORTED_SOURCES = {"codex", "qoder"}
 _TERMINAL = {"completed", "completed_with_issues", "failed", "interrupted"}
-_SESSIONS = re.compile(
-    r"^正在写入会话[：:]\s*(\d+)\s*/\s*(\d+)[（(]聊天记录阶段[）)]$",
-)
-_ASSET_NAME = re.compile(r"[「『](.+?)[」』]")
-_READY_TO_IMPORT = "兼容性优化完成，已进入待迁移区。"
 _TYPE_FIELDS = {
     "memory": "memory",
     "scheduled_task": "cron",
@@ -59,8 +51,8 @@ class ImportProviderSnapshot(BaseModel):
     error: str = ""
 
 
-class ImportJobSnapshot(BaseModel):
-    """UI-safe durable state; source content and secrets are excluded."""
+class ImportRun(BaseModel):
+    """Single durable state source for one import run."""
 
     job_id: str
     agent_id: str
@@ -71,6 +63,10 @@ class ImportJobSnapshot(BaseModel):
     seq: int = 0
     providers: list[ImportProviderSnapshot] = Field(default_factory=list)
     logs: list[str] = Field(default_factory=list)
+
+
+# Keep the wire/API name stable for existing clients.
+ImportJobSnapshot = ImportRun
 
 
 @dataclass
@@ -225,7 +221,6 @@ class PortabilityImportJobManager:
                 for item in self._selected_assets(
                     previous.plans[provider.source],
                     selection,
-                    force_retry=True,
                 )
             }
             provider.assets = [
@@ -490,33 +485,23 @@ class PortabilityImportJobManager:
                     )
                     live.plans[provider.source] = plan
                     provider.plan_id = plan.plan_id
-                manifest = self._manifest(live.workspace, receipt)
-                keys = (
+                retry_keys = (
                     self._tool_ids(retry_selection)
                     if retry_selection is not None
-                    else {
-                        f"{item.asset_type}:{item.source_id}"
-                        for item in provider.assets
-                    }
+                    else None
                 )
-                results = project_asset_results(
-                    plan,
-                    keys,
-                    manifest=manifest,
-                    receipt=receipt,
-                    force_retry=retry_from is not None,
-                )
-                if retry_from is None:
-                    provider.assets = results
-                else:
-                    updates = {
-                        (item.asset_type, item.source_id): item
-                        for item in results
-                    }
-                    provider.assets = [
-                        updates.get((item.asset_type, item.source_id), item)
-                        for item in provider.assets
-                    ]
+                for asset in provider.assets:
+                    key = f"{asset.asset_type}:{asset.source_id}"
+                    if (
+                        retry_keys is None or key in retry_keys
+                    ) and asset.state in {
+                        ImportAssetState.PENDING,
+                        ImportAssetState.REPAIRING,
+                        ImportAssetState.READY,
+                    }:
+                        asset.state = ImportAssetState.FAILED
+                        asset.reason_code = "missing_result"
+                        asset.message = "未收到资产导入结果，请重试。"
                 if retry_from is None:
                     provider.sessions_processed = provider.sessions_total
                     provider.sessions_imported = len(receipt.imported_sessions)
@@ -538,10 +523,7 @@ class PortabilityImportJobManager:
                     else None
                 )
                 for asset in provider.assets:
-                    if (
-                        retry_keys is None
-                        and asset.state is not ImportAssetState.NOT_NEEDED
-                    ) or (
+                    if (retry_keys is None) or (
                         retry_keys is not None
                         and f"{asset.asset_type}:{asset.source_id}"
                         in retry_keys
@@ -655,16 +637,35 @@ class PortabilityImportJobManager:
     def _selected_assets(
         plan: MigrationPlan,
         selection: ImportSelection,
-        *,
-        force_retry: bool = False,
     ) -> list[ImportAssetResult]:
-        keys = {
+        selected = {
             f"{'cron' if action_type == 'scheduled_task' else action_type}:"
             f"{source_id}"
             for action_type, selection_field in _TYPE_FIELDS.items()
             for source_id in getattr(selection, selection_field)
         }
-        return project_asset_results(plan, keys, force_retry=force_retry)
+        return [
+            ImportAssetResult(
+                asset_type=(
+                    "cron"
+                    if action.asset_type == "scheduled_task"
+                    else action.asset_type
+                ),
+                source_id=action.source_id,
+                name=action.name,
+                requires_sessions=action.requires_sessions,
+            )
+            for action in plan.actions
+            if (
+                (
+                    "cron"
+                    if action.asset_type == "scheduled_task"
+                    else action.asset_type
+                )
+                + f":{action.source_id}"
+                in selected
+            )
+        ]
 
     @staticmethod
     def _tool_ids(selection: ImportSelection) -> set[str]:
@@ -713,52 +714,18 @@ class PortabilityImportJobManager:
                     asset.asset_type == asset_type
                     and asset.source_id == source_id
                 ):
-                    if asset.state is not ImportAssetState.NOT_NEEDED:
-                        asset.state = ImportAssetState(state)
-                        asset.enabled = (
-                            None if enabled == "-" else enabled == "1"
-                        )
+                    asset.state = ImportAssetState(state)
+                    asset.enabled = None if enabled == "-" else enabled == "1"
                     return
-        match = _SESSIONS.search(message)
-        if match:
-            provider.sessions_processed = int(match.group(1))
-            provider.sessions_total = max(
-                provider.sessions_total,
-                int(match.group(2)),
-            )
-        name = _ASSET_NAME.search(message)
-        if name:
-            for asset in provider.assets:
-                if asset.name == name.group(1) and asset.state in {
-                    ImportAssetState.PENDING,
-                    ImportAssetState.REPAIRING,
-                }:
-                    asset.state = ImportAssetState.REPAIRING
-                    asset.reason_code = (
-                        "ready_to_import"
-                        if message.endswith(_READY_TO_IMPORT)
-                        else ""
-                    )
 
     @staticmethod
     def _log(live: _LiveJob, message: str) -> None:
         safe = redact_sensitive_text(message, limit=500)
         live.snapshot.logs = (live.snapshot.logs + [safe])[-50:]
 
-    @staticmethod
-    def _manifest(workspace: Any, receipt: ImportReceipt):
-        if not receipt.adaptation_manifest:
-            return None
-        path = Path(receipt.adaptation_manifest)
-        if not path.is_absolute():
-            path = Path(workspace.workspace_dir) / path
-        try:
-            return load_manifest(path)
-        except (OSError, ValueError):
-            return None
-
 
 __all__ = [
+    "ImportRun",
     "ImportJobSnapshot",
     "ImportProviderSnapshot",
     "PortabilityImportJobManager",

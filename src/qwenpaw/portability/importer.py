@@ -135,11 +135,17 @@ async def _asset_items(
     zones: dict[str, str] | None = None,
     zone_prefix: str = "",
     enabled: bool | None = True,
+    *,
+    completed: list[str] | None = None,
 ) -> AsyncIterator[tuple[int, Any]]:
     async def report(item: Any) -> None:
         zone = (zones or {}).get(f"{zone_prefix}:{item.source_id}", "")
         present = (
-            item.source_id in imported or getattr(item, "name", "") in imported
+            item.source_id in imported
+            or getattr(item, "name", "") in imported
+            or str(item.source_id).partition("@")[0] in imported
+            or getattr(item, "name", "") in (completed or ())
+            or item.source_id in (completed or ())
         )
         state = "succeeded" if present else "failed"
         active = None if enabled is None else enabled and zone == "migrate"
@@ -215,10 +221,13 @@ class ProviderImportService(ImportPlanningMixin):
         skipped_sessions = conversations.skipped
         archived_internal_sessions = conversations.archived_internal
         imported_skills: list[str] = []
+        completed_skills: list[str] = []
         skipped_skills: list[str] = []
         imported_mcp_servers: list[str] = []
+        completed_mcp_servers: list[str] = []
         skipped_mcp_servers: list[str] = []
         imported_memory_projects: list[str] = []
+        completed_memory_projects: list[str] = []
         skipped_memory_projects: list[str] = []
         restored_marketplaces: list[str] = []
         skipped_marketplaces: list[str] = []
@@ -227,6 +236,7 @@ class ProviderImportService(ImportPlanningMixin):
         installed_plugin_paths: dict[str, Path] = {}
         skipped_plugins: list[str] = []
         imported_scheduled_tasks: list[str] = []
+        completed_scheduled_tasks: list[str] = []
         skipped_scheduled_tasks: list[str] = []
         adaptation_status = "not_run"
         adaptation_manifest = ""
@@ -645,6 +655,7 @@ class ProviderImportService(ImportPlanningMixin):
                 "memory",
                 imported_memory_projects,
                 enabled=None,
+                completed=completed_memory_projects,
             ):
                 if _progress_milestone(memory_index, memory_total):
                     await _report(
@@ -660,6 +671,7 @@ class ProviderImportService(ImportPlanningMixin):
                             memory_changes.append((target, previous))
                             imported_memory_projects.append(project.source_id)
                         else:
+                            completed_memory_projects.append(project.source_id)
                             skipped_memory_projects.append(project.source_id)
 
                     await _commit_mutation(
@@ -686,6 +698,7 @@ class ProviderImportService(ImportPlanningMixin):
                 imported_skills,
                 adaptation_asset_zones,
                 "skills",
+                completed=completed_skills,
             ):
                 if _progress_milestone(skill_index, skill_total):
                     await _report(
@@ -779,6 +792,8 @@ class ProviderImportService(ImportPlanningMixin):
                             skill_backup = None
                             replaced_skills.pop(skill.name, None)
                     if not names:
+                        if result.get("conflicts") and not replace_existing:
+                            completed_skills.append(skill.name)
                         skipped_skills.append(skill.name)
                         if result.get("conflicts"):
                             warnings.append(
@@ -818,6 +833,7 @@ class ProviderImportService(ImportPlanningMixin):
                 imported_mcp_servers,
                 adaptation_asset_zones,
                 "mcp",
+                completed=completed_mcp_servers,
             ):
                 if _progress_milestone(mcp_index, mcp_total):
                     await _report(
@@ -840,6 +856,7 @@ class ProviderImportService(ImportPlanningMixin):
                     server.name in existing_driver_names
                     and not replace_existing
                 ):
+                    completed_mcp_servers.append(server.name)
                     skipped_mcp_servers.append(server.name)
                     warnings.append(
                         f"MCP {server.name!r} conflicts with an existing "
@@ -1031,6 +1048,7 @@ class ProviderImportService(ImportPlanningMixin):
                 adaptation_asset_zones,
                 "scheduled_tasks",
                 False,
+                completed=completed_scheduled_tasks,
             ):
                 if _progress_milestone(task_index, task_total):
                     await _report(
@@ -1136,6 +1154,7 @@ class ProviderImportService(ImportPlanningMixin):
                                     f"定时任务 {task.name!r} 的旧版迁移审核"
                                     "门禁已补齐，任务保持禁用。",
                                 )
+                        completed_scheduled_tasks.append(task.source_id)
                         skipped_scheduled_tasks.append(task.source_id)
                         continue
                 if cron_manager is None:

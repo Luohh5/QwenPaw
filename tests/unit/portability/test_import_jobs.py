@@ -113,6 +113,9 @@ class _FakeServices:
                 if progress:
                     await progress("正在写入会话：1/2（聊天记录阶段）")
                     await progress(f"正在修复 Skill「{source.title()} Skill」")
+                    await progress(
+                        f"\x1easset\tskill\tsucceeded\t0\t{source}-skill",
+                    )
                     await progress("api_key=sk-test-secret-1234567890")
                 if source in owner.fail_apply:
                     raise RuntimeError(f"{source} failed")
@@ -139,6 +142,9 @@ class _FakeServices:
                 source = "codex" if plan_id.endswith("c" * 32) else "qoder"
                 if progress:
                     await progress(f"正在修复 Skill「{source.title()} Skill」")
+                    await progress(
+                        f"\x1easset\tskill\tsucceeded\t0\t{source}-skill",
+                    )
                 now = datetime.now(timezone.utc)
                 return (
                     await self.plan_from(source),
@@ -196,12 +202,11 @@ def test_only_materialization_milestone_updates_session_progress() -> None:
     ) == (1, 2, 1, 0)
     assert provider.assets[0].state is ImportAssetState.SUCCEEDED
     assert provider.assets[0].enabled is False
-    provider.assets[0].state = ImportAssetState.REPAIRING
     PortabilityImportJobManager._project_progress(
         provider,
-        "Skill「Qoder Skill」兼容性优化完成，已进入待迁移区。",
+        "\x1easset\tskill\tready\t-\tqoder-skill",
     )
-    assert provider.assets[0].reason_code == "ready_to_import"
+    assert provider.assets[0].state is ImportAssetState.READY
 
 
 @pytest.mark.asyncio

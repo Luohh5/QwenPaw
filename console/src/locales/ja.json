@@ -95,13 +95,11 @@
     "states": {
       "pending": "待機中",
       "repairing": "修復中",
-      "ready_to_import": "修復済み、インポート待ち",
-      "not_needed": "不要",
+      "ready": "修復済み、インポート待ち",
       "failed": "失敗",
       "succeeded": "成功"
     },
     "hints": {
-      "notNeeded": "この項目は既に QwenPaw に存在するか、この移行計画では再インポートする必要がありません。",
       "failed": "関連する設定を手動で修正してください。",
       "disabled": "正常に移行しましたが、確認して有効化するまで無効のままです。"
     },

@@ -38,7 +38,7 @@ const FIELDS = {
 const COLORS: Record<ImportAssetState, string> = {
   pending: "default",
   repairing: "processing",
-  not_needed: "default",
+  ready: "success",
   failed: "error",
   succeeded: "success",
 };
@@ -65,18 +65,15 @@ function retrySelection(items: RetryAsset[]) {
 
 function AssetStatus({ asset }: { asset: ImportAssetResult }) {
   const { t } = useTranslation();
-  const readyToImport = asset.reason_code === "ready_to_import";
-  const state = readyToImport ? "ready_to_import" : asset.state;
+  const state = asset.state;
   const fallback =
-    asset.state === "not_needed"
-      ? t("portabilityImport.hints.notNeeded")
-      : asset.state === "failed"
+    asset.state === "failed"
       ? t("portabilityImport.hints.failed")
       : asset.state === "succeeded" && asset.enabled === false
       ? t("portabilityImport.hints.disabled")
       : "";
   const tag = (
-    <Tag color={readyToImport ? "success" : COLORS[asset.state]}>
+    <Tag color={COLORS[asset.state]}>
       {t(`portabilityImport.states.${state}`)}
     </Tag>
   );
@@ -130,9 +127,9 @@ function completion(providers: ImportProviderSnapshot[]) {
   const doneAssets = assets.reduce(
     (total, asset) =>
       total +
-      (["not_needed", "failed", "succeeded"].includes(asset.state)
+      (["failed", "succeeded"].includes(asset.state)
         ? 1
-        : asset.reason_code === "ready_to_import"
+        : asset.state === "ready"
         ? 0.5
         : 0),
     0,

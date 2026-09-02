@@ -97,13 +97,11 @@
     "states": {
       "pending": "Menunggu",
       "repairing": "Memperbaiki",
-      "ready_to_import": "Berhasil diperbaiki, menunggu impor",
-      "not_needed": "Tidak diperlukan",
+      "ready": "Berhasil diperbaiki, menunggu impor",
       "failed": "Gagal",
       "succeeded": "Berhasil"
     },
     "hints": {
-      "notNeeded": "Item ini sudah ada di QwenPaw atau tidak perlu diimpor oleh rencana migrasi ini.",
       "failed": "Sesuaikan konfigurasi terkait secara manual.",
       "disabled": "Berhasil diimpor tetapi tetap nonaktif hingga Anda meninjau dan mengaktifkannya."
     },

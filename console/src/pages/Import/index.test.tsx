@@ -235,13 +235,7 @@ describe("ImportPage", () => {
   });
 
   it("renders progress and the five public result states", () => {
-    const states = [
-      "pending",
-      "repairing",
-      "not_needed",
-      "failed",
-      "succeeded",
-    ];
+    const states = ["pending", "repairing", "ready", "failed", "succeeded"];
     vi.mocked(useImportJob).mockReturnValue(
       state({
         job: {

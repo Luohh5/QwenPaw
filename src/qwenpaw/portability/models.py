@@ -144,11 +144,11 @@ class ProviderInventory(BaseModel):
 
 
 class ImportAssetState(StrEnum):
-    """The five states exposed by the Console import workflow."""
+    """States exposed by the Console import workflow."""
 
     PENDING = "pending"
     REPAIRING = "repairing"
-    NOT_NEEDED = "not_needed"
+    READY = "ready"
     FAILED = "failed"
     SUCCEEDED = "succeeded"
 

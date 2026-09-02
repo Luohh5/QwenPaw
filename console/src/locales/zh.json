@@ -142,13 +142,11 @@
     "states": {
       "pending": "等待中",
       "repairing": "兼容性修复中",
-      "ready_to_import": "修复成功待迁移",
-      "not_needed": "无需导入",
+      "ready": "修复成功待迁移",
       "failed": "导入失败",
       "succeeded": "导入成功"
     },
     "hints": {
-      "notNeeded": "该工具已存在于 QwenPaw 中，或本次迁移计划无需再次导入。",
       "failed": "请手动修改相关配置。",
       "disabled": "已成功导入，但为保证安全暂未启用；请审核后手动启用。"
     },

@@ -97,13 +97,11 @@
     "states": {
       "pending": "Aguardando",
       "repairing": "Corrigindo",
-      "ready_to_import": "Corrigido, aguardando importação",
-      "not_needed": "Desnecessário",
+      "ready": "Corrigido, aguardando importação",
       "failed": "Falhou",
       "succeeded": "Concluído"
     },
     "hints": {
-      "notNeeded": "Este item já existe no QwenPaw ou não precisa ser importado por este plano de migração.",
       "failed": "Ajuste manualmente a configuração relacionada.",
       "disabled": "Importado com sucesso, mas mantido desativado até sua revisão e ativação."
     },

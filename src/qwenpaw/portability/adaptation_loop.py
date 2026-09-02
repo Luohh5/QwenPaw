@@ -46,6 +46,7 @@ from .models import ProviderInventory
 from .providers.base import (
     ProgressReporter,
     report_progress as _report,
+    report_result,
 )
 
 _MAX_REACT_ITERATIONS = 4_000
@@ -62,6 +63,12 @@ _REPAIR_TOOLS = (
     "migration_compat_update",
     "migration_compat_finalize",
 )
+_PUBLIC_TYPES = {
+    AssetType.SKILL: "skill",
+    AssetType.MCP: "mcp",
+    AssetType.PLUGIN: "plugin",
+    AssetType.SCHEDULED_TASK: "cron",
+}
 
 
 @dataclass(frozen=True)
@@ -551,6 +558,14 @@ class ActiveAdaptationContext:
             await self._publish(
                 f"{self._label(manifest.get_asset(key))}兼容性优化完成，已进入待迁移区。",
             )
+            await report_result(
+                self.progress,
+                "asset",
+                _PUBLIC_TYPES[asset.asset_type],
+                "ready",
+                "-",
+                asset.source_id,
+            )
             self._binding().completed.set()
             return {
                 "ok": True,
@@ -694,6 +709,14 @@ async def _repair_asset(
     )
     label = context._label(asset)  # pylint: disable=protected-access
     try:
+        await report_result(
+            context.progress,
+            "asset",
+            _PUBLIC_TYPES[asset.asset_type],
+            "repairing",
+            "-",
+            asset.source_id,
+        )
         await _run_phase(
             workspace,
             context,

@@ -3,7 +3,7 @@ export type ImportAssetType = "memory" | "cron" | "skill" | "mcp" | "plugin";
 export type ImportAssetState =
   | "pending"
   | "repairing"
-  | "not_needed"
+  | "ready"
   | "failed"
   | "succeeded";
 
