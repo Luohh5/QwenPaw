@@ -229,7 +229,10 @@ export function useImportJob() {
   );
 
   const start = useCallback(
-    async (selections: Partial<Record<ImportSource, ImportSelection>>) => {
+    async (
+      selections: Partial<Record<ImportSource, ImportSelection>>,
+      allowPluginExecution = false,
+    ) => {
       const snapshot = latest.current;
       if (!snapshot || !isCurrent(selectedAgent, snapshot.job_id)) {
         throw new Error("Import job has not been created");
@@ -241,6 +244,7 @@ export function useImportJob() {
           selectedAgent,
           snapshot.job_id,
           selections,
+          allowPluginExecution,
         );
         accept(selectedAgent, snapshot.job_id, {
           seq: started.seq,
@@ -259,7 +263,10 @@ export function useImportJob() {
   );
 
   const retry = useCallback(
-    async (selections: Partial<Record<ImportSource, ImportSelection>>) => {
+    async (
+      selections: Partial<Record<ImportSource, ImportSelection>>,
+      allowPluginExecution = false,
+    ) => {
       const snapshot = latest.current;
       if (!snapshot || !isCurrent(selectedAgent, snapshot.job_id)) {
         throw new Error("Import job has not been created");
@@ -271,6 +278,7 @@ export function useImportJob() {
           selectedAgent,
           snapshot.job_id,
           selections,
+          allowPluginExecution,
         );
         saveActiveJob(selectedAgent, retried.job_id);
         if (isCurrent(selectedAgent, snapshot.job_id)) show(retried);

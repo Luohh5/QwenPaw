@@ -182,6 +182,7 @@ class ImportAssetResult(BaseModel):
     enabled: bool | None = None
     reason_code: str = ""
     message: str = ""
+    requires_sessions: bool = False
 
 
 class MigrationAssetPlan(BaseModel):
@@ -193,6 +194,7 @@ class MigrationAssetPlan(BaseModel):
     action: str
     fidelity: str
     reason_zh: str = ""
+    requires_sessions: bool = False
 
 
 class MigrationPlan(BaseModel):

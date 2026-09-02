@@ -177,6 +177,18 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
     migrate_legacy_skills_to_skill_pool()
     ensure_qa_agent_exists()
 
+    from ..config.utils import get_agent_dirs
+    from ..portability.transaction_journal import recover_import_transactions
+
+    recovered_transactions = await recover_import_transactions(
+        get_agent_dirs(),
+    )
+    if recovered_transactions:
+        logger.warning(
+            "Recovered %d interrupted PawPort import transaction(s)",
+            len(recovered_transactions),
+        )
+
     # Migrate old conversations from sessions/*.json into each scroll agent's
     # history.db, so chats from before scroll existed stay recallable. This is
     # a one-off backfill, not core startup work: if it fails, we log and keep

@@ -18,6 +18,7 @@ from .models import (
 from .planner import build_migration_plan, tool_asset_fingerprints
 from .providers.base import ProgressReporter, report_progress as _report
 from .selection import select_inventory
+from .transaction_journal import ImportTransactionJournal
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,14 @@ class ImportPlanningMixin:
             receipt.warnings.append(
                 "迁移已成功，但计划状态回写失败：" f"{type(exc).__name__}: {exc}",
             )
+        else:
+            try:
+                await ImportTransactionJournal(
+                    Path(self._workspace.workspace_dir),
+                    plan.plan_id,
+                ).discard()
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("Failed to clean completed import journal")
         return receipt
 
     async def inspect(

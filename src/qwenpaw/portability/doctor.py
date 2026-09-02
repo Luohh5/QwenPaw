@@ -374,13 +374,10 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
             for card in await DriverConfigService(workspace).list_cards()
         }
         present = sum(name in cards for name in receipt.imported_mcp_servers)
-        zones = {
-            name: item.zone
-            for name, item in context.assets(AssetType.MCP).items()
-        }
         activation_ok = sum(
             name in cards
-            and cards[name].enabled is (zones.get(name) is AssetZone.MIGRATE)
+            and not cards[name].enabled
+            and cards[name].config.get("requires_review") is True
             for name in receipt.imported_mcp_servers
         )
         status = _status(
@@ -389,7 +386,7 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
         )
         detail = (
             f"计划导入 {len(receipt.imported_mcp_servers)} 个，实际保存 {present} 个；"
-            f"启用状态与兼容分区一致 {activation_ok} 个。"
+            f"保持禁用并等待人工确认 {activation_ok} 个。"
         )
         checks.append(_check("mcp", status, "MCP DriverCard", detail))
 

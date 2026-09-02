@@ -81,9 +81,10 @@
     "continue": "Continuar",
     "scanning": "Verificando conversas e configurações de ferramentas…",
     "chooseContent": "Escolha o que importar",
-    "defaultSelected": "Tudo vem selecionado. Desmarque o que não for necessário.",
+    "defaultSelected": "Conversas e ferramentas são selecionadas por padrão. Plugins exigem sua confirmação explícita.",
     "conversations": "Conversas",
     "toolsSetup": "Ferramentas e configurações",
+    "heartbeatRequiresSessions": "Esta tarefa agendada exige a importação das conversas.",
     "items": "{{count}} itens",
     "start": "Iniciar importação",
     "groups": {
@@ -119,6 +120,10 @@
     "selectAllFailed": "Selecionar todas as ferramentas com falha",
     "retrySelected": "Tentar novamente as selecionadas ({{count}})",
     "retryConfirm": "Tentar novamente {{count}} ferramentas com falha selecionadas? Itens com o mesmo nome serão substituídos.",
+    "pluginWarningTitle": "Aviso de execução de plugin",
+    "pluginWarning": "Estes plugins podem instalar dependências Python, executar código no processo do QwenPaw e registrar ferramentas, Hooks, rotas ou comandos globais. Importe apenas plugins de fontes confiáveis.",
+    "pluginWarningConfirm": "Confio nas fontes destes plugins e permito a instalação de dependências e a execução de código.",
+    "pluginWarningAction": "Confirmar e importar",
     "done": "Concluir"
   },
   "nav": {

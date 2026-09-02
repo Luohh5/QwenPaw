@@ -102,8 +102,22 @@ describe("ImportPage", () => {
               sessions_processed: 0,
               sessions_imported: 0,
               sessions_skipped: 0,
-              selection: { sessions: true, skills: ["skill-1"] },
+              selection: {
+                sessions: true,
+                cron: ["heartbeat-1"],
+                skills: ["skill-1"],
+              },
               assets: [
+                {
+                  asset_type: "cron",
+                  source_id: "heartbeat-1",
+                  name: "Heartbeat",
+                  state: "pending",
+                  enabled: null,
+                  reason_code: "",
+                  message: "",
+                  requires_sessions: true,
+                },
                 {
                   asset_type: "skill",
                   source_id: "skill-1",
@@ -112,6 +126,7 @@ describe("ImportPage", () => {
                   enabled: null,
                   reason_code: "",
                   message: "",
+                  requires_sessions: false,
                 },
               ],
               warnings: [],
@@ -144,10 +159,79 @@ describe("ImportPage", () => {
         name: "portabilityImport.conversations",
       }),
     );
+    fireEvent.click(
+      screen.getByRole("button", { name: "portabilityImport.start" }),
+    );
+    expect(actions.start).toHaveBeenLastCalledWith({
+      codex: expect.objectContaining({ sessions: false, cron: [] }),
+    });
     fireEvent.click(screen.getByRole("checkbox", { name: "Review Skill" }));
     expect(
       screen.getByRole("button", { name: "portabilityImport.start" }),
     ).toBeDisabled();
+  });
+
+  it("requires an explicit confirmation before importing a plugin", () => {
+    vi.mocked(useImportJob).mockReturnValue(
+      state({
+        job: {
+          job_id: "job",
+          agent_id: "agent",
+          state: "awaiting_selection",
+          phase: "select",
+          seq: 2,
+          logs: [],
+          providers: [
+            {
+              source: "codex",
+              state: "ready",
+              plan_id: "plan",
+              sessions_total: 0,
+              sessions_processed: 0,
+              sessions_imported: 0,
+              sessions_skipped: 0,
+              selection: { plugins: [] },
+              assets: [
+                {
+                  asset_type: "plugin",
+                  source_id: "plugin-1",
+                  name: "Plugin One",
+                  state: "pending",
+                  enabled: null,
+                  reason_code: "",
+                  message: "",
+                },
+              ],
+              warnings: [],
+              error: "",
+            },
+          ],
+        },
+      }) as never,
+    );
+    renderPage();
+
+    const plugin = screen.getByRole("checkbox", { name: "Plugin One" });
+    expect(plugin).not.toBeChecked();
+    fireEvent.click(plugin);
+    fireEvent.click(
+      screen.getByRole("button", { name: "portabilityImport.start" }),
+    );
+    expect(actions.start).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "portabilityImport.pluginWarningConfirm",
+      }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "portabilityImport.pluginWarningAction",
+      }),
+    );
+    expect(actions.start).toHaveBeenCalledWith(
+      { codex: { plugins: ["plugin-1"] } },
+      true,
+    );
   });
 
   it("renders progress and the five public result states", () => {
@@ -299,8 +383,11 @@ describe("ImportPage", () => {
       }),
     );
     fireEvent.click(screen.getByRole("button", { name: "common.retry" }));
-    expect(actions.retry).toHaveBeenCalledWith({
-      codex: { sessions: false, skills: ["skill-1"], mcp: ["mcp-1"] },
-    });
+    expect(actions.retry).toHaveBeenCalledWith(
+      {
+        codex: { sessions: false, skills: ["skill-1"], mcp: ["mcp-1"] },
+      },
+      false,
+    );
   });
 });

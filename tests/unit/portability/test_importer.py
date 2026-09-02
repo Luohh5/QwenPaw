@@ -5,6 +5,7 @@ import asyncio
 import json
 import shutil
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +21,9 @@ from qwenpaw.harnesses.events import HarnessHistoryItem, HarnessHistoryKind
 from qwenpaw.portability.importer import (
     ImportRollbackError,
     ProviderImportService,
+)
+from qwenpaw.portability.import_support import (
+    _replace_memory_project as replace_memory_project,
 )
 from qwenpaw.portability.adaptation_loop import AdaptationResult
 from qwenpaw.portability.compatibility import AssetZone, CompatibilityStore
@@ -197,6 +201,7 @@ async def test_provider_imports_scheduled_tasks_disabled_and_idempotent(
     first = await ProviderImportService(workspace).import_from("codex")
     second = await ProviderImportService(workspace).import_from("codex")
 
+    assert not list((tmp_path / ".qwenpaw/imports/transactions").glob("*"))
     assert first.imported_scheduled_tasks == ["automation-1"]
     assert second.imported_scheduled_tasks == []
     assert second.skipped_scheduled_tasks == ["automation-1"]
@@ -274,7 +279,7 @@ async def test_unfinished_mission_materializes_repair_items_disabled(
 
 
 @pytest.mark.asyncio
-async def test_migrate_zone_materializes_and_enables_assets(
+async def test_migrate_zone_materializes_assets(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -359,7 +364,8 @@ async def test_migrate_zone_materializes_and_enables_assets(
     )
     assert skill_manifest["skills"]["portable-skill"]["enabled"] is True
     cards = await DriverConfigService(workspace).list_cards()
-    assert len(cards) == 1 and cards[0].enabled is True
+    assert len(cards) == 1 and cards[0].enabled is False
+    assert cards[0].config["requires_review"] is True
     job = next(iter(workspace.cron_manager.jobs.values()))
     assert job.enabled is False
     assert job.meta["portability"]["requires_review"] is False
@@ -1046,6 +1052,60 @@ async def test_provider_memory_is_scoped_exact_and_idempotent(
     assert scope["cwd"] == "/source/project-a"
     assert scope["trust"] == "source_material_not_instructions"
     assert not (workspace.workspace_dir / "MEMORY.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_memory_write_rolls_back(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "source-memory/MEMORY.md"
+    source.parent.mkdir()
+    source.write_text("cancel me", encoding="utf-8")
+    inventory = ProviderInventory(
+        provider_id="codex",
+        provider_name="Codex",
+        detected=True,
+        memory_projects=[
+            SourceMemoryProject(
+                source_id="project-a",
+                project_key="Project A",
+                files=[
+                    SourceMemoryFile(
+                        source_path=source,
+                        relative_path=Path("MEMORY.md"),
+                    ),
+                ],
+            ),
+        ],
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_replace(*args):
+        started.set()
+        release.wait(timeout=2)
+        return replace_memory_project(*args)
+
+    _bind_inventory(monkeypatch, inventory)
+    _mock_adaptation(monkeypatch, workspace, inventory)
+    monkeypatch.setattr(
+        "qwenpaw.portability.importer._replace_memory_project",
+        blocked_replace,
+    )
+
+    task = asyncio.create_task(
+        ProviderImportService(workspace).import_from("codex"),
+    )
+    assert await asyncio.to_thread(started.wait, 2)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    root = workspace.workspace_dir / "memory/imports/codex"
+    assert not root.exists() or not any(root.iterdir())
 
 
 @pytest.mark.asyncio

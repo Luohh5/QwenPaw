@@ -34,12 +34,16 @@ export const portabilityImportApi = {
     agentId: string,
     jobId: string,
     selections: Partial<Record<ImportSource, ImportSelection>>,
+    allowPluginExecution = false,
   ) =>
     request<ImportJobSnapshot>(
       `${base(agentId)}/jobs/${encodeURIComponent(jobId)}/start`,
       {
         method: "POST",
-        body: JSON.stringify({ selections }),
+        body: JSON.stringify({
+          selections,
+          ...(allowPluginExecution && { allow_plugin_execution: true }),
+        }),
       },
     ),
 
@@ -47,12 +51,16 @@ export const portabilityImportApi = {
     agentId: string,
     jobId: string,
     selections: Partial<Record<ImportSource, ImportSelection>>,
+    allowPluginExecution = false,
   ) =>
     request<ImportJobSnapshot>(
       `${base(agentId)}/jobs/${encodeURIComponent(jobId)}/retry`,
       {
         method: "POST",
-        body: JSON.stringify({ selections }),
+        body: JSON.stringify({
+          selections,
+          ...(allowPluginExecution && { allow_plugin_execution: true }),
+        }),
       },
     ),
 

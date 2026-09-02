@@ -33,6 +33,11 @@ class StartImportJobRequest(BaseModel):
     """Per-source assets selected on the inventory step."""
 
     selections: dict[str, ImportSelection]
+    allow_plugin_execution: bool = False
+
+
+def _plugins_selected(selections: dict[str, ImportSelection]) -> bool:
+    return any(selection.plugins for selection in selections.values())
 
 
 def _local_only(request: Request) -> None:
@@ -128,6 +133,11 @@ async def start_import_job(
     _local_only(request)
     workspace = await get_agent_for_request(request)
     try:
+        if (
+            _plugins_selected(body.selections)
+            and not body.allow_plugin_execution
+        ):
+            raise ValueError("confirm plugin code execution before importing")
         return await PORTABILITY_IMPORT_JOBS.start(
             workspace,
             job_id,
@@ -147,6 +157,11 @@ async def retry_import_job(
     _local_only(request)
     workspace = await get_agent_for_request(request)
     try:
+        if (
+            _plugins_selected(body.selections)
+            and not body.allow_plugin_execution
+        ):
+            raise ValueError("confirm plugin code execution before importing")
         return await PORTABILITY_IMPORT_JOBS.retry(
             workspace,
             job_id,

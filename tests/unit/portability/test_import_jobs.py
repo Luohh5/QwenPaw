@@ -78,6 +78,13 @@ class _FakeServices:
                             action="agent_mission_test_and_adapt",
                             fidelity="mission_repair",
                         ),
+                        MigrationAssetPlan(
+                            asset_type="plugin",
+                            source_id=f"{source}-plugin",
+                            name=f"{source.title()} Plugin",
+                            action="agent_mission_test_and_adapt",
+                            fidelity="mission_repair",
+                        ),
                     ],
                 )
 
@@ -213,6 +220,11 @@ async def test_scan_is_concurrent_and_persisted(tmp_path: Path) -> None:
     assert all(item.sessions_total == 2 for item in snapshot.providers)
     assert all(
         item.assets[0].state is ImportAssetState.PENDING
+        for item in snapshot.providers
+    )
+    assert all(not item.selection.plugins for item in snapshot.providers)
+    assert all(
+        any(asset.asset_type == "plugin" for asset in item.assets)
         for item in snapshot.providers
     )
     assert (

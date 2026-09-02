@@ -30,6 +30,7 @@ export interface ImportAssetResult {
   enabled: boolean | null;
   reason_code: string;
   message: string;
+  requires_sessions: boolean;
 }
 
 export interface ImportProviderSnapshot {

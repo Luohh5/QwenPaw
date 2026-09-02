@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# pylint: disable=cell-var-from-loop
 """Additive, idempotent provider-to-QwenPaw import transaction."""
 
 from __future__ import annotations
@@ -7,7 +8,7 @@ import asyncio
 import json
 import logging
 import shutil
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ from ..plugins.loader import resolved_plugin_manifest_path
 from ..plugins.marketplace_registry import ExternalMarketplaceRegistry
 from ..utils.io_utils import (
     get_path_lock,
+    run_async_to_completion,
     run_sync_io,
     unlink_async,
     write_json_atomic_async,
@@ -50,11 +52,13 @@ from .providers.base import (
 )
 from .qoder_plugin_adapter import stage_qoder_skill_plugin
 from .scheduled_tasks import build_imported_job, imported_job_source
+from .transaction_journal import ImportTransactionJournal
 from .import_conversations import ConversationState, import_conversations
 from .import_support import (
     _RegistrySnapshot,
     _bounded_memory,
     _bounded_session,
+    _memory_import_root,
     _mcp_client_data,
     _progress_milestone,
     _remove_session_state,
@@ -156,6 +160,18 @@ async def _asset_items(
         await report(values[-1])
 
 
+async def _commit_mutation(
+    operation: Awaitable[Any],
+    commit: Callable[[Any], None],
+) -> Any:
+    async def run() -> Any:
+        result = await operation
+        commit(result)
+        return result
+
+    return await run_async_to_completion(run())
+
+
 class ProviderImportService(ImportPlanningMixin):
     """Trusted writer coordinating provider inventory and QwenPaw stores."""
 
@@ -167,7 +183,7 @@ class ProviderImportService(ImportPlanningMixin):
         """Keep provider construction local for stable integrations/mocks."""
         return create_migration_provider(source, self._workspace, **kwargs)
 
-    # pylint: disable-next=R0912,R0915,R0914
+    # pylint: disable-next=R0912,R0915,R0914,W0640
     async def _apply(
         self,
         inventory: ProviderInventory,
@@ -241,6 +257,18 @@ class ProviderImportService(ImportPlanningMixin):
         rollback_root = adaptation_root / ".rollback"
         skill_service = SkillService(self._workspace.workspace_dir)
         driver_config = DriverConfigService(self._workspace)
+        transaction = (
+            ImportTransactionJournal(
+                Path(self._workspace.workspace_dir),
+                plan_id,
+            )
+            if plan_id
+            else None
+        )
+
+        async def watch(target: Path) -> None:
+            if transaction is not None:
+                await transaction.watch(target)
 
         async def restore_mcp(
             card: Any,
@@ -282,15 +310,55 @@ class ProviderImportService(ImportPlanningMixin):
             )
 
         try:
-            await import_conversations(
-                self._workspace,
-                inventory,
-                sessions,
-                existing_by_source,
-                warnings,
-                started_at,
-                progress,
-                conversations,
+            if transaction is not None:
+                await transaction.begin()
+            targets: list[Path] = []
+            workspace_root = Path(self._workspace.workspace_dir)
+            if inventory.sessions:
+                targets += [
+                    workspace_root / "chats.json",
+                    workspace_root / "sessions",
+                ]
+            if inventory.skills:
+                targets += [
+                    workspace_root / "skills",
+                    workspace_root / "skill.json",
+                ]
+            if inventory.mcp_servers:
+                targets += [
+                    driver_config.cards_dir,
+                    getattr(
+                        driver_config.credential_store,
+                        "_path",
+                        workspace_root / "credentials.yaml",
+                    ),
+                ]
+            if inventory.memory_projects:
+                targets.append(
+                    _memory_import_root(
+                        self._workspace,
+                        inventory.provider_id,
+                    ),
+                )
+            if inventory.scheduled_tasks:
+                targets += [
+                    workspace_root / "jobs.json",
+                    workspace_root / "jobs_history",
+                ]
+            for target in targets:
+                await watch(target)
+
+            await run_async_to_completion(
+                import_conversations(
+                    self._workspace,
+                    inventory,
+                    sessions,
+                    existing_by_source,
+                    warnings,
+                    started_at,
+                    progress,
+                    conversations,
+                ),
             )
 
             try:
@@ -336,6 +404,7 @@ class ProviderImportService(ImportPlanningMixin):
             )
             marketplace_registry = ExternalMarketplaceRegistry(registry_path)
             if inventory.marketplaces:
+                await watch(marketplace_registry.path)
                 registry_file = marketplace_registry.path
                 marketplace_registry_snapshot = _RegistrySnapshot(
                     path=registry_file,
@@ -355,19 +424,25 @@ class ProviderImportService(ImportPlanningMixin):
                         "正在恢复插件 Marketplace 来源："
                         f"{marketplace_index}/{marketplace_total}",
                     )
+
+                def record_marketplace(result: Any) -> None:
+                    nonlocal marketplace_registry_touched
+                    marketplace_registry_touched |= bool(result[0])
+
                 (
                     changed,
                     credentials_removed,
-                ) = await marketplace_registry.register(
-                    provider=inventory.provider_id,
-                    source_id=marketplace.source_id,
-                    name=marketplace.name,
-                    source=marketplace.source,
-                    source_type=marketplace.source_type,
-                    ref_name=marketplace.ref_name,
+                ) = await _commit_mutation(
+                    marketplace_registry.register(
+                        provider=inventory.provider_id,
+                        source_id=marketplace.source_id,
+                        name=marketplace.name,
+                        source=marketplace.source,
+                        source_type=marketplace.source_type,
+                        ref_name=marketplace.ref_name,
+                    ),
+                    record_marketplace,
                 )
-                if changed:
-                    marketplace_registry_touched = True
                 if credentials_removed:
                     warnings.append(
                         f"Marketplace {marketplace.name!r} contained URL "
@@ -500,19 +575,23 @@ class ProviderImportService(ImportPlanningMixin):
                     source_path = Path(install_source).resolve()
                     plugin_id = _plugin_id(source_path)
                     existing_path = get_plugins_dir() / plugin_id
+                    await watch(existing_path)
                     if replace_existing and existing_path.is_dir():
                         backup = rollback_root / "plugins" / plugin_id
                         await run_sync_io(_copy_tree, existing_path, backup)
                         plugin_backup = (plugin_id, backup)
-                    record = await install_plugin_source(
-                        install_source,
-                        app=plugin_app,
-                        force=replace_existing,
-                        reload_agents=False,
-                    )
-                    installed_plugins.append(record.manifest.id)
-                    if plugin_backup is not None:
                         replaced_plugins.setdefault(*plugin_backup)
+                    record = await _commit_mutation(
+                        install_plugin_source(
+                            install_source,
+                            app=plugin_app,
+                            force=replace_existing,
+                            reload_agents=False,
+                        ),
+                        lambda value: installed_plugins.append(
+                            value.manifest.id,
+                        ),
+                    )
                     source_path = getattr(record, "source_path", None)
                     if source_path is not None:
                         installed_plugin_paths[plugin.source_id] = Path(
@@ -532,6 +611,7 @@ class ProviderImportService(ImportPlanningMixin):
                     if plugin_backup is not None:
                         try:
                             await restore_plugin(*plugin_backup)
+                            replaced_plugins.pop(plugin_backup[0], None)
                         except (
                             Exception
                         ) as restore_exc:  # pylint: disable=broad-except
@@ -573,17 +653,24 @@ class ProviderImportService(ImportPlanningMixin):
                         f"{memory_index}/{memory_total}",
                     )
                 try:
-                    target, previous, changed = await run_sync_io(
-                        _replace_memory_project,
-                        self._workspace,
-                        inventory.provider_id,
-                        project,
+
+                    def record_memory(result: Any) -> None:
+                        target, previous, changed = result
+                        if changed or replace_existing:
+                            memory_changes.append((target, previous))
+                            imported_memory_projects.append(project.source_id)
+                        else:
+                            skipped_memory_projects.append(project.source_id)
+
+                    await _commit_mutation(
+                        run_sync_io(
+                            _replace_memory_project,
+                            self._workspace,
+                            inventory.provider_id,
+                            project,
+                        ),
+                        record_memory,
                     )
-                    if changed or replace_existing:
-                        memory_changes.append((target, previous))
-                        imported_memory_projects.append(project.source_id)
-                    else:
-                        skipped_memory_projects.append(project.source_id)
                 except Exception as exc:  # pylint: disable=broad-except
                     skipped_memory_projects.append(project.source_id)
                     warnings.append(
@@ -620,10 +707,15 @@ class ProviderImportService(ImportPlanningMixin):
                 skill_backup: tuple[Path, Path | None] | None = None
                 try:
                     data = await run_sync_io(_skill_zip, skill)
-                    result = await run_sync_io(
-                        skill_service.import_from_zip,
-                        data,
-                        compatibility_zone == "migrate",
+                    result = await _commit_mutation(
+                        run_sync_io(
+                            skill_service.import_from_zip,
+                            data,
+                            compatibility_zone == "migrate",
+                        ),
+                        lambda value: imported_skills.extend(
+                            str(name) for name in value.get("imported", [])
+                        ),
                     )
                     names = [str(name) for name in result.get("imported", [])]
                     if (
@@ -658,15 +750,21 @@ class ProviderImportService(ImportPlanningMixin):
                                 manifest_backup,
                             )
                         skill_backup = (backup, manifest_backup)
+                        replaced_skills.setdefault(skill.name, skill_backup)
                         skill_service.disable_skill(skill.name)
                         await run_sync_io(
                             skill_service.delete_skill,
                             skill.name,
                         )
-                        result = await run_sync_io(
-                            skill_service.import_from_zip,
-                            data,
-                            compatibility_zone == "migrate",
+                        result = await _commit_mutation(
+                            run_sync_io(
+                                skill_service.import_from_zip,
+                                data,
+                                compatibility_zone == "migrate",
+                            ),
+                            lambda value: imported_skills.extend(
+                                str(name) for name in value.get("imported", [])
+                            ),
                         )
                         names = [
                             str(name) for name in result.get("imported", [])
@@ -679,14 +777,8 @@ class ProviderImportService(ImportPlanningMixin):
                                 *skill_backup,
                             )
                             skill_backup = None
-                        else:
-                            replaced_skills.setdefault(
-                                skill.name,
-                                skill_backup,
-                            )
-                    if names:
-                        imported_skills.extend(names)
-                    else:
+                            replaced_skills.pop(skill.name, None)
+                    if not names:
                         skipped_skills.append(skill.name)
                         if result.get("conflicts"):
                             warnings.append(
@@ -702,6 +794,7 @@ class ProviderImportService(ImportPlanningMixin):
                                 skill.name,
                                 *skill_backup,
                             )
+                            replaced_skills.pop(skill.name, None)
                         except (
                             Exception
                         ) as restore_exc:  # pylint: disable=broad-except
@@ -838,30 +931,39 @@ class ProviderImportService(ImportPlanningMixin):
                         _mcp_client_data(translated_server),
                         force_encrypt_bindings=True,
                     )
-                    card.enabled = compatibility_zone == "migrate"
+                    card.enabled = False
                     card.config = {
                         **dict(card.config),
                         "migration_source": inventory.provider_id,
                         "migration_source_id": server.source_id,
                         "source_enabled": server.enabled,
-                        "requires_review": compatibility_zone == "repair",
+                        "requires_review": True,
                         "auth_status": server.auth_status,
                         "source_runtime_bound": bool(
                             server.metadata.get("source_runtime_bound"),
                         ),
                     }
-                    if credential is not None:
-                        await driver_config.credential_store.put(credential)
-                        credential_ref = credential.ref
-                    await driver_config.save_card(
-                        card,
-                        reload_driver=compatibility_zone == "migrate",
-                    )
-                    card_written = True
-                    if replacement is None:
-                        created_mcp.append((card.name, credential_ref))
-                    else:
-                        replaced_mcp.append((*replacement, credential_ref))
+
+                    async def save_mcp() -> None:
+                        nonlocal card_written, credential_ref
+                        if credential is not None:
+                            await driver_config.credential_store.put(
+                                credential,
+                            )
+                            credential_ref = credential.ref
+                        await driver_config.save_card(
+                            card,
+                            reload_driver=False,
+                        )
+                        card_written = True
+                        if replacement is None:
+                            created_mcp.append((card.name, credential_ref))
+                        else:
+                            replaced_mcp.append(
+                                (*replacement, credential_ref),
+                            )
+
+                    await run_async_to_completion(save_mcp())
                     existing_driver_names.add(card.name)
                     existing_cards[card.name] = card
                     imported_mcp_servers.append(card.name)
@@ -1017,11 +1119,19 @@ class ProviderImportService(ImportPlanningMixin):
                         ):
                             normalized_existing = normalizer(existing_task)
                             if normalized_existing != existing_task:
-                                await cron_manager.create_or_replace_job(
-                                    normalized_existing,
-                                )
-                                replaced_scheduled_tasks.append(existing_task)
-                                existing_task_jobs[key] = normalized_existing
+
+                                async def normalize_task() -> None:
+                                    await cron_manager.create_or_replace_job(
+                                        normalized_existing,
+                                    )
+                                    replaced_scheduled_tasks.append(
+                                        existing_task,
+                                    )
+                                    existing_task_jobs[
+                                        key
+                                    ] = normalized_existing
+
+                                await run_async_to_completion(normalize_task())
                                 warnings.append(
                                     f"定时任务 {task.name!r} 的旧版迁移审核"
                                     "门禁已补齐，任务保持禁用。",
@@ -1069,14 +1179,19 @@ class ProviderImportService(ImportPlanningMixin):
                         existing_id = getattr(existing_task, "id", None)
                         if existing_id:
                             job = job.model_copy(update={"id": existing_id})
-                    await cron_manager.create_or_replace_job(job)
                     assert job.id is not None
-                    if repairing_invalid_task:
-                        replaced_scheduled_tasks.append(existing_task)
-                    else:
-                        created_scheduled_tasks.append(job.id)
-                    imported_scheduled_tasks.append(task.source_id)
-                    existing_task_jobs[key] = job
+                    job_id = job.id
+
+                    async def save_task() -> None:
+                        await cron_manager.create_or_replace_job(job)
+                        if repairing_invalid_task:
+                            replaced_scheduled_tasks.append(existing_task)
+                        else:
+                            created_scheduled_tasks.append(job_id)
+                        imported_scheduled_tasks.append(task.source_id)
+                        existing_task_jobs[key] = job
+
+                    await run_async_to_completion(save_task())
                 except Exception as exc:  # pylint: disable=broad-except
                     skipped_scheduled_tasks.append(task.source_id)
                     warnings.append(
@@ -1265,20 +1380,23 @@ class ProviderImportService(ImportPlanningMixin):
                             + getattr(previous_job, "id", ""),
                             exc,
                         )
+            for skill_name, snapshot in reversed(
+                tuple(replaced_skills.items()),
+            ):
+                try:
+                    await run_sync_io(
+                        _restore_skill,
+                        self._workspace.workspace_dir,
+                        skill_name,
+                        *snapshot,
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    record_rollback_failure(
+                        f"replaced Skill {skill_name}",
+                        exc,
+                    )
             for skill_name in reversed(imported_skills):
-                if (snapshot := replaced_skills.get(skill_name)) is not None:
-                    try:
-                        await run_sync_io(
-                            _restore_skill,
-                            self._workspace.workspace_dir,
-                            skill_name,
-                            *snapshot,
-                        )
-                    except Exception as exc:  # pylint: disable=broad-except
-                        record_rollback_failure(
-                            f"replaced Skill {skill_name}",
-                            exc,
-                        )
+                if skill_name in replaced_skills:
                     continue
                 try:
                     skill_service.disable_skill(skill_name)
@@ -1292,29 +1410,35 @@ class ProviderImportService(ImportPlanningMixin):
                 except Exception as exc:  # pylint: disable=broad-except
                     record_rollback_failure(f"Skill {skill_name}", exc)
             if plugin_app is not None:
+                for plugin_id, backup in reversed(
+                    tuple(replaced_plugins.items()),
+                ):
+                    try:
+                        await restore_plugin(plugin_id, backup)
+                    except Exception as exc:  # pylint: disable=broad-except
+                        record_rollback_failure(f"plugin {plugin_id}", exc)
                 for plugin_id in reversed(installed_plugins):
+                    if plugin_id in replaced_plugins:
+                        continue
                     try:
                         # pylint: disable-next=C0415
                         from ..app.routers.plugins import (
                             uninstall_plugin_source,
                         )
 
-                        if (backup := replaced_plugins.get(plugin_id)) is None:
-                            await uninstall_plugin_source(
-                                plugin_id,
-                                app=plugin_app,
-                                reload_agents=False,
-                            )
-                        else:
-                            await restore_plugin(plugin_id, backup)
+                        await uninstall_plugin_source(
+                            plugin_id,
+                            app=plugin_app,
+                            reload_agents=False,
+                        )
                     except Exception as exc:  # pylint: disable=broad-except
                         record_rollback_failure(f"plugin {plugin_id}", exc)
-            for target, previous in reversed(memory_changes):
+            for target, memory_previous in reversed(memory_changes):
                 try:
                     await run_sync_io(
                         _restore_memory_project,
                         target,
-                        previous,
+                        memory_previous,
                     )
                 except Exception as exc:  # pylint: disable=broad-except
                     record_rollback_failure(f"Memory {target}", exc)
@@ -1344,6 +1468,11 @@ class ProviderImportService(ImportPlanningMixin):
                         f"compatibility staging {adaptation_root}",
                         exc,
                     )
+            if not rollback_failures and transaction is not None:
+                try:
+                    await transaction.discard()
+                except Exception as exc:  # pylint: disable=broad-except
+                    record_rollback_failure("transaction journal", exc)
             if rollback_failures and isinstance(
                 original,
                 (Exception, asyncio.CancelledError),

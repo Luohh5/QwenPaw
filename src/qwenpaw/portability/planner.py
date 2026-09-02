@@ -385,6 +385,7 @@ def _asset(
     action: str,
     fidelity: str,
     reason_zh: str,
+    requires_sessions: bool = False,
 ) -> MigrationAssetPlan:
     return MigrationAssetPlan(
         asset_type=asset_type,
@@ -393,6 +394,7 @@ def _asset(
         action=action,
         fidelity=fidelity,
         reason_zh=reason_zh,
+        requires_sessions=requires_sessions,
     )
 
 
@@ -419,6 +421,9 @@ def _adaptable_actions(
             "agent_mission_test_and_adapt",
             "mission_repair",
             f"安全暂存后，{_ADAPTABLE[collection][1]}。",
+            collection == "scheduled_tasks"
+            and str(item.metadata.get("source_kind") or "").lower()
+            == "heartbeat",
         )
         for collection in collections
         for item in getattr(inventory, collection)

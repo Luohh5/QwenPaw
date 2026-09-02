@@ -171,6 +171,10 @@ export default function ImportPage() {
   >({});
   const [retryKeys, setRetryKeys] = useState<Record<string, string[]>>({});
   const [confirmRetry, setConfirmRetry] = useState(false);
+  const [pluginAction, setPluginAction] = useState<"start" | "retry" | null>(
+    null,
+  );
+  const [pluginConfirmed, setPluginConfirmed] = useState(false);
   const selectionKey = job?.job_id ?? "";
   const currentSelections = useMemo(
     () => selections[selectionKey] ?? {},
@@ -215,7 +219,11 @@ export default function ImportPage() {
       ),
     }));
   }, [currentSelections, job, selectionKey]);
-  useEffect(() => setConfirmRetry(false), [selectionKey]);
+  useEffect(() => {
+    setConfirmRetry(false);
+    setPluginAction(null);
+    setPluginConfirmed(false);
+  }, [selectionKey]);
 
   const current = !job ? 0 : job.state === "awaiting_selection" ? 1 : 2;
   const isRunning = job?.state === "running" || job?.state === "scanning";
@@ -254,6 +262,24 @@ export default function ImportPage() {
   const selectedRetryAssets = failedAssets.filter(({ provider, asset }) =>
     selectedRetryKeys.includes(retryKey({ provider, asset })),
   );
+  const selectedPluginNames = useMemo(
+    () =>
+      job?.providers.flatMap((provider) => {
+        const selected = new Set(
+          currentSelections[provider.source]?.plugins ?? [],
+        );
+        return provider.assets
+          .filter(
+            (asset) =>
+              asset.asset_type === "plugin" && selected.has(asset.source_id),
+          )
+          .map((asset) => asset.name);
+      }) ?? [],
+    [currentSelections, job],
+  );
+  const retryPluginNames = selectedRetryAssets
+    .filter(({ asset }) => asset.asset_type === "plugin")
+    .map(({ asset }) => asset.name);
   const hasSelection = Object.values(currentSelections).some(
     (selection) =>
       selection.sessions ||
@@ -274,15 +300,38 @@ export default function ImportPage() {
       ...current,
       [selectionKey]: checked ? failedAssets.map(retryKey) : [],
     }));
-  const runRetry = async () => {
+  const runRetry = async (allowPluginExecution = false) => {
     const key = selectionKey;
     if (!selectedRetryAssets.length) return;
-    await retry(retrySelection(selectedRetryAssets));
+    if (retryPluginNames.length && !allowPluginExecution) {
+      setConfirmRetry(false);
+      setPluginConfirmed(false);
+      setPluginAction("retry");
+      return;
+    }
+    const selection = retrySelection(selectedRetryAssets);
+    await retry(selection, allowPluginExecution);
     setRetryKeys((current) =>
       Object.fromEntries(Object.entries(current).filter(([id]) => id !== key)),
     );
     setConfirmRetry(false);
   };
+  const startImport = () => {
+    if (selectedPluginNames.length) {
+      setPluginConfirmed(false);
+      setPluginAction("start");
+      return;
+    }
+    void start(currentSelections);
+  };
+  const confirmPluginAction = async () => {
+    if (pluginAction === "start") await start(currentSelections, true);
+    else if (pluginAction === "retry") await runRetry(true);
+    setPluginAction(null);
+    setPluginConfirmed(false);
+  };
+  const pluginNames =
+    pluginAction === "retry" ? retryPluginNames : selectedPluginNames;
   const abandon = async () => {
     try {
       await cancel();
@@ -313,7 +362,12 @@ export default function ImportPage() {
   ) => {
     const field = FIELDS[type];
     const ids = provider.assets
-      .filter((asset) => asset.asset_type === type)
+      .filter(
+        (asset) =>
+          asset.asset_type === type &&
+          (currentSelections[provider.source]?.sessions ||
+            !asset.requires_sessions),
+      )
       .map((asset) => asset.source_id);
     updateSelection(provider.source, (selection) => ({
       ...selection,
@@ -329,7 +383,11 @@ export default function ImportPage() {
           FIELDS[type],
           checked
             ? provider.assets
-                .filter((asset) => asset.asset_type === type)
+                .filter(
+                  (asset) =>
+                    asset.asset_type === type &&
+                    (selection.sessions || !asset.requires_sessions),
+                )
                 .map((asset) => asset.source_id)
             : [],
         ]),
@@ -459,6 +517,17 @@ export default function ImportPage() {
                           updateSelection(provider.source, (selection) => ({
                             ...selection,
                             sessions: event.target.checked,
+                            cron: event.target.checked
+                              ? selection.cron
+                              : (selection.cron ?? []).filter(
+                                  (id) =>
+                                    !provider.assets.some(
+                                      (asset) =>
+                                        asset.asset_type === "cron" &&
+                                        asset.source_id === id &&
+                                        asset.requires_sessions,
+                                    ),
+                                ),
                           }))
                         }
                       >
@@ -539,18 +608,35 @@ export default function ImportPage() {
                                 className={styles.assetRow}
                                 key={asset.source_id}
                               >
-                                <Checkbox
-                                  checked={selected.includes(asset.source_id)}
-                                  onChange={(event) =>
-                                    toggleAsset(
-                                      provider,
-                                      asset,
-                                      event.target.checked,
-                                    )
+                                <Tooltip
+                                  title={
+                                    asset.requires_sessions &&
+                                    !currentSelections[provider.source]
+                                      ?.sessions
+                                      ? t(
+                                          "portabilityImport.heartbeatRequiresSessions",
+                                        )
+                                      : undefined
                                   }
                                 >
-                                  {asset.name}
-                                </Checkbox>
+                                  <Checkbox
+                                    checked={selected.includes(asset.source_id)}
+                                    disabled={
+                                      asset.requires_sessions &&
+                                      !currentSelections[provider.source]
+                                        ?.sessions
+                                    }
+                                    onChange={(event) =>
+                                      toggleAsset(
+                                        provider,
+                                        asset,
+                                        event.target.checked,
+                                      )
+                                    }
+                                  >
+                                    {asset.name}
+                                  </Checkbox>
+                                </Tooltip>
                               </div>
                             )),
                           },
@@ -566,7 +652,7 @@ export default function ImportPage() {
                 type="primary"
                 disabled={!hasSelection}
                 loading={loading}
-                onClick={() => void start(currentSelections)}
+                onClick={startImport}
               >
                 {t("portabilityImport.start")}
               </Button>
@@ -695,6 +781,28 @@ export default function ImportPage() {
           {t("portabilityImport.retryConfirm", {
             count: selectedRetryAssets.length,
           })}
+        </Modal>
+        <Modal
+          open={Boolean(pluginAction)}
+          title={t("portabilityImport.pluginWarningTitle")}
+          okText={t("portabilityImport.pluginWarningAction")}
+          cancelText={t("common.cancel")}
+          okButtonProps={{ disabled: !pluginConfirmed }}
+          onCancel={() => setPluginAction(null)}
+          onOk={() => void confirmPluginAction()}
+        >
+          <p>{t("portabilityImport.pluginWarning")}</p>
+          <ul>
+            {pluginNames.map((name) => (
+              <li key={name}>{name}</li>
+            ))}
+          </ul>
+          <Checkbox
+            checked={pluginConfirmed}
+            onChange={(event) => setPluginConfirmed(event.target.checked)}
+          >
+            {t("portabilityImport.pluginWarningConfirm")}
+          </Checkbox>
         </Modal>
       </main>
     </div>

@@ -81,9 +81,10 @@
     "continue": "Lanjutkan",
     "scanning": "Memeriksa percakapan dan pengaturan alat…",
     "chooseContent": "Pilih yang akan diimpor",
-    "defaultSelected": "Semua dipilih secara default. Hapus pilihan yang tidak diperlukan.",
+    "defaultSelected": "Percakapan dan alat dipilih secara default. Plugin memerlukan konfirmasi eksplisit Anda.",
     "conversations": "Percakapan",
     "toolsSetup": "Alat & pengaturan",
+    "heartbeatRequiresSessions": "Tugas terjadwal ini memerlukan percakapan untuk diimpor.",
     "items": "{{count}} item",
     "start": "Mulai impor",
     "groups": {
@@ -119,6 +120,10 @@
     "selectAllFailed": "Pilih semua alat yang gagal",
     "retrySelected": "Coba lagi yang dipilih ({{count}})",
     "retryConfirm": "Coba lagi {{count}} alat gagal yang dipilih? Item dengan nama yang sama akan ditimpa.",
+    "pluginWarningTitle": "Peringatan eksekusi plugin",
+    "pluginWarning": "Plugin ini dapat memasang dependensi Python, menjalankan kode dalam proses QwenPaw, serta mendaftarkan alat, Hook, rute, atau perintah global. Impor hanya plugin dari sumber yang tepercaya.",
+    "pluginWarningConfirm": "Saya memercayai sumber plugin ini dan mengizinkan pemasangan dependensi serta eksekusi kode.",
+    "pluginWarningAction": "Konfirmasi dan impor",
     "done": "Selesai"
   },
   "nav": {

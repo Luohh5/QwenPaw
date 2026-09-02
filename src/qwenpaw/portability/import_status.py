@@ -72,6 +72,7 @@ def project_asset_results(
             asset_type=public_type,
             source_id=action.source_id,
             name=action.name,
+            requires_sessions=action.requires_sessions,
         )
         canonical_id = ""
         if public_type == "plugin":
@@ -98,7 +99,7 @@ def project_asset_results(
             result.enabled = (
                 None
                 if public_type == "memory"
-                else public_type != "cron"
+                else public_type not in {"cron", "mcp"}
                 and bool(asset and asset.zone is AssetZone.MIGRATE)
             )
             if result.enabled is False:

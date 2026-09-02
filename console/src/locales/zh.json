@@ -126,9 +126,10 @@
     "continue": "继续",
     "scanning": "正在清点会话和工具设置…",
     "chooseContent": "选择要导入的内容",
-    "defaultSelected": "默认全部勾选，可取消不需要的内容。",
+    "defaultSelected": "聊天记录和工具默认勾选；插件需要你主动确认后才会导入。",
     "conversations": "聊天记录",
     "toolsSetup": "工具&设置",
+    "heartbeatRequiresSessions": "此定时任务需要同时导入聊天记录。",
     "items": "{{count}} 项",
     "start": "开始导入",
     "groups": {
@@ -164,6 +165,10 @@
     "selectAllFailed": "选择所有导入失败的工具",
     "retrySelected": "重试已选项（{{count}}）",
     "retryConfirm": "确认重新导入已选的 {{count}} 个失败工具吗？QwenPaw 中同名工具将被覆盖。",
+    "pluginWarningTitle": "插件代码执行提醒",
+    "pluginWarning": "这些插件可能安装 Python 依赖、在 QwenPaw 进程中执行代码，并注册全局工具、Hook、路由或命令。请只导入你信任来源的插件。",
+    "pluginWarningConfirm": "我确认这些插件来源可信，并同意安装依赖和执行插件代码。",
+    "pluginWarningAction": "确认并导入",
     "done": "完成"
   },
   "nav": {

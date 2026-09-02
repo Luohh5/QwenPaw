@@ -249,11 +249,13 @@ describe("useImportJob", () => {
       "agent-a",
       "import-agent-a",
       { codex: { sessions: true } },
+      false,
     );
     expect(portabilityImportApi.retry).toHaveBeenCalledWith(
       "agent-a",
       "import-agent-a",
       { codex: { sessions: false, skills: ["skill-1"] } },
+      false,
     );
     expect(result.current.job?.job_id).toBe("retry-agent-a");
   });

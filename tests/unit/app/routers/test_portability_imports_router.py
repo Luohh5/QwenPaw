@@ -142,6 +142,29 @@ async def test_job_routes_pin_workspace_and_submit_selection(api):
 
 
 @pytest.mark.asyncio
+async def test_plugin_import_requires_explicit_confirmation(api):
+    _workspace, jobs = api
+    selection = {"codex": ImportSelection(plugins=["plugin-1"])}
+    with pytest.raises(HTTPException, match="confirm plugin") as error:
+        await routes.start_import_job(
+            "import-" + "a" * 32,
+            routes.StartImportJobRequest(selections=selection),
+            _request(),
+        )
+    assert error.value.status_code == 400
+
+    await routes.start_import_job(
+        "import-" + "a" * 32,
+        routes.StartImportJobRequest(
+            selections=selection,
+            allow_plugin_execution=True,
+        ),
+        _request(),
+    )
+    assert jobs.calls[-1][-1] == selection
+
+
+@pytest.mark.asyncio
 async def test_events_are_sse_and_replay_sequence(api):
     _workspace, jobs = api
     job_id = "import-" + "a" * 32

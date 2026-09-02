@@ -22,9 +22,14 @@ describe("portabilityImportApi", () => {
     await portabilityImportApi.create("agent one", ["codex", "qoder"]);
     await portabilityImportApi.snapshot("agent one", "import-1");
     await portabilityImportApi.current("agent one");
-    await portabilityImportApi.start("agent one", "import-1", {
-      codex: selection,
-    });
+    await portabilityImportApi.start(
+      "agent one",
+      "import-1",
+      {
+        codex: selection,
+      },
+      true,
+    );
     await portabilityImportApi.retry("agent one", "import-1", {
       codex: { sessions: false, skills: ["skill-1"] },
     });
@@ -46,7 +51,10 @@ describe("portabilityImportApi", () => {
       5,
       `${base}/jobs/import-1/start`,
       expect.objectContaining({
-        body: JSON.stringify({ selections: { codex: selection } }),
+        body: JSON.stringify({
+          selections: { codex: selection },
+          allow_plugin_execution: true,
+        }),
       }),
     );
     expect(request).toHaveBeenNthCalledWith(

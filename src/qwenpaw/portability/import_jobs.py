@@ -427,7 +427,7 @@ class PortabilityImportJobManager:
                 provider.selection = self._default_selection(plan)
                 provider.assets = self._selected_assets(
                     plan,
-                    provider.selection,
+                    self._all_selection(plan),
                 )
                 provider.warnings = [
                     redact_sensitive_text(item, limit=500)
@@ -633,6 +633,13 @@ class PortabilityImportJobManager:
 
     @staticmethod
     def _default_selection(plan: MigrationPlan) -> ImportSelection:
+        """Select non-executable assets by default."""
+        selection = PortabilityImportJobManager._all_selection(plan)
+        selection.plugins = []
+        return selection
+
+    @staticmethod
+    def _all_selection(plan: MigrationPlan) -> ImportSelection:
         values: dict[str, Any] = {
             "sessions": any(
                 item.asset_type == "session" for item in plan.actions
