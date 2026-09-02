@@ -58,15 +58,11 @@ def _receipt(
     if zone is not None:
         if zone is AssetZone.MIGRATE:
             asset_key = f"scheduled_tasks:{task.source_id}"
-            store.record_test(
+            store.finalize(
                 asset_key,
                 passed=True,
                 summary="fixture",
-            )
-            store.classify(
-                asset_key,
-                AssetZone.MIGRATE,
-                "fixture",
+                reason="fixture",
             )
         store.finish()
     now = datetime.now(timezone.utc)
@@ -78,7 +74,6 @@ def _receipt(
         completed_at=now,
         imported_scheduled_tasks=[task.source_id],
         discovered_scheduled_task_count=discovered,
-        adaptation_status="completed",
         adaptation_manifest=str(manifest_path),
     )
     receipt_path = (

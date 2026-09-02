@@ -26,10 +26,8 @@
   "skipped_scheduled_tasks": [],
   "discovered_mcp_count": 1,
   "discovered_scheduled_task_count": 1,
-  "adaptation_status": "completed",
   "adaptation_manifest": "adaptation/manifest.json",
   "adaptation_summary": "adaptation/summary.md",
-  "adaptation_counts": {"migrate": 4, "repair": 0},
   "retry_of_migration_id": "",
   "warnings": ["fixture warning"],
   "doctor_report": {

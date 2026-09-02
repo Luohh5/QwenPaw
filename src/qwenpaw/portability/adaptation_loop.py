@@ -73,11 +73,9 @@ _PUBLIC_TYPES = {
 
 @dataclass(frozen=True)
 class AdaptationResult:
+    manifest: CompatibilityManifest
     manifest_path: Path
     summary_path: Path
-    status: str
-    counts: dict[str, int]
-    asset_zones: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -532,6 +530,20 @@ class ActiveAdaptationContext:
                 key,
                 "passed" if result.passed else "failed",
             )
+            manifest = await run_sync_io(
+                self.store.finalize,
+                key,
+                passed=result.passed,
+                summary=result.summary,
+                reason=reason,
+                evidence=result.evidence,
+            )
+            await run_sync_io(
+                self._audit,
+                "finalize",
+                key,
+                AssetZone.MIGRATE.value if result.passed else "repair",
+            )
             if not result.passed:
                 await self._publish(
                     f"{self._label(asset)}测试未通过，需要继续兼容性修复。",
@@ -543,18 +555,6 @@ class ActiveAdaptationContext:
                     "summary": result.summary,
                     "evidence": result.evidence,
                 }
-            manifest = await run_sync_io(
-                self.store.classify,
-                key,
-                AssetZone.MIGRATE,
-                reason,
-            )
-            await run_sync_io(
-                self._audit,
-                "classify",
-                key,
-                AssetZone.MIGRATE.value,
-            )
             await self._publish(
                 f"{self._label(manifest.get_asset(key))}兼容性优化完成，已进入待迁移区。",
             )
@@ -663,6 +663,8 @@ async def _run_phase(
         if task.done():
             await task
         else:
+            # Revoke tools before stopping a worker that finalized its asset.
+            _ACTIVE_CONTEXTS.pop(session_id, None)
             await _stop_worker(task)
     finally:
         _ACTIVE_CONTEXTS.pop(session_id, None)
@@ -747,7 +749,6 @@ async def _repair_with_mission(
         session_id,
         max_attempts,
     )
-    attempts: dict[str, int] = {}
     mode.start_internal_mission(session_id, loop_dir)
     try:
         for round_number in range(1, max_attempts + 1):
@@ -756,7 +757,6 @@ async def _repair_with_mission(
                 item.asset_key
                 for item in manifest.by_zone(AssetZone.REPAIR)
                 if not item.budget_exhausted
-                and attempts.get(item.asset_key, 0) < max_attempts
             ]
             if not pending:
                 break
@@ -766,8 +766,6 @@ async def _repair_with_mission(
                 f"以 {MAX_SPAWN_BATCH_CONCURRENCY} 个并行 Agent "
                 f"处理 {len(pending)} 项资产。",
             )
-            for key in pending:
-                attempts[key] = attempts.get(key, 0) + 1
             await _bounded_parallel(
                 pending,
                 lambda key: _repair_asset(workspace, context, key, warnings),
@@ -827,13 +825,12 @@ async def run_adaptation_loop(
         manifest = await run_sync_io(store.finish)
         await run_sync_io(write_summary, summary_path, manifest)
         return AdaptationResult(
+            manifest,
             manifest_path,
             summary_path,
-            manifest.state.value,
-            counts(manifest),
         )
 
-    tester = CompatibilityTester(workspace, inventory, store)
+    tester = CompatibilityTester(workspace, inventory)
     context = ActiveAdaptationContext(
         inventory=inventory,
         store=store,
@@ -876,12 +873,8 @@ async def run_adaptation_loop(
         f"待修复 {len(manifest.by_zone(AssetZone.REPAIR))}。",
     )
     return AdaptationResult(
+        manifest=manifest,
         manifest_path=manifest_path,
         summary_path=summary_path,
-        status=manifest.state.value,
-        counts=counts(manifest),
-        asset_zones={
-            item.asset_key: item.zone.value for item in manifest.assets
-        },
         warnings=warnings,
     )

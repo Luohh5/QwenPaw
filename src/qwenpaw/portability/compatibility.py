@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 from collections.abc import Sequence
@@ -59,7 +60,6 @@ class TestResult(BaseModel):
     passed: bool
     summary: str
     evidence: list[str] = Field(default_factory=list)
-    revision: int
     tested_at: datetime
 
 
@@ -73,7 +73,6 @@ class CompatibilityAsset(BaseModel):
     zone: AssetZone = AssetZone.REPAIR
     reason: str = ""
     snapshot: dict[str, Any] = Field(default_factory=dict)
-    revision: int = 0
     tests: int = 0
     changes: list[str] = Field(default_factory=list)
     last_test: TestResult | None = None
@@ -81,14 +80,7 @@ class CompatibilityAsset(BaseModel):
     tool_calls: int = 0
     tool_budget: int = _BASE_TOOL_BUDGET
     test_budget: int = 12
-    repair_rounds: int = 0
     updated_at: datetime
-
-    @property
-    def test_is_current(self) -> bool:
-        return bool(
-            self.last_test and self.last_test.revision == self.revision,
-        )
 
     @property
     def budget_exhausted(self) -> bool:
@@ -98,14 +90,13 @@ class CompatibilityAsset(BaseModel):
 class CompatibilityManifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: str = "3"
+    schema_version: str = "4"
     migration_id: str
     source: str
     created_at: datetime
     updated_at: datetime
     state: RunState = RunState.RUNNING
     assets: list[CompatibilityAsset] = Field(default_factory=list)
-    total_tests: int = 0
     stop_reason: str = ""
 
     @model_validator(mode="after")
@@ -113,8 +104,6 @@ class CompatibilityManifest(BaseModel):
         keys = [item.asset_key for item in self.assets]
         if len(keys) != len(set(keys)):
             raise ValueError("duplicate compatibility asset")
-        if self.total_tests != sum(item.tests for item in self.assets):
-            raise ValueError("inconsistent compatibility test count")
         return self
 
     def get_asset(self, key: str) -> CompatibilityAsset:
@@ -227,9 +216,19 @@ def load_manifest(path: Path | str) -> CompatibilityManifest:
         raise ValueError("invalid compatibility manifest")
     if stat.S_IMODE(target.stat().st_mode) & 0o077:
         os.chmod(target, 0o600)
-    return CompatibilityManifest.model_validate_json(
-        target.read_text(encoding="utf-8"),
-    )
+    value = json.loads(target.read_text(encoding="utf-8"))
+    # v3 stored revision-only bookkeeping; keep old reports readable.
+    if isinstance(value, dict) and value.get("schema_version") == "3":
+        value["schema_version"] = "4"
+        value.pop("total_tests", None)
+        for asset in value.get("assets", ()):
+            if isinstance(asset, dict):
+                asset.pop("revision", None)
+                asset.pop("repair_rounds", None)
+                test = asset.get("last_test")
+                if isinstance(test, dict):
+                    test.pop("revision", None)
+    return CompatibilityManifest.model_validate(value)
 
 
 class CompatibilityStore:
@@ -299,33 +298,33 @@ class CompatibilityStore:
             save_manifest(self.path, manifest)
             return manifest
 
-    def record_test(
+    def finalize(
         self,
         key: str,
         *,
         passed: bool,
         summary: str,
+        reason: str,
         evidence: Sequence[str] = (),
     ) -> CompatibilityManifest:
         def apply(manifest: CompatibilityManifest) -> None:
             asset = manifest.get_asset(key)
             if asset.zone is not AssetZone.REPAIR:
                 raise RuntimeError(
-                    "native compatibility tests run only in the repair zone",
+                    "asset has already left the repair zone",
                 )
             if asset.tests >= asset.test_budget:
                 raise RuntimeError("compatibility test budget exhausted")
             asset.tests += 1
-            manifest.total_tests += 1
             asset.last_test = TestResult(
                 passed=passed,
                 summary=_text(summary, 1000),
                 evidence=[_text(item, 1000) for item in evidence[:20]],
-                revision=asset.revision,
                 tested_at=_now(),
             )
-            if not passed:
-                asset.repair_rounds += 1
+            if passed:
+                asset.zone = AssetZone.MIGRATE
+                asset.reason = _text(reason, 1000)
             asset.updated_at = _now()
 
         return self._mutate(apply)
@@ -358,42 +357,9 @@ class CompatibilityStore:
             asset = manifest.get_asset(key)
             if asset.zone is not AssetZone.REPAIR:
                 raise RuntimeError("only repair-zone assets can be changed")
-            asset.revision += 1
             asset.reason = ""
             asset.changes.append(_text(change, 500))
-            asset.updated_at = _now()
-
-        return self._mutate(apply)
-
-    def classify(
-        self,
-        key: str,
-        zone: AssetZone,
-        reason: str,
-    ) -> CompatibilityManifest:
-        if zone is not AssetZone.MIGRATE:
-            raise ValueError("only tested assets can enter migrate")
-        if not reason.strip():
-            raise ValueError(
-                "classification requires an evidence-based reason",
-            )
-
-        def apply(manifest: CompatibilityManifest) -> None:
-            asset = manifest.get_asset(key)
-            if asset.zone is not AssetZone.REPAIR:
-                raise RuntimeError(
-                    f"{asset.zone.value} is a terminal compatibility zone",
-                )
-            if not asset.test_is_current:
-                raise RuntimeError(
-                    "run compatibility test after the latest change",
-                )
-            if not asset.last_test.passed:
-                raise RuntimeError(
-                    "a failed test cannot enter the migrate zone",
-                )
-            asset.zone = zone
-            asset.reason = _text(reason, 1000)
+            asset.last_test = None
             asset.updated_at = _now()
 
         return self._mutate(apply)

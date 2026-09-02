@@ -256,13 +256,8 @@ def test_import_receipt_matches_reviewed_contract() -> None:
         imported_scheduled_tasks=["cron-1"],
         discovered_mcp_count=1,
         discovered_scheduled_task_count=1,
-        adaptation_status="completed",
         adaptation_manifest="adaptation/manifest.json",
         adaptation_summary="adaptation/summary.md",
-        adaptation_counts={
-            "migrate": 4,
-            "repair": 0,
-        },
         warnings=["fixture warning"],
         doctor_report=MigrationDoctorReport(
             status="pass",

@@ -23,7 +23,6 @@ from ..plugins.loader import resolved_plugin_manifest_path
 from .compatibility import (
     AssetType,
     CompatibilityAsset,
-    CompatibilityStore,
 )
 from .compatibility_safety import (
     mcp_inline_secret_risks,
@@ -596,11 +595,9 @@ class CompatibilityTester:
         self,
         workspace: Any,
         inventory: ProviderInventory,
-        store: CompatibilityStore,
     ) -> None:
         self.workspace = workspace
         self.inventory = inventory
-        self.store = store
 
     def environment(self) -> dict[str, Any]:
         registry = getattr(
@@ -688,12 +685,6 @@ class CompatibilityTester:
                 f"QwenPaw 原生兼容测试失败：{type(exc).__name__}",
                 [redact_sensitive_text(exc, limit=1000)],
             )
-        self.store.record_test(
-            asset.asset_key,
-            passed=result.passed,
-            summary=result.summary,
-            evidence=result.evidence,
-        )
         return result
 
     @staticmethod

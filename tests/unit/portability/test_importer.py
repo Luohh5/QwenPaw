@@ -23,7 +23,11 @@ from qwenpaw.portability.import_support import (
     _replace_memory_project as replace_memory_project,
 )
 from qwenpaw.portability.adaptation_loop import AdaptationResult
-from qwenpaw.portability.compatibility import AssetZone, CompatibilityStore
+from qwenpaw.portability.compatibility import (
+    AssetZone,
+    CompatibilityStore,
+    load_manifest,
+)
 from qwenpaw.portability.models import (
     ImportSelection,
     ProviderInventory,
@@ -72,7 +76,7 @@ def _mock_adaptation(
     inventory: ProviderInventory,
     *,
     zone: str = "repair",
-    status: str = "completed",
+    status: str = "completed",  # pylint: disable=unused-argument
 ) -> None:
     keys = {
         **{f"skills:{item.source_id}": zone for item in inventory.skills},
@@ -108,17 +112,20 @@ def _mock_adaptation(
         )
         if zone == "migrate":
             for key in keys:
-                store.record_test(key, passed=True, summary="test fixture")
-                store.classify(key, AssetZone.MIGRATE, "test fixture")
+                store.finalize(
+                    key,
+                    passed=True,
+                    summary="test fixture",
+                    reason="test fixture",
+                )
             store.finish()
         else:
             store.finish(stopped=True, reason="test fixture")
         return AdaptationResult(
+            manifest=load_manifest(manifest_path),
             manifest_path=manifest_path,
             summary_path=workspace.workspace_dir / "missing-summary.md",
-            status=status,
-            counts={zone: len(keys)},
-            asset_zones=keys,
+            warnings=[],
         )
 
     monkeypatch.setattr(
@@ -310,7 +317,10 @@ async def test_unfinished_mission_materializes_repair_items_disabled(
     job = next(iter(workspace.cron_manager.jobs.values()))
     assert job.enabled is False
     assert job.meta["portability"]["requires_review"] is True
-    assert receipt.adaptation_counts["repair"] == 2
+    adaptation = load_manifest(
+        workspace.workspace_dir / receipt.adaptation_manifest,
+    )
+    assert len(adaptation.by_zone(AssetZone.REPAIR)) == 2
 
 
 @pytest.mark.asyncio
@@ -359,18 +369,36 @@ async def test_migrate_zone_materializes_assets(
     _mock_adaptation(monkeypatch, workspace, inventory)
 
     async def _approved(*_args, **_kwargs):
+        manifest_path = workspace.workspace_dir / "approved-manifest.json"
+        store = CompatibilityStore(manifest_path)
+        store.prepare(
+            migration_id="approved",
+            source=inventory.provider_id,
+            skills=inventory.skills,
+            mcp_servers=inventory.mcp_servers,
+            scheduled_tasks=inventory.scheduled_tasks,
+        )
+        for key in (
+            [f"skills:{item.source_id}" for item in inventory.skills]
+            + [f"mcp:{item.source_id}" for item in inventory.mcp_servers]
+            + [
+                f"scheduled_tasks:{item.source_id}"
+                for item in inventory.scheduled_tasks
+            ]
+        ):
+            store.finalize(
+                key,
+                passed=True,
+                summary="approved",
+                reason="approved",
+            )
         summary = workspace.workspace_dir / "compatibility-summary.md"
         summary.write_text("approved", encoding="utf-8")
         return AdaptationResult(
-            manifest_path=workspace.workspace_dir / "missing-manifest.json",
+            manifest=load_manifest(manifest_path),
+            manifest_path=manifest_path,
             summary_path=summary,
-            status="completed",
-            counts={"migrate": 3, "repair": 0, "discard": 0, "staging": 0},
-            asset_zones={
-                "skills:portable-skill": "migrate",
-                "mcp:portable-mcp": "migrate",
-                "scheduled_tasks:portable-task": "migrate",
-            },
+            warnings=[],
         )
 
     monkeypatch.setattr(

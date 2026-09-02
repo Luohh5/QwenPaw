@@ -177,10 +177,15 @@ def _adaptation_check(
     context: _DoctorContext,
 ) -> MigrationDoctorCheck | None:
     receipt = context.receipt
-    if (
-        receipt.adaptation_status == "not_run"
-        and not receipt.adaptation_manifest
-    ):
+    has_assets = any(
+        (
+            context.inventory.skills,
+            context.inventory.mcp_servers,
+            context.inventory.plugins,
+            context.inventory.scheduled_tasks,
+        ),
+    )
+    if not receipt.adaptation_manifest and not has_assets:
         return None
     manifest, error = context.manifest, context.manifest_error
     if not receipt.adaptation_manifest:

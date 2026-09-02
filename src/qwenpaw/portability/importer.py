@@ -212,10 +212,8 @@ class ProviderImportService(ImportPlanningMixin):
         imported_scheduled_tasks: list[str] = []
         completed_scheduled_tasks: list[str] = []
         skipped_scheduled_tasks: list[str] = []
-        adaptation_status = "not_run"
         adaptation_manifest = ""
         adaptation_summary = ""
-        adaptation_counts: dict[str, int] = {}
         adaptation_asset_zones: dict[str, str] = {}
         plugin_app = None
         adaptation_root = (
@@ -271,9 +269,10 @@ class ProviderImportService(ImportPlanningMixin):
                     migration_id,
                     progress,
                 )
-                adaptation_status = adaptation.status
-                adaptation_counts = dict(adaptation.counts)
-                adaptation_asset_zones = dict(adaptation.asset_zones)
+                adaptation_asset_zones = {
+                    item.asset_key: item.zone.value
+                    for item in adaptation.manifest.assets
+                }
                 try:
                     adaptation_manifest = str(
                         adaptation.manifest_path.relative_to(
@@ -293,7 +292,6 @@ class ProviderImportService(ImportPlanningMixin):
                 warnings.extend(adaptation.warnings)
             except Exception as exc:  # pylint: disable=broad-except
                 logger.exception("Portability adaptation loop failed")
-                adaptation_status = "failed_safe"
                 warnings.append(
                     "工具和设置自动兼容 Loop 运行失败；迁移将继续，并保持"
                     "相关资产禁用："
@@ -1109,10 +1107,8 @@ class ProviderImportService(ImportPlanningMixin):
                 discovered_scheduled_task_count=(
                     inventory.discovered_scheduled_task_count
                 ),
-                adaptation_status=adaptation_status,
                 adaptation_manifest=adaptation_manifest,
                 adaptation_summary=adaptation_summary,
-                adaptation_counts=adaptation_counts,
                 retry_of_migration_id=retry_of_migration_id,
                 warnings=warnings,
             )

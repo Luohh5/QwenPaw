@@ -41,16 +41,20 @@ def test_repair_workflow_requires_current_passing_test(
         skills=[_skill(tmp_path)],
     )
 
-    with pytest.raises(RuntimeError, match="latest change"):
-        store.classify("demo", AssetZone.MIGRATE, "works")
-    store.record_test("demo", passed=False, summary="bound to codex")
+    store.finalize(
+        "demo",
+        passed=False,
+        summary="bound to codex",
+        reason="bound",
+    )
     store.mark_changed("demo", "updated SKILL.md")
-    with pytest.raises(RuntimeError, match="latest change"):
-        store.classify("demo", AssetZone.MIGRATE, "works")
-
-    store.record_test("demo", passed=True, summary="native loader passed")
-    manifest = store.classify("demo", AssetZone.MIGRATE, "works")
-    assert manifest.by_zone(AssetZone.MIGRATE)[0].revision == 1
+    manifest = store.finalize(
+        "demo",
+        passed=True,
+        summary="native loader passed",
+        reason="works",
+    )
+    assert manifest.by_zone(AssetZone.MIGRATE)[0].last_test.passed
 
 
 def test_hard_stop_preserves_repair_items(
@@ -84,8 +88,12 @@ def test_asset_budget_reserves_final_classification_call(
         store.consume("demo", reserve=1)
 
     store.consume("demo")
-    store.record_test("demo", passed=True, summary="native loader passed")
-    result = store.classify("demo", AssetZone.MIGRATE, "ready")
+    result = store.finalize(
+        "demo",
+        passed=True,
+        summary="native loader passed",
+        reason="ready",
+    )
     assert result.assets[0].tool_calls == budget
     assert result.assets[0].zone is AssetZone.MIGRATE
 

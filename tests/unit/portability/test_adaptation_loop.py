@@ -330,7 +330,6 @@ def test_codex_plugin_mcp_resolves_command_in_staged_container(
     tester = CompatibilityTester(
         SimpleNamespace(workspace_dir=tmp_path),
         inventory,
-        SimpleNamespace(),
     )
 
     result = tester._test_mcp(server)
@@ -348,7 +347,6 @@ def test_inspect_returns_exact_live_plugin_api_signatures(tmp_path: Path):
             provider_name="Qoder",
             detected=True,
         ),
-        SimpleNamespace(),
     )
 
     contract = tester.environment()["plugin_contract"]
@@ -414,7 +412,6 @@ def test_schedule_inspect_returns_current_values_not_manifest_snapshot(
             detected=True,
             scheduled_tasks=[current],
         ),
-        store,
     )
 
     inspected = tester.inspect(asset)
@@ -546,7 +543,7 @@ async def test_mission_classifies_portable_asset_for_enabled_migration(
         timeout=1,
     )
     manifest = load_manifest(result.manifest_path)
-    assert result.status == "completed"
+    assert result.manifest.state.value == "completed"
     assert manifest.assets[0].zone is AssetZone.MIGRATE
     assert result.summary_path.is_file()
     mission_prd = json.loads(
@@ -572,12 +569,6 @@ async def test_mission_repairs_then_retests_skill(tmp_path: Path) -> None:
             "SKILL.md",
             "---\nname: demo\ndescription: demo\n---\nRun QwenPaw tools.\n",
         )
-        with pytest.raises(RuntimeError, match="latest change"):
-            context.store.classify(
-                "skills:demo",
-                AssetZone.MIGRATE,
-                "not retested",
-            )
         assert (await context.finalize_asset("skills:demo", "retested"))[
             "passed"
         ]
@@ -595,7 +586,7 @@ async def test_mission_repairs_then_retests_skill(tmp_path: Path) -> None:
         ],
     )
     result = await run_adaptation_loop(workspace, inventory, "migration-2")
-    assert result.asset_zones["skills:demo"] == "migrate"
+    assert result.manifest.get_asset("skills:demo").zone.value == "migrate"
     staged = inventory.skills[0].directory / "SKILL.md"
     assert "QwenPaw tools" in staged.read_text(encoding="utf-8")
 
@@ -628,8 +619,8 @@ async def test_static_failure_keeps_remote_plugin_in_repair(
         ],
     )
     result = await run_adaptation_loop(workspace, inventory, "migration-3")
-    assert result.status == "stopped_limit"
-    assert result.asset_zones["plugins:remote"] == "repair"
+    assert result.manifest.state.value == "stopped_limit"
+    assert result.manifest.get_asset("plugins:remote").zone.value == "repair"
     assert "每项最多 4 次尝试" in result.summary_path.read_text(
         encoding="utf-8",
     )
@@ -688,7 +679,7 @@ async def test_qoder_marketplace_skill_plugin_reaches_migrate_zone(
         "migration-cangjie",
     )
 
-    assert result.asset_zones["plugins:cangjie"] == "migrate"
+    assert result.manifest.get_asset("plugins:cangjie").zone.value == "migrate"
 
 
 @pytest.mark.asyncio
@@ -712,8 +703,8 @@ async def test_missing_mission_mode_fails_safe_into_repair(
         ],
     )
     result = await run_adaptation_loop(workspace, inventory, "migration-4")
-    assert result.status == "stopped_limit"
-    assert result.asset_zones["skills:demo"] == "repair"
+    assert result.manifest.state.value == "stopped_limit"
+    assert result.manifest.get_asset("skills:demo").zone.value == "repair"
     summary = result.summary_path.read_text(encoding="utf-8")
     assert "停止原因：无法完成 QwenPaw Mission" in summary
 
@@ -749,7 +740,9 @@ async def test_rejected_secret_repair_does_not_mutate_source(
 
     result = await run_adaptation_loop(workspace, inventory, "migration-5")
 
-    assert result.asset_zones["mcp:safe-mcp"] == "migrate", result.warnings
+    assert (
+        result.manifest.get_asset("mcp:safe-mcp").zone.value == "migrate"
+    ), result.warnings
     persisted = result.manifest_path.read_text(encoding="utf-8")
     assert "sk-do-not-persist" not in persisted
 
@@ -819,7 +812,7 @@ async def test_mixed_plugin_is_one_asset_with_component_review_and_repair(
         inventory,
         "migration-mixed",
     )
-    assert result.asset_zones["plugins:mixed"] == "migrate"
+    assert result.manifest.get_asset("plugins:mixed").zone.value == "migrate"
     staged = Path(inventory.plugins[0].install_source)
     assert (staged / "hooks/start.sh").is_file()
 
@@ -869,7 +862,7 @@ async def test_mission_repairs_assets_in_parallel_with_isolated_scope(
         ),
         "migration-parallel",
     )
-    assert result.status == "completed"
+    assert result.manifest.state.value == "completed"
     assert workspace.max_active_queries == 2
     assert (
         load_manifest(result.manifest_path).get_asset("skills:first").tests
@@ -978,5 +971,5 @@ async def test_mission_tools_run_concurrently_for_distinct_assets(
         timeout=5,
     )
 
-    assert result.status == "completed"
+    assert result.manifest.state.value == "completed"
     assert set(entered) == {"skills:first", "skills:second"}
