@@ -1159,11 +1159,33 @@ class ProviderImportService(ImportPlanningMixin):
                             (inventory.provider_id, target_thread_id),
                         )
                         if target_chat is None:
-                            raise ValueError(
-                                "Codex heartbeat 的目标会话未迁移，不能安全" + "绑定到其他会话。",
+                            target_session_id = (
+                                f"import:{inventory.provider_id}:scheduled:"
+                                f"{task.source_id}"
                             )
-                        target_session_id = target_chat.session_id
-                        target_user_id = target_chat.user_id
+                            target_user_id = target_session_id
+                            chat = self._workspace.chat_manager
+                            chat_id = await chat.get_chat_id_by_session(
+                                target_session_id,
+                                "console",
+                                target_user_id,
+                            )
+                            fallback_chat = await chat.get_or_create_chat(
+                                session_id=target_session_id,
+                                user_id=target_user_id,
+                                channel="console",
+                                name=f"{task.name}（迁移定时任务）",
+                                source="cron",
+                            )
+                            if chat_id is None:
+                                created_chats.append(fallback_chat.id)
+                            warnings.append(
+                                f"Codex heartbeat {task.name!r} 的目标会话不可"
+                                "迁移；已新建独立 QwenPaw 会话，不保留原历史上下文。",
+                            )
+                        else:
+                            target_session_id = target_chat.session_id
+                            target_user_id = target_chat.user_id
                     job = build_imported_job(
                         inventory.provider_id,
                         task,

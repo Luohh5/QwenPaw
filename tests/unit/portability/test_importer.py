@@ -222,6 +222,44 @@ async def test_provider_imports_scheduled_tasks_disabled_and_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_without_source_chat_uses_new_cron_chat(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.cron_manager = _CronManager()
+    inventory = ProviderInventory(
+        provider_id="codex",
+        provider_name="Codex",
+        detected=True,
+        scheduled_tasks=[
+            SourceScheduledTask(
+                source_id="heartbeat-1",
+                name="Release monitor",
+                schedule_type="cron",
+                cron="30 9 * * *",
+                prompt="Check releases",
+                metadata={
+                    "source_kind": "heartbeat",
+                    "target_thread_id": "unavailable-thread",
+                },
+            ),
+        ],
+    )
+    _bind_inventory(monkeypatch, inventory)
+    _mock_adaptation(monkeypatch, workspace, inventory)
+
+    receipt = await ProviderImportService(workspace).import_from("codex")
+
+    job = next(iter(workspace.cron_manager.jobs.values()))
+    assert receipt.imported_scheduled_tasks == ["heartbeat-1"]
+    assert job.runtime.share_session is True
+    assert job.dispatch.target.user_id == job.dispatch.target.session_id
+    assert len(await workspace.chat_manager.list_chats(archived=None)) == 1
+    assert any("已新建独立 QwenPaw 会话" in item for item in receipt.warnings)
+
+
+@pytest.mark.asyncio
 async def test_unfinished_mission_materializes_repair_items_disabled(
     tmp_path: Path,
     monkeypatch,
