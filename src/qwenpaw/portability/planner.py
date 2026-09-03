@@ -261,6 +261,8 @@ def _canonical_source(
         stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)
     ):
         return "rejected-non-regular", path
+    if source.kind == "file":
+        return "file", path
     try:
         canonical = path.resolve(strict=True)
     except OSError as exc:
@@ -271,10 +273,21 @@ def _canonical_source(
 def _hash_inventory_sources(
     hasher: Any,
     inventory: ProviderInventory,
+    file_payloads: dict[Path, bytes] | None = None,
 ) -> None:
-    classified = {
-        _canonical_source(source) for source in _fingerprint_sources(inventory)
-    }
+    classified = set()
+    for source in _fingerprint_sources(inventory):
+        if source.kind == "file" and file_payloads is not None:
+            try:
+                file_payloads[source.path]
+            except KeyError as exc:
+                raise _fingerprint_error(
+                    source.path,
+                    "memory snapshot is unavailable",
+                ) from exc
+            classified.add(("snapshot", source.path))
+        else:
+            classified.add(_canonical_source(source))
     roots = sorted(
         (path for kind, path in classified if kind == "tree"),
         key=lambda path: path.parts,
@@ -287,13 +300,13 @@ def _hash_inventory_sources(
 
     root_set = set(selected_roots)
     files = {
-        path
+        (kind, path)
         for kind, path in classified
-        if kind == "file" and not _has_parent_in(path, root_set)
+        if kind in {"file", "snapshot"} and not _has_parent_in(path, root_set)
     }
     markers = {(kind, path) for kind, path in classified if _is_marker(kind)}
     work = [("tree", path) for path in selected_roots]
-    work.extend(("file", path) for path in files)
+    work.extend(files)
     work.extend(markers)
     work.sort(key=lambda item: (str(item[1]), item[0]))
 
@@ -304,16 +317,27 @@ def _hash_inventory_sources(
         elif kind == "file":
             budget.add_entry(path)
             _hash_regular_file(hasher, path, budget)
+        elif kind == "snapshot":
+            data = file_payloads[path] if file_payloads is not None else b""
+            budget.add_entry(path)
+            budget.add_file(path, len(data))
+            _hash_record(hasher, "file", str(path))
+            hasher.update(len(data).to_bytes(8, "big"))
+            hasher.update(data)
         else:
             budget.add_entry(path)
             _hash_record(hasher, kind, str(path))
 
 
 def _is_marker(kind: str) -> bool:
-    return kind not in {"tree", "file"}
+    return kind not in {"tree", "file", "snapshot"}
 
 
-def inventory_fingerprint(inventory: ProviderInventory) -> str:
+def inventory_fingerprint(
+    inventory: ProviderInventory,
+    *,
+    file_payloads: dict[Path, bytes] | None = None,
+) -> str:
     """Fingerprint normalized objects plus referenced portable file bytes."""
     hasher = hashlib.sha256()
     payload = inventory.model_dump(
@@ -331,7 +355,7 @@ def inventory_fingerprint(inventory: ProviderInventory) -> str:
             separators=(",", ":"),
         ).encode("utf-8"),
     )
-    _hash_inventory_sources(hasher, inventory)
+    _hash_inventory_sources(hasher, inventory, file_payloads)
     return hasher.hexdigest()
 
 
@@ -375,6 +399,7 @@ def tool_asset_fingerprints(
     inventory: ProviderInventory,
     *,
     include_sessions: bool = False,
+    file_payloads: dict[Path, bytes] | None = None,
 ) -> dict[str, str]:
     """Fingerprint selected tools and, when requested, conversations."""
     updates = {field: [] for _kind, field in _TOOL_FIELDS} | {
@@ -418,7 +443,10 @@ def tool_asset_fingerprints(
                     ),
                 },
             )
-            result[f"{kind}:{item.source_id}"] = inventory_fingerprint(scoped)
+            result[f"{kind}:{item.source_id}"] = inventory_fingerprint(
+                scoped,
+                file_payloads=file_payloads if kind == "memory" else None,
+            )
     if include_sessions:
         result["sessions"] = _session_fingerprint(inventory)
     return result

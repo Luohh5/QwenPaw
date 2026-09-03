@@ -21,7 +21,12 @@ from ..models import (
     SourceSkill,
 )
 from ._utils import parse_datetime
-from .base import ProgressReporter, make_inventory, progress_milestone
+from .base import (
+    ProgressReporter,
+    SessionReadBudget,
+    make_inventory,
+    progress_milestone,
+)
 from .external_state import (
     codex_memory_status,
     discover_codex_memory,
@@ -33,6 +38,7 @@ from .locator import resolve_source_location
 
 _DISCOVERY_TIMEOUT_SECONDS = 60
 _SESSION_TIMEOUT_SECONDS = 90
+_SESSION_SCAN_TIMEOUT_SECONDS = 300
 _READ_CONCURRENCY = 2
 
 
@@ -72,6 +78,8 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
         *,
         limit: int,
         progress: ProgressReporter | None = None,
+        include_sessions: bool = True,
+        session_ids: set[str] | None = None,
     ) -> ProviderInventory:
         """Discover and normalize Codex-owned portable objects."""
         local_only = self._source_location.data_home_source == "explicit"
@@ -88,13 +96,16 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
                 settings,
             )
         rollout_reader = self._rollout_reader
-        offline_threads = await run_sync_io(
-            rollout_reader.list_threads,
-            limit=limit,
-        )
-        ignored_session_ids = await run_sync_io(
-            rollout_reader.list_non_root_thread_ids,
-        )
+        offline_threads: list[dict[str, Any]] = []
+        ignored_session_ids: list[str] = []
+        if include_sessions:
+            offline_threads = await run_sync_io(
+                rollout_reader.list_threads,
+                limit=limit,
+            )
+            ignored_session_ids = await run_sync_io(
+                rollout_reader.list_non_root_thread_ids,
+            )
         if rollout_reader.index_truncated:
             warnings = [
                 "Codex rollout discovery reached its safety limit; older "
@@ -169,7 +180,7 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             set(ignored_session_ids) | set(automation_run_thread_ids),
         )
         ignored_source_ids = set(ignored_session_ids)
-        if automation_run_thread_ids:
+        if include_sessions and automation_run_thread_ids:
             # Refill the bounded root list after DB-only automation IDs are
             # removed, so internal runs cannot consume the user's session
             # import quota merely because an older rollout lacks the newer
@@ -244,10 +255,10 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
                 ],
             )
 
-        if progress is not None:
+        if include_sessions and progress is not None:
             await progress("正在合并 Codex 会话索引与本地 JSONL 备份…")
         online_threads: list[dict[str, Any]] = []
-        if installed:
+        if include_sessions and installed:
             try:
                 online_threads = await asyncio.wait_for(
                     adapter.list_external_threads(limit=limit),
@@ -279,24 +290,35 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
                 "conversations.",
             )
         raw_threads = _merge_threads(online_threads, offline_threads, limit)
+        if session_ids is not None:
+            raw_threads = [
+                item
+                for item in raw_threads
+                if str(item.get("id") or item.get("threadId") or "")
+                in session_ids
+            ]
         if len(raw_threads) >= limit:
             warnings.append(
                 f"Codex session safety limit ({limit}) was reached; older "
                 "threads beyond this bounded import were not read.",
             )
-        if progress is not None:
+        if include_sessions and progress is not None:
             await progress(
                 f"发现 {len(raw_threads)} 个 Codex 会话，正在读取历史"
                 f"（最多 {_READ_CONCURRENCY} 个同时读取，失败会自动改读 JSONL）…",
             )
 
-        sessions, read_warnings, recovered = await self._read_sessions(
-            adapter,
-            rollout_reader,
-            raw_threads,
-            installed=installed,
-            progress=progress,
-        )
+        sessions: list[SourceSession] = []
+        read_warnings: list[str] = []
+        recovered = 0
+        if include_sessions:
+            sessions, read_warnings, recovered = await self._read_sessions(
+                adapter,
+                rollout_reader,
+                raw_threads,
+                installed=installed,
+                progress=progress,
+            )
         warnings.extend(read_warnings)
         if recovered:
             warnings.append(
@@ -487,7 +509,7 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
         )
         return servers
 
-    # pylint: disable-next=too-many-locals
+    # pylint: disable-next=too-many-locals,too-many-statements
     async def _read_sessions(
         self,
         adapter: Any,
@@ -497,10 +519,9 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
         installed: bool,
         progress: ProgressReporter | None,
     ) -> tuple[list[SourceSession], list[str], int]:
-        semaphore = asyncio.Semaphore(_READ_CONCURRENCY)
         progress_lock = asyncio.Lock()
         completed = 0
-        recovered = 0
+        budget = SessionReadBudget()
 
         async def _read_one(
             raw: dict[str, Any],
@@ -510,25 +531,24 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             used_fallback = False
             failure: BaseException | None = None
             history = []
-            async with semaphore:
-                if source_id and installed and not raw.get("offlineOnly"):
-                    try:
-                        history = await asyncio.wait_for(
-                            adapter.read_external_thread(source_id),
-                            timeout=_SESSION_TIMEOUT_SECONDS,
-                        )
-                    except Exception as exc:  # pylint: disable=broad-except
+            if source_id and installed and not raw.get("offlineOnly"):
+                try:
+                    history = await asyncio.wait_for(
+                        adapter.read_external_thread(source_id),
+                        timeout=_SESSION_TIMEOUT_SECONDS,
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    failure = exc
+            if source_id and (failure is not None or not history):
+                try:
+                    history = await run_sync_io(
+                        rollout_reader.read_thread,
+                        source_id,
+                    )
+                    used_fallback = bool(history)
+                except Exception as exc:  # pylint: disable=broad-except
+                    if failure is None:
                         failure = exc
-                if source_id and (failure is not None or not history):
-                    try:
-                        history = await run_sync_io(
-                            rollout_reader.read_thread,
-                            source_id,
-                        )
-                        used_fallback = bool(history)
-                    except Exception as exc:  # pylint: disable=broad-except
-                        if failure is None:
-                            failure = exc
 
             if not source_id:
                 result: tuple[SourceSession | None, str | None, bool] = (
@@ -582,18 +602,46 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
                     )
             return result
 
-        results = await asyncio.gather(
-            *(_read_one(raw) for raw in raw_threads),
-        )
         sessions: list[SourceSession] = []
         warnings: list[str] = []
-        for session, warning, used_fallback in results:
-            if session is not None:
-                sessions.append(session)
-            if warning:
-                warnings.append(warning)
-            if used_fallback:
-                recovered += 1
+        recovered = 0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _SESSION_SCAN_TIMEOUT_SECONDS
+        for start in range(0, len(raw_threads), _READ_CONCURRENCY):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                warnings.append(
+                    "Codex session scan reached its 300 second time limit; "
+                    "remaining histories were not read.",
+                )
+                break
+            batch = raw_threads[start : start + _READ_CONCURRENCY]
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*(_read_one(raw) for raw in batch)),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                warnings.append(
+                    "Codex session scan reached its 300 second time limit; "
+                    "remaining histories were not read.",
+                )
+                break
+            for session, warning, used_fallback in results:
+                if warning:
+                    warnings.append(warning)
+                if session is not None:
+                    reason = budget.add(session)
+                    if reason:
+                        warnings.append(reason)
+                        if budget.exhausted:
+                            break
+                    else:
+                        sessions.append(session)
+                if used_fallback:
+                    recovered += 1
+            if budget.exhausted:
+                break
         return sessions, warnings, recovered
 
 

@@ -18,6 +18,7 @@ _UUID_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _MAX_HISTORY_BYTES = 64 * 1024 * 1024
+_MAX_HISTORY_ITEMS = 20_000
 _MAX_LINE_BYTES = 4 * 1024 * 1024
 _MAX_HEADER_LINE_BYTES = 1024 * 1024
 _MAX_HEADER_LINES = 64
@@ -215,7 +216,16 @@ class CodexRolloutReader:
             raise FileNotFoundError(f"Codex rollout not found: {thread_id}")
         history: list[HarnessHistoryItem] = []
         seen: set[tuple[str, str]] = set()
+        total_bytes = 0
         for path in record.paths:
+            try:
+                total_bytes += path.stat().st_size
+            except OSError as exc:
+                raise FileNotFoundError(path) from exc
+            if total_bytes > _MAX_HISTORY_BYTES:
+                raise ValueError(
+                    f"Codex rollout exceeds its safety limit: {path.name}",
+                )
             for item in _read_rollout_history(path):
                 stable_id = item.item_id
                 key = (item.kind.value, stable_id)
@@ -224,6 +234,11 @@ class CodexRolloutReader:
                         continue
                     seen.add(key)
                 history.append(item)
+                if len(history) > _MAX_HISTORY_ITEMS:
+                    raise ValueError(
+                        "Codex rollout exceeds its item safety limit: "
+                        f"{path.name}",
+                    )
         return history
 
     def skill_records(self, *, limit: int = 500) -> list[dict[str, Any]]:

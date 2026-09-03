@@ -5,12 +5,56 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, Protocol
 
-from ..models import ProviderInventory
+from ..models import ProviderInventory, SourceSession
 
 ProgressReporter = Callable[[str], Awaitable[None]]
 logger = logging.getLogger(__name__)
+
+MAX_SESSION_HISTORY_ITEMS = 20_000
+MAX_SESSION_HISTORY_BYTES = 64 * 1024 * 1024
+MAX_TOTAL_SESSION_HISTORY_ITEMS = 100_000
+MAX_TOTAL_SESSION_HISTORY_BYTES = 128 * 1024 * 1024
+
+
+@dataclass
+class SessionReadBudget:
+    """Bound histories retained by one provider inventory."""
+
+    items: int = 0
+    bytes: int = 0
+    exhausted: bool = False
+
+    def add(self, session: SourceSession) -> str | None:
+        item_count = len(session.history)
+        byte_count = sum(
+            len(item.model_dump_json().encode("utf-8", errors="replace"))
+            for item in session.history
+        )
+        if item_count > MAX_SESSION_HISTORY_ITEMS:
+            return (
+                f"Session {session.source_id} exceeds the "
+                f"{MAX_SESSION_HISTORY_ITEMS:,} history item limit."
+            )
+        if byte_count > MAX_SESSION_HISTORY_BYTES:
+            return (
+                f"Session {session.source_id} exceeds the 64 MiB "
+                "history limit."
+            )
+        if (
+            self.items + item_count > MAX_TOTAL_SESSION_HISTORY_ITEMS
+            or self.bytes + byte_count > MAX_TOTAL_SESSION_HISTORY_BYTES
+        ):
+            self.exhausted = True
+            return (
+                "Session scan reached the 100,000 item / 128 MiB "
+                "aggregate history limit."
+            )
+        self.items += item_count
+        self.bytes += byte_count
+        return None
 
 
 async def report_progress(
@@ -63,5 +107,7 @@ class MigrationProvider(Protocol):
         *,
         limit: int,
         progress: ProgressReporter | None = None,
+        include_sessions: bool = True,
+        session_ids: set[str] | None = None,
     ) -> ProviderInventory:
         """Return a bounded, normalized inventory from the source."""

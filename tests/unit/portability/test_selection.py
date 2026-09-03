@@ -263,6 +263,7 @@ class _PlanningService(ImportPlanningMixin):
             agent_id="agent-1",
         )
         self.inventory = inventory
+        self.inventory_options: dict | None = None
         self.executed: ProviderInventory | None = None
         self.plan = MigrationPlan(
             plan_id="plan-" + "a" * 32,
@@ -282,6 +283,7 @@ class _PlanningService(ImportPlanningMixin):
         return None
 
     async def _inventory(self, *_args, **_kwargs) -> ProviderInventory:
+        self.inventory_options = _kwargs
         return self.inventory
 
     async def _execute_plan(self, _plan, inventory, **_kwargs):
@@ -303,6 +305,12 @@ async def test_apply_selection_filters_before_execution(
     assert service.executed is not None
     assert [item.source_id for item in service.executed.skills] == ["skill-1"]
     assert service.executed.plugins == []
+    assert service.inventory_options == {
+        "source_home": None,
+        "progress": None,
+        "include_sessions": False,
+        "session_ids": None,
+    }
 
 
 @pytest.mark.asyncio

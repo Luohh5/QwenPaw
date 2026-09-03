@@ -48,11 +48,11 @@ from .scheduled_tasks import build_imported_job, imported_job_source
 from .selection import bound_mcp_plugin
 from .import_conversations import ConversationState, import_conversations
 from .import_support import (
-    _bounded_memory,
     _bounded_session,
     _mcp_client_data,
     _progress_milestone,
     _create_memory_project,
+    MemoryPayloads,
     _skill_zip,
 )
 from .import_planning import ImportPlanningMixin
@@ -139,12 +139,13 @@ class ProviderImportService(ImportPlanningMixin):
         plan_id: str = "",
         progress: ProgressReporter | None = None,
         retry_of_migration_id: str = "",
+        memory_payloads: MemoryPayloads | None = None,
     ) -> ImportReceipt:
         """Apply assets independently; a failed asset does not undo others."""
         migration_id = f"migration-{uuid4().hex}"
         warnings = list(inventory.warnings)
         sessions = [_bounded_session(item) for item in inventory.sessions]
-        _bounded_memory(inventory.memory_projects)
+        memory_payloads = memory_payloads or {}
         existing_chats = await self._workspace.chat_manager.list_chats(
             archived=None,
         )
@@ -510,6 +511,7 @@ class ProviderImportService(ImportPlanningMixin):
                             self._workspace,
                             inventory.provider_id,
                             project,
+                            memory_payloads[project.source_id],
                         ),
                         record_memory,
                     )

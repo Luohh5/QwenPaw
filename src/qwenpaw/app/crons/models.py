@@ -165,8 +165,8 @@ class JobRuntimeSpec(BaseModel):
         default=True,
         description=(
             "Whether to share session with target user. "
-            "If False, each execution creates a visible cron-sourced chat "
-            "whose isolated session ID contains that execution's run ID."
+            "If False, executions use one dedicated visible cron-sourced "
+            "chat for this job."
         ),
     )
     tool_safety: bool = Field(

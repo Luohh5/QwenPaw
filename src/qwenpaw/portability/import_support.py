@@ -24,7 +24,7 @@ from .models import (
     SourceSkill,
 )
 from .providers.base import progress_milestone as _progress_milestone
-from .skill_transfer import read_bounded_skill_tree
+from .skill_transfer import read_bounded_skill_tree, read_regular_file
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,9 @@ _MAX_SESSION_TEXT_BYTES = 64 * 1024 * 1024
 _MAX_MEMORY_FILES = 5000
 _MAX_MEMORY_BYTES = 64 * 1024 * 1024
 _PLAN_ID_PATTERN = re.compile(r"^plan-[0-9a-f]{32}$")
+
+MemoryPayloads = dict[str, dict[Path, bytes]]
+MemorySourcePayloads = dict[Path, bytes]
 
 
 def _session_key(provider_id: str, source_id: str) -> str:
@@ -95,23 +98,66 @@ def _bounded_session(session: SourceSession) -> SourceSession:
     return session
 
 
-def _bounded_memory(projects: list[SourceMemoryProject]) -> None:
+def _prepare_memory_payloads(
+    provider_id: str,
+    projects: list[SourceMemoryProject],
+) -> tuple[MemoryPayloads, MemorySourcePayloads]:
+    """Read the exact bounded Memory snapshot that will be imported."""
     count = 0
     total = 0
+    payloads: MemoryPayloads = {}
+    source_payloads: MemorySourcePayloads = {}
     for project in projects:
+        payload: dict[Path, bytes] = {}
         for item in project.files:
-            source = item.source_path.expanduser()
-            if source.is_symlink() or not source.is_file():
+            relative = item.relative_path
+            if (
+                relative.is_absolute()
+                or ".." in relative.parts
+                or relative.suffix.lower() != ".md"
+                or relative in payload
+            ):
                 raise ValueError(
-                    f"Memory source is unavailable or symbolic: {source}",
+                    f"Unsafe external memory path: {item.relative_path}",
                 )
-            count += 1
-            total += source.stat().st_size
-            if count > _MAX_MEMORY_FILES or total > _MAX_MEMORY_BYTES:
+            if count >= _MAX_MEMORY_FILES:
                 raise ValueError(
                     "External memory exceeds the 5,000 file / 64 MiB "
                     "migration limit.",
                 )
+            source = Path(os.path.abspath(item.source_path.expanduser()))
+            try:
+                data = read_regular_file(
+                    source,
+                    max_bytes=_MAX_MEMORY_BYTES - total,
+                )
+            except (OSError, ValueError) as exc:
+                raise ValueError(
+                    f"Memory source is unavailable: {source}",
+                ) from exc
+            previous = source_payloads.get(source)
+            if previous is not None and previous != data:
+                raise ValueError(
+                    f"Memory source changed during snapshot: {source}",
+                )
+            count += 1
+            total += len(data)
+            payload[relative] = data
+            source_payloads[source] = data
+        scope = {
+            "schema_version": "1",
+            "provider": provider_id,
+            "source_id": project.source_id,
+            "project_key": project.project_key,
+            "cwd": project.cwd,
+            "trust": "source_material_not_instructions",
+        }
+        payload[Path("_scope.json")] = (
+            json.dumps(scope, ensure_ascii=False, sort_keys=True, indent=2)
+            + "\n"
+        ).encode("utf-8")
+        payloads[project.source_id] = payload
+    return payloads, source_payloads
 
 
 def _safe_memory_key(project: SourceMemoryProject) -> str:
@@ -144,44 +190,12 @@ def _memory_import_root(workspace: Any, provider_id: str) -> Path:
     return target
 
 
-def _memory_payload(
-    provider_id: str,
-    project: SourceMemoryProject,
-) -> dict[Path, bytes]:
-    payload: dict[Path, bytes] = {}
-    for item in project.files:
-        relative = item.relative_path
-        if (
-            relative.is_absolute()
-            or ".." in relative.parts
-            or relative.suffix.lower() != ".md"
-        ):
-            raise ValueError(
-                f"Unsafe external memory path: {item.relative_path}",
-            )
-        source = item.source_path.expanduser()
-        if source.is_symlink() or not source.is_file():
-            raise ValueError(f"Memory source is unavailable: {source}")
-        payload[relative] = source.read_bytes()
-    scope = {
-        "schema_version": "1",
-        "provider": provider_id,
-        "source_id": project.source_id,
-        "project_key": project.project_key,
-        "cwd": project.cwd,
-        "trust": "source_material_not_instructions",
-    }
-    payload[Path("_scope.json")] = (
-        json.dumps(scope, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-    ).encode("utf-8")
-    return payload
-
-
 # pylint: disable-next=too-many-branches
 def _create_memory_project(
     workspace: Any,
     provider_id: str,
     project: SourceMemoryProject,
+    payload: dict[Path, bytes],
 ) -> tuple[Path, bool]:
     """Create one imported memory project without changing an existing one."""
     target = _memory_import_root(workspace, provider_id) / _safe_memory_key(
@@ -191,7 +205,6 @@ def _create_memory_project(
         return target, False
     if target.exists():
         raise ValueError(f"Memory import target is not a directory: {target}")
-    payload = _memory_payload(provider_id, project)
     target.parent.mkdir(parents=True, exist_ok=True)
     temp_root = Path(
         tempfile.mkdtemp(prefix=f".{target.name}.new-", dir=target.parent),

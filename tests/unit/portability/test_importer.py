@@ -25,6 +25,7 @@ from qwenpaw.harnesses.events import HarnessHistoryItem, HarnessHistoryKind
 from qwenpaw.portability.importer import ProviderImportService
 from qwenpaw.portability.import_support import (
     _create_memory_project as create_memory_project,
+    _prepare_memory_payloads,
 )
 from qwenpaw.portability.adaptation_loop import AdaptationResult
 from qwenpaw.portability.compatibility import (
@@ -59,8 +60,11 @@ class _Provider:
         *,
         limit: int,
         progress=None,
+        include_sessions=True,
+        session_ids=None,
     ) -> ProviderInventory:
         assert limit >= 1
+        del include_sessions, session_ids
         if progress is not None:
             await progress("provider inventory")
         return self._inventory
@@ -1242,6 +1246,59 @@ async def test_provider_memory_is_scoped_exact_and_idempotent(
     assert scope["cwd"] == "/source/project-a"
     assert scope["trust"] == "source_material_not_instructions"
     assert not (workspace.workspace_dir / "MEMORY.md").exists()
+
+
+def test_memory_snapshot_is_verified_then_written_without_rereading(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "source-memory/fact.md"
+    source.parent.mkdir()
+    source.write_text("verified", encoding="utf-8")
+    project = SourceMemoryProject(
+        source_id="project-a",
+        project_key="Project A",
+        files=[
+            SourceMemoryFile(
+                source_path=source,
+                relative_path=Path("fact.md"),
+            ),
+        ],
+    )
+
+    payloads, source_payloads = _prepare_memory_payloads("codex", [project])
+    source.write_text("changed after snapshot", encoding="utf-8")
+    target, changed = create_memory_project(
+        workspace,
+        "codex",
+        project,
+        payloads[project.source_id],
+    )
+
+    assert changed is True
+    assert source_payloads[source] == b"verified"
+    assert (target / "fact.md").read_bytes() == b"verified"
+
+
+def test_memory_snapshot_rejects_symbolic_link(tmp_path: Path) -> None:
+    secret = tmp_path / "secret.md"
+    secret.write_text("do not import", encoding="utf-8")
+    source = tmp_path / "source-memory/fact.md"
+    source.parent.mkdir()
+    source.symlink_to(secret)
+    project = SourceMemoryProject(
+        source_id="project-a",
+        project_key="Project A",
+        files=[
+            SourceMemoryFile(
+                source_path=source,
+                relative_path=Path("fact.md"),
+            ),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="Memory source is unavailable"):
+        _prepare_memory_payloads("codex", [project])
 
 
 @pytest.mark.asyncio

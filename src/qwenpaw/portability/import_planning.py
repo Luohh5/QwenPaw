@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any
 from ..utils import io_utils
 from ..utils.io_utils import get_path_lock, read_json_async
-from .import_support import _PLAN_ID_PATTERN
+from .import_support import (
+    MemoryPayloads,
+    _PLAN_ID_PATTERN,
+    _prepare_memory_payloads,
+)
 from .models import (
     ImportReceipt,
     ImportSelection,
@@ -52,6 +56,7 @@ class ImportPlanningMixin:
         started_at: datetime,
         progress: ProgressReporter | None,
         retry_of_migration_id: str = "",
+        memory_payloads: MemoryPayloads | None = None,
     ) -> ImportReceipt:
         """Mark plan lifecycle around independent asset writes."""
         transaction = ImportTransactionJournal(
@@ -68,6 +73,7 @@ class ImportPlanningMixin:
                 plan_id=plan.plan_id,
                 progress=progress,
                 retry_of_migration_id=retry_of_migration_id,
+                memory_payloads=memory_payloads or {},
             )
         except BaseException:
             plan.state = "ready"
@@ -164,6 +170,7 @@ class ImportPlanningMixin:
                 parent.source,
                 source_home=source_home,
                 progress=progress,
+                include_sessions=False,
             )
             plan = await build_migration_plan(
                 self._workspace,
@@ -172,12 +179,28 @@ class ImportPlanningMixin:
             )
             await self._write_plan(plan)
             inventory = select_inventory(inventory, selection)
+            memory_payloads, file_payloads = await io_utils.run_sync_io(
+                _prepare_memory_payloads,
+                inventory.provider_id,
+                inventory.memory_projects,
+            )
+            current = await io_utils.run_sync_io(
+                tool_asset_fingerprints,
+                inventory,
+                file_payloads=file_payloads,
+            )
+            expected = _expected_fingerprints(plan.asset_fingerprints, current)
+            if current != expected:
+                raise ValueError(
+                    "来源数据在预演后发生了变化。请重新扫描后重试。",
+                )
             receipt = await self._execute_plan(
                 plan,
                 inventory,
                 started_at=datetime.now(timezone.utc),
                 progress=progress,
                 retry_of_migration_id=parent.migration_id,
+                memory_payloads=memory_payloads,
             )
         return plan, receipt
 
@@ -203,17 +226,35 @@ class ImportPlanningMixin:
                     f"该迁移计划当前状态为 {plan.state!r}，不能重复执行。",
                 )
             source_home = _source_home(plan.source_home)
+            include_sessions = selection is None or selection.sessions
+            session_ids = (
+                {
+                    action.source_id
+                    for action in plan.actions
+                    if action.asset_type == "session"
+                }
+                if include_sessions
+                else None
+            )
             inventory = await self._inventory(
                 plan.source,
                 source_home=source_home,
                 progress=progress,
+                include_sessions=include_sessions,
+                session_ids=session_ids,
             )
             if selection is not None:
                 inventory = select_inventory(inventory, selection)
+            memory_payloads, file_payloads = await io_utils.run_sync_io(
+                _prepare_memory_payloads,
+                inventory.provider_id,
+                inventory.memory_projects,
+            )
             current = await io_utils.run_sync_io(
                 tool_asset_fingerprints,
                 inventory,
                 include_sessions=selection is None or selection.sessions,
+                file_payloads=file_payloads,
             )
             expected = _expected_fingerprints(
                 plan.asset_fingerprints,
@@ -228,6 +269,7 @@ class ImportPlanningMixin:
                 inventory,
                 started_at=datetime.now(timezone.utc),
                 progress=progress,
+                memory_payloads=memory_payloads,
             )
 
     async def _inventory(
@@ -237,6 +279,8 @@ class ImportPlanningMixin:
         source_home: Path | None,
         progress: ProgressReporter | None,
         require_detected: bool = True,
+        include_sessions: bool = True,
+        session_ids: set[str] | None = None,
     ) -> ProviderInventory:
         await _report(progress, f"正在检测 {source} 并读取可迁移内容…")
         # Keep compatibility with tests and integrations that patch the old
@@ -251,6 +295,8 @@ class ImportPlanningMixin:
         inventory = await provider.inventory(
             limit=_MAX_SESSIONS,
             progress=progress,
+            include_sessions=include_sessions,
+            session_ids=session_ids,
         )
         if require_detected and not inventory.detected:
             detail = "; ".join(inventory.warnings) or "未检测到来源数据"

@@ -9,7 +9,12 @@ from typing import Any
 
 from ...utils.io_utils import run_sync_io
 from ..models import ProviderInventory, SourceLocation, SourceSession
-from .base import ProgressReporter, make_inventory, progress_milestone
+from .base import (
+    ProgressReporter,
+    SessionReadBudget,
+    make_inventory,
+    progress_milestone,
+)
 from .external_state import (
     discover_qoder_mcp,
     discover_qoder_memory,
@@ -28,7 +33,7 @@ from .qoder_schedules import discover_qoder_scheduled_tasks
 from .locator import resolve_source_location
 
 _READ_CONCURRENCY = 4
-_READ_BATCH_SIZE = 32
+_SESSION_SCAN_TIMEOUT_SECONDS = 300
 
 
 class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
@@ -71,6 +76,8 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
         *,
         limit: int,
         progress: ProgressReporter | None = None,
+        include_sessions: bool = True,
+        session_ids: set[str] | None = None,
     ) -> ProviderInventory:
         """Discover and normalize local Qoder JSONL sessions."""
         discovery: Any = await asyncio.gather(
@@ -78,11 +85,17 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
             run_sync_io(discover_qoder_plugins, self._qoder_home),
             run_sync_io(discover_qoder_skills, self._qoder_home),
             run_sync_io(discover_qoder_mcp, self._qoder_home),
-            run_sync_io(discover_qoder_transcripts, self._qoder_home),
-            run_sync_io(load_qoder_index, self._qoder_user_data),
             run_sync_io(
                 discover_qoder_scheduled_tasks,
                 self._qoder_user_data,
+            ),
+            *(
+                (
+                    run_sync_io(discover_qoder_transcripts, self._qoder_home),
+                    run_sync_io(load_qoder_index, self._qoder_user_data),
+                )
+                if include_sessions
+                else ()
             ),
         )
         (
@@ -90,10 +103,15 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
             plugin_state,
             skills,
             mcp_state,
-            records,
-            index_state,
             scheduled_task_state,
+            *session_state,
         ) = discovery
+        records: list[Any] = []
+        qoder_index = None
+        index_warnings: list[str] = []
+        if include_sessions:
+            records, index_state = session_state
+            qoder_index, index_warnings = index_state
         marketplaces, plugins = plugin_state
         mcp_servers, mcp_warnings, discovered_mcp_count = mcp_state
         (
@@ -104,13 +122,16 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
         mcp_servers.extend(plugin_mcp_servers)
         mcp_warnings.extend(plugin_mcp_warnings)
         discovered_mcp_count += plugin_mcp_count
-        qoder_index, index_warnings = index_state
         (
             scheduled_tasks,
             scheduled_task_warnings,
             _,
         ) = scheduled_task_state
 
+        if session_ids is not None:
+            records = [
+                record for record in records if record.source_id in session_ids
+            ]
         total_records = len(records)
         sessions: list[SourceSession] = []
         warnings: list[str] = [
@@ -118,7 +139,7 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
             *mcp_warnings,
             *scheduled_task_warnings,
         ]
-        if total_records >= MAX_DISCOVERED_TRANSCRIPTS:
+        if include_sessions and total_records >= MAX_DISCOVERED_TRANSCRIPTS:
             warnings.append(
                 "Qoder transcript discovery reached its safety limit; older "
                 "candidate files were not scanned.",
@@ -128,27 +149,26 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
             "not copied. Components of enabled third-party plugins enter "
             "compatibility review as one plugin asset.",
         )
-        if progress is not None:
+        if include_sessions and progress is not None:
             await progress(
                 f"发现 {total_records} 个 Qoder 会话候选文件，正在区分 "
                 "用户会话与内部 Agent 轨迹（最多 4 个同时读取）…",
             )
 
-        semaphore = asyncio.Semaphore(_READ_CONCURRENCY)
         progress_lock = asyncio.Lock()
         completed = 0
+        budget = SessionReadBudget()
 
         async def _read_one(
             record: Any,
         ) -> tuple[SourceSession | None, list[str], bool]:
             nonlocal completed
             try:
-                async with semaphore:
-                    result = await run_sync_io(
-                        read_qoder_transcript,
-                        record,
-                        qoder_index,
-                    )
+                result = await run_sync_io(
+                    read_qoder_transcript,
+                    record,
+                    qoder_index,
+                )
             except Exception as exc:  # pylint: disable=broad-except
                 warning = "Could not read Qoder session "
                 warning += f"{record.source_id}: {exc}"
@@ -169,19 +189,42 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
             return result
 
         ignored_session_ids: list[str] = []
-        for start in range(0, len(records), _READ_BATCH_SIZE):
-            batch = records[slice(start, start + _READ_BATCH_SIZE)]
-            results = await asyncio.gather(
-                *(_read_one(record) for record in batch),
-            )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _SESSION_SCAN_TIMEOUT_SECONDS
+        for start in range(0, len(records), _READ_CONCURRENCY):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                warnings.append(
+                    "Qoder session scan reached its 300 second time limit; "
+                    "remaining histories were not read.",
+                )
+                break
+            batch = records[start : start + _READ_CONCURRENCY]
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*(_read_one(record) for record in batch)),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                warnings.append(
+                    "Qoder session scan reached its 300 second time limit; "
+                    "remaining histories were not read.",
+                )
+                break
             for record, result in zip(batch, results):
                 session, session_warnings, internal_trace = result
                 if session is not None:
-                    sessions.append(session)
+                    reason = budget.add(session)
+                    if reason:
+                        warnings.append(reason)
+                        if budget.exhausted:
+                            break
+                    else:
+                        sessions.append(session)
                 if internal_trace:
                     ignored_session_ids.append(record.source_id)
                 warnings.extend(session_warnings)
-            if len({session.source_id for session in sessions}) >= limit:
+            if budget.exhausted or len(sessions) >= limit:
                 break
 
         # The filename is normally the session id. De-duplicate once more by

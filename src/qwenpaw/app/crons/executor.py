@@ -42,16 +42,15 @@ def _safe_session_component(value: str | None, *, fallback: str) -> str:
     return f"{prefix}-{digest}"
 
 
-def _isolated_run_session_id(
+def _cron_session_id(
     *,
     target_session_id: str | None,
     job_id: str | None,
-    run_id: str,
 ) -> str:
-    """Build one session id per cron execution."""
+    """Build one bounded dedicated session id per cron job."""
     target = _safe_session_component(target_session_id, fallback="session")
     job = _safe_session_component(job_id, fallback="job")
-    return f"cron:{target}:job:{job}:run:{run_id}"
+    return f"cron:{target}:job:{job}"
 
 
 def _bounded_trace_meta(value: str | None) -> str:
@@ -162,12 +161,11 @@ class CronExecutor:
         if share_session:
             req["session_id"] = target_session_id or f"cron:{job.id}"
         else:
-            # A non-shared cron run is a first-class task: it gets a fresh
-            # session and ChatSpec rather than inheriting earlier run context.
-            req["session_id"] = _isolated_run_session_id(
+            # Keep one dedicated visible chat per job. Cron hooks isolate the
+            # model context for each execution while retaining run history.
+            req["session_id"] = _cron_session_id(
                 target_session_id=target_session_id,
                 job_id=job.id,
-                run_id=run_id,
             )
             req["session_source"] = "cron"
         request_context["cron_run_session_id"] = req["session_id"]

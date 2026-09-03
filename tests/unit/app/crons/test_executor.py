@@ -173,7 +173,7 @@ async def test_final_mode_no_completed_message_returns_no_content(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_non_shared_job_creates_a_distinct_session_for_each_run(
+async def test_non_shared_job_reuses_its_dedicated_session(
     monkeypatch,
 ):
     workspace = _Workspace()
@@ -201,11 +201,12 @@ async def test_non_shared_job_creates_a_distinct_session_for_each_run(
     first_session = workspace.requests[0]["session_id"]
     second_session = workspace.requests[1]["session_id"]
     assert first["run_id"] != second["run_id"]
-    assert first_session != second_session
+    assert first_session == second_session
     assert first_session == first["session_id"]
     assert second_session == second["session_id"]
-    assert first_session.endswith(f":run:{first['run_id']}")
-    assert second_session.endswith(f":run:{second['run_id']}")
+    assert first_session.startswith("cron:")
+    assert ":job:" in first_session
+    assert ":run:" not in first_session
     assert len(first_session) <= 115
     assert re.fullmatch(r"[A-Za-z0-9:._-]+", first_session)
     assert workspace.requests[0]["session_source"] == "cron"
