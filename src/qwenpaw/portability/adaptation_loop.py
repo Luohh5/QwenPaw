@@ -50,6 +50,7 @@ from .providers.base import (
 _MAX_REACT_ITERATIONS = 4_000
 _HEARTBEAT_SECONDS = 12
 _IDLE_SECONDS = 300
+_WORKER_STOP_GRACE_SECONDS = 3
 _MAX_FILE_BYTES = 256 * 1024
 _EXCERPT_BYTES = 16 * 1024
 _MAX_REPLACEMENT_BYTES = 32 * 1024
@@ -103,12 +104,12 @@ def _release_worker(agent_id: str, task: asyncio.Task) -> None:
 
 
 def has_draining_workers(workspace: Any) -> bool:
-    """Whether an import is waiting for a cancelled Mission worker."""
+    """Whether a cancelled Mission worker still owns this Agent."""
     return bool(_DRAINING_WORKERS.get(workspace.agent_id))
 
 
 async def _stop_worker(workspace: Any, task: asyncio.Task) -> None:
-    """Cancel one worker while its owning import remains responsible for it."""
+    """Request a stop without blocking on an uncooperative worker."""
     if task.done():
         return
     agent_id = workspace.agent_id
@@ -117,13 +118,23 @@ async def _stop_worker(workspace: Any, task: asyncio.Task) -> None:
         workers.add(task)
         task.add_done_callback(lambda done: _release_worker(agent_id, done))
     task.cancel()
-    try:
-        await task
-    except (
-        asyncio.CancelledError,
-        Exception,
-    ):  # pylint: disable=broad-exception-caught
-        pass
+    await asyncio.wait({task}, timeout=_WORKER_STOP_GRACE_SECONDS)
+
+
+async def drain_adaptation_workers(*, timeout: float = 5) -> int:
+    """Give registered workers one bounded final cancellation attempt."""
+    tasks = {
+        task
+        for workers in _DRAINING_WORKERS.values()
+        for task in workers
+        if not task.done()
+    }
+    for task in tasks:
+        task.cancel()
+    if not tasks:
+        return 0
+    _done, pending = await asyncio.wait(tasks, timeout=timeout)
+    return len(pending)
 
 
 def _active_binding() -> _RequestBinding:
@@ -755,6 +766,8 @@ async def _repair_with_mission(
             )
             manifest = await run_sync_io(load_manifest, context.store.path)
             await run_sync_io(sync_mission, loop_dir, manifest)
+            if has_draining_workers(workspace):
+                return "兼容性修复 Agent 未能及时停止；已停止本次 Mission，" "待其退出后可重新导入。"
             if await mode.check_internal_mission(session_id):
                 return ""
         manifest = await run_sync_io(load_manifest, context.store.path)

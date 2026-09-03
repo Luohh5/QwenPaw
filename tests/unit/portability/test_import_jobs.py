@@ -428,10 +428,100 @@ async def test_cancel_keeps_draining_mission_job_active(
 
     assert snapshot.state == "cancelling"
     assert not live.task.done()
+    with pytest.raises(RuntimeError, match="compatibility worker"):
+        await manager.create(workspace, ["codex"])
     release.set()
     live.task.cancel()
     await live.task
     assert (await manager.cancel(workspace, job_id)).state == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_cancel_of_uncooperative_job_is_bounded_and_keeps_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    manager = PortabilityImportJobManager()
+    release = asyncio.Event()
+
+    async def worker() -> None:
+        while not release.is_set():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                continue
+
+    live = _LiveJob(
+        workspace=workspace,
+        snapshot=ImportRun(
+            job_id="import-" + "e" * 32,
+            agent_id=workspace.agent_id,
+            state="running",
+        ),
+    )
+    manager._jobs[(workspace.agent_id, live.snapshot.job_id)] = live
+    manager._spawn(live, worker)
+    await asyncio.sleep(0)
+    monkeypatch.setattr(
+        "qwenpaw.portability.import_jobs._CANCEL_GRACE_SECONDS",
+        0.01,
+    )
+
+    snapshot = await asyncio.wait_for(
+        manager.cancel(workspace, live.snapshot.job_id),
+        timeout=0.2,
+    )
+
+    assert snapshot.state == "cancelling"
+    with pytest.raises(RuntimeError, match="already active"):
+        await manager.create(workspace, ["codex"])
+    release.set()
+    live.task.cancel()
+    await live.task
+    assert (await manager.snapshot(workspace, live.snapshot.job_id)).state == (
+        "interrupted"
+    )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_of_uncooperative_job_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    manager = PortabilityImportJobManager()
+    release = asyncio.Event()
+
+    async def worker() -> None:
+        while not release.is_set():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                continue
+
+    live = _LiveJob(
+        workspace=workspace,
+        snapshot=ImportRun(
+            job_id="import-" + "f" * 32,
+            agent_id=workspace.agent_id,
+            state="running",
+        ),
+    )
+    manager._jobs[(workspace.agent_id, live.snapshot.job_id)] = live
+    manager._spawn(live, worker)
+    await asyncio.sleep(0)
+    monkeypatch.setattr(
+        "qwenpaw.portability.import_jobs._CANCEL_GRACE_SECONDS",
+        0.01,
+    )
+
+    await asyncio.wait_for(manager.shutdown(drain_timeout=0.01), timeout=0.2)
+
+    assert live.snapshot.state == "cancelling"
+    release.set()
+    live.task.cancel()
+    await live.task
 
 
 @pytest.mark.asyncio

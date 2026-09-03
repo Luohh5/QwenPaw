@@ -16,7 +16,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 from ..utils.io_utils import read_json_async, write_json_atomic_async
-from .adaptation_loop import has_draining_workers
+from .adaptation_loop import drain_adaptation_workers, has_draining_workers
 from .compatibility_safety import redact_sensitive_text
 from .importer import ProviderImportService
 from .models import (
@@ -87,6 +87,7 @@ class _LiveJob:
     progress_updates: int = 0
     persist_lock: asyncio.Lock = dataclass_field(default_factory=asyncio.Lock)
     task: asyncio.Task | None = None
+    cancel_requested: bool = False
 
 
 class PortabilityImportJobManager:
@@ -108,6 +109,7 @@ class PortabilityImportJobManager:
     ) -> ImportRun:
         """Create a job and start source discovery in the background."""
         self._ensure_open()
+        self._ensure_no_draining_workers(workspace)
         if await self.current(workspace):
             raise RuntimeError("an import is already active for this agent")
         normalized = list(dict.fromkeys(sources))
@@ -137,6 +139,7 @@ class PortabilityImportJobManager:
     ) -> ImportRun:
         """Apply the user selection for every successfully scanned source."""
         self._ensure_open()
+        self._ensure_no_draining_workers(workspace)
         live = await self._live(workspace, job_id)
         if live.snapshot.state != "awaiting_selection":
             raise RuntimeError("import job is not awaiting selection")
@@ -184,6 +187,7 @@ class PortabilityImportJobManager:
     ) -> ImportRun:
         """Retry explicitly selected failed tools in a fresh import job."""
         self._ensure_open()
+        self._ensure_no_draining_workers(workspace)
         previous = await self._live(workspace, job_id)
         if previous.snapshot.state not in _TERMINAL:
             raise RuntimeError("import job has not finished")
@@ -246,7 +250,7 @@ class PortabilityImportJobManager:
         )
         return snapshot.model_copy(deep=True)
 
-    async def shutdown(self) -> None:
+    async def shutdown(self, *, drain_timeout: float = 5) -> None:
         """Stop active jobs before their workspace services close."""
         self._closing = True
         await asyncio.gather(
@@ -257,21 +261,29 @@ class PortabilityImportJobManager:
             ),
             return_exceptions=True,
         )
+        await self.drain(timeout=drain_timeout)
 
     async def drain(self, *, timeout: float = 5) -> None:
-        """Give cancelled Mission workers a final bounded chance to exit."""
+        """Give live jobs and registered Mission workers one bounded drain."""
         tasks = [
             live.task
             for live in self._jobs.values()
             if live.task is not None and not live.task.done()
         ]
-        if not tasks:
-            return
-        _done, pending = await asyncio.wait(tasks, timeout=timeout)
-        if pending:
+        workers = asyncio.create_task(
+            drain_adaptation_workers(timeout=timeout),
+        )
+        _done, pending = (
+            await asyncio.wait(tasks, timeout=timeout)
+            if tasks
+            else (set(), set())
+        )
+        worker_count = await workers
+        if pending or worker_count:
             logger.warning(
-                "Import jobs still draining during shutdown: %d",
+                "Import workers still draining: jobs=%d mission=%d",
                 len(pending),
+                worker_count,
             )
 
     async def cancel(
@@ -279,22 +291,23 @@ class PortabilityImportJobManager:
         workspace: Any,
         job_id: str,
     ) -> ImportRun:
-        """Stop one active import without releasing stuck Mission work."""
+        """Request one active import to stop without waiting indefinitely."""
         live = await self._live(workspace, job_id)
         if live.snapshot.state in _TERMINAL:
             return live.snapshot.model_copy(deep=True)
         cancel_error = ""
+        live.cancel_requested = True
+        if live.snapshot.state != "cancelling":
+            live.snapshot.state = "cancelling"
+            self._log(live, "正在停止导入，等待当前安全操作结束。")
+            await self._emit(live, persist=True)
         if live.task is not None and not live.task.done():
             live.task.cancel()
             done, _ = await asyncio.wait(
                 {live.task},
                 timeout=_CANCEL_GRACE_SECONDS,
             )
-            if not done and has_draining_workers(workspace):
-                if live.snapshot.state != "cancelling":
-                    live.snapshot.state = "cancelling"
-                    self._log(live, "正在等待兼容性修复 Agent 停止。")
-                    await self._emit(live, persist=True)
+            if not done:
                 return live.snapshot.model_copy(deep=True)
             try:
                 await live.task
@@ -319,6 +332,14 @@ class PortabilityImportJobManager:
         if self._closing:
             raise RuntimeError("import service is shutting down")
 
+    @staticmethod
+    def _ensure_no_draining_workers(workspace: Any) -> None:
+        if has_draining_workers(workspace):
+            raise RuntimeError(
+                "a compatibility worker is still stopping; "
+                "retry after it exits",
+            )
+
     def _spawn(self, live: _LiveJob, operation: Callable[[], Any]) -> None:
         async def run() -> None:
             try:
@@ -338,6 +359,12 @@ class PortabilityImportJobManager:
                                 limit=500,
                             )
                     await self._emit(live, persist=True)
+            else:
+                if (
+                    live.cancel_requested
+                    and live.snapshot.state not in _TERMINAL
+                ):
+                    await self._mark_interrupted(live)
 
         live.task = asyncio.create_task(run())
 
@@ -346,7 +373,7 @@ class PortabilityImportJobManager:
             return
         live.snapshot.state = "interrupted"
         for provider in live.snapshot.providers:
-            if provider.state == "running":
+            if provider.state not in {"completed", "failed"}:
                 provider.state = "failed"
                 provider.error = "导入已取消。"
         await self._emit(live, persist=True)
@@ -486,6 +513,9 @@ class PortabilityImportJobManager:
             await self._emit(live, persist=True)
 
         await asyncio.gather(*(scan(item) for item in live.snapshot.providers))
+        if live.cancel_requested:
+            await self._mark_interrupted(live)
+            return
         live.snapshot.state = (
             "awaiting_selection"
             if any(item.state == "ready" for item in live.snapshot.providers)
@@ -500,6 +530,9 @@ class PortabilityImportJobManager:
         retry_from: _LiveJob | None = None,
     ) -> None:
         for provider in live.snapshot.providers:
+            if live.cancel_requested:
+                await self._mark_interrupted(live)
+                return
             if retry_from is None and provider.source not in live.plans:
                 continue
             retry_selection = live.retry_selections.get(provider.source)
@@ -578,6 +611,15 @@ class PortabilityImportJobManager:
                             asset.state = ImportAssetState.FAILED
                             asset.message = "请手动修改相关配置后重试。"
             await self._emit(live, persist=True)
+        if live.cancel_requested and not any(
+            item.state == "failed"
+            or any(
+                asset.state is ImportAssetState.FAILED for asset in item.assets
+            )
+            for item in live.snapshot.providers
+        ):
+            await self._mark_interrupted(live)
+            return
         live.snapshot.state = (
             "completed_with_issues"
             if any(
@@ -776,8 +818,9 @@ class PortabilityImportJobManager:
     def _project_progress(
         provider: ImportProviderSnapshot,
         message: str,
-        asset_index: dict[tuple[str, str, str], ImportAssetResult]
-        | None = None,
+        asset_index: (
+            dict[tuple[str, str, str], ImportAssetResult] | None
+        ) = None,
     ) -> None:
         result = message.split("\t")
         if len(result) == 5 and result[0] == "\x1esessions":

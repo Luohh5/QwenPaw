@@ -342,8 +342,7 @@ export default function ImportPage() {
     pluginAction === "retry" ? retryPluginNames : selectedPluginNames;
   const abandon = async () => {
     try {
-      await cancel();
-      reset();
+      if ((await cancel()).state === "interrupted") reset();
     } catch {
       // The hook keeps the error visible.
     }
@@ -431,8 +430,15 @@ export default function ImportPage() {
         {error && <Alert type="error" showIcon message={error} />}
         {job && !isDone && (
           <div className={styles.actions}>
-            <Button danger loading={loading} onClick={() => void abandon()}>
-              {t("common.cancel")}
+            <Button
+              danger
+              disabled={isCancelling}
+              loading={loading}
+              onClick={() => void abandon()}
+            >
+              {t(
+                isCancelling ? "portabilityImport.cancelling" : "common.cancel",
+              )}
             </Button>
           </div>
         )}

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { useImportJob } from "./useImportJob";
@@ -227,6 +227,28 @@ describe("ImportPage", () => {
       { codex: { plugins: ["plugin-1"] } },
       true,
     );
+  });
+
+  it("keeps a cancelling import visible", async () => {
+    vi.mocked(actions.cancel).mockResolvedValue({ state: "cancelling" });
+    vi.mocked(useImportJob).mockReturnValue(
+      state({
+        job: {
+          job_id: "job",
+          agent_id: "agent",
+          state: "running",
+          seq: 2,
+          logs: [],
+          providers: [],
+        },
+      }) as never,
+    );
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "common.cancel" }));
+
+    await waitFor(() => expect(actions.cancel).toHaveBeenCalled());
+    expect(actions.reset).not.toHaveBeenCalled();
   });
 
   it("renders progress and the public result states", () => {

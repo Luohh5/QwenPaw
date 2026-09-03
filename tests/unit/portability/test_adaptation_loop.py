@@ -18,6 +18,7 @@ from qwenpaw.plugins.api import PluginApi
 from qwenpaw.portability.adaptation_loop import (
     _DRAINING_WORKERS,
     _stop_worker,
+    drain_adaptation_workers,
     get_active_adaptation_context,
     run_adaptation_loop,
 )
@@ -92,7 +93,9 @@ class _Workspace:
 
 
 @pytest.mark.asyncio
-async def test_stopping_an_uncooperative_worker_keeps_ownership() -> None:
+async def test_stopping_an_uncooperative_worker_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     release = asyncio.Event()
 
     async def worker() -> None:
@@ -105,14 +108,49 @@ async def test_stopping_an_uncooperative_worker_keeps_ownership() -> None:
     workspace = SimpleNamespace(agent_id="agent")
     task = asyncio.create_task(worker())
     await asyncio.sleep(0)
-    stopping = asyncio.create_task(_stop_worker(workspace, task))
-    await asyncio.sleep(0)
+    monkeypatch.setattr(
+        "qwenpaw.portability.adaptation_loop._WORKER_STOP_GRACE_SECONDS",
+        0.01,
+    )
+    await _stop_worker(workspace, task)
     assert task in _DRAINING_WORKERS[workspace.agent_id]
-    assert not stopping.done()
+    assert await drain_adaptation_workers(timeout=0.01) == 1
     release.set()
     task.cancel()
-    await stopping
+    await task
     assert workspace.agent_id not in _DRAINING_WORKERS
+
+
+@pytest.mark.asyncio
+async def test_draining_worker_stops_mission_without_starting_another_round(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def action(_context) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "qwenpaw.portability.adaptation_loop.has_draining_workers",
+        lambda _workspace: True,
+    )
+    workspace = _Workspace(tmp_path, action)
+    inventory = ProviderInventory(
+        provider_id="codex",
+        provider_name="Codex",
+        detected=True,
+        skills=[
+            _skill(
+                tmp_path,
+                "---\nname: demo\ndescription: demo\n---\nUse QwenPaw.\n",
+            ),
+        ],
+    )
+
+    result = await run_adaptation_loop(workspace, inventory, "migration-idle")
+
+    assert result.manifest.state.value == "stopped_limit"
+    assert len(workspace.requests) == 1
+    assert any("未能及时停止" in warning for warning in result.warnings)
 
 
 def test_native_plugin_test_rejects_manifest_without_entry(
