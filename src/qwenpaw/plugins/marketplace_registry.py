@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from ..config.utils import get_plugins_dir
@@ -48,7 +48,7 @@ class ExternalMarketplaceRegistry:
         return {"schema_version": "1", "sources": sources}
 
     # pylint: disable-next=too-many-arguments
-    async def register(
+    async def register_if_absent(
         self,
         *,
         provider: str,
@@ -57,8 +57,8 @@ class ExternalMarketplaceRegistry:
         source: str,
         source_type: str,
         ref_name: str = "",
-    ) -> tuple[bool, bool]:
-        """Add/update a source; return ``(changed, credentials_removed)``."""
+    ) -> tuple[Literal["created", "same", "conflict"], bool]:
+        """Return ``(created|same|conflict, credentials_removed)``."""
         async with get_path_lock(self.path):
             payload = await self.read()
             cleaned_source, credentials_removed = _clean_source(source)
@@ -74,8 +74,12 @@ class ExternalMarketplaceRegistry:
                     "available" if cleaned_source else "source_unavailable"
                 ),
             }
-            if payload["sources"].get(key) == record:
-                return False, credentials_removed
+            existing = payload["sources"].get(key)
+            if existing is not None:
+                return (
+                    "same" if existing == record else "conflict",
+                    credentials_removed,
+                )
             payload["sources"][key] = record
             self.path.parent.mkdir(parents=True, exist_ok=True)
             await write_json_atomic_async(
@@ -84,7 +88,7 @@ class ExternalMarketplaceRegistry:
                 sort_keys=True,
                 new_file_mode=0o600,
             )
-            return True, credentials_removed
+            return "created", credentials_removed
 
 
 __all__ = ["ExternalMarketplaceRegistry"]

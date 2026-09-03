@@ -122,7 +122,7 @@ class ImportPlanningMixin:
         *,
         progress: ProgressReporter | None = None,
     ) -> tuple[MigrationPlan, ImportReceipt]:
-        """Re-import selected failed tools with explicit replacement."""
+        """Retry failed tools without replacing any existing QwenPaw asset."""
         if selection.sessions or not any(
             getattr(selection, field)
             for field in ("memory", "cron", "skills", "mcp", "plugins")

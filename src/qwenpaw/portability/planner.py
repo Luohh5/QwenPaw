@@ -18,6 +18,7 @@ from .models import (
     MigrationPlan,
     ProviderInventory,
 )
+from .selection import bound_mcp_plugin
 from .skill_transfer import read_regular_file
 
 _MAX_FINGERPRINT_ENTRIES = 6_000
@@ -354,6 +355,11 @@ def tool_asset_fingerprints(inventory: ProviderInventory) -> dict[str, str]:
                     for market in inventory.marketplaces
                     if item.marketplace in (market.source_id, market.name)
                 ]
+                scoped.mcp_servers = [
+                    server
+                    for server in inventory.mcp_servers
+                    if bound_mcp_plugin(server) == item.source_id
+                ]
             result[f"{kind}:{item.source_id}"] = inventory_fingerprint(scoped)
     return result
 
@@ -375,24 +381,29 @@ async def build_migration_plan(
     source_home: str = "",
 ) -> MigrationPlan:
     """Build a selectable plan without changing runtime assets."""
-    actions = [
-        MigrationAssetPlan(
-            asset_type=asset_type,
-            source_id=item.source_id,
-            name=(
-                getattr(item, "project_key", "")
-                or getattr(item, "title", "")
-                or item.name
-            ),
-            requires_sessions=(
-                asset_type == "scheduled_task"
-                and str(item.metadata.get("source_kind") or "").lower()
-                == "heartbeat"
-            ),
-        )
-        for collection, asset_type in _PLAN_TYPES
-        for item in getattr(inventory, collection)
-    ]
+    actions = []
+    for collection, asset_type in _PLAN_TYPES:
+        for item in getattr(inventory, collection):
+            if asset_type == "mcp" and bound_mcp_plugin(item):
+                continue
+            actions.append(
+                MigrationAssetPlan(
+                    asset_type=asset_type,
+                    source_id=item.source_id,
+                    name=(
+                        getattr(item, "project_key", "")
+                        or getattr(item, "title", "")
+                        or item.name
+                    ),
+                    requires_sessions=(
+                        asset_type == "scheduled_task"
+                        and str(
+                            item.metadata.get("source_kind") or "",
+                        ).lower()
+                        == "heartbeat"
+                    ),
+                ),
+            )
     return MigrationPlan(
         plan_id=f"plan-{uuid4().hex}",
         source=inventory.provider_id,

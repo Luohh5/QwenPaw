@@ -23,7 +23,10 @@ from qwenpaw.portability.models import (
     SourceSession,
     SourceSkill,
 )
-from qwenpaw.portability.planner import tool_asset_fingerprints
+from qwenpaw.portability.planner import (
+    build_migration_plan,
+    tool_asset_fingerprints,
+)
 from qwenpaw.portability.selection import select_inventory
 
 
@@ -76,10 +79,11 @@ def _inventory(tmp_path: Path) -> ProviderInventory:
     )
 
 
-def test_select_plugin_keeps_owned_mcp_unselected_and_marketplace(
+def test_select_plugin_includes_bound_mcp_and_marketplace(
     tmp_path: Path,
 ) -> None:
     source = _inventory(tmp_path)
+    source.mcp_servers[1].metadata["source_plugin_relative_cwd"] = "."
 
     selected = select_inventory(
         source,
@@ -87,14 +91,14 @@ def test_select_plugin_keeps_owned_mcp_unselected_and_marketplace(
     )
 
     assert [item.source_id for item in selected.plugins] == ["plugin-1"]
-    assert selected.mcp_servers == []
+    assert [item.source_id for item in selected.mcp_servers] == ["plugin-mcp"]
     assert [item.source_id for item in selected.marketplaces] == ["market-1"]
     assert selected.sessions == []
     assert selected.ignored_session_ids == []
     assert len(source.mcp_servers) == 2
 
 
-def test_select_plugin_owned_mcp_does_not_include_parent_plugin(
+def test_select_mcp_with_plugin_provenance_stays_independent(
     tmp_path: Path,
 ) -> None:
     selected = select_inventory(
@@ -115,6 +119,52 @@ def test_plugin_relative_mcp_requires_selected_plugin(tmp_path: Path) -> None:
             inventory,
             ImportSelection(sessions=False, mcp=["plugin-mcp"]),
         )
+
+    selected = select_inventory(
+        inventory,
+        ImportSelection(sessions=False, plugins=["plugin-1"]),
+    )
+    assert [item.source_id for item in selected.mcp_servers] == ["plugin-mcp"]
+
+
+@pytest.mark.asyncio
+async def test_plan_hides_bound_mcp_and_fingerprints_it_with_plugin(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path)
+    bound_mcp = inventory.mcp_servers[1]
+    bound_mcp.metadata["source_plugin_relative_cwd"] = "."
+    workspace = SimpleNamespace(workspace_dir=tmp_path, agent_id="agent-1")
+
+    plan = await build_migration_plan(workspace, inventory)
+    action_ids = {action.source_id for action in plan.actions}
+    fingerprint = plan.asset_fingerprints["plugins:plugin-1"]
+
+    assert "mcp-1" in action_ids
+    assert "plugin-mcp" not in action_ids
+    bound_mcp.args = ["changed"]
+    assert (
+        tool_asset_fingerprints(inventory)["plugins:plugin-1"] != fingerprint
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_rejects_a_bound_mcp_without_plugin(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path)
+    inventory.mcp_servers[1].metadata["source_plugin_relative_cwd"] = "."
+    service = _PlanningService(tmp_path, inventory)
+    service.plan.state = "applied"
+    service.plan.migration_id = "migration-1"
+
+    with pytest.raises(ValueError, match="plugin-mcp.*plugin-1"):
+        await service.retry_selection(
+            service.plan.plan_id,
+            ImportSelection(sessions=False, mcp=["plugin-mcp"]),
+        )
+
+    assert service.executed is None
 
 
 def test_select_individual_asset_groups(tmp_path: Path) -> None:
@@ -151,19 +201,24 @@ def test_selection_rejects_unknown_or_duplicate_ids(tmp_path: Path) -> None:
         )
 
 
-def test_heartbeat_requires_conversation_selection(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="heartbeat.*sessions"):
-        select_inventory(
-            _inventory(tmp_path),
-            ImportSelection(sessions=False, cron=["heartbeat-1"]),
-        )
+def test_heartbeat_can_use_a_previously_imported_conversation(
+    tmp_path: Path,
+) -> None:
+    selected = select_inventory(
+        _inventory(tmp_path),
+        ImportSelection(sessions=False, cron=["heartbeat-1"]),
+    )
+
+    assert [item.source_id for item in selected.scheduled_tasks] == [
+        "heartbeat-1",
+    ]
 
 
 @pytest.mark.parametrize(
     "state",
     list(ImportAssetState),
 )
-def test_asset_result_accepts_only_five_public_states(
+def test_asset_result_accepts_all_public_states(
     state: ImportAssetState,
 ) -> None:
     result = ImportAssetResult(
@@ -175,7 +230,14 @@ def test_asset_result_accepts_only_five_public_states(
     )
 
     assert result.state is state
-    assert len(ImportAssetState) == 5
+    assert {item.value for item in ImportAssetState} == {
+        "pending",
+        "repairing",
+        "ready",
+        "failed",
+        "succeeded",
+        "existing",
+    }
 
 
 class _PlanningService(ImportPlanningMixin):

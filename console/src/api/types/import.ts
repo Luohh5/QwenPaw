@@ -5,7 +5,8 @@ export type ImportAssetState =
   | "repairing"
   | "ready"
   | "failed"
-  | "succeeded";
+  | "succeeded"
+  | "existing";
 
 export interface ImportSourceProbe {
   source: ImportSource;

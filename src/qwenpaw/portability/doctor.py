@@ -22,7 +22,6 @@ from .models import (
 from .scheduled_tasks import imported_job_source, is_nonlocal_workspace
 from .compatibility import (
     AssetType,
-    AssetZone,
     CompatibilityManifest,
     RunState,
     counts,
@@ -324,15 +323,8 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
         }
         states = _skill_states(workspace)
         present = sum(name in visible for name in receipt.imported_skills)
-        zones = {
-            name: item.zone
-            for name, item in context.assets(AssetType.SKILL).items()
-        }
         activation_ok = sum(
-            name in zones
-            and name in visible
-            and states.get(name, False)
-            is (zones.get(name) is AssetZone.MIGRATE)
+            name in visible and states.get(name) is False
             for name in receipt.imported_skills
         )
         status = _status(
@@ -345,7 +337,7 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
                 status,
                 "Skill 安全状态",
                 f"计划导入 {len(receipt.imported_skills)} 个，实际可见 {present} 个；"
-                f"启用状态与兼容分区一致 {activation_ok} 个。",
+                f"保持禁用并等待人工确认 {activation_ok} 个。",
             ),
         )
 
@@ -444,7 +436,7 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
                 "插件安装状态",
                 f"原生安装流程返回 {len(receipt.installed_plugins)} 个插件，"
                 f"磁盘清单确认 {present} 个，来源标记异常 {invalid_provenance} 个；"
-                "实际启用状态由兼容流程的 migrate/repair 分区决定。",
+                "生成包装器中的 Skill 保持禁用，等待用户审核。",
             ),
         )
 
@@ -504,21 +496,13 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
                     marker = _job_request_context(job).get(
                         "portability_review_required",
                     )
-                    if asset.zone is AssetZone.MIGRATE:
-                        return (
-                            not job.enabled
-                            and job.runtime.tool_safety
-                            and not pending
-                            and marker is False
-                            and portability.get("safety")
-                            == "reviewed_disabled"
-                        )
                     return (
-                        asset.zone is AssetZone.REPAIR
-                        and not job.enabled
+                        not job.enabled
                         and job.runtime.tool_safety
                         and pending
                         and marker is True
+                        and portability.get("safety")
+                        == "disabled_until_explicit_promotion"
                     )
 
                 activation_safe = sum(
@@ -556,8 +540,7 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
                         "定时任务安全状态",
                         f"导入 {len(expected)} 个，"
                         f"唯一落盘 {unique}/{len(expected)} 个，"
-                        f"审核门禁和"
-                        f"禁用状态与兼容分区一致 {activation_safe}/"
+                        f"保持禁用并等待人工审核 {activation_safe}/"
                         f"{len(expected)} 个；远程或未验证工作区"
                         f"未绑定本机目录 {remote_unmapped}/"
                         f"{len(remote_expected)} 个。",

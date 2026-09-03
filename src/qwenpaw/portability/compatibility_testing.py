@@ -765,7 +765,7 @@ class CompatibilityTester:
     @staticmethod
     def _test_plugin(plugin: Any) -> NativeTestResult:
         if plugin.metadata.get("adapter") == "qoder_skill_only_v1":
-            wrapper = stage_qoder_skill_plugin(plugin, enabled=False)
+            wrapper = stage_qoder_skill_plugin(plugin)
             try:
                 for skill_file in sorted(wrapper.rglob("SKILL.md")):
                     content = skill_file.read_text(encoding="utf-8")
@@ -780,7 +780,7 @@ class CompatibilityTester:
             finally:
                 shutil.rmtree(wrapper.parent, ignore_errors=True)
         if plugin.metadata.get("adapter") == CODEX_PLUGIN_ADAPTER:
-            wrapper = stage_codex_content_plugin(plugin, enabled=False)
+            wrapper = stage_codex_content_plugin(plugin)
             try:
                 for skill_file in sorted(wrapper.rglob("SKILL.md")):
                     content = skill_file.read_text(encoding="utf-8")

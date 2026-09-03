@@ -65,14 +65,14 @@ def _skill_paths(source: Path, manifest: dict[str, Any]) -> list[Path]:
     return paths
 
 
-def _backend(skill_paths: list[Path], root: Path, enabled: bool) -> str:
+def _backend(skill_paths: list[Path], root: Path) -> str:
     calls = []
     for path in skill_paths:
         relative = path.relative_to(root).as_posix()
         calls.append(
             "        api.register_skill_provider(\n"
             f"            skills_dir=_ROOT / {relative!r},\n"
-            f"            enabled_by_default={enabled!r},\n"
+            "            enabled_by_default=False,\n"
             '            channels=["all"],\n'
             "        )",
         )
@@ -92,7 +92,6 @@ def _backend(skill_paths: list[Path], root: Path, enabled: bool) -> str:
 def _qwenpaw_manifest(
     plugin: SourcePlugin,
     manifest: dict[str, Any],
-    enabled: bool,
 ) -> dict[str, Any]:
     plugin_id = bounded_plain_text(manifest.get("name") or plugin.name, 128)
     if not _PLUGIN_ID_RE.fullmatch(plugin_id):
@@ -124,17 +123,13 @@ def _qwenpaw_manifest(
                 "source": "codex",
                 "source_id": plugin.source_id,
                 "adapter": ADAPTER,
-                "requires_review": not enabled,
+                "requires_review": True,
             },
         },
     }
 
 
-def stage_codex_content_plugin(
-    plugin: SourcePlugin,
-    *,
-    enabled: bool = False,
-) -> Path:
+def stage_codex_content_plugin(plugin: SourcePlugin) -> Path:
     """Build a native wrapper from an isolated Codex plugin snapshot."""
     source = Path(plugin.install_source).expanduser()
     if source.is_symlink():
@@ -157,12 +152,12 @@ def stage_codex_content_plugin(
                 continue
             write_tree_entry(target, entry)
         (target / "plugin.py").write_text(
-            _backend(skills, source, enabled),
+            _backend(skills, source),
             encoding="utf-8",
         )
         (target / "plugin.json").write_text(
             json.dumps(
-                _qwenpaw_manifest(plugin, manifest, enabled),
+                _qwenpaw_manifest(plugin, manifest),
                 ensure_ascii=False,
                 indent=2,
             )

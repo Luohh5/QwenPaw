@@ -25,6 +25,7 @@ const requiredPaths = [
   "portabilityImport.states.succeeded",
   "portabilityImport.hints.failed",
   "portabilityImport.hints.disabled",
+  "portabilityImport.hints.cronReview",
   "harnesses.connected",
   "harnesses.disconnected",
   "harnesses.notConnected",

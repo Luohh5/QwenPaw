@@ -285,6 +285,12 @@ def test_generated_plugin_ids_do_not_depend_on_display_names(
         qoder_manifest = json.loads(
             (qoder_staged / "plugin.json").read_text(encoding="utf-8"),
         )
+        codex_backend = (codex_staged / "plugin.py").read_text(
+            encoding="utf-8",
+        )
+        qoder_backend = (qoder_staged / "plugin.py").read_text(
+            encoding="utf-8",
+        )
 
         assert (codex_manifest["id"], codex_manifest["name"]) == (
             "expo",
@@ -294,6 +300,10 @@ def test_generated_plugin_ids_do_not_depend_on_display_names(
             "mini-plugin",
             "Mini Plugin",
         )
+        assert "enabled_by_default=False" in codex_backend
+        assert "enabled_by_default=False" in qoder_backend
+        assert codex_manifest["meta"]["migration"]["requires_review"] is True
+        assert qoder_manifest["meta"]["migration"]["requires_review"] is True
     finally:
         shutil.rmtree(codex_staged.parent)
         shutil.rmtree(qoder_staged.parent)

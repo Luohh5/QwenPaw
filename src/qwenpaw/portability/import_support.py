@@ -15,7 +15,7 @@ import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from uuid import NAMESPACE_URL, uuid5
 
 from .models import (
     SourceMemoryProject,
@@ -178,60 +178,33 @@ def _memory_payload(
 
 
 # pylint: disable-next=too-many-branches
-def _replace_memory_project(
+def _create_memory_project(
     workspace: Any,
     provider_id: str,
     project: SourceMemoryProject,
 ) -> tuple[Path, bool]:
+    """Create one imported memory project without changing an existing one."""
     target = _memory_import_root(workspace, provider_id) / _safe_memory_key(
         project,
     )
-    payload = _memory_payload(provider_id, project)
-    existing_files: dict[Path, bytes] = {}
-    existing: dict[Path, bytes] | None = existing_files
     if target.is_dir():
-        total = 0
-        for path in target.rglob("*"):
-            if path.is_symlink():
-                existing = None
-                break
-            if path.is_file():
-                data = path.read_bytes()
-                total += len(data)
-                if total > _MAX_MEMORY_BYTES:
-                    existing = None
-                    break
-                existing_files[path.relative_to(target)] = data
-    else:
-        existing = None
-    if existing == payload:
         return target, False
+    if target.exists():
+        raise ValueError(f"Memory import target is not a directory: {target}")
+    payload = _memory_payload(provider_id, project)
     target.parent.mkdir(parents=True, exist_ok=True)
     temp_root = Path(
         tempfile.mkdtemp(prefix=f".{target.name}.new-", dir=target.parent),
     )
-    old_root = target.parent / f".{target.name}.old-{uuid4().hex}"
     try:
         for relative, data in payload.items():
             output = temp_root / relative
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(data)
-        if target.exists():
-            os.replace(target, old_root)
         os.replace(temp_root, target)
-        if old_root.exists():
-            shutil.rmtree(old_root)
-    except BaseException:
-        if target.exists() and old_root.exists():
-            shutil.rmtree(target)
-        if old_root.exists():
-            os.replace(old_root, target)
-        raise
     finally:
         if temp_root.exists():
             shutil.rmtree(temp_root)
-        if old_root.exists():
-            shutil.rmtree(old_root)
     return target, True
 
 

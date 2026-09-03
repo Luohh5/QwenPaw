@@ -137,7 +137,7 @@
     "defaultSelected": "Conversations and tools are selected by default. Plugins require your explicit confirmation.",
     "conversations": "Conversations",
     "toolsSetup": "Tools & setup",
-    "heartbeatRequiresSessions": "This scheduled task requires conversations to be imported.",
+    "heartbeatRequiresSessions": "This scheduled task needs its source conversation. Import it now or migrate it before retrying.",
     "items": "{{count}} items",
     "start": "Start import",
     "groups": {
@@ -152,11 +152,13 @@
       "repairing": "Repairing",
       "ready": "Repaired, pending import",
       "failed": "Failed",
-      "succeeded": "Succeeded"
+      "succeeded": "Succeeded",
+      "existing": "Already exists"
     },
     "hints": {
       "failed": "Please adjust the related configuration manually.",
-      "disabled": "Imported successfully but kept disabled until you review and enable it."
+      "disabled": "Imported successfully but kept disabled until you review and enable it.",
+      "cronReview": "Imported disabled and blocked from running until you explicitly review it in Cron Jobs; enable it separately afterwards."
     },
     "sessionStates": {
       "failed": "Import failed",
@@ -170,9 +172,9 @@
     "targetAgent": "Target agent: {{agent}}",
     "selectAllFailed": "Select all failed tools",
     "retrySelected": "Retry selected ({{count}})",
-    "retryConfirm": "Retry {{count}} selected failed tool(s)? Existing items with the same name will be overwritten.",
+    "retryConfirm": "Retry {{count}} selected failed tool(s)? Existing QwenPaw items will be kept.",
     "pluginWarningTitle": "Plugin execution warning",
-    "pluginWarning": "These plugins may install Python dependencies, execute code in the QwenPaw process, and register global tools, hooks, routes, or commands. Import only plugins from sources you trust.",
+    "pluginWarning": "These plugins may install Python dependencies, execute code in the QwenPaw process, and register global tools, hooks, routes, or commands. Selecting a plugin also imports its bound MCP configurations and credentials disabled for review. Import only plugins from sources you trust.",
     "pluginWarningConfirm": "I trust these plugin sources and allow dependency installation and code execution.",
     "pluginWarningAction": "Confirm and import",
     "done": "Done"

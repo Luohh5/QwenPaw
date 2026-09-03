@@ -239,7 +239,7 @@ def _copy_optional_readme(source: Path, target: Path) -> None:
     target.chmod(0o600)
 
 
-def _plugin_backend(enabled: bool) -> str:
+def _plugin_backend() -> str:
     return (
         "# -*- coding: utf-8 -*-\n"
         '"""Generated adapter for a Qoder Skill-only plugin."""\n\n'
@@ -249,7 +249,7 @@ def _plugin_backend(enabled: bool) -> str:
         "    def register(self, api) -> None:\n"
         "        api.register_skill_provider(\n"
         '            skills_dir=_ROOT / "skills",\n'
-        f"            enabled_by_default={enabled!r},\n"
+        "            enabled_by_default=False,\n"
         '            channels=["all"],\n'
         "        )\n\n\n"
         "plugin = ImportedQoderSkillPlugin()\n"
@@ -265,7 +265,6 @@ def _author(value: Any) -> str:
 def _qwenpaw_manifest(
     plugin: SourcePlugin,
     manifest: dict[str, Any],
-    enabled: bool,
 ) -> dict[str, Any]:
     plugin_id = bounded_plain_text(
         manifest.get("name") or plugin.name,
@@ -302,17 +301,13 @@ def _qwenpaw_manifest(
                 "source_id": plugin.source_id,
                 "adapter": "qoder_skill_only_v1",
                 "harness_bound": bool(plugin.metadata.get("harness_bound")),
-                "requires_review": not enabled,
+                "requires_review": True,
             },
         },
     }
 
 
-def stage_qoder_skill_plugin(
-    plugin: SourcePlugin,
-    *,
-    enabled: bool = False,
-) -> Path:
+def stage_qoder_skill_plugin(plugin: SourcePlugin) -> Path:
     """Build a review-safe QwenPaw wrapper for a Qoder Skill-only plugin."""
     source = _validated_source(plugin)
     manifest = _read_qoder_manifest(source)
@@ -328,12 +323,12 @@ def stage_qoder_skill_plugin(
             target / "README.qoder.md",
         )
         (target / "plugin.py").write_text(
-            _plugin_backend(enabled),
+            _plugin_backend(),
             encoding="utf-8",
         )
         (target / "plugin.json").write_text(
             json.dumps(
-                _qwenpaw_manifest(plugin, manifest, enabled),
+                _qwenpaw_manifest(plugin, manifest),
                 ensure_ascii=False,
                 indent=2,
             )

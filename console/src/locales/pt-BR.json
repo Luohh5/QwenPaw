@@ -100,11 +100,13 @@
       "repairing": "Corrigindo",
       "ready": "Corrigido, aguardando importação",
       "failed": "Falhou",
-      "succeeded": "Concluído"
+      "succeeded": "Concluído",
+      "existing": "Já existe"
     },
     "hints": {
       "failed": "Ajuste manualmente a configuração relacionada.",
-      "disabled": "Importado com sucesso, mas mantido desativado até sua revisão e ativação."
+      "disabled": "Importado com sucesso, mas mantido desativado até sua revisão e ativação.",
+      "cronReview": "Importado desativado e impedido de executar até uma revisão explícita em Tarefas Cron; depois, ative-o separadamente."
     },
     "sessionStates": {
       "failed": "Falha na importação",
@@ -118,9 +120,9 @@
     "targetAgent": "Agente de destino: {{agent}}",
     "selectAllFailed": "Selecionar todas as ferramentas com falha",
     "retrySelected": "Tentar novamente as selecionadas ({{count}})",
-    "retryConfirm": "Tentar novamente {{count}} ferramentas com falha selecionadas? Itens com o mesmo nome serão substituídos.",
+    "retryConfirm": "Tentar novamente {{count}} ferramentas com falha selecionadas? Itens existentes do QwenPaw serão preservados.",
     "pluginWarningTitle": "Aviso de execução de plugin",
-    "pluginWarning": "Estes plugins podem instalar dependências Python, executar código no processo do QwenPaw e registrar ferramentas, Hooks, rotas ou comandos globais. Importe apenas plugins de fontes confiáveis.",
+    "pluginWarning": "Estes plugins podem instalar dependências Python, executar código no processo do QwenPaw e registrar ferramentas, Hooks, rotas ou comandos globais. Selecionar um plugin também importa suas configurações e credenciais MCP vinculadas, desativadas para revisão. Importe apenas plugins de fontes confiáveis.",
     "pluginWarningConfirm": "Confio nas fontes destes plugins e permito a instalação de dependências e a execução de código.",
     "pluginWarningAction": "Confirmar e importar",
     "done": "Concluir"

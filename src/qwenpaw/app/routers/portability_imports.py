@@ -153,7 +153,7 @@ async def retry_import_job(
     body: StartImportJobRequest,
     request: Request,
 ):
-    """Retry failed tools in a fresh overwrite-capable import job."""
+    """Retry failed tools without replacing existing QwenPaw assets."""
     _local_only(request)
     workspace = await get_agent_for_request(request)
     try:

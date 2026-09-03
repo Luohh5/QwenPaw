@@ -6,21 +6,25 @@ import json
 import shutil
 import sys
 import threading
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from qwenpaw.agents.skill_system import SkillService
 from qwenpaw.app.chats.manager import ChatManager
+from qwenpaw.app.chats.models import ChatSpec
 from qwenpaw.app.chats.repo import JsonChatRepository
 from qwenpaw.app.chats.session import SafeJSONSession
 from qwenpaw.app.crons.manager import CronManager
 from qwenpaw.app.driver_config_service import DriverConfigService
+from qwenpaw.drivers.adapters.mcp_legacy_config import (
+    legacy_mcp_client_to_driver,
+)
 from qwenpaw.harnesses.events import HarnessHistoryItem, HarnessHistoryKind
 from qwenpaw.portability.importer import ProviderImportService
 from qwenpaw.portability.import_support import (
-    _replace_memory_project as replace_memory_project,
+    _create_memory_project as create_memory_project,
 )
 from qwenpaw.portability.adaptation_loop import AdaptationResult
 from qwenpaw.portability.compatibility import (
@@ -41,6 +45,7 @@ from qwenpaw.portability.models import (
     SourceScheduledTask,
 )
 from qwenpaw.portability.scheduled_tasks import build_imported_job
+from qwenpaw.plugins.marketplace_registry import ExternalMarketplaceRegistry
 
 
 class _Provider:
@@ -195,6 +200,12 @@ class _CronManager:
     async def create_or_replace_job(self, spec):
         self.jobs[spec.id] = spec
 
+    async def create_job_if_absent(self, spec):
+        if spec.id in self.jobs:
+            return False
+        self.jobs[spec.id] = spec
+        return True
+
     def validate_job_spec(self, spec):
         if spec.schedule.cron == "99 99 * * *":
             raise ValueError("invalid persisted cron")
@@ -263,7 +274,7 @@ async def test_provider_imports_scheduled_tasks_disabled_and_idempotent(
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_without_source_chat_uses_new_cron_chat(
+async def test_heartbeat_without_source_chat_is_not_imported(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -292,12 +303,63 @@ async def test_heartbeat_without_source_chat_uses_new_cron_chat(
 
     receipt = await _import_from(ProviderImportService(workspace), "codex")
 
-    job = next(iter(workspace.cron_manager.jobs.values()))
+    assert receipt.imported_scheduled_tasks == []
+    assert workspace.cron_manager.jobs == {}
+    assert await workspace.chat_manager.list_chats(archived=None) == []
+    assert any(
+        "requires its source conversation" in item for item in receipt.warnings
+    )
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_retry_uses_a_previously_imported_conversation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.cron_manager = _CronManager()
+    await workspace.chat_manager.create_chat(
+        ChatSpec(
+            name="Imported chat",
+            session_id="console:imported",
+            user_id="imported",
+            meta={
+                "portability": {"source": "codex", "source_id": "thread-1"},
+            },
+        ),
+    )
+    inventory = ProviderInventory(
+        provider_id="codex",
+        provider_name="Codex",
+        detected=True,
+        scheduled_tasks=[
+            SourceScheduledTask(
+                source_id="heartbeat-1",
+                name="Release monitor",
+                schedule_type="cron",
+                cron="30 9 * * *",
+                prompt="Check releases",
+                metadata={
+                    "source_kind": "heartbeat",
+                    "target_thread_id": "thread-1",
+                },
+            ),
+        ],
+    )
+    _bind_inventory(monkeypatch, inventory)
+    _mock_adaptation(monkeypatch, workspace, inventory)
+    service = ProviderImportService(workspace)
+    plan = await service.plan_from("codex")
+
+    receipt = await service.apply_selection(
+        plan.plan_id,
+        ImportSelection(sessions=False, cron=["heartbeat-1"]),
+    )
+
     assert receipt.imported_scheduled_tasks == ["heartbeat-1"]
+    job = next(iter(workspace.cron_manager.jobs.values()))
     assert job.runtime.share_session is True
-    assert job.dispatch.target.user_id == job.dispatch.target.session_id
-    assert len(await workspace.chat_manager.list_chats(archived=None)) == 1
-    assert any("已新建独立 QwenPaw 会话" in item for item in receipt.warnings)
+    assert job.dispatch.target.session_id == "console:imported"
 
 
 @pytest.mark.asyncio
@@ -454,7 +516,7 @@ async def test_migrate_zone_materializes_assets(
     )
 
     assert {
-        "\x1easset\tskill\tsucceeded\t1\tportable-skill",
+        "\x1easset\tskill\tsucceeded\t0\tportable-skill",
         "\x1easset\tmcp\tsucceeded\t1\tportable-mcp",
         "\x1easset\tcron\tsucceeded\t0\tportable-task",
     } <= set(progress)
@@ -462,19 +524,22 @@ async def test_migrate_zone_materializes_assets(
     skill_manifest = json.loads(
         (workspace.workspace_dir / "skill.json").read_text(encoding="utf-8"),
     )
-    assert skill_manifest["skills"]["portable-skill"]["enabled"] is True
+    assert skill_manifest["skills"]["portable-skill"]["enabled"] is False
     cards = await DriverConfigService(workspace).list_cards()
     assert len(cards) == 1 and cards[0].enabled is False
     assert cards[0].config["requires_review"] is True
     job = next(iter(workspace.cron_manager.jobs.values()))
     assert job.enabled is False
-    assert job.meta["portability"]["requires_review"] is False
-    assert job.meta["portability"]["safety"] == "reviewed_disabled"
+    assert job.meta["portability"]["requires_review"] is True
+    assert (
+        job.meta["portability"]["safety"]
+        == "disabled_until_explicit_promotion"
+    )
     assert receipt.adaptation_summary == "compatibility-summary.md"
 
 
 @pytest.mark.asyncio
-async def test_import_repairs_unreviewed_invalid_legacy_scheduled_task(
+async def test_import_keeps_unreviewed_invalid_legacy_scheduled_task(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -503,16 +568,13 @@ async def test_import_repairs_unreviewed_invalid_legacy_scheduled_task(
 
     receipt = await _import_from(ProviderImportService(workspace), "codex")
 
-    assert receipt.imported_scheduled_tasks == ["legacy-ghost"]
-    repaired = workspace.cron_manager.jobs[ghost.id]
-    assert repaired.schedule.cron == "30 9 * * *"
-    assert repaired.enabled is False
-    assert repaired.meta["portability"]["requires_review"] is True
-    assert any("旧版留下" in warning for warning in receipt.warnings)
+    assert receipt.imported_scheduled_tasks == []
+    assert workspace.cron_manager.jobs[ghost.id].schedule.cron == "99 99 * * *"
+    assert any("already exists" in warning for warning in receipt.warnings)
 
 
 @pytest.mark.asyncio
-async def test_failed_import_restores_invalid_legacy_scheduled_task(
+async def test_failed_import_keeps_existing_scheduled_task(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -549,9 +611,8 @@ async def test_failed_import_restores_invalid_legacy_scheduled_task(
     with pytest.raises(OSError, match="receipt unavailable"):
         await _import_from(ProviderImportService(workspace), "codex")
 
-    restored = workspace.cron_manager.jobs[ghost.id]
-    assert restored.schedule.cron == "30 9 * * *"
-    assert restored.enabled is False
+    existing = workspace.cron_manager.jobs[ghost.id]
+    assert existing.schedule.cron == "99 99 * * *"
 
 
 @pytest.mark.asyncio
@@ -923,6 +984,58 @@ async def test_provider_import_persists_disabled_mcp_with_encrypted_secret(
 
 
 @pytest.mark.asyncio
+async def test_mcp_retry_reuses_its_prepared_credential(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    server = SourceMCPServer(
+        source_id="filesystem",
+        name="filesystem",
+        transport="stdio",
+        command="npx",
+        args=["server-filesystem"],
+        env={"API_TOKEN": "test-token"},
+    )
+    _card, credential = legacy_mcp_client_to_driver(
+        server.name,
+        server,
+        force_encrypt_bindings=True,
+    )
+    assert credential is not None
+    owner = {
+        "owner": "pawport",
+        "provider": "codex",
+        "source_id": server.source_id,
+    }
+    await DriverConfigService(workspace).credential_store.put(
+        replace(
+            credential,
+            meta={
+                **credential.meta,
+                "pawport": {**owner, "state": "prepared"},
+            },
+        ),
+    )
+    inventory = ProviderInventory(
+        provider_id="codex",
+        provider_name="Codex",
+        detected=True,
+        mcp_servers=[server],
+    )
+    _bind_inventory(monkeypatch, inventory)
+    _mock_adaptation(monkeypatch, workspace, inventory)
+
+    receipt = await _import_from(ProviderImportService(workspace), "codex")
+
+    assert receipt.imported_mcp_servers == ["filesystem"]
+    restored = await DriverConfigService(workspace).credential_store.get(
+        credential.ref,
+    )
+    assert restored.meta["pawport"] == {**owner, "state": "committed"}
+
+
+@pytest.mark.asyncio
 async def test_provider_import_encrypts_even_public_named_mcp_bindings(
     tmp_path: Path,
     monkeypatch,
@@ -1160,16 +1273,16 @@ async def test_cancel_after_memory_commit_keeps_asset(
     started = threading.Event()
     release = threading.Event()
 
-    def blocked_replace(*args):
+    def blocked_create(*args):
         started.set()
         release.wait(timeout=2)
-        return replace_memory_project(*args)
+        return create_memory_project(*args)
 
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
     monkeypatch.setattr(
-        "qwenpaw.portability.importer._replace_memory_project",
-        blocked_replace,
+        "qwenpaw.portability.importer._create_memory_project",
+        blocked_create,
     )
 
     task = asyncio.create_task(
@@ -1186,7 +1299,7 @@ async def test_cancel_after_memory_commit_keeps_asset(
 
 
 @pytest.mark.asyncio
-async def test_retry_selection_replaces_an_existing_skill(
+async def test_retry_selection_keeps_an_existing_skill(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1233,12 +1346,12 @@ async def test_retry_selection_replaces_an_existing_skill(
     assert (
         (workspace.workspace_dir / "skills/portable-skill/SKILL.md")
         .read_text(encoding="utf-8")
-        .endswith("after\n")
+        .endswith("before\n")
     )
 
 
 @pytest.mark.asyncio
-async def test_failed_skill_retry_restores_the_existing_skill(
+async def test_skill_retry_never_deletes_the_existing_skill(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1272,17 +1385,6 @@ async def test_failed_skill_retry_restores_the_existing_skill(
         "---\nname: portable-skill\ndescription: test\n---\n\nafter\n",
         encoding="utf-8",
     )
-    original = SkillService.import_from_zip
-    calls = 0
-
-    def fail_second_import(self, data, enable=False):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise RuntimeError("simulated retry failure")
-        return original(self, data, enable)
-
-    monkeypatch.setattr(SkillService, "import_from_zip", fail_second_import)
     _plan, receipt = await service.retry_selection(plan.plan_id, selection)
 
     assert any("portable-skill" in item for item in receipt.warnings)
@@ -1308,7 +1410,7 @@ async def test_provider_plugin_restores_marketplace_then_native_installs(
     )
     calls = []
 
-    async def _install(source, *, app, force, reload_agents):
+    async def _install(source, *, app, force, reload_agents, **_kwargs):
         calls.append((source, app, force, reload_agents))
         return SimpleNamespace(
             manifest=SimpleNamespace(id="qwen-demo"),
@@ -1363,6 +1465,58 @@ async def test_provider_plugin_restores_marketplace_then_native_installs(
     registry = json.loads(workspace.marketplace_registry_path.read_text())
     assert registry["sources"]["codex:codex:local"]["source"] == str(
         plugin_source.parent.parent,
+    )
+
+
+@pytest.mark.asyncio
+async def test_marketplace_conflict_does_not_prepare_its_plugin(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.marketplace_registry_path = tmp_path / "marketplaces.json"
+    await ExternalMarketplaceRegistry(
+        workspace.marketplace_registry_path,
+    ).register_if_absent(
+        provider="codex",
+        source_id="codex:local",
+        name="local",
+        source="/existing-marketplace",
+        source_type="directory",
+    )
+    plugin_source = tmp_path / "marketplace/plugins/demo"
+    plugin_source.mkdir(parents=True)
+    inventory = ProviderInventory(
+        provider_id="codex",
+        provider_name="Codex",
+        detected=True,
+        marketplaces=[
+            SourceMarketplace(
+                source_id="codex:local",
+                name="local",
+                source=str(plugin_source.parent.parent),
+                source_type="directory",
+            ),
+        ],
+        plugins=[
+            SourcePlugin(
+                source_id="demo@local",
+                name="demo",
+                marketplace="local",
+                install_source=str(plugin_source),
+            ),
+        ],
+    )
+    _bind_inventory(monkeypatch, inventory)
+    _mock_adaptation(monkeypatch, workspace, inventory)
+
+    receipt = await _import_from(ProviderImportService(workspace), "codex")
+
+    assert receipt.restored_marketplaces == []
+    assert receipt.prepared_plugins == []
+    assert any(
+        "because its Marketplace conflicts with QwenPaw" in item
+        for item in receipt.warnings
     )
 
 
@@ -1436,7 +1590,7 @@ async def test_qoder_custom_skill_plugin_uses_native_adapter(
     installed_plugins_root = tmp_path / "installed-plugins"
     installed_plugins_root.mkdir()
 
-    async def _install(source_path, *, app, force, reload_agents):
+    async def _install(source_path, *, app, force, reload_agents, **_kwargs):
         del app, force, reload_agents
         staged = Path(source_path)
         captured["manifest"] = json.loads(
@@ -1556,7 +1710,7 @@ async def test_codex_content_plugin_registers_skills_and_owned_mcp(
     installed_root = tmp_path / "installed-plugins"
     installed_root.mkdir()
 
-    async def _install(source_path, *, app, force, reload_agents):
+    async def _install(source_path, *, app, force, reload_agents, **_kwargs):
         del app, force, reload_agents
         staged = Path(source_path)
         installed = installed_root / "creative-production"
@@ -1615,6 +1769,7 @@ async def test_codex_content_plugin_registers_skills_and_owned_mcp(
     assert receipt.imported_mcp_servers == ["creative"]
     backend = (installed_root / "creative-production/plugin.py").read_text()
     assert "register_skill_provider" in backend
+    assert "enabled_by_default=False" in backend
     card = (workspace.workspace_dir / "drivers/mcp/creative.yaml").read_text()
     assert str(installed_root / "creative-production") in card
 
@@ -1654,7 +1809,7 @@ async def test_receipt_failure_keeps_committed_assets(
     app = SimpleNamespace(state=SimpleNamespace(plugin_loader=object()))
     uninstalled = []
 
-    async def _install(_source, *, app, force, reload_agents):
+    async def _install(_source, *, app, force, reload_agents, **_kwargs):
         del app, force, reload_agents
         return SimpleNamespace(manifest=SimpleNamespace(id="qwen-demo"))
 

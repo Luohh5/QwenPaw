@@ -142,6 +142,7 @@ class ImportAssetState(StrEnum):
     READY = "ready"
     FAILED = "failed"
     SUCCEEDED = "succeeded"
+    EXISTING = "existing"
 
 
 class ImportSelection(BaseModel):

@@ -8,19 +8,16 @@ import json
 import logging
 import shutil
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from ..agents.skill_system import SkillService
-from ..agents.skill_system.store import (
-    get_workspace_skill_manifest_path,
-    get_workspace_skills_dir,
-)
 from ..app.driver_config_service import DriverConfigService
 from ..drivers.adapters.mcp_legacy_config import legacy_mcp_client_to_driver
-from ..drivers.contracts import iter_credential_refs
+from ..drivers.errors import CredentialNotFoundError
 from ..plugins.loader import resolved_plugin_manifest_path
 from ..plugins.marketplace_registry import ExternalMarketplaceRegistry
 from ..utils.io_utils import (
@@ -48,6 +45,7 @@ from .providers.base import (
 )
 from .qoder_plugin_adapter import stage_qoder_skill_plugin
 from .scheduled_tasks import build_imported_job, imported_job_source
+from .selection import bound_mcp_plugin
 from .transaction_journal import ImportTransactionJournal
 from .import_conversations import ConversationState, import_conversations
 from .import_support import (
@@ -55,7 +53,7 @@ from .import_support import (
     _bounded_session,
     _mcp_client_data,
     _progress_milestone,
-    _replace_memory_project,
+    _create_memory_project,
     _skill_zip,
 )
 from .import_planning import ImportPlanningMixin
@@ -66,27 +64,6 @@ _GENERATED_PLUGIN_ADAPTERS = {
     CODEX_PLUGIN_ADAPTER,
     "qoder_skill_only_v1",
 }
-
-
-def _copy_tree(source: Path, target: Path) -> None:
-    shutil.rmtree(target, ignore_errors=True)
-    shutil.copytree(source, target)
-
-
-def _restore_skill(
-    workspace_dir: Path,
-    name: str,
-    backup: Path,
-    manifest_backup: Path | None,
-) -> None:
-    target = get_workspace_skills_dir(workspace_dir) / name
-    shutil.rmtree(target, ignore_errors=True)
-    shutil.copytree(backup, target)
-    manifest = get_workspace_skill_manifest_path(workspace_dir)
-    if manifest_backup is None:
-        manifest.unlink(missing_ok=True)
-    else:
-        shutil.copy2(manifest_backup, manifest)
 
 
 def _plugin_id(source: Path) -> str:
@@ -104,30 +81,21 @@ async def _asset_items(
     values: list[Any],
     progress: ProgressReporter | None,
     asset_type: str,
-    imported: list[str],
+    states: dict[str, str],
     zones: dict[str, str] | None = None,
     zone_prefix: str = "",
     enabled: bool | None = True,
-    *,
-    completed: list[str] | None = None,
 ) -> AsyncIterator[tuple[int, Any]]:
     async def report(item: Any) -> None:
         zone = (zones or {}).get(f"{zone_prefix}:{item.source_id}", "")
-        present = (
-            item.source_id in imported
-            or getattr(item, "name", "") in imported
-            or str(item.source_id).partition("@")[0] in imported
-            or getattr(item, "name", "") in (completed or ())
-            or item.source_id in (completed or ())
-        )
-        state = "succeeded" if present else "failed"
+        state = states.get(item.source_id, "failed")
         active = None if enabled is None else enabled and zone == "migrate"
         await report_result(
             progress,
             "asset",
             asset_type,
             state,
-            "-" if active is None or not present else int(active),
+            "-" if active is None or state != "succeeded" else int(active),
             item.source_id,
         )
 
@@ -175,7 +143,6 @@ class ProviderImportService(ImportPlanningMixin):
     ) -> ImportReceipt:
         """Apply assets independently; a failed asset does not undo others."""
         migration_id = f"migration-{uuid4().hex}"
-        replace_existing = bool(retry_of_migration_id)
         warnings = list(inventory.warnings)
         sessions = [_bounded_session(item) for item in inventory.sessions]
         _bounded_memory(inventory.memory_projects)
@@ -195,29 +162,25 @@ class ProviderImportService(ImportPlanningMixin):
         skipped_sessions = conversations.skipped
         archived_internal_sessions = conversations.archived_internal
         imported_skills: list[str] = []
-        completed_skills: list[str] = []
         imported_mcp_servers: list[str] = []
-        completed_mcp_servers: list[str] = []
         imported_memory_projects: list[str] = []
-        completed_memory_projects: list[str] = []
         restored_marketplaces: list[str] = []
         prepared_plugins: list[str] = []
         installed_plugins: list[str] = []
         installed_plugin_paths: dict[str, Path] = {}
         imported_scheduled_tasks: list[str] = []
-        completed_scheduled_tasks: list[str] = []
         skipped_scheduled_tasks: list[str] = []
+        asset_states: dict[str, dict[str, str]] = {
+            "plugin": {},
+            "memory": {},
+            "skill": {},
+            "mcp": {},
+            "cron": {},
+        }
         adaptation_manifest = ""
         adaptation_summary = ""
         adaptation_asset_zones: dict[str, str] = {}
         plugin_app = None
-        adaptation_root = (
-            Path(self._workspace.workspace_dir)
-            / ".qwenpaw"
-            / "imports"
-            / migration_id
-        )
-        asset_backup_root = adaptation_root / ".asset-backups"
         skill_service = SkillService(self._workspace.workspace_dir)
         driver_config = DriverConfigService(self._workspace)
         transaction = (
@@ -228,18 +191,6 @@ class ProviderImportService(ImportPlanningMixin):
             if plan_id
             else None
         )
-
-        async def restore_mcp(
-            card: Any,
-            credentials: list[Any],
-            replacement_ref: str,
-        ) -> None:
-            await driver_config.card_store.delete(card.name)
-            if replacement_ref:
-                await driver_config.credential_store.delete(replacement_ref)
-            for credential in credentials:
-                await driver_config.credential_store.put(credential)
-            await driver_config.save_card(card, reload_driver=card.enabled)
 
         try:
             if transaction is not None:
@@ -299,6 +250,7 @@ class ProviderImportService(ImportPlanningMixin):
                 None,
             )
             marketplace_registry = ExternalMarketplaceRegistry(registry_path)
+            marketplace_status: dict[str, str] = {}
             marketplace_total = len(inventory.marketplaces)
             for marketplace_index, marketplace in enumerate(
                 inventory.marketplaces,
@@ -312,8 +264,8 @@ class ProviderImportService(ImportPlanningMixin):
                     )
 
                 try:
-                    changed, credentials_removed = await _commit_mutation(
-                        marketplace_registry.register(
+                    status, credentials_removed = await _commit_mutation(
+                        marketplace_registry.register_if_absent(
                             provider=inventory.provider_id,
                             source_id=marketplace.source_id,
                             name=marketplace.name,
@@ -327,6 +279,8 @@ class ProviderImportService(ImportPlanningMixin):
                         f"Marketplace {marketplace.name!r} failed: {exc}",
                     )
                     continue
+                marketplace_status[marketplace.source_id] = status
+                marketplace_status[marketplace.name] = status
                 if credentials_removed:
                     warnings.append(
                         f"Marketplace {marketplace.name!r} contained URL "
@@ -339,8 +293,13 @@ class ProviderImportService(ImportPlanningMixin):
                         "independent source is unavailable. Its provenance "
                         "was recorded, but no source checkout was copied.",
                     )
-                elif changed:
+                elif status == "created":
                     restored_marketplaces.append(marketplace.name)
+                elif status == "conflict":
+                    warnings.append(
+                        f"Marketplace {marketplace.name!r} already exists "
+                        "with different settings; kept the QwenPaw copy.",
+                    )
 
             installable_plugins = [
                 plugin
@@ -376,7 +335,7 @@ class ProviderImportService(ImportPlanningMixin):
                 inventory.plugins,
                 progress,
                 "plugin",
-                installed_plugins,
+                asset_states["plugin"],
                 adaptation_asset_zones,
                 "plugins",
             ):
@@ -386,6 +345,12 @@ class ProviderImportService(ImportPlanningMixin):
                         "正在通过 QwenPaw 原生流程安装兼容插件："
                         f"{plugin_index}/{plugin_total}",
                     )
+                if marketplace_status.get(plugin.marketplace) == "conflict":
+                    warnings.append(
+                        f"Plugin {plugin.source_id!r} was not installed "
+                        "because its Marketplace conflicts with QwenPaw.",
+                    )
+                    continue
                 if not plugin.install_source:
                     warnings.append(
                         f"Plugin {plugin.source_id!r} has no independent "
@@ -426,6 +391,7 @@ class ProviderImportService(ImportPlanningMixin):
                     )
                     continue
                 staged_plugin: Path | None = None
+                plugin_id = ""
                 try:
                     # pylint: disable-next=C0415
                     from ..app.routers.plugins import (
@@ -437,7 +403,6 @@ class ProviderImportService(ImportPlanningMixin):
                         staged_plugin = await run_sync_io(
                             stage_qoder_skill_plugin,
                             plugin,
-                            enabled=compatibility_zone == "migrate",
                         )
                         install_source = str(staged_plugin)
                     elif (
@@ -446,21 +411,29 @@ class ProviderImportService(ImportPlanningMixin):
                         staged_plugin = await run_sync_io(
                             stage_codex_content_plugin,
                             plugin,
-                            enabled=compatibility_zone == "migrate",
                         )
                         install_source = str(staged_plugin)
                     source_path = Path(install_source).resolve()
                     plugin_id = _plugin_id(source_path)
+
+                    def record_plugin(value: Any) -> None:
+                        installed_plugins.append(value.manifest.id)
+                        asset_states["plugin"][plugin.source_id] = "succeeded"
+
                     record = await _commit_mutation(
                         install_plugin_source(
                             install_source,
                             app=plugin_app,
-                            force=replace_existing,
+                            force=False,
                             reload_agents=False,
+                            pawport_owner={
+                                "owner": "pawport",
+                                "provider": inventory.provider_id,
+                                "source_id": plugin.source_id,
+                            },
+                            recover_incomplete=True,
                         ),
-                        lambda value: installed_plugins.append(
-                            value.manifest.id,
-                        ),
+                        record_plugin,
                     )
                     source_path = getattr(record, "source_path", None)
                     if source_path is not None:
@@ -470,14 +443,35 @@ class ProviderImportService(ImportPlanningMixin):
                     if staged_plugin is not None:
                         warnings.append(
                             f"Adapted content plugin {plugin.source_id!r} "
-                            "into a QwenPaw native wrapper; its Skills are "
-                            + (
-                                "enabled."
-                                if compatibility_zone == "migrate"
-                                else "installed disabled for further repair."
-                            ),
+                            "into a QwenPaw native wrapper; its Skills remain "
+                            "disabled pending explicit review.",
                         )
                 except Exception as exc:  # pylint: disable=broad-except
+                    if "installation target already exists" in str(
+                        exc,
+                    ) or "already loaded" in str(exc):
+                        asset_states["plugin"][plugin.source_id] = "existing"
+                        loader = getattr(
+                            getattr(plugin_app, "state", None),
+                            "plugin_loader",
+                            None,
+                        )
+                        loaded = getattr(loader, "_loaded_plugins", {}).get(
+                            plugin_id,
+                        )
+                        if getattr(loaded, "source_path", None) is not None:
+                            installed_plugin_paths[plugin.source_id] = Path(
+                                loaded.source_path,
+                            )
+                        for root in getattr(loader, "plugin_dirs", ()):
+                            if plugin.source_id in installed_plugin_paths:
+                                break
+                            candidate = Path(root) / plugin_id
+                            if candidate.is_dir():
+                                installed_plugin_paths[
+                                    plugin.source_id
+                                ] = candidate
+                                break
                     warnings.append(
                         f"Plugin {plugin.source_id!r} failed native "
                         f"installation: {type(exc).__name__}: {exc}",
@@ -501,9 +495,8 @@ class ProviderImportService(ImportPlanningMixin):
                 inventory.memory_projects,
                 progress,
                 "memory",
-                imported_memory_projects,
+                asset_states["memory"],
                 enabled=None,
-                completed=completed_memory_projects,
             ):
                 if _progress_milestone(memory_index, memory_total):
                     await _report(
@@ -515,14 +508,19 @@ class ProviderImportService(ImportPlanningMixin):
 
                     def record_memory(result: Any) -> None:
                         _target, changed = result
-                        if changed or replace_existing:
+                        if changed:
                             imported_memory_projects.append(project.source_id)
+                            asset_states["memory"][
+                                project.source_id
+                            ] = "succeeded"
                         else:
-                            completed_memory_projects.append(project.source_id)
+                            asset_states["memory"][
+                                project.source_id
+                            ] = "existing"
 
                     await _commit_mutation(
                         run_sync_io(
-                            _replace_memory_project,
+                            _create_memory_project,
                             self._workspace,
                             inventory.provider_id,
                             project,
@@ -540,10 +538,10 @@ class ProviderImportService(ImportPlanningMixin):
                 inventory.skills,
                 progress,
                 "skill",
-                imported_skills,
+                asset_states["skill"],
                 adaptation_asset_zones,
                 "skills",
-                completed=completed_skills,
+                False,
             ):
                 if _progress_milestone(skill_index, skill_total):
                     await _report(
@@ -561,101 +559,44 @@ class ProviderImportService(ImportPlanningMixin):
                         "隔离暂存区，可修复后重试。",
                     )
                     continue
-                skill_backup: tuple[Path, Path | None] | None = None
                 try:
                     data = await run_sync_io(_skill_zip, skill)
+
+                    def record_skill(value: Any) -> None:
+                        names = [
+                            str(name) for name in value.get("imported", [])
+                        ]
+                        imported_skills.extend(names)
+                        asset_states["skill"][skill.source_id] = (
+                            "succeeded"
+                            if names
+                            else (
+                                "existing"
+                                if value.get("conflicts")
+                                else "failed"
+                            )
+                        )
+
                     result = await _commit_mutation(
                         run_sync_io(
                             skill_service.import_from_zip,
                             data,
-                            compatibility_zone == "migrate",
+                            enable=False,
+                            pawport_owner={
+                                "owner": "pawport",
+                                "provider": inventory.provider_id,
+                                "source_id": skill.source_id,
+                            },
                         ),
-                        lambda value: imported_skills.extend(
-                            str(name) for name in value.get("imported", [])
-                        ),
+                        record_skill,
                     )
                     names = [str(name) for name in result.get("imported", [])]
-                    if (
-                        not names
-                        and result.get("conflicts")
-                        and replace_existing
-                    ):
-                        skill_dir = (
-                            get_workspace_skills_dir(
-                                self._workspace.workspace_dir,
-                            )
-                            / skill.name
+                    if not names and result.get("conflicts"):
+                        warnings.append(
+                            f"Skill {skill.name!r} already exists; kept the "
+                            "QwenPaw copy.",
                         )
-                        if not skill_dir.is_dir():
-                            raise RuntimeError(
-                                "conflicting Skill files are missing",
-                            )
-                        backup = asset_backup_root / "skills" / skill.name
-                        await run_sync_io(_copy_tree, skill_dir, backup)
-                        manifest = get_workspace_skill_manifest_path(
-                            self._workspace.workspace_dir,
-                        )
-                        manifest_backup = (
-                            asset_backup_root / "skill.json"
-                            if manifest.is_file()
-                            else None
-                        )
-                        if manifest_backup is not None:
-                            await run_sync_io(
-                                shutil.copy2,
-                                manifest,
-                                manifest_backup,
-                            )
-                        skill_backup = (backup, manifest_backup)
-                        skill_service.disable_skill(skill.name)
-                        await run_sync_io(
-                            skill_service.delete_skill,
-                            skill.name,
-                        )
-                        result = await _commit_mutation(
-                            run_sync_io(
-                                skill_service.import_from_zip,
-                                data,
-                                compatibility_zone == "migrate",
-                            ),
-                            lambda value: imported_skills.extend(
-                                str(name) for name in value.get("imported", [])
-                            ),
-                        )
-                        names = [
-                            str(name) for name in result.get("imported", [])
-                        ]
-                        if not names:
-                            await run_sync_io(
-                                _restore_skill,
-                                self._workspace.workspace_dir,
-                                skill.name,
-                                *skill_backup,
-                            )
-                            skill_backup = None
-                    if not names:
-                        if result.get("conflicts") and not replace_existing:
-                            completed_skills.append(skill.name)
-                        if result.get("conflicts"):
-                            warnings.append(
-                                f"Skill {skill.name!r} already exists; kept "
-                                "the QwenPaw copy.",
-                            )
                 except Exception as exc:  # pylint: disable=broad-except
-                    if skill_backup is not None:
-                        try:
-                            await run_sync_io(
-                                _restore_skill,
-                                self._workspace.workspace_dir,
-                                skill.name,
-                                *skill_backup,
-                            )
-                        except (
-                            Exception
-                        ) as restore_exc:  # pylint: disable=broad-except
-                            raise RuntimeError(
-                                "Skill replacement failed; restoration failed",
-                            ) from restore_exc
                     warnings.append(
                         f"Skill {skill.name!r} was quarantined/skipped: {exc}",
                     )
@@ -669,10 +610,9 @@ class ProviderImportService(ImportPlanningMixin):
                 inventory.mcp_servers,
                 progress,
                 "mcp",
-                imported_mcp_servers,
+                asset_states["mcp"],
                 adaptation_asset_zones,
                 "mcp",
-                completed=completed_mcp_servers,
             ):
                 if _progress_milestone(mcp_index, mcp_total):
                     await _report(
@@ -690,11 +630,8 @@ class ProviderImportService(ImportPlanningMixin):
                         "后重试。",
                     )
                     continue
-                if (
-                    server.name in existing_driver_names
-                    and not replace_existing
-                ):
-                    completed_mcp_servers.append(server.name)
+                if server.name in existing_driver_names:
+                    asset_states["mcp"][server.source_id] = "existing"
                     warnings.append(
                         f"MCP {server.name!r} conflicts with an existing "
                         "QwenPaw Driver; kept the QwenPaw copy.",
@@ -726,29 +663,8 @@ class ProviderImportService(ImportPlanningMixin):
                     )
                     continue
                 credential_ref = ""
-                replacement: tuple[Any, list[Any]] | None = None
                 card_written = False
                 try:
-                    if (
-                        replace_existing
-                        and (previous_card := existing_cards.get(server.name))
-                        is not None
-                    ):
-                        previous_credentials = []
-                        for reference in iter_credential_refs(
-                            previous_card,
-                        ).values():
-                            credential = (
-                                await driver_config.load_optional_credential(
-                                    reference.ref,
-                                )
-                            )
-                            if (
-                                credential is not None
-                                and not credential.ref.startswith("env:")
-                            ):
-                                previous_credentials.append(credential)
-                        replacement = (previous_card, previous_credentials)
                     translated_server = server
                     relative_cwd = str(
                         server.metadata.get("source_plugin_relative_cwd")
@@ -784,6 +700,11 @@ class ProviderImportService(ImportPlanningMixin):
                         force_encrypt_bindings=True,
                     )
                     card.enabled = False
+                    owner = {
+                        "owner": "pawport",
+                        "provider": inventory.provider_id,
+                        "source_id": server.source_id,
+                    }
                     card.config = {
                         **dict(card.config),
                         "migration_source": inventory.provider_id,
@@ -797,17 +718,62 @@ class ProviderImportService(ImportPlanningMixin):
                     }
 
                     async def save_mcp() -> None:
-                        nonlocal card_written, credential_ref
+                        nonlocal card_written, credential, credential_ref
                         if credential is not None:
-                            await driver_config.credential_store.put(
+                            credential_store = driver_config.credential_store
+                            credential = replace(
                                 credential,
+                                meta={
+                                    **credential.meta,
+                                    "pawport": {**owner, "state": "prepared"},
+                                },
                             )
+                            try:
+                                existing_credential = (
+                                    await credential_store.get(
+                                        credential.ref,
+                                    )
+                                )
+                            except CredentialNotFoundError:
+                                existing_credential = None
+                            if existing_credential is None:
+                                credential_written = (
+                                    await credential_store.put_if_absent(
+                                        credential,
+                                    )
+                                )
+                                if not credential_written:
+                                    raise FileExistsError(
+                                        "import credential already exists",
+                                    )
+                            elif dict(existing_credential.meta).get(
+                                "pawport",
+                            ) == {**owner, "state": "prepared"}:
+                                await credential_store.put(credential)
+                            else:
+                                raise FileExistsError(
+                                    "import credential already exists",
+                                )
                             credential_ref = credential.ref
-                        await driver_config.save_card(
+                        card_written = await driver_config.save_card_if_absent(
                             card,
-                            reload_driver=False,
                         )
-                        card_written = True
+                        if not card_written:
+                            raise FileExistsError("DriverCard already exists")
+                        if credential is not None:
+                            await credential_store.put(
+                                replace(
+                                    credential,
+                                    meta={
+                                        **credential.meta,
+                                        "pawport": {
+                                            **owner,
+                                            "state": "committed",
+                                        },
+                                    },
+                                ),
+                            )
+                        asset_states["mcp"][server.source_id] = "succeeded"
 
                     await run_async_to_completion(save_mcp())
                     existing_driver_names.add(card.name)
@@ -825,32 +791,49 @@ class ProviderImportService(ImportPlanningMixin):
                             f"MCP {server.name!r} authentication state was "
                             "not copied; authorize it again before enabling.",
                         )
-                except Exception as exc:  # pylint: disable=broad-except
+                except BaseException as exc:
                     try:
-                        if replacement is not None:
-                            await restore_mcp(
-                                *replacement,
+                        if card_written:
+                            await driver_config.card_store.delete(server.name)
+                        if credential_ref:
+                            await driver_config.credential_store.delete(
                                 credential_ref,
                             )
-                        else:
-                            if card_written:
-                                await driver_config.card_store.delete(
-                                    server.name,
-                                )
-                            if credential_ref:
-                                await driver_config.credential_store.delete(
-                                    credential_ref,
-                                )
                     except (
                         Exception
                     ) as restore_exc:  # pylint: disable=broad-except
                         raise RuntimeError(
-                            "MCP replacement failed and could not be restored",
+                            "MCP import failed and could not be cleaned up",
                         ) from restore_exc
+                    if isinstance(exc, FileExistsError) and (
+                        "DriverCard" in str(exc)
+                    ):
+                        asset_states["mcp"][server.source_id] = "existing"
                     warnings.append(
                         f"MCP {server.name!r} could not be translated and "
                         f"was skipped: {type(exc).__name__}: {exc}",
                     )
+                    if not isinstance(exc, Exception):
+                        raise
+
+            for plugin_id in sorted(
+                {
+                    parent
+                    for server in inventory.mcp_servers
+                    if (parent := bound_mcp_plugin(server))
+                    and asset_states["mcp"].get(server.source_id, "failed")
+                    not in {"succeeded", "existing"}
+                },
+            ):
+                asset_states["plugin"][plugin_id] = "failed"
+                await report_result(
+                    progress,
+                    "asset",
+                    "plugin",
+                    "failed",
+                    "-",
+                    plugin_id,
+                )
 
             cron_manager = getattr(self._workspace, "cron_manager", None)
             existing_task_jobs: dict[tuple[str, str], Any] = {}
@@ -872,11 +855,10 @@ class ProviderImportService(ImportPlanningMixin):
                 inventory.scheduled_tasks,
                 progress,
                 "cron",
-                imported_scheduled_tasks,
+                asset_states["cron"],
                 adaptation_asset_zones,
                 "scheduled_tasks",
                 False,
-                completed=completed_scheduled_tasks,
             ):
                 if _progress_milestone(task_index, task_total):
                     await _report(
@@ -897,96 +879,19 @@ class ProviderImportService(ImportPlanningMixin):
                     continue
                 key = (inventory.provider_id, task.source_id)
                 existing_task = existing_task_jobs.get(key)
-                repairing_invalid_task = False
-                if existing_task is not None and replace_existing:
-                    repairing_invalid_task = True
-                if existing_task is not None and not replace_existing:
-                    validator = getattr(
-                        cron_manager,
-                        "validate_job_spec",
-                        None,
-                    )
-                    if not callable(validator):
-                        skipped_scheduled_tasks.append(task.source_id)
-                        continue
-                    try:
-                        validator(existing_task)
-                    except Exception as exc:  # pylint: disable=broad-except
-                        portability = getattr(existing_task, "meta", {}).get(
-                            "portability",
-                            {},
-                        )
-                        review_checker = getattr(
-                            cron_manager,
-                            "requires_portability_review",
-                            None,
-                        )
-                        still_awaiting_review = (
-                            bool(review_checker(existing_task))
-                            if callable(review_checker)
-                            else bool(
-                                isinstance(portability, dict)
-                                and (
-                                    portability.get("requires_review") is True
-                                    or portability.get("safety")
-                                    == "disabled_until_explicit_promotion"
-                                ),
-                            )
-                        )
-                        if not still_awaiting_review:
-                            skipped_scheduled_tasks.append(task.source_id)
-                            warnings.append(
-                                f"已有定时任务 {task.name!r} 无法注册，但"
-                                "它已经过人工处理，本次不会覆盖："
-                                f"{type(exc).__name__}: {exc}",
-                            )
-                            continue
-                        repairing_invalid_task = True
-                        warnings.append(
-                            f"检测到旧版留下的无效定时任务 "
-                            f"{task.name!r}；将用已通过兼容检查的禁用"
-                            "模板修复，不会执行任务。",
-                        )
-                    else:
-                        review_checker = getattr(
-                            cron_manager,
-                            "requires_portability_review",
-                            None,
-                        )
-                        normalizer = getattr(
-                            cron_manager,
-                            "canonicalize_imported_job_for_review",
-                            None,
-                        )
-                        if (
-                            callable(review_checker)
-                            and review_checker(existing_task)
-                            and callable(normalizer)
-                        ):
-                            normalized_existing = normalizer(existing_task)
-                            if normalized_existing != existing_task:
-
-                                async def normalize_task() -> None:
-                                    await cron_manager.create_or_replace_job(
-                                        normalized_existing,
-                                    )
-                                    existing_task_jobs[
-                                        key
-                                    ] = normalized_existing
-
-                                await run_async_to_completion(normalize_task())
-                                warnings.append(
-                                    f"定时任务 {task.name!r} 的旧版迁移审核"
-                                    "门禁已补齐，任务保持禁用。",
-                                )
-                        completed_scheduled_tasks.append(task.source_id)
-                        skipped_scheduled_tasks.append(task.source_id)
-                        continue
                 if cron_manager is None:
                     skipped_scheduled_tasks.append(task.source_id)
                     warnings.append(
                         f"定时任务 {task.name!r} 未写入：目标智能体的 Cron "
                         "服务尚未初始化。聊天记录和其他资产不受影响。",
+                    )
+                    continue
+                if existing_task is not None:
+                    asset_states["cron"][task.source_id] = "existing"
+                    skipped_scheduled_tasks.append(task.source_id)
+                    warnings.append(
+                        f"定时任务 {task.name!r} already exists; kept the "
+                        "QwenPaw copy.",
                     )
                     continue
                 try:
@@ -1003,51 +908,38 @@ class ProviderImportService(ImportPlanningMixin):
                             (inventory.provider_id, target_thread_id),
                         )
                         if target_chat is None:
-                            target_session_id = (
-                                f"import:{inventory.provider_id}:scheduled:"
-                                f"{task.source_id}"
-                            )
-                            target_user_id = target_session_id
-                            chat = self._workspace.chat_manager
-                            await chat.get_or_create_chat(
-                                session_id=target_session_id,
-                                user_id=target_user_id,
-                                channel="console",
-                                name=f"{task.name}（迁移定时任务）",
-                                source="cron",
-                            )
                             warnings.append(
-                                f"Codex heartbeat {task.name!r} 的目标会话不可"
-                                "迁移；已新建独立 QwenPaw 会话，不保留原历史上下文。",
+                                f"Codex heartbeat {task.name!r} requires its"
+                                " source conversation; import that"
+                                " conversation before retrying the task.",
                             )
-                        else:
-                            target_session_id = target_chat.session_id
-                            target_user_id = target_chat.user_id
+                            continue
+                        target_session_id = target_chat.session_id
+                        target_user_id = target_chat.user_id
                     job = build_imported_job(
                         inventory.provider_id,
                         task,
                         target_user_id=target_user_id,
                         target_session_id=target_session_id,
-                        reviewed=compatibility_zone == "migrate",
                     )
                     if source_kind == "heartbeat":
                         job.runtime = job.runtime.model_copy(
                             update={"share_session": True},
                         )
-                    if repairing_invalid_task:
-                        existing_id = getattr(existing_task, "id", None)
-                        if existing_id:
-                            job = job.model_copy(update={"id": existing_id})
                     assert job.id is not None
 
                     async def save_task() -> None:
-                        await cron_manager.create_or_replace_job(job)
+                        if not await cron_manager.create_job_if_absent(job):
+                            raise FileExistsError("Cron job already exists")
                         imported_scheduled_tasks.append(task.source_id)
                         existing_task_jobs[key] = job
+                        asset_states["cron"][task.source_id] = "succeeded"
 
                     await run_async_to_completion(save_task())
                 except Exception as exc:  # pylint: disable=broad-except
                     skipped_scheduled_tasks.append(task.source_id)
+                    if isinstance(exc, FileExistsError):
+                        asset_states["cron"][task.source_id] = "existing"
                     warnings.append(
                         f"定时任务 {task.name!r} 已保留在迁移清单中，但未"
                         f"启用或写入：{type(exc).__name__}: {exc}",
@@ -1115,7 +1007,6 @@ class ProviderImportService(ImportPlanningMixin):
                 new_file_mode=0o600,
             )
             await _report(progress, "迁移事务已安全提交。")
-            await run_sync_io(shutil.rmtree, asset_backup_root, True)
             if transaction is not None:
                 await transaction.discard()
             return receipt

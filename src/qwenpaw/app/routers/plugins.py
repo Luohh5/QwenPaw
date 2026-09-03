@@ -479,6 +479,8 @@ async def _load_plugin_with_optional_force_reinstall(
     *,
     force: bool,
     reload_agents: bool = True,
+    pawport_owner: dict | None = None,
+    recover_incomplete: bool = False,
 ):
     """Load a plugin, optionally unloading first under one lifecycle lock.
 
@@ -543,6 +545,8 @@ async def _load_plugin_with_optional_force_reinstall(
         before_force_unload=_before_force_unload if force else None,
         after_force_unload=_after_force_unload if force else None,
         after_load=_after_load,
+        pawport_owner=pawport_owner,
+        recover_incomplete=recover_incomplete,
     )
 
 
@@ -666,6 +670,8 @@ async def install_plugin_source(
     app,
     force: bool = False,
     reload_agents: bool = True,
+    pawport_owner: dict | None = None,
+    recover_incomplete: bool = False,
 ):
     """Install through the native plugin lifecycle used by the HTTP route."""
     request = SimpleNamespace(app=app)
@@ -696,6 +702,8 @@ async def install_plugin_source(
             source_path,
             force=force,
             reload_agents=reload_agents,
+            pawport_owner=pawport_owner,
+            recover_incomplete=recover_incomplete,
         )
     finally:
         if temp_dir is not None:

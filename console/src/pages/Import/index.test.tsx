@@ -158,8 +158,12 @@ describe("ImportPage", () => {
       screen.getByRole("button", { name: "portabilityImport.start" }),
     );
     expect(actions.start).toHaveBeenLastCalledWith({
-      codex: expect.objectContaining({ sessions: false, cron: [] }),
+      codex: expect.objectContaining({
+        sessions: false,
+        cron: ["heartbeat-1"],
+      }),
     });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Heartbeat" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Review Skill" }));
     expect(
       screen.getByRole("button", { name: "portabilityImport.start" }),
@@ -225,8 +229,15 @@ describe("ImportPage", () => {
     );
   });
 
-  it("renders progress and the five public result states", () => {
-    const states = ["pending", "repairing", "ready", "failed", "succeeded"];
+  it("renders progress and the public result states", () => {
+    const states = [
+      "pending",
+      "repairing",
+      "ready",
+      "failed",
+      "succeeded",
+      "existing",
+    ];
     vi.mocked(useImportJob).mockReturnValue(
       state({
         job: {

@@ -5,8 +5,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from qwenpaw.portability.models import SourceScheduledTask
 from qwenpaw.app.crons.manager import CronManager
+from qwenpaw.portability.models import SourceScheduledTask
 from qwenpaw.portability.scheduled_tasks import (
     build_imported_job,
     imported_job_id,
@@ -43,28 +43,10 @@ def test_build_imported_job_is_stable_disabled_and_safe(tmp_path) -> None:
     assert imported_job_source(first) == ("codex", "source-task")
     assert first.meta["portability"]["source_enabled"] is True
     assert first.meta["portability"]["requires_review"] is True
-
-
-def test_mission_reviewed_job_is_disabled_without_review_gate(
-    tmp_path,
-) -> None:
-    task = SourceScheduledTask(
-        source_id="approved",
-        name="Approved",
-        schedule_type="cron",
-        cron="0 9 * * *",
-        prompt="Create the report",
-        cwd=str(tmp_path),
-    )
-
-    job = build_imported_job("codex", task, reviewed=True)
-
-    assert job.enabled is False
-    assert job.runtime.tool_safety is True
-    assert job.meta["portability"]["requires_review"] is False
-    assert job.meta["portability"]["safety"] == "reviewed_disabled"
-    assert job.request.request_context["portability_review_required"] is False
-    assert CronManager.requires_portability_review(job) is False
+    assert "promoted_at" not in first.meta["portability"]
+    assert "promoted_by" not in first.meta["portability"]
+    assert first.request.request_context["portability_review_required"] is True
+    assert CronManager.requires_portability_review(first) is True
 
 
 def test_build_imported_job_rejects_unsupported_and_expired_tasks() -> None:

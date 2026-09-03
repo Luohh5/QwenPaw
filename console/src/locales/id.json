@@ -100,11 +100,13 @@
       "repairing": "Memperbaiki",
       "ready": "Berhasil diperbaiki, menunggu impor",
       "failed": "Gagal",
-      "succeeded": "Berhasil"
+      "succeeded": "Berhasil",
+      "existing": "Sudah ada"
     },
     "hints": {
       "failed": "Sesuaikan konfigurasi terkait secara manual.",
-      "disabled": "Berhasil diimpor tetapi tetap nonaktif hingga Anda meninjau dan mengaktifkannya."
+      "disabled": "Berhasil diimpor tetapi tetap nonaktif hingga Anda meninjau dan mengaktifkannya.",
+      "cronReview": "Diimpor dalam keadaan nonaktif dan tidak dapat dijalankan sampai Anda meninjaunya secara eksplisit di Tugas Cron; aktifkan secara terpisah setelahnya."
     },
     "sessionStates": {
       "failed": "Impor gagal",
@@ -118,9 +120,9 @@
     "targetAgent": "Agent tujuan: {{agent}}",
     "selectAllFailed": "Pilih semua alat yang gagal",
     "retrySelected": "Coba lagi yang dipilih ({{count}})",
-    "retryConfirm": "Coba lagi {{count}} alat gagal yang dipilih? Item dengan nama yang sama akan ditimpa.",
+    "retryConfirm": "Coba lagi {{count}} alat gagal yang dipilih? Item QwenPaw yang sudah ada akan dipertahankan.",
     "pluginWarningTitle": "Peringatan eksekusi plugin",
-    "pluginWarning": "Plugin ini dapat memasang dependensi Python, menjalankan kode dalam proses QwenPaw, serta mendaftarkan alat, Hook, rute, atau perintah global. Impor hanya plugin dari sumber yang tepercaya.",
+    "pluginWarning": "Plugin ini dapat memasang dependensi Python, menjalankan kode dalam proses QwenPaw, serta mendaftarkan alat, Hook, rute, atau perintah global. Memilih plugin juga mengimpor konfigurasi dan kredensial MCP terikatnya dalam keadaan nonaktif untuk ditinjau. Impor hanya plugin dari sumber yang tepercaya.",
     "pluginWarningConfirm": "Saya memercayai sumber plugin ini dan mengizinkan pemasangan dependensi serta eksekusi kode.",
     "pluginWarningAction": "Konfirmasi dan impor",
     "done": "Selesai"

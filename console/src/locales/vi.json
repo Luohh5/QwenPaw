@@ -100,11 +100,13 @@
       "repairing": "Đang sửa",
       "ready": "Đã sửa xong, chờ nhập",
       "failed": "Thất bại",
-      "succeeded": "Thành công"
+      "succeeded": "Thành công",
+      "existing": "Đã tồn tại"
     },
     "hints": {
       "failed": "Vui lòng chỉnh sửa cấu hình liên quan theo cách thủ công.",
-      "disabled": "Đã nhập thành công nhưng vẫn tắt cho đến khi bạn xem xét và bật."
+      "disabled": "Đã nhập thành công nhưng vẫn tắt cho đến khi bạn xem xét và bật.",
+      "cronReview": "Đã nhập ở trạng thái tắt và bị chặn chạy cho đến khi bạn xác nhận rõ ràng trong Tác vụ Cron; sau đó hãy bật riêng."
     },
     "sessionStates": {
       "failed": "Nhập thất bại",
@@ -118,9 +120,9 @@
     "targetAgent": "Agent đích: {{agent}}",
     "selectAllFailed": "Chọn tất cả công cụ thất bại",
     "retrySelected": "Thử lại mục đã chọn ({{count}})",
-    "retryConfirm": "Thử lại {{count}} công cụ thất bại đã chọn? Mục cùng tên sẽ bị ghi đè.",
+    "retryConfirm": "Thử lại {{count}} công cụ thất bại đã chọn? Mục QwenPaw hiện có sẽ được giữ nguyên.",
     "pluginWarningTitle": "Cảnh báo thực thi plugin",
-    "pluginWarning": "Các plugin này có thể cài đặt phụ thuộc Python, thực thi mã trong tiến trình QwenPaw và đăng ký công cụ, Hook, route hoặc lệnh toàn cục. Chỉ nhập plugin từ nguồn bạn tin cậy.",
+    "pluginWarning": "Các plugin này có thể cài đặt phụ thuộc Python, thực thi mã trong tiến trình QwenPaw và đăng ký công cụ, Hook, route hoặc lệnh toàn cục. Chọn plugin cũng sẽ nhập cấu hình và thông tin xác thực MCP liên kết ở trạng thái tắt để xem xét. Chỉ nhập plugin từ nguồn bạn tin cậy.",
     "pluginWarningConfirm": "Tôi tin cậy nguồn của các plugin này và cho phép cài đặt phụ thuộc cũng như thực thi mã.",
     "pluginWarningAction": "Xác nhận và nhập",
     "done": "Hoàn tất"

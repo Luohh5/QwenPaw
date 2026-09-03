@@ -41,6 +41,7 @@ const COLORS: Record<ImportAssetState, string> = {
   ready: "success",
   failed: "error",
   succeeded: "success",
+  existing: "warning",
 };
 
 type RetryAsset = {
@@ -70,7 +71,11 @@ function AssetStatus({ asset }: { asset: ImportAssetResult }) {
     asset.state === "failed"
       ? t("portabilityImport.hints.failed")
       : asset.state === "succeeded" && asset.enabled === false
-      ? t("portabilityImport.hints.disabled")
+      ? t(
+          asset.asset_type === "cron"
+            ? "portabilityImport.hints.cronReview"
+            : "portabilityImport.hints.disabled",
+        )
       : "";
   const tag = (
     <Tag color={COLORS[asset.state]}>
@@ -358,12 +363,7 @@ export default function ImportPage() {
   ) => {
     const field = FIELDS[type];
     const ids = provider.assets
-      .filter(
-        (asset) =>
-          asset.asset_type === type &&
-          (currentSelections[provider.source]?.sessions ||
-            !asset.requires_sessions),
-      )
+      .filter((asset) => asset.asset_type === type)
       .map((asset) => asset.source_id);
     updateSelection(provider.source, (selection) => ({
       ...selection,
@@ -379,11 +379,7 @@ export default function ImportPage() {
           FIELDS[type],
           checked
             ? provider.assets
-                .filter(
-                  (asset) =>
-                    asset.asset_type === type &&
-                    (selection.sessions || !asset.requires_sessions),
-                )
+                .filter((asset) => asset.asset_type === type)
                 .map((asset) => asset.source_id)
             : [],
         ]),
@@ -513,17 +509,6 @@ export default function ImportPage() {
                           updateSelection(provider.source, (selection) => ({
                             ...selection,
                             sessions: event.target.checked,
-                            cron: event.target.checked
-                              ? selection.cron
-                              : (selection.cron ?? []).filter(
-                                  (id) =>
-                                    !provider.assets.some(
-                                      (asset) =>
-                                        asset.asset_type === "cron" &&
-                                        asset.source_id === id &&
-                                        asset.requires_sessions,
-                                    ),
-                                ),
                           }))
                         }
                       >
@@ -606,9 +591,7 @@ export default function ImportPage() {
                               >
                                 <Tooltip
                                   title={
-                                    asset.requires_sessions &&
-                                    !currentSelections[provider.source]
-                                      ?.sessions
+                                    asset.requires_sessions
                                       ? t(
                                           "portabilityImport.heartbeatRequiresSessions",
                                         )
@@ -617,11 +600,6 @@ export default function ImportPage() {
                                 >
                                   <Checkbox
                                     checked={selected.includes(asset.source_id)}
-                                    disabled={
-                                      asset.requires_sessions &&
-                                      !currentSelections[provider.source]
-                                        ?.sessions
-                                    }
                                     onChange={(event) =>
                                       toggleAsset(
                                         provider,

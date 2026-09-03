@@ -24,6 +24,16 @@ def _selected(values: list[Any], ids: set[str], label: str) -> list[Any]:
     return [item for item in values if item.source_id in ids]
 
 
+def bound_mcp_plugin(server: Any) -> str:
+    """Return the plugin that must be installed before this MCP can run."""
+    parent = str(server.metadata.get("source_plugin") or "")
+    return (
+        parent
+        if parent and server.metadata.get("source_plugin_relative_cwd")
+        else ""
+    )
+
+
 def select_inventory(
     inventory: ProviderInventory,
     selection: ImportSelection,
@@ -31,26 +41,17 @@ def select_inventory(
     """Return a deep copy containing only selected assets."""
     chosen = {key: set(getattr(selection, key)) for key in _FIELDS}
     for server in inventory.mcp_servers:
-        parent = str(server.metadata.get("source_plugin") or "")
+        parent = bound_mcp_plugin(server)
         if (
             server.source_id in chosen["mcp"]
-            and server.metadata.get("source_plugin_relative_cwd")
+            and parent
             and parent not in chosen["plugins"]
         ):
             raise ValueError(
                 f"plugin-owned MCP {server.source_id} requires {parent}",
             )
-
-    tasks = _selected(
-        inventory.scheduled_tasks,
-        chosen["cron"],
-        "cron",
-    )
-    if not selection.sessions and any(
-        str(item.metadata.get("source_kind") or "").lower() == "heartbeat"
-        for item in tasks
-    ):
-        raise ValueError("heartbeat selection requires sessions")
+        if parent in chosen["plugins"]:
+            chosen["mcp"].add(server.source_id)
 
     updates = {
         field: _selected(getattr(inventory, field), chosen[key], key)
@@ -72,4 +73,4 @@ def select_inventory(
     return inventory.model_copy(update=updates, deep=True)
 
 
-__all__ = ["select_inventory"]
+__all__ = ["bound_mcp_plugin", "select_inventory"]

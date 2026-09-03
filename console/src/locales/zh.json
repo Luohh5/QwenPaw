@@ -137,7 +137,7 @@
     "defaultSelected": "聊天记录和工具默认勾选；插件需要你主动确认后才会导入。",
     "conversations": "聊天记录",
     "toolsSetup": "工具&设置",
-    "heartbeatRequiresSessions": "此定时任务需要同时导入聊天记录。",
+    "heartbeatRequiresSessions": "此定时任务需要其来源聊天记录；可本次一并导入，或在重试前先完成聊天记录迁移。",
     "items": "{{count}} 项",
     "start": "开始导入",
     "groups": {
@@ -152,11 +152,13 @@
       "repairing": "兼容性修复中",
       "ready": "修复成功待迁移",
       "failed": "导入失败",
-      "succeeded": "导入成功"
+      "succeeded": "导入成功",
+      "existing": "已存在，未覆盖"
     },
     "hints": {
       "failed": "请手动修改相关配置。",
-      "disabled": "已成功导入，但为保证安全暂未启用；请审核后手动启用。"
+      "disabled": "已成功导入，但为保证安全暂未启用；请审核后手动启用。",
+      "cronReview": "已导入并保持禁用；需先在定时任务页面明确审核，之后再单独启用。"
     },
     "sessionStates": {
       "failed": "导入失败",
@@ -170,9 +172,9 @@
     "targetAgent": "导入目标智能体：{{agent}}",
     "selectAllFailed": "选择所有导入失败的工具",
     "retrySelected": "重试已选项（{{count}}）",
-    "retryConfirm": "确认重新导入已选的 {{count}} 个失败工具吗？QwenPaw 中同名工具将被覆盖。",
+    "retryConfirm": "确认重新导入已选的 {{count}} 个失败工具吗？QwenPaw 中同名工具将保留，不会覆盖。",
     "pluginWarningTitle": "插件代码执行提醒",
-    "pluginWarning": "这些插件可能安装 Python 依赖、在 QwenPaw 进程中执行代码，并注册全局工具、Hook、路由或命令。请只导入你信任来源的插件。",
+    "pluginWarning": "这些插件可能安装 Python 依赖、在 QwenPaw 进程中执行代码，并注册全局工具、Hook、路由或命令。选择插件时，其绑定 MCP 的配置和凭据也会一并迁移，并默认禁用以待审查。请只导入你信任来源的插件。",
     "pluginWarningConfirm": "我确认这些插件来源可信，并同意安装依赖和执行插件代码。",
     "pluginWarningAction": "确认并导入",
     "done": "完成"

@@ -249,6 +249,14 @@ class CronManager(ManagerBase):
             previous = await self._repo.get_job(spec.id or "")
             await self._persist_and_register(spec, previous=previous)
 
+    async def create_job_if_absent(self, spec: CronJobSpec) -> bool:
+        """Create a job without replacing a concurrent or existing import."""
+        async with self._lock:
+            if await self._repo.get_job(spec.id or "") is not None:
+                return False
+            await self._persist_and_register(spec, previous=None)
+            return True
+
     @api_action(
         methods={"http", "cli", "slash"},
         http_method="DELETE",

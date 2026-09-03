@@ -166,11 +166,11 @@ async def test_doctor_fails_if_imported_job_loses_review_gate(
 
     check = _schedule_check(report)
     assert check.status == "fail"
-    assert "状态与兼容分区一致 0/1" in check.detail_zh
+    assert "保持禁用并等待人工审核 0/1" in check.detail_zh
 
 
 @pytest.mark.asyncio
-async def test_doctor_accepts_reviewed_migrate_job_while_disabled(
+async def test_doctor_accepts_review_gated_migrate_job_while_disabled(
     tmp_path: Path,
 ) -> None:
     workspace_dir = tmp_path / "workspace"
@@ -183,7 +183,7 @@ async def test_doctor_accepts_reviewed_migrate_job_while_disabled(
         prompt="Review the local workspace",
         cwd=str(tmp_path),
     )
-    job = build_imported_job("qoder", task, reviewed=True)
+    job = build_imported_job("qoder", task)
     receipt = _receipt(workspace_dir, task, zone=AssetZone.MIGRATE)
     workspace = SimpleNamespace(
         workspace_dir=workspace_dir,
@@ -193,7 +193,7 @@ async def test_doctor_accepts_reviewed_migrate_job_while_disabled(
 
     check = _schedule_check(report)
     assert check.status == "pass"
-    assert "状态与兼容分区一致 1/1" in check.detail_zh
+    assert "保持禁用并等待人工审核 1/1" in check.detail_zh
 
     workspace.cron_manager.jobs[0] = job.model_copy(
         update={"enabled": True},
