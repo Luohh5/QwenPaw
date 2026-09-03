@@ -10,8 +10,10 @@ from types import SimpleNamespace
 import pytest
 
 from qwenpaw.portability.import_jobs import (
+    ImportRun,
     ImportProviderSnapshot,
     PortabilityImportJobManager,
+    _LiveJob,
 )
 from qwenpaw.portability.models import (
     ImportAssetResult,
@@ -200,6 +202,73 @@ def test_only_materialization_milestone_updates_session_progress() -> None:
 
 
 @pytest.mark.asyncio
+async def test_large_progress_is_coalesced_without_losing_asset_states(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    manager = PortabilityImportJobManager()
+    provider = ImportProviderSnapshot(
+        source="codex",
+        assets=[
+            ImportAssetResult(
+                asset_type="skill",
+                source_id=f"skill-{index}",
+                name=f"Skill {index}",
+            )
+            for index in range(100)
+        ],
+    )
+    live = _LiveJob(
+        workspace=workspace,
+        snapshot=ImportRun(
+            job_id="import-" + "a" * 32,
+            agent_id=workspace.agent_id,
+            state="running",
+            providers=[provider],
+        ),
+    )
+    manager._prepare_progress(live)
+
+    for index in range(100):
+        await manager._apply_progress(
+            live,
+            provider,
+            f"\x1easset\tskill\tsucceeded\t0\tskill-{index}",
+        )
+
+    assert live.snapshot.seq == 20
+    assert len(live.events) == 1
+    assert all(
+        asset.state is ImportAssetState.SUCCEEDED for asset in provider.assets
+    )
+
+
+@pytest.mark.asyncio
+async def test_restored_running_job_marks_unfinished_assets_retryable(
+    tmp_path: Path,
+) -> None:
+    services = _FakeServices()
+    services.block_apply.clear()
+    workspace = _workspace(tmp_path)
+    manager = PortabilityImportJobManager(service_factory=services.factory)
+    created = await manager.create(workspace, ["codex"])
+    await _wait_job(manager, workspace, created.job_id)
+    await manager.start(
+        workspace,
+        created.job_id,
+        {"codex": ImportSelection(skills=["codex-skill"])},
+    )
+    await services.apply_started.wait()
+
+    restored = PortabilityImportJobManager(service_factory=services.factory)
+    snapshot = await restored.snapshot(workspace, created.job_id)
+    await manager.cancel(workspace, created.job_id)
+
+    assert snapshot.state == "interrupted"
+    assert snapshot.providers[0].assets[0].state is ImportAssetState.FAILED
+
+
+@pytest.mark.asyncio
 async def test_scan_is_concurrent_and_persisted(tmp_path: Path) -> None:
     services = _FakeServices()
     workspace = _workspace(tmp_path)
@@ -316,6 +385,53 @@ async def test_empty_selection_is_rejected_and_active_job_can_cancel(
     assert (await manager.cancel(workspace, created.job_id)).state == (
         "interrupted"
     )
+
+
+@pytest.mark.asyncio
+async def test_cancel_keeps_draining_mission_job_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    manager = PortabilityImportJobManager()
+    release = asyncio.Event()
+
+    async def worker() -> None:
+        while not release.is_set():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                continue
+
+    job_id = "import-" + "d" * 32
+    live = _LiveJob(
+        workspace=workspace,
+        snapshot=ImportRun(
+            job_id=job_id,
+            agent_id=workspace.agent_id,
+            state="running",
+        ),
+        task=asyncio.create_task(worker()),
+    )
+    manager._jobs[(workspace.agent_id, job_id)] = live
+    await asyncio.sleep(0)
+    monkeypatch.setattr(
+        "qwenpaw.portability.import_jobs._CANCEL_GRACE_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        "qwenpaw.portability.import_jobs.has_draining_workers",
+        lambda _workspace: True,
+    )
+
+    snapshot = await manager.cancel(workspace, job_id)
+
+    assert snapshot.state == "cancelling"
+    assert not live.task.done()
+    release.set()
+    live.task.cancel()
+    await live.task
+    assert (await manager.cancel(workspace, job_id)).state == "interrupted"
 
 
 @pytest.mark.asyncio

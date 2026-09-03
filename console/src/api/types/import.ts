@@ -52,6 +52,7 @@ export interface ImportJobSnapshot {
     | "scanning"
     | "awaiting_selection"
     | "running"
+    | "cancelling"
     | "completed"
     | "completed_with_issues"
     | "failed"

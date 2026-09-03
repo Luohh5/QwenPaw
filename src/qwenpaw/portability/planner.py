@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from ..utils.io_utils import run_sync_io
 from .models import (
     MigrationAssetPlan,
     MigrationPlan,
@@ -342,24 +343,41 @@ def tool_asset_fingerprints(inventory: ProviderInventory) -> dict[str, str]:
         "marketplaces": [],
         "warnings": [],
     }
+    empty = inventory.model_copy(update=updates)
+    marketplaces: dict[str, list[Any]] = {}
+    for marketplace in inventory.marketplaces:
+        keys = (
+            (marketplace.source_id,)
+            if marketplace.source_id == marketplace.name
+            else (marketplace.source_id, marketplace.name)
+        )
+        for key in keys:
+            marketplaces.setdefault(key, []).append(marketplace)
+    bound_mcps: dict[str, list[Any]] = {}
+    for server in inventory.mcp_servers:
+        if plugin_id := bound_mcp_plugin(server):
+            bound_mcps.setdefault(plugin_id, []).append(server)
+
     result = {}
     for kind, field in _TOOL_FIELDS:
         for item in getattr(inventory, field):
-            scoped = inventory.model_copy(
-                update={**updates, field: [item]},
-                deep=True,
+            scoped = empty.model_copy(
+                update={
+                    field: [item],
+                    "marketplaces": (
+                        marketplaces.get(item.marketplace, [])
+                        if kind == "plugins"
+                        else []
+                    ),
+                    "mcp_servers": (
+                        bound_mcps.get(item.source_id, [])
+                        if kind == "plugins"
+                        else [item]
+                        if field == "mcp_servers"
+                        else []
+                    ),
+                },
             )
-            if kind == "plugins":
-                scoped.marketplaces = [
-                    market
-                    for market in inventory.marketplaces
-                    if item.marketplace in (market.source_id, market.name)
-                ]
-                scoped.mcp_servers = [
-                    server
-                    for server in inventory.mcp_servers
-                    if bound_mcp_plugin(server) == item.source_id
-                ]
             result[f"{kind}:{item.source_id}"] = inventory_fingerprint(scoped)
     return result
 
@@ -374,8 +392,8 @@ _PLAN_TYPES = (
 )
 
 
-async def build_migration_plan(
-    workspace: Any,
+def _build_migration_plan(
+    agent_id: str,
     inventory: ProviderInventory,
     *,
     source_home: str = "",
@@ -408,10 +426,25 @@ async def build_migration_plan(
         plan_id=f"plan-{uuid4().hex}",
         source=inventory.provider_id,
         source_home=source_home,
-        agent_id=workspace.agent_id,
+        agent_id=agent_id,
         created_at=datetime.now(timezone.utc),
         asset_fingerprints=tool_asset_fingerprints(inventory),
         actions=actions,
+    )
+
+
+async def build_migration_plan(
+    workspace: Any,
+    inventory: ProviderInventory,
+    *,
+    source_home: str = "",
+) -> MigrationPlan:
+    """Build a selectable plan without blocking the event loop."""
+    return await run_sync_io(
+        _build_migration_plan,
+        workspace.agent_id,
+        inventory,
+        source_home=source_home,
     )
 
 

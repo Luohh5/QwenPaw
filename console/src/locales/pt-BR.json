@@ -115,6 +115,8 @@
     },
     "finished": "Importação concluída",
     "importing": "Importação em andamento",
+    "cancelling": "Interrompendo importação",
+    "cancellingHint": "Aguardando o Agent de reparo de compatibilidade parar com segurança.",
     "keepOpen": "Revise cada item abaixo. Não feche o QwenPaw durante a importação.",
     "details": "Detalhes da migração",
     "targetAgent": "Agente de destino: {{agent}}",

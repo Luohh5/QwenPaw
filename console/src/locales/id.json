@@ -115,6 +115,8 @@
     },
     "finished": "Impor selesai",
     "importing": "Impor sedang berjalan",
+    "cancelling": "Menghentikan impor",
+    "cancellingHint": "Menunggu Agent perbaikan kompatibilitas berhenti dengan aman.",
     "keepOpen": "Tinjau status setiap item di bawah. Jangan tutup QwenPaw selama impor.",
     "details": "Detail migrasi",
     "targetAgent": "Agent tujuan: {{agent}}",

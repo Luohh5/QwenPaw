@@ -195,17 +195,15 @@ class ProviderImportService(ImportPlanningMixin):
         try:
             if transaction is not None:
                 await transaction.begin()
-            await run_async_to_completion(
-                import_conversations(
-                    self._workspace,
-                    inventory,
-                    sessions,
-                    existing_by_source,
-                    warnings,
-                    started_at,
-                    progress,
-                    conversations,
-                ),
+            await import_conversations(
+                self._workspace,
+                inventory,
+                sessions,
+                existing_by_source,
+                warnings,
+                started_at,
+                progress,
+                conversations,
             )
 
             try:

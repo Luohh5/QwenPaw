@@ -9,6 +9,7 @@ import {
   Collapse,
   Empty,
   Modal,
+  Pagination,
   Progress,
   Spin,
   Steps,
@@ -28,6 +29,7 @@ import { useImportJob } from "./useImportJob";
 import styles from "./index.module.less";
 
 const GROUPS = ["memory", "cron", "skill", "mcp", "plugin"] as const;
+const ASSET_PAGE_SIZE = 100;
 const FIELDS = {
   memory: "memory",
   cron: "cron",
@@ -177,6 +179,7 @@ export default function ImportPage() {
     null,
   );
   const [pluginConfirmed, setPluginConfirmed] = useState(false);
+  const [assetPages, setAssetPages] = useState<Record<string, number>>({});
   const selectionKey = job?.job_id ?? "";
   const currentSelections = useMemo(
     () => selections[selectionKey] ?? {},
@@ -234,6 +237,7 @@ export default function ImportPage() {
         job.state,
       ),
   );
+  const isCancelling = job?.state === "cancelling";
   const percent = useMemo(() => completion(job?.providers ?? []), [job]);
 
   const updateSelection = (
@@ -259,9 +263,12 @@ export default function ImportPage() {
       ) ?? [],
     [job],
   );
-  const selectedRetryKeys = retryKeys[selectionKey] ?? [];
+  const selectedRetryKeySet = useMemo(
+    () => new Set(retryKeys[selectionKey] ?? []),
+    [retryKeys, selectionKey],
+  );
   const selectedRetryAssets = failedAssets.filter(({ provider, asset }) =>
-    selectedRetryKeys.includes(retryKey({ provider, asset })),
+    selectedRetryKeySet.has(retryKey({ provider, asset })),
   );
   const selectedPluginNames = useMemo(
     () =>
@@ -385,6 +392,10 @@ export default function ImportPage() {
         ]),
       ),
     }));
+
+  const assetPage = (key: string) => assetPages[key] ?? 1;
+  const setAssetPage = (key: string, page: number) =>
+    setAssetPages((current) => ({ ...current, [key]: page }));
 
   return (
     <div className={styles.page}>
@@ -522,12 +533,19 @@ export default function ImportPage() {
                     </div>
                     {provider.assets.length > 0 &&
                       (() => {
+                        const selectedIds = new Set(
+                          GROUPS.flatMap((type) =>
+                            (
+                              currentSelections[provider.source]?.[
+                                FIELDS[type]
+                              ] ?? []
+                            ).map((id) => `${type}:${id}`),
+                          ),
+                        );
                         const selected = provider.assets.filter((asset) =>
-                          (
-                            currentSelections[provider.source]?.[
-                              FIELDS[asset.asset_type]
-                            ] ?? []
-                          ).includes(asset.source_id),
+                          selectedIds.has(
+                            `${asset.asset_type}:${asset.source_id}`,
+                          ),
                         ).length;
                         return (
                           <div className={styles.row}>
@@ -559,17 +577,24 @@ export default function ImportPage() {
                         );
                         if (!assets.length) return [];
                         const field = FIELDS[type];
-                        const selected =
-                          currentSelections[provider.source]?.[field] ?? [];
+                        const selected = new Set(
+                          currentSelections[provider.source]?.[field] ?? [],
+                        );
+                        const pageKey = `select:${provider.source}:${type}`;
+                        const page = assetPage(pageKey);
+                        const pageAssets = assets.slice(
+                          (page - 1) * ASSET_PAGE_SIZE,
+                          page * ASSET_PAGE_SIZE,
+                        );
                         return [
                           {
                             key: type,
                             label: (
                               <Checkbox
-                                checked={selected.length === assets.length}
+                                checked={selected.size === assets.length}
                                 indeterminate={Boolean(
-                                  selected.length &&
-                                    selected.length < assets.length,
+                                  selected.size &&
+                                    selected.size < assets.length,
                                 )}
                                 onClick={(event) => event.stopPropagation()}
                                 onChange={(event) =>
@@ -584,35 +609,50 @@ export default function ImportPage() {
                                 {assets.length})
                               </Checkbox>
                             ),
-                            children: assets.map((asset) => (
-                              <div
-                                className={styles.assetRow}
-                                key={asset.source_id}
-                              >
-                                <Tooltip
-                                  title={
-                                    asset.requires_sessions
-                                      ? t(
-                                          "portabilityImport.heartbeatRequiresSessions",
-                                        )
-                                      : undefined
-                                  }
-                                >
-                                  <Checkbox
-                                    checked={selected.includes(asset.source_id)}
-                                    onChange={(event) =>
-                                      toggleAsset(
-                                        provider,
-                                        asset,
-                                        event.target.checked,
-                                      )
-                                    }
+                            children: (
+                              <>
+                                {pageAssets.map((asset) => (
+                                  <div
+                                    className={styles.assetRow}
+                                    key={asset.source_id}
                                   >
-                                    {asset.name}
-                                  </Checkbox>
-                                </Tooltip>
-                              </div>
-                            )),
+                                    <Tooltip
+                                      title={
+                                        asset.requires_sessions
+                                          ? t(
+                                              "portabilityImport.heartbeatRequiresSessions",
+                                            )
+                                          : undefined
+                                      }
+                                    >
+                                      <Checkbox
+                                        checked={selected.has(asset.source_id)}
+                                        onChange={(event) =>
+                                          toggleAsset(
+                                            provider,
+                                            asset,
+                                            event.target.checked,
+                                          )
+                                        }
+                                      >
+                                        {asset.name}
+                                      </Checkbox>
+                                    </Tooltip>
+                                  </div>
+                                ))}
+                                {assets.length > ASSET_PAGE_SIZE && (
+                                  <Pagination
+                                    current={page}
+                                    pageSize={ASSET_PAGE_SIZE}
+                                    size="small"
+                                    total={assets.length}
+                                    onChange={(next) =>
+                                      setAssetPage(pageKey, next)
+                                    }
+                                  />
+                                )}
+                              </>
+                            ),
                           },
                         ];
                       })}
@@ -649,10 +689,18 @@ export default function ImportPage() {
                   {t(
                     isDone
                       ? "portabilityImport.finished"
+                      : isCancelling
+                      ? "portabilityImport.cancelling"
                       : "portabilityImport.importing",
                   )}
                 </h3>
-                <p>{t("portabilityImport.keepOpen")}</p>
+                <p>
+                  {t(
+                    isCancelling
+                      ? "portabilityImport.cancellingHint"
+                      : "portabilityImport.keepOpen",
+                  )}
+                </p>
               </div>
             </div>
             {job.providers.map((provider) => (
@@ -663,27 +711,47 @@ export default function ImportPage() {
                     <ConversationStatus provider={provider} />
                   </div>
                 )}
-                {provider.assets.map((asset) => (
-                  <div
-                    className={styles.assetRow}
-                    key={`${asset.asset_type}:${asset.source_id}`}
-                  >
-                    <span>{asset.name}</span>
-                    <AssetStatus asset={asset} />
-                    {asset.state === "failed" && (
-                      <Checkbox
-                        aria-label={asset.name}
-                        checked={selectedRetryKeys.includes(
-                          retryKey({ provider, asset }),
-                        )}
-                        disabled={!isDone}
-                        onChange={(event) =>
-                          toggleRetry({ provider, asset }, event.target.checked)
-                        }
-                      />
-                    )}
-                  </div>
-                ))}
+                {provider.assets
+                  .slice(
+                    (assetPage(`result:${provider.source}`) - 1) *
+                      ASSET_PAGE_SIZE,
+                    assetPage(`result:${provider.source}`) * ASSET_PAGE_SIZE,
+                  )
+                  .map((asset) => (
+                    <div
+                      className={styles.assetRow}
+                      key={`${asset.asset_type}:${asset.source_id}`}
+                    >
+                      <span>{asset.name}</span>
+                      <AssetStatus asset={asset} />
+                      {asset.state === "failed" && (
+                        <Checkbox
+                          aria-label={asset.name}
+                          checked={selectedRetryKeySet.has(
+                            retryKey({ provider, asset }),
+                          )}
+                          disabled={!isDone}
+                          onChange={(event) =>
+                            toggleRetry(
+                              { provider, asset },
+                              event.target.checked,
+                            )
+                          }
+                        />
+                      )}
+                    </div>
+                  ))}
+                {provider.assets.length > ASSET_PAGE_SIZE && (
+                  <Pagination
+                    current={assetPage(`result:${provider.source}`)}
+                    pageSize={ASSET_PAGE_SIZE}
+                    size="small"
+                    total={provider.assets.length}
+                    onChange={(next) =>
+                      setAssetPage(`result:${provider.source}`, next)
+                    }
+                  />
+                )}
                 {provider.error && (
                   <Alert
                     icon={<CircleAlert />}

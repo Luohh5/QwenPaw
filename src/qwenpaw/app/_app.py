@@ -680,6 +680,8 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
             except Exception as e:
                 logger.error(f"Error stopping MultiAgentManager: {e}")
 
+        await PORTABILITY_IMPORT_JOBS.drain()
+
         # These three cleanup tasks are independent; run in parallel.
         from ..agents.skill_system.hub import aclose_hub_client
 

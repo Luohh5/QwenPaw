@@ -115,6 +115,8 @@
     },
     "finished": "Nhập hoàn tất",
     "importing": "Đang nhập dữ liệu",
+    "cancelling": "Đang dừng nhập dữ liệu",
+    "cancellingHint": "Đang chờ Agent sửa khả năng tương thích dừng an toàn.",
     "keepOpen": "Bạn có thể xem trạng thái từng mục bên dưới. Không đóng QwenPaw trong khi nhập.",
     "details": "Chi tiết di chuyển",
     "targetAgent": "Agent đích: {{agent}}",

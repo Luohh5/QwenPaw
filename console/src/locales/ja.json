@@ -113,6 +113,8 @@
     },
     "finished": "インポート完了",
     "importing": "インポート中",
+    "cancelling": "インポートを停止中",
+    "cancellingHint": "互換性修復 Agent が安全に停止するのを待っています。",
     "keepOpen": "各項目の状態を確認できます。処理中は QwenPaw を閉じないでください。",
     "details": "移行の詳細",
     "targetAgent": "インポート先エージェント：{{agent}}",

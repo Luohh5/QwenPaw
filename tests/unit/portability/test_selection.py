@@ -98,6 +98,22 @@ def test_select_plugin_includes_bound_mcp_and_marketplace(
     assert len(source.mcp_servers) == 2
 
 
+def test_tool_fingerprints_do_not_deep_copy_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory = _inventory(tmp_path)
+    original = ProviderInventory.model_copy
+
+    def model_copy(self, *args, **kwargs):
+        assert not kwargs.get("deep")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ProviderInventory, "model_copy", model_copy)
+
+    assert tool_asset_fingerprints(inventory)
+
+
 def test_select_mcp_with_plugin_provenance_stays_independent(
     tmp_path: Path,
 ) -> None:

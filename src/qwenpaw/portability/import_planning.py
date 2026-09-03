@@ -199,7 +199,10 @@ class ImportPlanningMixin:
             )
             if selection is not None:
                 inventory = select_inventory(inventory, selection)
-            current = tool_asset_fingerprints(inventory)
+            current = await io_utils.run_sync_io(
+                tool_asset_fingerprints,
+                inventory,
+            )
             expected = {
                 key: plan.asset_fingerprints.get(key) for key in current
             }
