@@ -155,14 +155,30 @@ def test_qq_channel_health_reports_running(
       - Cover the health_check path for a live (mock-connected) QQ
         channel rather than the usual disabled/unhealthy branch.
 
+    Test flow:
+      1. Poll GET /health until 200: enabling a channel is an async
+         reload, and a single query can land in the registration
+         window and get 404 (see comment below).
+
     API endpoints:
       - GET /api/config/channels/qq/health
     """
-    resp = app_server.api_request(
-        "GET",
-        "/api/config/channels/qq/health",
-        timeout=_HTTP_TIMEOUT,
-    )
+    # Enabling the channel is an async reload: replace_channel()
+    # awaits channel.start() outside the manager lock (the WS thread
+    # can complete IDENTIFY before that), then registers the channel
+    # under the lock. The health endpoint walks the registry, so it
+    # returns 404 during that window -- a CI flake was traced to this
+    # race. Poll until the channel becomes visible.
+    deadline = time.time() + 10.0
+    while True:
+        resp = app_server.api_request(
+            "GET",
+            "/api/config/channels/qq/health",
+            timeout=_HTTP_TIMEOUT,
+        )
+        if resp.status_code == 200 or time.time() >= deadline:
+            break
+        time.sleep(0.3)
     assert resp.status_code == 200, app_server.logs_tail()
     body = resp.json()
     assert body.get("channel") == "qq" or "status" in body, body
@@ -242,14 +258,40 @@ def test_qq_outbound_send_carries_msg_id_reply_context(
         msg_seq for c2c passive replies.
 
     Test flow:
-      1. Push a C2C message with a distinctive msg_id.
-      2. Wait for the outbound send; inspect the recorded body.
+      1. Register the mock model and wait for the QQ channel to reconnect
+         when first-time model activation schedules an agent reload.
+      2. Push a C2C message with a distinctive msg_id.
+      3. Wait for the outbound send; inspect the recorded body.
     """
     srv, mock_url = mock_llm
     srv.force_tool_call = False
     unregister_mock_provider(app_server, MOCK_LLM_PROVIDER_ID)
+
+    # Global model activation copies the model into an agent that does not
+    # have one yet, then schedules a zero-downtime reload asynchronously.
+    # Waiting for the replacement QQ connection prevents this message from
+    # being consumed by the old workspace just before it is stopped.  When
+    # the full module runs, an earlier test may already have initialized the
+    # model, in which case activation does not reload and no wait is needed.
+    agent = app_server.api_request(
+        "GET",
+        "/api/agents/default",
+        timeout=_HTTP_TIMEOUT,
+    )
+    assert agent.status_code == 200, app_server.logs_tail()
+    active_model = agent.json().get("active_model") or {}
+    reload_expected = not active_model.get("provider_id")
+    if reload_expected:
+        qq_channel_up.reset_identified()
+
     provider_id = register_mock_provider(app_server, mock_url)
     try:
+        if reload_expected:
+            assert qq_channel_up.wait_identified(timeout=60.0), (
+                "QQ channel did not reconnect after initial model "
+                "activation: " + app_server.logs_tail()[-3000:]
+            )
+
         marker_msg_id = "integ-qq-msgid-ctx"
         before = len(qq_channel_up.api_calls)
         qq_channel_up.push_c2c_message(

@@ -393,7 +393,7 @@ export default function ImportPage() {
   return (
     <div className={styles.page}>
       <PageHeader
-        parent={t("nav.apps")}
+        parent={t("nav.marketplace")}
         current={t("portabilityImport.title")}
       />
       <main className={styles.content}>

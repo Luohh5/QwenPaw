@@ -56,6 +56,10 @@ from ..providers.retry_chat_model import (
 )
 from ..token_usage import TokenRecordingModelWrapper
 from ..utils.io_utils import run_sync_io
+from ..utils.image_resize import (
+    get_max_image_pixels,
+    resize_base64_image,
+)
 from ..utils.logging import sanitize_log_value
 from ..utils.media_paths import (
     file_url_to_path as _file_url_to_path,
@@ -477,6 +481,82 @@ async def _prepare_media_sources(
         )
 
 
+def _resize_base64_images(items: list, max_pixels: int) -> int:
+    """Resize base64 images in a copied request message tree.
+
+    Resize failures intentionally propagate so unsupported or corrupt
+    images are never sent unchanged as an implicit fallback.
+    """
+    resized_count = 0
+    for block in items:
+        kind = _media_kind(block)
+        source = (
+            block.get("source")
+            if isinstance(block, dict)
+            else getattr(block, "source", None)
+        )
+        source_type = _media_source_value(source, "type")
+        data = _media_source_value(source, "data", "")
+        if kind == "image" and source_type == "base64" and data:
+            resized_data, changed = resize_base64_image(
+                str(data),
+                max_pixels,
+            )
+            if changed:
+                if isinstance(source, dict):
+                    source["data"] = resized_data
+                else:
+                    source.data = resized_data
+                resized_count += 1
+
+        block_type = (
+            block.get("type")
+            if isinstance(block, dict)
+            else getattr(block, "type", None)
+        )
+        nested = None
+        if block_type == "tool_result":
+            nested = (
+                block.get("output")
+                if isinstance(block, dict)
+                else getattr(block, "output", None)
+            )
+        elif block_type == "hint":
+            nested = (
+                block.get("hint")
+                if isinstance(block, dict)
+                else getattr(block, "hint", None)
+            )
+        if isinstance(nested, list):
+            resized_count += _resize_base64_images(nested, max_pixels)
+    return resized_count
+
+
+async def _resize_request_images(msgs: list) -> int:
+    """Resize oversized images in request copies when explicitly enabled."""
+    max_pixels = get_max_image_pixels()
+    if max_pixels <= 0:
+        return 0
+    return await run_sync_io(
+        _resize_base64_images_in_messages,
+        msgs,
+        max_pixels,
+    )
+
+
+def _resize_base64_images_in_messages(
+    msgs: list,
+    max_pixels: int,
+) -> int:
+    """Synchronously resize images across copied request messages."""
+    resized_count = 0
+    for msg in msgs:
+        content = getattr(msg, "content", None)
+        if isinstance(content, list):
+            resized_count += _resize_base64_images(content, max_pixels)
+    return resized_count
+
+
 def _prepared_task_result(
     task: "asyncio.Task[_LocalMediaRead]",
 ) -> _LocalMediaRead:
@@ -628,6 +708,7 @@ def _video_oversize_placeholder(
     size: int,
     *,
     response_api: bool = False,
+    max_inline_media_bytes: int = MAX_INLINE_MEDIA_BYTES,
 ) -> dict:
     """Text placeholder substituted for a video that exceeds
     the inline cap.
@@ -650,13 +731,17 @@ def _video_oversize_placeholder(
         "text": (
             "[video omitted from model context: "
             f"local file is {size} bytes, exceeds "
-            f"inline limit of {MAX_INLINE_MEDIA_BYTES}"
+            f"inline limit of {max_inline_media_bytes}"
             " bytes]"
         ),
     }
 
 
-def _format_anthropic_video_data_block(block: Any) -> dict | None:
+def _format_anthropic_video_data_block(
+    block: Any,
+    *,
+    max_inline_media_bytes: int = MAX_INLINE_MEDIA_BYTES,
+) -> dict | None:
     """Format a 2.0 ``DataBlock`` of video media for Anthropic-compatible APIs.
 
     agentscope's stock Anthropic formatter drops every non-image
@@ -678,8 +763,11 @@ def _format_anthropic_video_data_block(block: Any) -> dict | None:
     if data_attr is not None:
         # base64 length -> approximate raw byte count.
         size = len(data_attr or "") * 3 // 4
-        if size > MAX_INLINE_MEDIA_BYTES:
-            return _video_oversize_placeholder(size)
+        if 0 < max_inline_media_bytes < size:
+            return _video_oversize_placeholder(
+                size,
+                max_inline_media_bytes=max_inline_media_bytes,
+            )
         return {
             "type": "video",
             "source": {
@@ -717,6 +805,7 @@ def _format_anthropic_video_data_block(block: Any) -> dict | None:
 def _format_openai_video_block(
     video_block: dict,
     response_api: bool = False,
+    max_inline_media_bytes: int = MAX_INLINE_MEDIA_BYTES,
 ) -> dict:
     """Format a video block for OpenAI-compatible API.
 
@@ -748,10 +837,11 @@ def _format_openai_video_block(
     if source["type"] == "base64":
         media_type = source["media_type"]
         size = len(source.get("data") or "") * 3 // 4
-        if size > MAX_INLINE_MEDIA_BYTES:
+        if 0 < max_inline_media_bytes < size:
             return _video_oversize_placeholder(
                 size,
                 response_api=response_api,
+                max_inline_media_bytes=max_inline_media_bytes,
             )
         url = f"data:{media_type};base64,{source['data']}"
     elif source["type"] == "url":
@@ -785,6 +875,7 @@ def _replace_video_placeholders(
     video_subs: dict[str, dict],
     *,
     response_api: bool = False,
+    max_inline_media_bytes: int = MAX_INLINE_MEDIA_BYTES,
 ) -> None:
     """Replace video placeholder text blocks with formatted
     video blocks in OpenAI-formatted messages.
@@ -813,6 +904,7 @@ def _replace_video_placeholders(
                     _format_openai_video_block(
                         video_subs[item["text"]],
                         response_api=response_api,
+                        max_inline_media_bytes=max_inline_media_bytes,
                     ),
                 )
             else:
@@ -922,6 +1014,7 @@ def _promote_tool_result_videos(
     messages: list[dict],
     *,
     response_api: bool = False,
+    max_inline_media_bytes: int = MAX_INLINE_MEDIA_BYTES,
 ) -> list[dict]:
     """Inject promoted video user messages after tool result messages.
 
@@ -985,7 +1078,13 @@ def _promote_tool_result_videos(
     new_messages: list[dict] = []
     for fmt_msg in messages:
         new_messages.append(fmt_msg)
-        tcid = fmt_msg.get("tool_call_id")
+        # OpenAI chat format: tool results carry `tool_call_id`. Responses API:
+        # only the `function_call_output` item is the tool result — the
+        # assistant `function_call` item also has `call_id` but must NOT be
+        # treated as a result (would duplicate the promoted video).
+        if fmt_msg.get("type") == "function_call":
+            continue
+        tcid = fmt_msg.get("tool_call_id") or fmt_msg.get("call_id")
         if not isinstance(tcid, str) or tcid not in promotions:
             continue
         tool_name, videos = promotions[tcid]
@@ -1009,6 +1108,7 @@ def _promote_tool_result_videos(
                 _format_openai_video_block(
                     vid_block,
                     response_api=response_api,
+                    max_inline_media_bytes=max_inline_media_bytes,
                 ),
             )
         promoted.append(
@@ -1220,11 +1320,17 @@ def _reasoning_by_assistant_segment(
     return aligned
 
 
+def _local_path_to_file_url(path: str) -> str:
+    """Build an unescaped file URL compatible with upstream formatters."""
+    normalized_path = path.replace("\\", "/")
+    return f"file://{normalized_path}"
+
+
 # pylint: disable=too-many-branches
 def _fixup_media_list(items: list) -> None:
     """Normalize media blocks in a list in-place.
 
-    - Strips ``file://`` prefixes from source URLs (dict blocks).
+    - Normalizes local source URLs while preserving typed ``file://`` URIs.
     - Replaces media blocks whose local file no longer exists with
       a text placeholder so the downstream formatter won't throw.
     - Converts ``file`` blocks to text placeholders — neither the
@@ -1274,9 +1380,8 @@ def _fixup_media_list(items: list) -> None:
                 )
         elif btype == "data":
             # 2.0 DataBlock — decode percent-encoded file:// URLs and
-            # check if local file still exists.  Pydantic's AnyUrl
-            # re-encodes non-ASCII chars; we must undo that before
-            # the DashScope formatter tries to open() the path.
+            # check if local file still exists. Keep the file scheme so
+            # formatters do not mistake the local path for a remote URL.
             source = getattr(block, "source", None)
             url_str = str(getattr(source, "url", "")) if source else ""
             if url_str.startswith("file://"):
@@ -1297,7 +1402,7 @@ def _fixup_media_list(items: list) -> None:
                         ),
                     )
                 elif source is not None:
-                    source.url = local_path
+                    source.url = _local_path_to_file_url(local_path)
         elif btype == "file":
             if isinstance(block, dict):
                 source = block.get("source") or {}
@@ -1416,7 +1521,12 @@ def _create_file_block_support_formatter(
                 seen.add(key)
 
             if media_type.startswith("video/"):
-                return _format_anthropic_video_data_block(block)
+                return _format_anthropic_video_data_block(
+                    block,
+                    max_inline_media_bytes=(
+                        getattr(self, "max_bytes", MAX_INLINE_MEDIA_BYTES)
+                    ),
+                )
             return super()._format_anthropic_data_block(block)
 
         # pylint: disable=too-many-branches, too-many-statements
@@ -1429,11 +1539,6 @@ def _create_file_block_support_formatter(
             # previous request behind for the capability fallback layer.
             self._qwenpaw_last_wire_media_count = 0
             self._qwenpaw_last_wire_audio_count = 0
-
-            # Per-wire-request dedup scope — second occurrence of the
-            # same media source becomes a text placeholder.  Reset on
-            # every call so state never leaks across requests.
-            seen_media_token = _FORMATTER_SEEN_MEDIA_KEYS.set(set())
 
             def _battr(block, key, default=None):
                 """Get attribute from dict or Pydantic block."""
@@ -1509,7 +1614,13 @@ def _create_file_block_support_formatter(
                     MAX_INLINE_MEDIA_BYTES,
                 ),
             )
+            await _resize_request_images(normalized_msgs)
 
+            # Per-wire-request dedup scope — second occurrence of the
+            # same media source becomes a text placeholder. Set this only
+            # after request preparation succeeds so preparation failures
+            # cannot leak context state.
+            seen_media_token = _FORMATTER_SEEN_MEDIA_KEYS.set(set())
             try:
                 # OpenAI-family formatters reject video blocks; substitute
                 # them with text placeholders before formatting and restore
@@ -1531,6 +1642,9 @@ def _create_file_block_support_formatter(
                         messages,
                         video_subs,
                         response_api=_is_response_formatter,
+                        max_inline_media_bytes=(
+                            getattr(self, "max_bytes", MAX_INLINE_MEDIA_BYTES)
+                        ),
                     )
                     _restore_video_blocks(normalized_msgs, video_subs)
 
@@ -1543,6 +1657,9 @@ def _create_file_block_support_formatter(
                         normalized_msgs,
                         messages,
                         response_api=_is_response_formatter,
+                        max_inline_media_bytes=(
+                            getattr(self, "max_bytes", MAX_INLINE_MEDIA_BYTES)
+                        ),
                     )
             finally:
                 _FORMATTER_SEEN_MEDIA_KEYS.reset(seen_media_token)
@@ -2132,9 +2249,18 @@ def _create_formatter_instance(
         GeminiChatFormatter,
         OpenAIResponseFormatter,
     )
-    if isinstance(base_formatter, _promote_types):
+    is_promote_type = isinstance(base_formatter, _promote_types)
+    if is_promote_type:
         kwargs["promote_tool_result_images"] = True
-    return formatter_class(**kwargs)
+    formatter = formatter_class(**kwargs)
+    if is_promote_type:
+        # ``promote_tool_result_images`` is not a Pydantic field of the
+        # agentscope formatter, so ``extra="ignore"`` silently drops it
+        # from constructor kwargs (AgentScope 2.0.6 no longer accepts it).
+        # Set it on the constructed instance directly so the promotion
+        # gate inside ``FileBlockSupportFormatter.format`` stays effective.
+        object.__setattr__(formatter, "promote_tool_result_images", True)
+    return formatter
 
 
 def _install_model_formatter(

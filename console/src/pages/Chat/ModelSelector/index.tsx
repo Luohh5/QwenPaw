@@ -17,7 +17,6 @@ import {
   Eye,
   GitBranch,
   LoaderCircle,
-  Pin,
   Search,
   Settings,
   XCircle,
@@ -38,6 +37,7 @@ import {
   buildEligibleProviders,
   buildHiddenCandidates,
   modelKey,
+  splitProvidersByTier,
 } from "./modelSelectorModels";
 import type { CandidateModel, EligibleProvider } from "./modelSelectorModels";
 import { useModelSelectorData } from "./useModelSelectorData";
@@ -61,9 +61,13 @@ function publishActiveMaxInputLength(
   }
 }
 
-const PINNED_STORAGE_KEY = "qwenpaw_model_selector_pinned";
 const RECENT_STORAGE_KEY = "qwenpaw_model_selector_recent";
-const RECOMMENDED_LIMIT = 6;
+const DEFAULT_VISIBLE_MODELS = 5;
+const VIEW_MORE_STEP = 20;
+
+interface ModelSelectorProps {
+  showAdvancedModelControls?: boolean;
+}
 
 function readStoredModelKeys(key: string): string[] {
   try {
@@ -76,7 +80,9 @@ function readStoredModelKeys(key: string): string[] {
   }
 }
 
-export default function ModelSelector() {
+export default function ModelSelector({
+  showAdvancedModelControls = false,
+}: ModelSelectorProps) {
   const { t } = useTranslation();
   const [saving, setSaving] = useState(false);
   const [addingKey, setAddingKey] = useState<string | null>(null);
@@ -89,14 +95,7 @@ export default function ModelSelector() {
       "pro",
   );
   const [collapsedProviders, setCollapsedProviders] = useState<Set<string>>(
-    () => {
-      try {
-        const raw = localStorage.getItem("qwenpaw_model_selector_collapsed");
-        return raw ? new Set(JSON.parse(raw) as string[]) : new Set();
-      } catch {
-        return new Set();
-      }
-    },
+    () => new Set(),
   );
   const savingRef = useRef(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -119,11 +118,7 @@ export default function ModelSelector() {
   const [expandedModels, setExpandedModels] = useState<Record<string, number>>(
     {},
   );
-  const [showAllModels, setShowAllModels] = useState(false);
   const [showCandidateModels, setShowCandidateModels] = useState(false);
-  const [pinnedModelKeys, setPinnedModelKeys] = useState<string[]>(() =>
-    readStoredModelKeys(PINNED_STORAGE_KEY),
-  );
   const [recentModelKeys, setRecentModelKeys] = useState<string[]>(() =>
     readStoredModelKeys(RECENT_STORAGE_KEY),
   );
@@ -196,32 +191,9 @@ export default function ModelSelector() {
     [providers],
   );
 
-  // Split by model-level is_free, not provider-level is_free_tier
+  // Free providers appear in both tabs; other providers use model-level tags.
   const { freeProviders, proProviders } = useMemo(() => {
-    const freeMap = new Map<string, EligibleProvider>();
-    const proMap = new Map<string, EligibleProvider>();
-    for (const p of eligibleProviders) {
-      const freeModels = p.models.filter((m) => m.is_free);
-      const proModels = p.models.filter((m) => !m.is_free);
-      if (freeModels.length > 0 || (p.is_free_tier && p.models.length === 0)) {
-        freeMap.set(p.id, { ...p, models: freeModels });
-      }
-      // PRO: show paid models when API key is configured, provider
-      // doesn't require a key, or provider is user-created / local
-      if (
-        proModels.length > 0 &&
-        (p.has_api_key ||
-          p.require_api_key === false ||
-          p.is_custom ||
-          p.is_local)
-      ) {
-        proMap.set(p.id, { ...p, models: proModels });
-      }
-    }
-    return {
-      freeProviders: [...freeMap.values()],
-      proProviders: [...proMap.values()],
-    };
+    return splitProvidersByTier(eligibleProviders);
   }, [eligibleProviders]);
 
   // Filter by search query
@@ -313,8 +285,6 @@ export default function ModelSelector() {
         const leftKey = modelKey(left.provider.id, left.model.id);
         const rightKey = modelKey(right.provider.id, right.model.id);
         const score = (key: string, providerId: string, id: string) => {
-          const pinned = pinnedModelKeys.indexOf(key);
-          if (pinned >= 0) return pinned - 300;
           const recent = recentModelKeys.indexOf(key);
           if (recent >= 0) return recent - 200;
           if (providerId === activeProviderId && id === activeModelId)
@@ -326,33 +296,8 @@ export default function ModelSelector() {
           score(rightKey, right.provider.id, right.model.id)
         );
       });
-      let visible = ranked;
-      if (!showAllModels && !trimmedSearch) {
-        const alwaysVisible = ranked.filter(({ provider, model }) => {
-          const key = modelKey(provider.id, model.id);
-          return (
-            pinnedModelKeys.includes(key) ||
-            recentModelKeys.includes(key) ||
-            (provider.id === activeProviderId && model.id === activeModelId)
-          );
-        });
-        const alwaysVisibleKeys = new Set(
-          alwaysVisible.map(({ provider, model }) =>
-            modelKey(provider.id, model.id),
-          ),
-        );
-        const recommended = ranked.filter(({ provider, model }) => {
-          const key = modelKey(provider.id, model.id);
-          return model.is_recommended && !alwaysVisibleKeys.has(key);
-        });
-        const remainingSlots = Math.max(
-          0,
-          RECOMMENDED_LIMIT - alwaysVisible.length,
-        );
-        visible = [...alwaysVisible, ...recommended.slice(0, remainingSlots)];
-      }
       const grouped = new Map<string, EligibleProvider>();
-      for (const item of visible) {
+      for (const item of ranked) {
         const current = grouped.get(item.provider.id);
         if (current) current.models.push(item.model);
         else
@@ -363,14 +308,7 @@ export default function ModelSelector() {
       }
       return [...grouped.values()];
     },
-    [
-      activeModelId,
-      activeProviderId,
-      pinnedModelKeys,
-      recentModelKeys,
-      showAllModels,
-      trimmedSearch,
-    ],
+    [activeModelId, activeProviderId, recentModelKeys],
   );
 
   const rememberRecent = (providerId: string, modelId: string) => {
@@ -385,29 +323,17 @@ export default function ModelSelector() {
     });
   };
 
-  const togglePinned = (providerId: string, modelId: string) => {
-    const key = modelKey(providerId, modelId);
-    setPinnedModelKeys((previous) => {
-      const next = previous.includes(key)
-        ? previous.filter((item) => item !== key)
-        : [key, ...previous];
-      localStorage.setItem(PINNED_STORAGE_KEY, JSON.stringify(next));
-      return next;
-    });
-  };
-
-  // Display label for trigger button
-  const activeModelName = (() => {
-    if (!activeProviderId || !activeModelId)
-      return t("modelSelector.selectModel");
-    for (const p of eligibleProviders) {
-      if (p.id === activeProviderId) {
-        const m = p.models.find((m) => m.id === activeModelId);
-        if (m) return m.name || m.id;
-      }
-    }
-    return activeModelId;
+  // Display the active model metadata in the trigger button.
+  const activeModel = (() => {
+    if (!activeProviderId || !activeModelId) return null;
+    const provider = eligibleProviders.find(
+      (item) => item.id === activeProviderId,
+    );
+    return provider?.models.find((model) => model.id === activeModelId) ?? null;
   })();
+  const activeModelName =
+    activeModel?.name || activeModelId || t("modelSelector.selectModel");
+  const activeModelIsFree = Boolean(activeModel?.is_free);
 
   const showActiveProviderIcon = Boolean(activeProviderId);
 
@@ -658,24 +584,26 @@ export default function ModelSelector() {
       } else {
         next.add(providerId);
       }
-      localStorage.setItem(
-        "qwenpaw_model_selector_collapsed",
-        JSON.stringify([...next]),
-      );
       return next;
     });
   };
 
-  const renderProviderModels = (provider: EligibleProvider) => {
+  const renderProviderModels = (
+    provider: EligibleProvider,
+    limitInitialModels = false,
+  ) => {
     const needsOAuth =
       provider.supports_oauth &&
       !provider.has_api_key &&
       !provider.oauth_connected;
     const isCollapsed = collapsedProviders.has(provider.id);
-    const visibleCount =
-      trimmedSearch || !showAllModels
-        ? provider.models.length
-        : expandedModels[provider.id] ?? 5;
+    const shouldLimitModels = !trimmedSearch && limitInitialModels;
+    const visibleCount = shouldLimitModels
+      ? Math.min(
+          expandedModels[provider.id] ?? DEFAULT_VISIBLE_MODELS,
+          provider.models.length,
+        )
+      : provider.models.length;
     const visibleModels = provider.models.slice(0, visibleCount);
     const remaining = provider.models.length - visibleCount;
     const hasMore = remaining > 0;
@@ -743,23 +671,6 @@ export default function ModelSelector() {
                         {t("modelSelector.vision")}
                       </span>
                     )}
-                    <button
-                      type="button"
-                      className={styles.pinButton}
-                      aria-label={t("modelSelector.pinModel")}
-                      onClick={() => togglePinned(provider.id, model.id)}
-                    >
-                      <Pin
-                        size={13}
-                        fill={
-                          pinnedModelKeys.includes(
-                            modelKey(provider.id, model.id),
-                          )
-                            ? "currentColor"
-                            : "none"
-                        }
-                      />
-                    </button>
                     {isActive && (
                       <Check size={14} className={styles.checkIcon} />
                     )}
@@ -775,12 +686,15 @@ export default function ModelSelector() {
                   e.stopPropagation();
                   setExpandedModels((prev) => ({
                     ...prev,
-                    [provider.id]: visibleCount + 10,
+                    [provider.id]: Math.min(
+                      visibleCount + VIEW_MORE_STEP,
+                      provider.models.length,
+                    ),
                   }));
                 }}
               >
                 {t("modelSelector.viewMore", {
-                  count: Math.min(10, remaining),
+                  count: Math.min(remaining, VIEW_MORE_STEP),
                 })}
               </button>
             )}
@@ -897,7 +811,9 @@ export default function ModelSelector() {
           <AlertTriangle size={14} className={styles.freeBannerIcon} />
           <span>{t("modelSelector.freeBannerText")}</span>
         </div>
-        {rankModels(readyProviders).map(renderProviderModels)}
+        {rankModels(readyProviders).map((provider) =>
+          renderProviderModels(provider, false),
+        )}
         {oauthOnlyProviders.map(renderOAuthConnectEntry)}
         {needsKeyProviders.length > 0 && (
           <>
@@ -964,10 +880,14 @@ export default function ModelSelector() {
 
     return (
       <>
-        <div className={styles.proBanner}>
-          <span>{t("modelSelector.proBannerText")}</span>
-        </div>
-        {rankModels(filteredPro).map(renderProviderModels)}
+        {showAdvancedModelControls && (
+          <div className={styles.proBanner}>
+            <span>{t("modelSelector.proBannerText")}</span>
+          </div>
+        )}
+        {rankModels(filteredPro).map((provider) =>
+          renderProviderModels(provider, true),
+        )}
       </>
     );
   };
@@ -1052,63 +972,58 @@ export default function ModelSelector() {
           </div>
         )}
         {activeTab === "free" ? renderFreeTab() : renderProTab()}
-        {!trimmedSearch && (
-          <button
-            type="button"
-            className={styles.showAllButton}
-            onClick={() => setShowAllModels((value) => !value)}
-          >
-            {showAllModels
-              ? t("modelSelector.showRecommended")
-              : t("modelSelector.showAll")}
-          </button>
+        {showAdvancedModelControls && (
+          <CandidateModelSection
+            candidates={visibleCandidates}
+            expanded={candidateModelsExpanded}
+            controlsId={candidateModelsId}
+            searchActive={Boolean(trimmedSearch)}
+            addingKey={addingKey}
+            visibilityKey={visibilityKey}
+            t={t}
+            onToggle={() => setShowCandidateModels((value) => !value)}
+            onAdd={handleAddCandidate}
+            onHide={(candidate) => handleVisibility(candidate, true)}
+          />
         )}
-        <CandidateModelSection
-          candidates={visibleCandidates}
-          expanded={candidateModelsExpanded}
-          controlsId={candidateModelsId}
-          searchActive={Boolean(trimmedSearch)}
-          addingKey={addingKey}
-          visibilityKey={visibilityKey}
-          t={t}
-          onToggle={() => setShowCandidateModels((value) => !value)}
-          onAdd={handleAddCandidate}
-          onHide={(candidate) => handleVisibility(candidate, true)}
-        />
-        {!trimmedSearch && hiddenCandidates.length > 0 && (
-          <details className={styles.hiddenModels}>
-            <summary>
-              {t("modelSelector.hiddenModels", {
-                count: hiddenCandidates.length,
+        {showAdvancedModelControls &&
+          !trimmedSearch &&
+          hiddenCandidates.length > 0 && (
+            <details className={styles.hiddenModels}>
+              <summary>
+                {t("modelSelector.hiddenModels", {
+                  count: hiddenCandidates.length,
+                })}
+              </summary>
+              {hiddenCandidates.map((candidate) => {
+                const key = modelKey(candidate.provider.id, candidate.model.id);
+                return (
+                  <div key={key} className={styles.hiddenModelItem}>
+                    <span title={candidate.model.name || candidate.model.id}>
+                      {candidate.model.name || candidate.model.id}
+                    </span>
+                    <button
+                      type="button"
+                      aria-label={t("modelSelector.restoreModel")}
+                      disabled={visibilityKey === key}
+                      onClick={() => handleVisibility(candidate, false)}
+                    >
+                      <Eye size={14} />
+                      {t("modelSelector.restore")}
+                    </button>
+                  </div>
+                );
               })}
-            </summary>
-            {hiddenCandidates.map((candidate) => {
-              const key = modelKey(candidate.provider.id, candidate.model.id);
-              return (
-                <div key={key} className={styles.hiddenModelItem}>
-                  <span title={candidate.model.name || candidate.model.id}>
-                    {candidate.model.name || candidate.model.id}
-                  </span>
-                  <button
-                    type="button"
-                    aria-label={t("modelSelector.restoreModel")}
-                    disabled={visibilityKey === key}
-                    onClick={() => handleVisibility(candidate, false)}
-                  >
-                    <Eye size={14} />
-                    {t("modelSelector.restore")}
-                  </button>
-                </div>
-              );
-            })}
-          </details>
+            </details>
+          )}
+        {showAdvancedModelControls && (
+          <AgentModelSettings
+            agentId={selectedAgent}
+            providers={eligibleProviders}
+            activeProviderId={activeProviderId}
+            activeModelId={activeModelId}
+          />
         )}
-        <AgentModelSettings
-          agentId={selectedAgent}
-          providers={eligibleProviders}
-          activeProviderId={activeProviderId}
-          activeModelId={activeModelId}
-        />
       </div>
     </div>
   );
@@ -1138,7 +1053,7 @@ export default function ModelSelector() {
             {showActiveProviderIcon && activeProviderId && (
               <ProviderIcon providerId={activeProviderId} size={16} />
             )}
-            {fallbackModel && (
+            {showAdvancedModelControls && fallbackModel && (
               <Tooltip
                 title={t("modelSelector.fallbackActive", {
                   provider: fallbackModel.providerName,
@@ -1168,6 +1083,9 @@ export default function ModelSelector() {
                 activeModelName
               )}
             </span>
+            {activeModelIsFree && (
+              <span className={styles.freeTag}>{t("modelSelector.free")}</span>
+            )}
             {/* Hidden span used to measure intrinsic text width. Placed
                 outside .triggerName so it does not duplicate text for
                 screen readers or testing-library queries. */}

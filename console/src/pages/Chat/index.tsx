@@ -16,6 +16,18 @@ import i18n from "../../i18n";
 import { useLocation, useNavigate } from "react-router-dom";
 import sessionApi from "./sessionApi";
 import {
+  getDraftStorageKey,
+  parseDraft,
+  serializeDraft,
+  type DraftState,
+} from "./chatInputDraft";
+import {
+  stopBackgroundQueue,
+  setBackgroundAbort,
+  clearBackgroundAbortIfCurrent,
+  hasBackgroundQueue,
+} from "./backgroundQueueRegistry";
+import {
   attachClientMessageId,
   createClientMessageId,
   QWENPAW_CLIENT_MESSAGE_ID_KEY,
@@ -119,6 +131,7 @@ import { useCodingTabsStore } from "../../stores/codingTabsStore";
 import { RichFileReferenceInputProvider } from "./RichFileReferenceInput";
 import type { ParsedFileReference } from "./fileReferenceFormatting";
 import { scrollReverseMessageList } from "./messageScroll";
+import { LONG_CHAT_USER_MESSAGE_ANCHORS } from "./longChatPerformance";
 
 interface ApprovalMessageData {
   requestId: string;
@@ -133,6 +146,8 @@ interface ApprovalMessageData {
   toolParams: Record<string, unknown>;
   createdAt: number;
   timeoutSeconds: number;
+  // One-line rationale the agent emitted before requesting this tool call.
+  reasoning?: string;
   // Approval-scope choice (console-only). When isGeneralized is true the
   // card offers Approve Pattern (similar) vs Approve Exact (exact).
   isGeneralized?: boolean;
@@ -209,25 +224,8 @@ import {
 // ---------------------------------------------------------------------------
 // Background queue sender — keeps sending after ChatPage unmounts.
 // Supports multiple concurrent sessions: each session has its own controller.
+// The controller registry lives in backgroundQueueRegistry (unit-tested).
 // ---------------------------------------------------------------------------
-
-const _bgAborts = new Map<string, AbortController>();
-
-function stopBackgroundQueue(queueKey?: string) {
-  if (queueKey) {
-    const ctrl = _bgAborts.get(queueKey);
-    if (ctrl) {
-      ctrl.abort();
-      _bgAborts.delete(queueKey);
-    }
-  } else {
-    // Stop all (used during full cleanup if needed)
-    for (const ctrl of _bgAborts.values()) {
-      ctrl.abort();
-    }
-    _bgAborts.clear();
-  }
-}
 
 /**
  * Wait until the backend reports the chat is no longer generating
@@ -335,7 +333,7 @@ async function startBackgroundQueue(
   if (useMessageQueueStore.getState().getQueue(queueKey).length === 0) return;
 
   const ctrl = new AbortController();
-  _bgAborts.set(queueKey, ctrl);
+  setBackgroundAbort(queueKey, ctrl);
 
   // Acquire the per-session send lock so only one tab keeps draining the queue
   // after the page unmounts. If the lock is taken, skip background sending.
@@ -502,7 +500,7 @@ async function startBackgroundQueue(
     useMessageQueueStore.getState().setCurrentSendingId(null);
   });
 
-  if (_bgAborts.get(queueKey) === ctrl) _bgAborts.delete(queueKey);
+  clearBackgroundAbortIfCurrent(queueKey, ctrl);
 }
 
 /**
@@ -517,7 +515,7 @@ function startAllBackgroundQueues(excludeSessionId?: string) {
     const sessionId = key.slice(STORAGE_PREFIX.length);
     if (sessionId === excludeSessionId) continue;
     // Skip sessions already running a background sender
-    if (_bgAborts.has(sessionId)) continue;
+    if (hasBackgroundQueue(sessionId)) continue;
     try {
       const raw = localStorage.getItem(key);
       if (!raw) continue;
@@ -1002,20 +1000,7 @@ function useMessageHistoryNavigation(
 // Chat input draft persistence
 // ---------------------------------------------------------------------------
 
-const DRAFT_STORAGE_KEY_PREFIX = "qwenpaw_chat_input_draft";
 let draftSuppressed = false;
-
-function getDraftStorageKey(agentId?: string): string {
-  return agentId
-    ? `${DRAFT_STORAGE_KEY_PREFIX}_${agentId}`
-    : DRAFT_STORAGE_KEY_PREFIX;
-}
-
-interface DraftState {
-  value: string;
-  selectionStart: number;
-  selectionEnd: number;
-}
 
 function useChatInputDraft(isChatActive: () => boolean, agentId?: string) {
   const storageKey = getDraftStorageKey(agentId);
@@ -1036,8 +1021,9 @@ function useChatInputDraft(isChatActive: () => boolean, agentId?: string) {
         selectionStart: textarea.selectionStart,
         selectionEnd: textarea.selectionEnd,
       };
-      if (draft.value) {
-        localStorage.setItem(storageKey, JSON.stringify(draft));
+      const serialized = serializeDraft(draft);
+      if (serialized) {
+        localStorage.setItem(storageKey, serialized);
       } else {
         localStorage.removeItem(storageKey);
       }
@@ -1073,20 +1059,14 @@ function useChatInputDraft(isChatActive: () => boolean, agentId?: string) {
       const textarea = getTextarea();
       if (textarea) {
         clearInterval(restoreInterval);
-        const raw = localStorage.getItem(storageKey);
-        if (raw) {
-          try {
-            const draft: DraftState = JSON.parse(raw);
-            if (draft.value) {
-              setTextareaValue(textarea, draft.value);
-              requestAnimationFrame(() => {
-                textarea.selectionStart = draft.selectionStart;
-                textarea.selectionEnd = draft.selectionEnd;
-              });
-            }
-          } catch {
-            // Ignore malformed data
-          }
+        // parseDraft fails soft on missing/malformed/empty stored data
+        const draft = parseDraft(localStorage.getItem(storageKey));
+        if (draft) {
+          setTextareaValue(textarea, draft.value);
+          requestAnimationFrame(() => {
+            textarea.selectionStart = draft.selectionStart;
+            textarea.selectionEnd = draft.selectionEnd;
+          });
         }
       } else if (restoreAttempts >= maxRestoreAttempts) {
         clearInterval(restoreInterval);
@@ -1720,6 +1700,7 @@ export default function ChatPage() {
         toolParams: approval.tool_params,
         createdAt: approval.created_at,
         timeoutSeconds: approval.timeout_seconds,
+        reasoning: approval.reasoning,
         isGeneralized: approval.is_generalized,
         exactTarget: approval.exact_target,
         similarTarget: approval.similar_target,
@@ -2524,14 +2505,17 @@ export default function ChatPage() {
 
   const copyResponse = useCallback(
     async (response: CopyableResponse) => {
+      const text = extractCopyableText(response);
+      if (!text) return;
+
       try {
-        await copyText(extractCopyableText(response));
+        await copyText(text);
         message.success(t("common.copied"));
       } catch {
         message.error(t("common.copyFailed"));
       }
     },
-    [t],
+    [message, t],
   );
 
   const customFetch = useCallback(
@@ -3107,7 +3091,7 @@ export default function ChatPage() {
     }));
     const userMessageAnchorsConfig = {
       ...defaultConfig.theme.bubbleList.userMessageAnchors,
-      variant: "navigator" as const,
+      ...LONG_CHAT_USER_MESSAGE_ANCHORS,
     };
 
     // leftHeader: whole-section render wins, otherwise partial merge {logo, title}.
@@ -3146,7 +3130,7 @@ export default function ChatPage() {
               onLoadingChange={setChatLoading}
             />
             <ChatHeaderTitle />
-            <span style={{ flex: 1 }} />
+            <span className={styles.headerSpacer} />
             {usesQwenPawBackend ? (
               <ModelSelector />
             ) : backendCapabilities?.model_selection ? (
@@ -3214,7 +3198,12 @@ export default function ChatPage() {
                 onTranscription={handleWhisperTranscription}
               />
             ) : null}
-            {usesQwenPawBackend && <LoopModeSelector />}
+            {usesQwenPawBackend && (
+              <LoopModeSelector
+                className={isMobile ? styles.mobileComposerControl : undefined}
+                compact={isMobile}
+              />
+            )}
             {pluginSenderPrefix}
           </>
         ),
@@ -3225,22 +3214,34 @@ export default function ChatPage() {
             }`}
           >
             {(usesQwenPawBackend || backendCapabilities?.context_usage) && (
-              <ContextUsageIndicator
-                onCompact={handleCompactCommand}
-                onNew={handleNewCommand}
-              />
+              <span className={styles.senderContextAffix}>
+                <ContextUsageIndicator
+                  onCompact={handleCompactCommand}
+                  onNew={handleNewCommand}
+                />
+              </span>
             )}
             {usesQwenPawBackend && (
               <SessionProjectDirectory
                 scope={sessionScope}
-                compact={compactSender}
+                compact={isMobile || compactSender}
+                className={
+                  isMobile || compactSender
+                    ? styles.mobileComposerControl
+                    : undefined
+                }
               />
             )}
             {usesQwenPawBackend ? (
               <ApprovalLevelToggle
                 sessionId={queueSessionId}
                 runningConfigApprovalLevel={runningConfigApprovalLevel}
-                compact={compactSender}
+                compact={isMobile || compactSender}
+                className={
+                  isMobile || compactSender
+                    ? styles.mobileComposerControl
+                    : undefined
+                }
                 onChange={(sessionOverride) => {
                   sessionApprovalLevelRef.current = sessionOverride;
                 }}
@@ -3250,6 +3251,8 @@ export default function ChatPage() {
                 backend={selectedAgentBackend}
                 sessionId={queueSessionId}
                 presets={approvalPresets}
+                className={isMobile ? styles.mobileComposerControl : undefined}
+                compact={isMobile}
                 onChange={(settings) => {
                   backendControlsRef.current = settings;
                 }}
@@ -3564,6 +3567,7 @@ export default function ChatPage() {
     toggleHistoryPanel,
     handleCompactCommand,
     handleNewCommand,
+    isMobile,
     compactSender,
     sessionScope,
     filesWorkspaceOpen,
@@ -3692,6 +3696,7 @@ export default function ChatPage() {
               findingsCount={request.findingsCount}
               findingsSummary={request.findingsSummary}
               toolParams={request.toolParams}
+              reasoning={request.reasoning}
               createdAt={request.createdAt}
               timeoutSeconds={request.timeoutSeconds}
               sessionId={request.sessionId}
