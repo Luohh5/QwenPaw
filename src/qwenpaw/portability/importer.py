@@ -196,19 +196,14 @@ class ProviderImportService(ImportPlanningMixin):
         archived_internal_sessions = conversations.archived_internal
         imported_skills: list[str] = []
         completed_skills: list[str] = []
-        skipped_skills: list[str] = []
         imported_mcp_servers: list[str] = []
         completed_mcp_servers: list[str] = []
-        skipped_mcp_servers: list[str] = []
         imported_memory_projects: list[str] = []
         completed_memory_projects: list[str] = []
-        skipped_memory_projects: list[str] = []
         restored_marketplaces: list[str] = []
-        skipped_marketplaces: list[str] = []
         prepared_plugins: list[str] = []
         installed_plugins: list[str] = []
         installed_plugin_paths: dict[str, Path] = {}
-        skipped_plugins: list[str] = []
         imported_scheduled_tasks: list[str] = []
         completed_scheduled_tasks: list[str] = []
         skipped_scheduled_tasks: list[str] = []
@@ -328,7 +323,6 @@ class ProviderImportService(ImportPlanningMixin):
                         ),
                     )
                 except Exception as exc:  # pylint: disable=broad-except
-                    skipped_marketplaces.append(marketplace.name)
                     warnings.append(
                         f"Marketplace {marketplace.name!r} failed: {exc}",
                     )
@@ -340,7 +334,6 @@ class ProviderImportService(ImportPlanningMixin):
                         "must be configured again.",
                     )
                 if not marketplace.source:
-                    skipped_marketplaces.append(marketplace.name)
                     warnings.append(
                         f"Marketplace {marketplace.name!r} is built-in or its "
                         "independent source is unavailable. Its provenance "
@@ -348,8 +341,6 @@ class ProviderImportService(ImportPlanningMixin):
                     )
                 elif changed:
                     restored_marketplaces.append(marketplace.name)
-                else:
-                    skipped_marketplaces.append(marketplace.name)
 
             installable_plugins = [
                 plugin
@@ -396,7 +387,6 @@ class ProviderImportService(ImportPlanningMixin):
                         f"{plugin_index}/{plugin_total}",
                     )
                 if not plugin.install_source:
-                    skipped_plugins.append(plugin.source_id)
                     warnings.append(
                         f"Plugin {plugin.source_id!r} has no independent "
                         "QwenPaw-compatible install source. Its installed "
@@ -409,7 +399,6 @@ class ProviderImportService(ImportPlanningMixin):
                     "failed_safe",
                 )
                 if compatibility_zone not in {"migrate", "repair"}:
-                    skipped_plugins.append(plugin.source_id)
                     warnings.append(
                         f"Plugin {plugin.source_id!r} was not installed: "
                         f"compatibility zone is {compatibility_zone!r}. "
@@ -430,7 +419,6 @@ class ProviderImportService(ImportPlanningMixin):
                     )
                     continue
                 if plugin_app is None:
-                    skipped_plugins.append(plugin.source_id)
                     warnings.append(
                         f"Plugin {plugin.source_id!r} is compatible, but the "
                         "QwenPaw native plugin loader is not ready. Retry "
@@ -490,7 +478,6 @@ class ProviderImportService(ImportPlanningMixin):
                             ),
                         )
                 except Exception as exc:  # pylint: disable=broad-except
-                    skipped_plugins.append(plugin.source_id)
                     warnings.append(
                         f"Plugin {plugin.source_id!r} failed native "
                         f"installation: {type(exc).__name__}: {exc}",
@@ -532,7 +519,6 @@ class ProviderImportService(ImportPlanningMixin):
                             imported_memory_projects.append(project.source_id)
                         else:
                             completed_memory_projects.append(project.source_id)
-                            skipped_memory_projects.append(project.source_id)
 
                     await _commit_mutation(
                         run_sync_io(
@@ -544,7 +530,6 @@ class ProviderImportService(ImportPlanningMixin):
                         record_memory,
                     )
                 except Exception as exc:  # pylint: disable=broad-except
-                    skipped_memory_projects.append(project.source_id)
                     warnings.append(
                         f"Memory project {project.project_key!r} was "
                         f"quarantined/skipped: {type(exc).__name__}: {exc}",
@@ -570,7 +555,6 @@ class ProviderImportService(ImportPlanningMixin):
                     "failed_safe",
                 )
                 if compatibility_zone not in {"migrate", "repair"}:
-                    skipped_skills.append(skill.name)
                     warnings.append(
                         f"Skill {skill.name!r} 未写入 QwenPaw：兼容状态为 "
                         f"{compatibility_zone!r}；源文件仍保留在兼容清单/"
@@ -652,7 +636,6 @@ class ProviderImportService(ImportPlanningMixin):
                     if not names:
                         if result.get("conflicts") and not replace_existing:
                             completed_skills.append(skill.name)
-                        skipped_skills.append(skill.name)
                         if result.get("conflicts"):
                             warnings.append(
                                 f"Skill {skill.name!r} already exists; kept "
@@ -673,7 +656,6 @@ class ProviderImportService(ImportPlanningMixin):
                             raise RuntimeError(
                                 "Skill replacement failed; restoration failed",
                             ) from restore_exc
-                    skipped_skills.append(skill.name)
                     warnings.append(
                         f"Skill {skill.name!r} was quarantined/skipped: {exc}",
                     )
@@ -702,7 +684,6 @@ class ProviderImportService(ImportPlanningMixin):
                     "failed_safe",
                 )
                 if compatibility_zone not in {"migrate", "repair"}:
-                    skipped_mcp_servers.append(server.name)
                     warnings.append(
                         f"MCP {server.name!r} 未写入 DriverCard：兼容状态"
                         f"为 {compatibility_zone!r}；请根据兼容清单修复"
@@ -714,7 +695,6 @@ class ProviderImportService(ImportPlanningMixin):
                     and not replace_existing
                 ):
                     completed_mcp_servers.append(server.name)
-                    skipped_mcp_servers.append(server.name)
                     warnings.append(
                         f"MCP {server.name!r} conflicts with an existing "
                         "QwenPaw Driver; kept the QwenPaw copy.",
@@ -725,7 +705,6 @@ class ProviderImportService(ImportPlanningMixin):
                     "streamable_http",
                     "sse",
                 }:
-                    skipped_mcp_servers.append(server.name)
                     warnings.append(
                         f"MCP {server.name!r} uses unsupported transport "
                         f"{server.transport!r} and was skipped.",
@@ -740,7 +719,6 @@ class ProviderImportService(ImportPlanningMixin):
                     server.cwd,
                 )
                 if inline_secret_risks:
-                    skipped_mcp_servers.append(server.name)
                     warnings.append(
                         f"MCP {server.name!r} 的命令参数或 URL 可能包含"
                         "无法安全绑定的明文凭据，已拒绝写入 DriverCard；"
@@ -869,7 +847,6 @@ class ProviderImportService(ImportPlanningMixin):
                         raise RuntimeError(
                             "MCP replacement failed and could not be restored",
                         ) from restore_exc
-                    skipped_mcp_servers.append(server.name)
                     warnings.append(
                         f"MCP {server.name!r} could not be translated and "
                         f"was skipped: {type(exc).__name__}: {exc}",
@@ -1091,22 +1068,13 @@ class ProviderImportService(ImportPlanningMixin):
                 ignored_source_sessions=list(inventory.ignored_session_ids),
                 archived_internal_sessions=archived_internal_sessions,
                 imported_skills=imported_skills,
-                skipped_skills=skipped_skills,
                 imported_mcp_servers=imported_mcp_servers,
-                skipped_mcp_servers=skipped_mcp_servers,
                 imported_memory_projects=imported_memory_projects,
-                skipped_memory_projects=skipped_memory_projects,
                 restored_marketplaces=restored_marketplaces,
-                skipped_marketplaces=skipped_marketplaces,
                 prepared_plugins=prepared_plugins,
                 installed_plugins=installed_plugins,
-                skipped_plugins=skipped_plugins,
                 imported_scheduled_tasks=imported_scheduled_tasks,
                 skipped_scheduled_tasks=skipped_scheduled_tasks,
-                discovered_mcp_count=inventory.discovered_mcp_count,
-                discovered_scheduled_task_count=(
-                    inventory.discovered_scheduled_task_count
-                ),
                 adaptation_manifest=adaptation_manifest,
                 adaptation_summary=adaptation_summary,
                 retry_of_migration_id=retry_of_migration_id,
@@ -1126,7 +1094,6 @@ class ProviderImportService(ImportPlanningMixin):
             try:
                 receipt.doctor_report = await run_migration_doctor(
                     self._workspace,
-                    inventory,
                     receipt,
                 )
             except Exception as exc:  # pylint: disable=broad-except

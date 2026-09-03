@@ -60,29 +60,21 @@ class _FakeServices:
                     source=source,
                     agent_id=workspace.agent_id,
                     created_at=datetime.now(timezone.utc),
-                    inventory_fingerprint=source,
-                    inventory_counts={"sessions": 2},
                     actions=[
                         MigrationAssetPlan(
                             asset_type="session",
                             source_id=f"{source}-thread",
                             name="Conversation",
-                            action="import_history",
-                            fidelity="converted_with_loss",
                         ),
                         MigrationAssetPlan(
                             asset_type="skill",
                             source_id=f"{source}-skill",
                             name=f"{source.title()} Skill",
-                            action="agent_mission_test_and_adapt",
-                            fidelity="mission_repair",
                         ),
                         MigrationAssetPlan(
                             asset_type="plugin",
                             source_id=f"{source}-plugin",
                             name=f"{source.title()} Plugin",
-                            action="agent_mission_test_and_adapt",
-                            fidelity="mission_repair",
                         ),
                     ],
                 )
@@ -215,7 +207,7 @@ async def test_scan_is_concurrent_and_persisted(tmp_path: Path) -> None:
     assert services.max_active_scans == 2
     assert snapshot.state == "awaiting_selection"
     assert [item.source for item in snapshot.providers] == ["codex", "qoder"]
-    assert all(item.sessions_total == 2 for item in snapshot.providers)
+    assert all(item.sessions_total == 1 for item in snapshot.providers)
     assert all(
         item.assets[0].state is ImportAssetState.PENDING
         for item in snapshot.providers
@@ -265,7 +257,7 @@ async def test_apply_projects_progress_and_replays_terminal_event(
     ]
 
     assert snapshot.state == "completed"
-    assert snapshot.providers[0].sessions_processed == 2
+    assert snapshot.providers[0].sessions_processed == 1
     assert snapshot.providers[0].sessions_imported == 1
     assert snapshot.providers[0].assets[0].state is ImportAssetState.SUCCEEDED
     assert snapshot.providers[0].assets[0].enabled is False

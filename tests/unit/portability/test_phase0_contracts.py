@@ -254,8 +254,6 @@ def test_import_receipt_matches_reviewed_contract() -> None:
         prepared_plugins=["plugin-1@market-1"],
         installed_plugins=["plugin-1"],
         imported_scheduled_tasks=["cron-1"],
-        discovered_mcp_count=1,
-        discovered_scheduled_task_count=1,
         adaptation_manifest="adaptation/manifest.json",
         adaptation_summary="adaptation/summary.md",
         warnings=["fixture warning"],

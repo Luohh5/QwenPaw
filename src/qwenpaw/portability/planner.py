@@ -362,72 +362,14 @@ def tool_asset_fingerprints(inventory: ProviderInventory) -> dict[str, str]:
     return result
 
 
-def _imported_memory_ids(workspace: Any, provider_id: str) -> set[str]:
-    root = Path(workspace.workspace_dir)
-    source_ids: set[str] = set()
-    if not root.is_dir() or root.is_symlink():
-        return source_ids
-    for path in root.glob(f"**/imports/{provider_id}/*/_scope.json"):
-        try:
-            value = json.loads(read_regular_file(path).decode("utf-8"))
-        except (OSError, ValueError, TypeError):
-            continue
-        source_id = value.get("source_id") if isinstance(value, dict) else None
-        if source_id:
-            source_ids.add(str(source_id))
-    return source_ids
-
-
-def _asset(
-    asset_type: str,
-    source_id: str,
-    name: str,
-    action: str,
-    fidelity: str,
-    reason_zh: str,
-    requires_sessions: bool = False,
-) -> MigrationAssetPlan:
-    return MigrationAssetPlan(
-        asset_type=asset_type,
-        source_id=source_id,
-        name=name,
-        action=action,
-        fidelity=fidelity,
-        reason_zh=reason_zh,
-        requires_sessions=requires_sessions,
-    )
-
-
-_ADAPTABLE = {
-    "skills": ("skill", "由 Mission 进行兼容性测试与修复"),
-    "mcp_servers": ("mcp", "由 Mission 进行兼容性测试与修复"),
-    "plugins": ("plugin", "由 Mission 进行兼容性测试与修复"),
-    "scheduled_tasks": (
-        "scheduled_task",
-        "由 Mission 进行兼容性测试与修复",
-    ),
-}
-
-
-def _adaptable_actions(
-    inventory: ProviderInventory,
-    *collections: str,
-) -> list[MigrationAssetPlan]:
-    return [
-        _asset(
-            _ADAPTABLE[collection][0],
-            item.source_id,
-            item.name,
-            "agent_mission_test_and_adapt",
-            "mission_repair",
-            f"安全暂存后，{_ADAPTABLE[collection][1]}。",
-            collection == "scheduled_tasks"
-            and str(item.metadata.get("source_kind") or "").lower()
-            == "heartbeat",
-        )
-        for collection in collections
-        for item in getattr(inventory, collection)
-    ]
+_PLAN_TYPES = (
+    ("sessions", "session"),
+    ("memory_projects", "memory"),
+    ("skills", "skill"),
+    ("mcp_servers", "mcp"),
+    ("plugins", "plugin"),
+    ("scheduled_tasks", "scheduled_task"),
+)
 
 
 async def build_migration_plan(
@@ -436,111 +378,25 @@ async def build_migration_plan(
     *,
     source_home: str = "",
 ) -> MigrationPlan:
-    """Build a reviewable plan without changing runtime assets."""
-    chats = await workspace.chat_manager.list_chats(archived=None)
-    existing_sessions = {
-        (
-            str((chat.meta.get("portability") or {}).get("source")),
-            str((chat.meta.get("portability") or {}).get("source_id")),
-        )
-        for chat in chats
-    }
-    existing_memory = _imported_memory_ids(
-        workspace,
-        inventory.provider_id,
-    )
-    actions: list[MigrationAssetPlan] = []
-
-    for session in inventory.sessions:
-        key = (inventory.provider_id, session.source_id)
-        if key in existing_sessions:
-            actions.append(
-                _asset(
-                    "session",
-                    session.source_id,
-                    session.title,
-                    "already_present",
-                    "converted_with_loss",
-                    "目标智能体中已存在同一来源会话，将保留现有副本。",
-                ),
-            )
-        elif not session.history:
-            actions.append(
-                _asset(
-                    "session",
-                    session.source_id,
-                    session.title,
-                    "skip",
-                    "unsupported",
-                    "没有可读取的对话历史，无法生成可浏览会话。",
-                ),
-            )
-        else:
-            actions.append(
-                _asset(
-                    "session",
-                    session.source_id,
-                    session.title,
-                    "import_history",
-                    "converted_with_loss",
-                    "会保留可见消息和历史工具轨迹；原 Harness 中继续执行的语义不保证完全一致。",
-                ),
-            )
-
-    actions.extend(_adaptable_actions(inventory, "skills", "mcp_servers"))
-
-    for project in inventory.memory_projects:
-        already = project.source_id in existing_memory
-        actions.append(
-            _asset(
-                "memory",
-                project.source_id,
-                project.project_key,
-                "already_present" if already else "import_scoped",
-                "lossless",
-                (
-                    "相同来源的记忆作用域已经存在，将按内容哈希判断是否需要更新。"
-                    if already
-                    else "按原始字节保存到 imported memory 区，并标记为参考资料而不是指令。"
-                ),
+    """Build a selectable plan without changing runtime assets."""
+    actions = [
+        MigrationAssetPlan(
+            asset_type=asset_type,
+            source_id=item.source_id,
+            name=(
+                getattr(item, "project_key", "")
+                or getattr(item, "title", "")
+                or item.name
+            ),
+            requires_sessions=(
+                asset_type == "scheduled_task"
+                and str(item.metadata.get("source_kind") or "").lower()
+                == "heartbeat"
             ),
         )
-
-    for marketplace in inventory.marketplaces:
-        actions.append(
-            _asset(
-                "marketplace",
-                marketplace.source_id,
-                marketplace.name,
-                "restore_source" if marketplace.source else "record_only",
-                "converted" if marketplace.source else "archive_only",
-                (
-                    "恢复独立来源信息，凭据和 URL 查询参数不会复制。"
-                    if marketplace.source
-                    else "没有独立来源，只记录出处，不复制已安装缓存。"
-                ),
-            ),
-        )
-
-    actions.extend(
-        _adaptable_actions(inventory, "plugins", "scheduled_tasks"),
-    )
-
-    counts = {
-        "sessions": len(inventory.sessions),
-        "ignored_source_sessions": len(inventory.ignored_session_ids),
-        "skills": len(inventory.skills),
-        "mcp_servers": len(inventory.mcp_servers),
-        "memory_scopes": len(inventory.memory_projects),
-        "marketplaces": len(inventory.marketplaces),
-        "plugins": len(inventory.plugins),
-        "scheduled_tasks": len(inventory.scheduled_tasks),
-        "actions": len(actions),
-        "manual_review": sum(
-            item.fidelity == "manual_review" for item in actions
-        ),
-        "unsupported": sum(item.fidelity == "unsupported" for item in actions),
-    }
+        for collection, asset_type in _PLAN_TYPES
+        for item in getattr(inventory, collection)
+    ]
     return MigrationPlan(
         plan_id=f"plan-{uuid4().hex}",
         source=inventory.provider_id,
@@ -548,9 +404,7 @@ async def build_migration_plan(
         source_location=inventory.source_location,
         agent_id=workspace.agent_id,
         created_at=datetime.now(timezone.utc),
-        inventory_fingerprint=inventory_fingerprint(inventory),
         asset_fingerprints=tool_asset_fingerprints(inventory),
-        inventory_counts=counts,
         actions=actions,
         warnings=list(inventory.warnings),
     )

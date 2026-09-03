@@ -415,9 +415,8 @@ class PortabilityImportJobManager:
                 )
                 live.plans[provider.source] = plan
                 provider.plan_id = plan.plan_id
-                provider.sessions_total = plan.inventory_counts.get(
-                    "sessions",
-                    0,
+                provider.sessions_total = sum(
+                    item.asset_type == "session" for item in plan.actions
                 )
                 provider.selection = self._default_selection(plan)
                 provider.assets = self._selected_assets(

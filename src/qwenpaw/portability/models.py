@@ -186,14 +186,11 @@ class ImportAssetResult(BaseModel):
 
 
 class MigrationAssetPlan(BaseModel):
-    """One reviewable action in a provider migration plan."""
+    """One selectable asset in a migration plan."""
 
     asset_type: str
     source_id: str
     name: str
-    action: str
-    fidelity: str
-    reason_zh: str = ""
     requires_sessions: bool = False
 
 
@@ -207,9 +204,7 @@ class MigrationPlan(BaseModel):
     source_location: SourceLocation | None = None
     agent_id: str
     created_at: datetime
-    inventory_fingerprint: str
     asset_fingerprints: dict[str, str] = Field(default_factory=dict)
-    inventory_counts: dict[str, int] = Field(default_factory=dict)
     actions: list[MigrationAssetPlan] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     state: str = "ready"
@@ -250,20 +245,13 @@ class ImportReceipt(BaseModel):
     ignored_source_sessions: list[str] = Field(default_factory=list)
     archived_internal_sessions: list[str] = Field(default_factory=list)
     imported_skills: list[str] = Field(default_factory=list)
-    skipped_skills: list[str] = Field(default_factory=list)
     imported_mcp_servers: list[str] = Field(default_factory=list)
-    skipped_mcp_servers: list[str] = Field(default_factory=list)
     imported_memory_projects: list[str] = Field(default_factory=list)
-    skipped_memory_projects: list[str] = Field(default_factory=list)
     restored_marketplaces: list[str] = Field(default_factory=list)
-    skipped_marketplaces: list[str] = Field(default_factory=list)
     prepared_plugins: list[str] = Field(default_factory=list)
     installed_plugins: list[str] = Field(default_factory=list)
-    skipped_plugins: list[str] = Field(default_factory=list)
     imported_scheduled_tasks: list[str] = Field(default_factory=list)
     skipped_scheduled_tasks: list[str] = Field(default_factory=list)
-    discovered_mcp_count: int = 0
-    discovered_scheduled_task_count: int = 0
     adaptation_manifest: str = ""
     adaptation_summary: str = ""
     retry_of_migration_id: str = ""

@@ -17,8 +17,6 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from ..app.chats.session import session_relative_paths
-from ..utils.io_utils import unlink_async
 from .models import (
     SourceMemoryProject,
     SourceMCPServer,
@@ -250,15 +248,3 @@ def _skill_zip(skill: SourceSkill) -> bytes:
             info.external_attr = entry.mode << 16
             archive.writestr(info, entry.data or b"")
     return output.getvalue()
-
-
-async def _remove_session_state(
-    workspace: Any,
-    *,
-    session_id: str,
-    user_id: str,
-    channel: str,
-) -> None:
-    save_dir = Path(workspace.session.save_dir)
-    for relative in session_relative_paths(session_id, user_id, channel):
-        await unlink_async(save_dir / relative, missing_ok=True)

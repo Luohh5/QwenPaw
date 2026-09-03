@@ -18,7 +18,6 @@ from .models import (
     ImportReceipt,
     MigrationDoctorCheck,
     MigrationDoctorReport,
-    ProviderInventory,
 )
 from .scheduled_tasks import imported_job_source, is_nonlocal_workspace
 from .compatibility import (
@@ -34,7 +33,6 @@ from .compatibility import (
 @dataclass(frozen=True)
 class _DoctorContext:
     workspace: Any
-    inventory: ProviderInventory
     receipt: ImportReceipt
     manifest: CompatibilityManifest | None
     manifest_error: str
@@ -66,8 +64,8 @@ def _status(actual: int, expected: list[str], success: str = "pass") -> str:
     return success if actual == len(expected) else "fail"
 
 
-def _installed_plugin_ids() -> set[str]:
-    installed: set[str] = set()
+def _installed_plugins() -> dict[str, dict[str, Any]]:
+    installed: dict[str, dict[str, Any]] = {}
     root = get_plugins_dir()
     if not root.is_dir():
         return installed
@@ -84,7 +82,7 @@ def _installed_plugin_ids() -> set[str]:
         except (OSError, ValueError, TypeError):
             continue
         if isinstance(value, dict):
-            installed.add(str(value.get("id") or child.name))
+            installed[str(value.get("id") or child.name)] = value
     return installed
 
 
@@ -179,10 +177,12 @@ def _adaptation_check(
     receipt = context.receipt
     has_assets = any(
         (
-            context.inventory.skills,
-            context.inventory.mcp_servers,
-            context.inventory.plugins,
-            context.inventory.scheduled_tasks,
+            receipt.imported_skills,
+            receipt.imported_mcp_servers,
+            receipt.imported_memory_projects,
+            receipt.installed_plugins,
+            receipt.prepared_plugins,
+            receipt.imported_scheduled_tasks,
         ),
     )
     if not receipt.adaptation_manifest and not has_assets:
@@ -272,7 +272,6 @@ async def _session_check(
     context: _DoctorContext,
 ) -> MigrationDoctorCheck | None:
     workspace = context.workspace
-    inventory = context.inventory
     receipt = context.receipt
     expected = set(receipt.imported_sessions)
     if not expected:
@@ -281,12 +280,9 @@ async def _session_check(
     by_source = {
         str((chat.meta.get("portability") or {}).get("source_id")): chat
         for chat in chats
-        if (chat.meta.get("portability") or {}).get("source")
-        == inventory.provider_id
+        if (chat.meta.get("portability") or {}).get("source") == receipt.source
     }
     readable = 0
-    cwd_ok = 0
-    cwd_expected = 0
     for source_id in expected:
         chat = by_source.get(source_id)
         if chat is None:
@@ -301,39 +297,18 @@ async def _session_check(
         )
         if isinstance(context, list) and context:
             readable += 1
-        session = next(
-            (
-                item
-                for item in inventory.sessions
-                if item.source_id == source_id
-            ),
-            None,
-        )
-        if session is not None and session.cwd and Path(session.cwd).is_dir():
-            cwd_expected += 1
-            runtime_context = chat.meta.get("runtime_context") or {}
-            if str(runtime_context.get("project_dir") or "") == str(
-                Path(session.cwd).resolve(),
-            ):
-                cwd_ok += 1
     status = "pass" if readable == len(expected) else "fail"
     detail = f"已导入 {len(expected)} 个会话，其中 {readable} 个可以读取历史。"
-    if cwd_expected:
-        detail += f" 需要恢复项目目录的 {cwd_expected} 个会话中，"
-        detail += f"{cwd_ok} 个匹配。"
-        if cwd_ok != cwd_expected and status == "pass":
-            status = "warning"
     return _check("sessions", status, "会话完整性", detail)
 
 
 async def run_migration_doctor(  # pylint: disable=R0912,R0915
     workspace: Any,
-    inventory: ProviderInventory,
     receipt: ImportReceipt,
 ) -> MigrationDoctorReport:
     """Verify imported assets and return user-facing Chinese results."""
     manifest, error = _verified_adaptation_manifest(workspace, receipt)
-    context = _DoctorContext(workspace, inventory, receipt, manifest, error)
+    context = _DoctorContext(workspace, receipt, manifest, error)
     checks: list[MigrationDoctorCheck] = []
     session_result = await _session_check(context)
     if session_result is not None:
@@ -354,7 +329,8 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
             for name, item in context.assets(AssetType.SKILL).items()
         }
         activation_ok = sum(
-            name in visible
+            name in zones
+            and name in visible
             and states.get(name, False)
             is (zones.get(name) is AssetZone.MIGRATE)
             for name in receipt.imported_skills
@@ -378,11 +354,14 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
             card.name: card
             for card in await DriverConfigService(workspace).list_cards()
         }
+        mcp_sources = set(context.assets(AssetType.MCP, "source_id"))
         present = sum(name in cards for name in receipt.imported_mcp_servers)
         activation_ok = sum(
             name in cards
             and not cards[name].enabled
             and cards[name].config.get("requires_review") is True
+            and cards[name].config.get("migration_source") == receipt.source
+            and cards[name].config.get("migration_source_id") in mcp_sources
             for name in receipt.imported_mcp_servers
         )
         status = _status(
@@ -396,7 +375,7 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
         checks.append(_check("mcp", status, "MCP DriverCard", detail))
 
     if receipt.imported_memory_projects:
-        ids = _memory_scope_ids(workspace, inventory.provider_id)
+        ids = _memory_scope_ids(workspace, receipt.source)
         verified = sum(
             item in ids for item in receipt.imported_memory_projects
         )
@@ -418,7 +397,7 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
         restored = sum(
             any(
                 isinstance(item, dict)
-                and item.get("provider") == inventory.provider_id
+                and item.get("provider") == receipt.source
                 and item.get("name") == name
                 for item in sources.values()
             )
@@ -436,17 +415,36 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
         )
 
     if receipt.installed_plugins:
-        installed = _installed_plugin_ids()
+        installed = _installed_plugins()
         present = sum(item in installed for item in receipt.installed_plugins)
-        status = _status(present, receipt.installed_plugins, "warning")
+        invalid_provenance = 0
+        plugin_sources = set(context.assets(AssetType.PLUGIN, "source_id"))
+        for item in receipt.installed_plugins:
+            migration = (installed.get(item, {}).get("meta") or {}).get(
+                "migration",
+            )
+            if isinstance(migration, dict) and (
+                migration.get("source") != receipt.source
+                or migration.get("source_id") not in plugin_sources
+            ):
+                invalid_provenance += 1
+        status = (
+            "fail"
+            if invalid_provenance
+            else _status(
+                present,
+                receipt.installed_plugins,
+                "warning",
+            )
+        )
         checks.append(
             _check(
                 "plugins",
                 status,
                 "插件安装状态",
                 f"原生安装流程返回 {len(receipt.installed_plugins)} 个插件，"
-                f"磁盘清单确认 {present} 个；实际启用状态由兼容流程的"
-                "migrate/repair 分区决定。",
+                f"磁盘清单确认 {present} 个，来源标记异常 {invalid_provenance} 个；"
+                "实际启用状态由兼容流程的 migrate/repair 分区决定。",
             ),
         )
 
@@ -462,12 +460,7 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
             ),
         )
 
-    if (
-        inventory.scheduled_tasks
-        or receipt.discovered_scheduled_task_count
-        or receipt.imported_scheduled_tasks
-        or receipt.skipped_scheduled_tasks
-    ):
+    if receipt.imported_scheduled_tasks or receipt.skipped_scheduled_tasks:
         cron_manager = getattr(workspace, "cron_manager", None)
         if cron_manager is None:
             checks.append(
@@ -487,7 +480,7 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
                     if key is not None:
                         grouped_by_source.setdefault(key, []).append(job)
                 expected = {
-                    (inventory.provider_id, source_id)
+                    (receipt.source, source_id)
                     for source_id in receipt.imported_scheduled_tasks
                 }
                 present = sum(key in grouped_by_source for key in expected)
@@ -531,14 +524,13 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
                 activation_safe = sum(
                     activation_matches(key) for key in expected
                 )
-                tasks_by_id = {
-                    task.source_id: task for task in inventory.scheduled_tasks
-                }
                 remote_expected = {
-                    (inventory.provider_id, source_id)
-                    for source_id in receipt.imported_scheduled_tasks
-                    if source_id in tasks_by_id
-                    and is_nonlocal_workspace(tasks_by_id[source_id].metadata)
+                    key
+                    for key in expected
+                    if len(grouped_by_source.get(key, [])) == 1
+                    and _remote_or_unverified_source(
+                        grouped_by_source[key][0],
+                    )
                 }
                 remote_unmapped = sum(
                     len(grouped_by_source.get(key, [])) == 1
@@ -548,89 +540,27 @@ async def run_migration_doctor(  # pylint: disable=R0912,R0915
                     for key in remote_expected
                 )
 
-                imported = receipt.imported_scheduled_tasks
-                skipped = receipt.skipped_scheduled_tasks
-                processed_ids = imported + skipped
-                normalized_count = len(inventory.scheduled_tasks)
-                discovered_count = receipt.discovered_scheduled_task_count
-                duplicate_receipt_ids = len(processed_ids) != len(
-                    set(processed_ids),
-                )
-                processed_matches = len(
-                    processed_ids,
-                ) == normalized_count and set(processed_ids) == set(
-                    tasks_by_id,
-                )
-                discovery_valid = (
-                    discovered_count == 0
-                    or discovered_count >= normalized_count
-                )
-
-                compatibility_classified: int | None = None
-                if context.manifest is not None:
-                    compatibility_classified = sum(
-                        source_id in schedule_assets
-                        and schedule_assets[source_id].zone
-                        in {AssetZone.MIGRATE, AssetZone.REPAIR}
-                        for source_id in imported
-                    )
-
                 hard_failure = any(
                     (
                         present != len(expected),
                         unique != len(expected),
                         activation_safe != len(expected),
                         remote_unmapped != len(remote_expected),
-                        duplicate_receipt_ids,
-                        not processed_matches,
-                        not discovery_valid,
-                        compatibility_classified is not None
-                        and compatibility_classified != len(imported),
                     ),
                 )
-                raw_rejections = max(discovered_count - normalized_count, 0)
-                legacy_discovery_count = (
-                    discovered_count == 0 and normalized_count > 0
-                )
                 status = "fail" if hard_failure else "pass"
-                if status == "pass" and (
-                    raw_rejections or legacy_discovery_count
-                ):
-                    status = "warning"
-                compatibility_detail = ""
-                if compatibility_classified is not None:
-                    compatibility_detail = (
-                        f" 兼容清单确认已分类 {compatibility_classified}/"
-                        f"{len(imported)} 个。"
-                    )
-                elif imported:
-                    compatibility_detail = " 本次无可用兼容清单，无法复核 READY 状态。"
-                discovery_detail = (
-                    f"来源发现 {discovered_count} 个、规范化 {normalized_count} "
-                    f"个、回执导入 {len(imported)} 个、跳过 {len(skipped)} 个、"
-                    f"落盘 {present} 个。"
-                )
-                if raw_rejections:
-                    discovery_detail += (
-                        f" 另有 {raw_rejections} 个来源记录未进入可迁移"
-                        "定义（例如已结束、已取消、损坏或规则无法"
-                        "等价转换），仅保留在来源扫描告警中。"
-                    )
-                elif legacy_discovery_count:
-                    discovery_detail += " 旧回执未记录来源发现总数。"
                 checks.append(
                     _check(
                         "scheduled_tasks",
                         status,
                         "定时任务安全状态",
-                        discovery_detail
-                        + f" 唯一落盘 {unique}/{len(expected)} 个，审核门禁和"
+                        f"导入 {len(expected)} 个，"
+                        f"唯一落盘 {unique}/{len(expected)} 个，"
+                        f"审核门禁和"
                         f"禁用状态与兼容分区一致 {activation_safe}/"
                         f"{len(expected)} 个；远程或未验证工作区"
                         f"未绑定本机目录 {remote_unmapped}/"
-                        f"{len(remote_expected)} 个。"
-                        + compatibility_detail
-                        + " 待修复任务仍需人工处理。",
+                        f"{len(remote_expected)} 个。",
                     ),
                 )
             except Exception as exc:  # pylint: disable=broad-except

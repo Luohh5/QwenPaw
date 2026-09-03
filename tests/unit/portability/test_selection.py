@@ -23,10 +23,7 @@ from qwenpaw.portability.models import (
     SourceSession,
     SourceSkill,
 )
-from qwenpaw.portability.planner import (
-    inventory_fingerprint,
-    tool_asset_fingerprints,
-)
+from qwenpaw.portability.planner import tool_asset_fingerprints
 from qwenpaw.portability.selection import select_inventory
 
 
@@ -194,7 +191,6 @@ class _PlanningService(ImportPlanningMixin):
             source="codex",
             agent_id="agent-1",
             created_at=datetime.now(timezone.utc),
-            inventory_fingerprint=inventory_fingerprint(inventory),
             asset_fingerprints=tool_asset_fingerprints(inventory),
         )
 

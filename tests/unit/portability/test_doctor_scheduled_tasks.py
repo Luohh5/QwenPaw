@@ -11,7 +11,6 @@ from qwenpaw.portability.compatibility import AssetZone, CompatibilityStore
 from qwenpaw.portability.doctor import run_migration_doctor
 from qwenpaw.portability.models import (
     ImportReceipt,
-    ProviderInventory,
     SourceScheduledTask,
 )
 from qwenpaw.portability.scheduled_tasks import build_imported_job
@@ -45,7 +44,6 @@ def _receipt(
     workspace_dir: Path,
     task: SourceScheduledTask,
     *,
-    discovered: int = 1,
     zone: AssetZone | None = AssetZone.REPAIR,
 ) -> ImportReceipt:
     manifest_path = workspace_dir / ".qwenpaw" / "compatibility.json"
@@ -73,7 +71,6 @@ def _receipt(
         started_at=now,
         completed_at=now,
         imported_scheduled_tasks=[task.source_id],
-        discovered_scheduled_task_count=discovered,
         adaptation_manifest=str(manifest_path),
     )
     receipt_path = (
@@ -85,7 +82,7 @@ def _receipt(
 
 @pytest.fixture(name="doctor_case")
 def _doctor_case(tmp_path: Path):
-    def make(*, discovered: int = 1, zone=AssetZone.REPAIR):
+    def make(*, zone=AssetZone.REPAIR):
         task = _task(tmp_path)
         job = build_imported_job("qoder", task)
         workspace_dir = tmp_path / "workspace"
@@ -96,17 +93,9 @@ def _doctor_case(tmp_path: Path):
                 workspace_dir=workspace_dir,
                 cron_manager=_CronManager([job]),
             ),
-            inventory=ProviderInventory(
-                provider_id="qoder",
-                provider_name="Qoder",
-                detected=True,
-                scheduled_tasks=[task],
-                discovered_scheduled_task_count=discovered,
-            ),
             receipt=_receipt(
                 workspace_dir,
                 task,
-                discovered=discovered,
                 zone=zone,
             ),
         )
@@ -127,15 +116,12 @@ async def test_doctor_reconciles_ready_remote_job_and_review_gate(
     case = doctor_case()
     report = await run_migration_doctor(
         case.workspace,
-        case.inventory,
         case.receipt,
     )
 
     check = _schedule_check(report)
     assert check.status == "pass"
-    assert "兼容清单确认已分类 1/1" in check.detail_zh
     assert "远程或未验证工作区未绑定本机目录 1/1" in check.detail_zh
-    assert "来源发现 1 个、规范化 1 个、回执导入 1 个" in check.detail_zh
 
 
 @pytest.mark.asyncio
@@ -159,30 +145,12 @@ async def test_doctor_fails_if_remote_job_was_bound_to_local_project_dir(
     )
     report = await run_migration_doctor(
         case.workspace,
-        case.inventory,
         case.receipt,
     )
 
     check = _schedule_check(report)
     assert check.status == "fail"
     assert "远程或未验证工作区未绑定本机目录 0/1" in check.detail_zh
-
-
-@pytest.mark.asyncio
-async def test_doctor_warns_when_source_reader_rejected_raw_definitions(
-    doctor_case,
-) -> None:
-    case = doctor_case(discovered=2)
-    report = await run_migration_doctor(
-        case.workspace,
-        case.inventory,
-        case.receipt,
-    )
-
-    check = _schedule_check(report)
-    assert check.status == "warning"
-    assert "另有 1 个来源记录未进入可迁移定义" in check.detail_zh
-    assert "已结束、已取消、损坏或规则无法等价转换" in check.detail_zh
 
 
 @pytest.mark.asyncio
@@ -193,7 +161,6 @@ async def test_doctor_fails_if_imported_job_loses_review_gate(
     case.job.meta["portability"]["requires_review"] = False
     report = await run_migration_doctor(
         case.workspace,
-        case.inventory,
         case.receipt,
     )
 
@@ -222,14 +189,7 @@ async def test_doctor_accepts_reviewed_migrate_job_while_disabled(
         workspace_dir=workspace_dir,
         cron_manager=_CronManager([job]),
     )
-    inventory = ProviderInventory(
-        provider_id="qoder",
-        provider_name="Qoder",
-        detected=True,
-        scheduled_tasks=[task],
-    )
-
-    report = await run_migration_doctor(workspace, inventory, receipt)
+    report = await run_migration_doctor(workspace, receipt)
 
     check = _schedule_check(report)
     assert check.status == "pass"
@@ -238,6 +198,6 @@ async def test_doctor_accepts_reviewed_migrate_job_while_disabled(
     workspace.cron_manager.jobs[0] = job.model_copy(
         update={"enabled": True},
     )
-    report = await run_migration_doctor(workspace, inventory, receipt)
+    report = await run_migration_doctor(workspace, receipt)
 
     assert _schedule_check(report).status == "fail"

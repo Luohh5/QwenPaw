@@ -41,7 +41,6 @@ from qwenpaw.portability.models import (
     SourceSkill,
     SourceScheduledTask,
 )
-from qwenpaw.portability.planner import inventory_fingerprint
 from qwenpaw.portability.scheduled_tasks import build_imported_job
 
 
@@ -306,7 +305,6 @@ async def test_unfinished_mission_materializes_repair_items_disabled(
     receipt = await ProviderImportService(workspace).import_from("codex")
 
     assert receipt.imported_skills == ["bound-skill"]
-    assert receipt.skipped_skills == []
     assert (workspace.workspace_dir / "skills/bound-skill").exists()
     skill_manifest = json.loads(
         (workspace.workspace_dir / "skill.json").read_text(encoding="utf-8"),
@@ -519,20 +517,6 @@ async def test_failed_import_restores_invalid_legacy_scheduled_task(
     assert restored.enabled is False
 
 
-def test_inventory_fingerprint_ignores_new_non_root_source_sessions() -> None:
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        ignored_session_ids=["guardian-1"],
-    )
-    before = inventory_fingerprint(inventory)
-
-    inventory.ignored_session_ids.append("guardian-2")
-
-    assert inventory_fingerprint(inventory) == before
-
-
 @pytest.mark.asyncio
 async def test_provider_import_is_additive_and_idempotent(
     tmp_path: Path,
@@ -634,8 +618,7 @@ async def test_dry_run_plan_can_be_revalidated_and_applied(
 
     assert plan.state == "ready"
     assert plan.source_home == ""
-    assert plan.inventory_counts["sessions"] == 1
-    assert plan.actions[0].action == "import_history"
+    assert sum(item.asset_type == "session" for item in plan.actions) == 1
     assert await workspace.chat_manager.list_chats(archived=None) == []
     receipt_root = workspace.workspace_dir / ".qwenpaw/imports"
     assert not list(
@@ -818,7 +801,6 @@ async def test_provider_skill_symbolic_link_is_skipped(
     receipt = await ProviderImportService(workspace).import_from("codex")
 
     assert receipt.imported_skills == []
-    assert receipt.skipped_skills == ["linked"]
     assert any("symbolic link" in warning for warning in receipt.warnings)
 
 
@@ -894,7 +876,9 @@ async def test_provider_import_persists_disabled_mcp_with_encrypted_secret(
     second = await ProviderImportService(workspace).import_from("codex")
 
     assert first.imported_mcp_servers == ["filesystem"]
-    assert second.skipped_mcp_servers == ["filesystem"]
+    assert any(
+        "conflicts with an existing" in item for item in second.warnings
+    )
     card_path = workspace.workspace_dir / "drivers/mcp/filesystem.yaml"
     assert card_path.is_file()
     card_text = card_path.read_text(encoding="utf-8")
@@ -1023,7 +1007,7 @@ async def test_provider_import_rejects_inline_mcp_argument_secret(
     receipt = await ProviderImportService(workspace).import_from("codex")
 
     assert receipt.imported_mcp_servers == []
-    assert receipt.skipped_mcp_servers == [server.name]
+    assert any(server.name in item for item in receipt.warnings)
     assert not (
         workspace.workspace_dir / f"drivers/mcp/{server.name}.yaml"
     ).exists()
@@ -1103,7 +1087,7 @@ async def test_provider_memory_is_scoped_exact_and_idempotent(
     second = await ProviderImportService(workspace).import_from("codex")
 
     assert first.imported_memory_projects == ["project-a"]
-    assert second.skipped_memory_projects == ["project-a"]
+    assert second.imported_memory_projects == []
     imported = list(
         (workspace.workspace_dir / "memory/imports/codex").glob(
             "*/MEMORY.md",
@@ -1118,7 +1102,7 @@ async def test_provider_memory_is_scoped_exact_and_idempotent(
 
 
 @pytest.mark.asyncio
-async def test_cancel_after_memory_write_rolls_back(
+async def test_cancel_after_memory_commit_keeps_asset(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1271,7 +1255,7 @@ async def test_failed_skill_retry_restores_the_existing_skill(
     monkeypatch.setattr(SkillService, "import_from_zip", fail_second_import)
     _plan, receipt = await service.retry_selection(plan.plan_id, selection)
 
-    assert receipt.skipped_skills == ["portable-skill"]
+    assert any("portable-skill" in item for item in receipt.warnings)
     assert (
         (workspace.workspace_dir / "skills/portable-skill/SKILL.md")
         .read_text(encoding="utf-8")
@@ -1607,7 +1591,7 @@ async def test_codex_content_plugin_registers_skills_and_owned_mcp(
 
 
 @pytest.mark.asyncio
-async def test_failed_receipt_rolls_back_memory_and_native_plugin(
+async def test_receipt_failure_keeps_committed_assets(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1724,7 +1708,7 @@ async def test_failed_receipt_rolls_back_memory_and_native_plugin(
 
 
 @pytest.mark.asyncio
-async def test_failed_receipt_rolls_back_all_core_asset_writers(
+async def test_receipt_failure_keeps_all_asset_writers(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1801,71 +1785,3 @@ async def test_failed_receipt_rolls_back_all_core_asset_writers(
     assert workspace.cron_manager.jobs
     imports = workspace.workspace_dir / ".qwenpaw/imports"
     assert not list(imports.glob("migration-*.json"))
-
-
-@pytest.mark.asyncio
-async def test_rollback_failure_continues_later_cleanup(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    workspace = _workspace(tmp_path)
-    skill_source = tmp_path / "rollback-after-chat-failure"
-    skill_source.mkdir()
-    (skill_source / "SKILL.md").write_text(
-        "---\n"
-        "name: rollback-after-chat-failure\n"
-        "description: Rollback fixture\n"
-        "---\n\n"
-        "Use ordinary QwenPaw tools.\n",
-        encoding="utf-8",
-    )
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        sessions=[
-            SourceSession(
-                source_id="rollback-session",
-                title="Rollback session",
-                history=[
-                    HarnessHistoryItem(
-                        kind=HarnessHistoryKind.USER,
-                        text="Do rollback work",
-                        item_id="rollback-message",
-                    ),
-                ],
-            ),
-        ],
-        skills=[
-            SourceSkill(
-                source_id="rollback-after-chat-failure",
-                name="rollback-after-chat-failure",
-                directory=skill_source,
-            ),
-        ],
-    )
-    _bind_inventory(monkeypatch, inventory)
-    _mock_adaptation(monkeypatch, workspace, inventory, zone="migrate")
-
-    async def _fail_receipt(*_args, **_kwargs):
-        raise OSError("receipt storage unavailable")
-
-    async def _fail_delete_chats(_chat_ids):
-        raise OSError("chat cleanup unavailable")
-
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.write_json_atomic_async",
-        _fail_receipt,
-    )
-    monkeypatch.setattr(
-        workspace.chat_manager,
-        "delete_chats",
-        _fail_delete_chats,
-    )
-
-    with pytest.raises(OSError, match="receipt storage unavailable"):
-        await ProviderImportService(workspace).import_from("codex")
-
-    assert (
-        workspace.workspace_dir / "skills/rollback-after-chat-failure"
-    ).exists()
