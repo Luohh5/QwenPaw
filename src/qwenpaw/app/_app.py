@@ -183,9 +183,15 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
     from ..config.utils import get_agent_dirs
     from ..portability.transaction_journal import recover_import_transactions
 
-    recovered_transactions = await recover_import_transactions(
-        get_agent_dirs(),
-    )
+    try:
+        recovered_transactions = await recover_import_transactions(
+            get_agent_dirs(),
+        )
+    except Exception:
+        logger.exception(
+            "PawPort transaction recovery failed; continuing startup",
+        )
+        recovered_transactions = []
     if recovered_transactions:
         logger.warning(
             "Recovered %d interrupted PawPort import transaction(s)",

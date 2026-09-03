@@ -46,7 +46,6 @@ from .providers.base import (
 from .qoder_plugin_adapter import stage_qoder_skill_plugin
 from .scheduled_tasks import build_imported_job, imported_job_source
 from .selection import bound_mcp_plugin
-from .transaction_journal import ImportTransactionJournal
 from .import_conversations import ConversationState, import_conversations
 from .import_support import (
     _bounded_memory,
@@ -183,18 +182,7 @@ class ProviderImportService(ImportPlanningMixin):
         plugin_app = None
         skill_service = SkillService(self._workspace.workspace_dir)
         driver_config = DriverConfigService(self._workspace)
-        transaction = (
-            ImportTransactionJournal(
-                Path(self._workspace.workspace_dir),
-                plan_id,
-            )
-            if plan_id
-            else None
-        )
-
         try:
-            if transaction is not None:
-                await transaction.begin()
             await import_conversations(
                 self._workspace,
                 inventory,
@@ -1005,8 +993,6 @@ class ProviderImportService(ImportPlanningMixin):
                 new_file_mode=0o600,
             )
             await _report(progress, "迁移事务已安全提交。")
-            if transaction is not None:
-                await transaction.discard()
             return receipt
         except BaseException:
             logger.exception("Import stopped after committed assets were kept")

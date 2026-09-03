@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from ..utils import io_utils
 from ..utils.io_utils import get_path_lock, read_json_async
 from .import_support import _PLAN_ID_PATTERN
@@ -25,6 +26,21 @@ logger = logging.getLogger(__name__)
 _MAX_SESSIONS = 500
 
 
+def _imports_root(workspace: Any) -> Path:
+    return Path(workspace.workspace_dir) / ".qwenpaw" / "imports"
+
+
+def _source_home(value: str) -> Path | None:
+    return Path(value) if value else None
+
+
+def _expected_fingerprints(
+    fingerprints: dict[str, str],
+    current: dict[str, str],
+) -> dict[str, str | None]:
+    return {key: fingerprints.get(key) for key in current}
+
+
 class ImportPlanningMixin:
     """Discover sources and manage replay-safe migration plans."""
 
@@ -38,9 +54,14 @@ class ImportPlanningMixin:
         retry_of_migration_id: str = "",
     ) -> ImportReceipt:
         """Mark plan lifecycle around independent asset writes."""
-        plan.state = "applying"
-        await self._write_plan(plan)
+        transaction = ImportTransactionJournal(
+            Path(self._workspace.workspace_dir),
+            plan.plan_id,
+        )
         try:
+            await transaction.begin()
+            plan.state = "applying"
+            await self._write_plan(plan)
             receipt = await self._apply(
                 inventory,
                 started_at=started_at,
@@ -52,6 +73,7 @@ class ImportPlanningMixin:
             plan.state = "ready"
             try:
                 await self._write_plan(plan)
+                await transaction.discard()
             except Exception:  # pylint: disable=broad-except
                 logger.exception("Failed to restore migration plan state")
             raise
@@ -66,10 +88,7 @@ class ImportPlanningMixin:
             )
         else:
             try:
-                await ImportTransactionJournal(
-                    Path(self._workspace.workspace_dir),
-                    plan.plan_id,
-                ).discard()
+                await transaction.discard()
             except Exception:  # pylint: disable=broad-except
                 logger.exception("Failed to clean completed import journal")
         return receipt
@@ -82,9 +101,7 @@ class ImportPlanningMixin:
         progress: ProgressReporter | None = None,
     ) -> MigrationPlan:
         """Create and persist a dry-run migration plan without importing."""
-        lock_path = (
-            Path(self._workspace.workspace_dir) / ".qwenpaw" / "imports"
-        )
+        lock_path = _imports_root(self._workspace)
         await _report(progress, "正在生成迁移预演，不会修改现有数据…")
         async with get_path_lock(lock_path):
             inventory = await self._inventory(
@@ -132,9 +149,7 @@ class ImportPlanningMixin:
             )
         if not _PLAN_ID_PATTERN.fullmatch(parent_plan_id):
             raise ValueError("迁移计划编号格式无效。")
-        lock_path = (
-            Path(self._workspace.workspace_dir) / ".qwenpaw" / "imports"
-        )
+        lock_path = _imports_root(self._workspace)
         async with get_path_lock(lock_path):
             parent = await self._read_plan(parent_plan_id)
             if parent.agent_id != self._workspace.agent_id:
@@ -143,9 +158,7 @@ class ImportPlanningMixin:
                 )
             if parent.state != "applied":
                 raise ValueError("只能重试已完成迁移中的失败工具。")
-            source_home = (
-                Path(parent.source_home) if parent.source_home else None
-            )
+            source_home = _source_home(parent.source_home)
             await _report(progress, "正在重新读取来源并准备失败工具重试…")
             inventory = await self._inventory(
                 parent.source,
@@ -177,9 +190,7 @@ class ImportPlanningMixin:
     ) -> ImportReceipt:
         if not _PLAN_ID_PATTERN.fullmatch(plan_id):
             raise ValueError("迁移计划编号格式无效。")
-        lock_path = (
-            Path(self._workspace.workspace_dir) / ".qwenpaw" / "imports"
-        )
+        lock_path = _imports_root(self._workspace)
         await _report(progress, "正在重新核对迁移计划和来源数据…")
         async with get_path_lock(lock_path):
             plan = await self._read_plan(plan_id)
@@ -191,7 +202,7 @@ class ImportPlanningMixin:
                 raise ValueError(
                     f"该迁移计划当前状态为 {plan.state!r}，不能重复执行。",
                 )
-            source_home = Path(plan.source_home) if plan.source_home else None
+            source_home = _source_home(plan.source_home)
             inventory = await self._inventory(
                 plan.source,
                 source_home=source_home,
@@ -202,10 +213,12 @@ class ImportPlanningMixin:
             current = await io_utils.run_sync_io(
                 tool_asset_fingerprints,
                 inventory,
+                include_sessions=selection is None or selection.sessions,
             )
-            expected = {
-                key: plan.asset_fingerprints.get(key) for key in current
-            }
+            expected = _expected_fingerprints(
+                plan.asset_fingerprints,
+                current,
+            )
             if current != expected:
                 message = "来源数据在预演后发生了变化。请重新扫描，"
                 message += "确认新计划后再执行。"

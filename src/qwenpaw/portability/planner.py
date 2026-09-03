@@ -291,11 +291,7 @@ def _hash_inventory_sources(
         for kind, path in classified
         if kind == "file" and not _has_parent_in(path, root_set)
     }
-    markers = {
-        (kind, path)
-        for kind, path in classified
-        if kind not in {"tree", "file"}
-    }
+    markers = {(kind, path) for kind, path in classified if _is_marker(kind)}
     work = [("tree", path) for path in selected_roots]
     work.extend(("file", path) for path in files)
     work.extend(markers)
@@ -311,6 +307,10 @@ def _hash_inventory_sources(
         else:
             budget.add_entry(path)
             _hash_record(hasher, kind, str(path))
+
+
+def _is_marker(kind: str) -> bool:
+    return kind not in {"tree", "file"}
 
 
 def inventory_fingerprint(inventory: ProviderInventory) -> str:
@@ -335,8 +335,48 @@ def inventory_fingerprint(inventory: ProviderInventory) -> str:
     return hasher.hexdigest()
 
 
-def tool_asset_fingerprints(inventory: ProviderInventory) -> dict[str, str]:
-    """Fingerprint each importable tool without volatile conversations."""
+def _session_fingerprint(inventory: ProviderInventory) -> str:
+    """Fingerprint exactly the source data used to materialize chats."""
+    hasher = hashlib.sha256()
+    _hash_record(hasher, "provider", inventory.provider_id)
+    _hash_record(hasher, "locator", inventory.locator)
+    for session in sorted(inventory.sessions, key=lambda item: item.source_id):
+        values = session.model_dump(
+            mode="json",
+            exclude={"history", "metadata"},
+        )
+        _hash_record(
+            hasher,
+            "session",
+            json.dumps(
+                values,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+        for item in session.history:
+            _hash_record(
+                hasher,
+                "history",
+                json.dumps(
+                    item.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+    for source_id in sorted(inventory.ignored_session_ids):
+        _hash_record(hasher, "ignored", source_id)
+    return hasher.hexdigest()
+
+
+def tool_asset_fingerprints(
+    inventory: ProviderInventory,
+    *,
+    include_sessions: bool = False,
+) -> dict[str, str]:
+    """Fingerprint selected tools and, when requested, conversations."""
     updates = {field: [] for _kind, field in _TOOL_FIELDS} | {
         "sessions": [],
         "ignored_session_ids": [],
@@ -379,6 +419,8 @@ def tool_asset_fingerprints(inventory: ProviderInventory) -> dict[str, str]:
                 },
             )
             result[f"{kind}:{item.source_id}"] = inventory_fingerprint(scoped)
+    if include_sessions:
+        result["sessions"] = _session_fingerprint(inventory)
     return result
 
 
@@ -428,7 +470,10 @@ def _build_migration_plan(
         source_home=source_home,
         agent_id=agent_id,
         created_at=datetime.now(timezone.utc),
-        asset_fingerprints=tool_asset_fingerprints(inventory),
+        asset_fingerprints=tool_asset_fingerprints(
+            inventory,
+            include_sessions=True,
+        ),
         actions=actions,
     )
 
