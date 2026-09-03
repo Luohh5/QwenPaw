@@ -770,51 +770,6 @@ class Envelope:
     # Command short-circuit
     # ------------------------------------------------------------------
 
-    async def command_delta(self, text: str) -> AsyncGenerator[Any, None]:
-        """Append a live text delta for a long-running slash command."""
-        from ..schemas import ContentType, TextContent
-
-        delta = str(text or "")
-        if not delta:
-            return
-        if not self._message_started:
-            yield self._tag_seq(self._completed_message)
-            self._message_started = True
-
-        state = self._text_blocks.setdefault(
-            "__command__",
-            {"index": 0, "text": ""},
-        )
-        state["text"] += delta
-        chunk = TextContent(
-            type=ContentType.TEXT,
-            text=delta,
-            delta=True,
-            index=0,
-        )
-        chunk.msg_id = self._message_id
-        yield self._tag_seq(chunk)
-
-    async def complete_command(
-        self,
-        cmd_msg: Any,
-    ) -> AsyncGenerator[Any, None]:
-        """Finish a slash command after one or more live progress deltas."""
-        final_text = cmd_msg.get_text_content() or ""
-        state = self._text_blocks.setdefault(
-            "__command__",
-            {"index": 0, "text": ""},
-        )
-        if final_text:
-            separator = "\n\n" if state["text"] else ""
-            async for item in self.command_delta(separator + final_text):
-                yield item
-        async for item in self._finish_command(
-            cmd_msg,
-            str(state.get("text") or ""),
-        ):
-            yield item
-
     async def from_msg(self, cmd_msg: Any) -> AsyncGenerator[Any, None]:
         """Translate a completed slash-command message."""
         async for item in self._finish_command(

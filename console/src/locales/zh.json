@@ -112,7 +112,7 @@
   },
   "portabilityImport": {
     "title": "导入",
-    "description": "将其他 AI 应用中的最近聊天记录和工具&设置迁移到 QwenPaw，开启 Loop 模式对所有工具&设置进行针对于 QwenPaw 环境的兼容性修复。",
+    "description": "将其他 AI 应用中的聊天记录、工具和设置迁移到 QwenPaw，并自动完成兼容性修复。",
     "steps": {
       "sources": "选择应用",
       "inventory": "选择内容",

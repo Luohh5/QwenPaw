@@ -28,7 +28,6 @@ export interface ImportAssetResult {
   name: string;
   state: ImportAssetState;
   enabled: boolean | null;
-  reason_code: string;
   message: string;
   requires_sessions: boolean;
 }
@@ -40,10 +39,8 @@ export interface ImportProviderSnapshot {
   sessions_total: number;
   sessions_processed: number;
   sessions_imported: number;
-  sessions_skipped: number;
   selection: ImportSelection;
   assets: ImportAssetResult[];
-  warnings: string[];
   error: string;
 }
 
@@ -58,7 +55,6 @@ export interface ImportJobSnapshot {
     | "completed_with_issues"
     | "failed"
     | "interrupted";
-  phase: string;
   seq: number;
   providers: ImportProviderSnapshot[];
   logs: string[];

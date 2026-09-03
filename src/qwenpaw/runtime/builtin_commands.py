@@ -219,9 +219,6 @@ def _make_control_adapter(
             user_id=(getattr(request, "user_id", "") if request else "") or "",
             agent_id=getattr(ctx, "agent_id", "") or "",
             args=parsed_args,
-            progress_reporter=(
-                getattr(ctx, "extras", {}).get("_command_progress_reporter")
-            ),
         )
 
         try:

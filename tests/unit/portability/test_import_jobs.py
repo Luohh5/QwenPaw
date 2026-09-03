@@ -30,6 +30,12 @@ def _workspace(tmp_path: Path, agent_id: str = "agent-1"):
     )
 
 
+async def _wait_job(manager, workspace, job_id: str) -> None:
+    live = await manager._live(workspace, job_id)
+    if live.task:
+        await live.task
+
+
 class _FakeServices:
     def __init__(self) -> None:
         self.active_scans = 0
@@ -183,8 +189,7 @@ def test_only_materialization_milestone_updates_session_progress() -> None:
         provider.sessions_processed,
         provider.sessions_total,
         provider.sessions_imported,
-        provider.sessions_skipped,
-    ) == (1, 2, 1, 0)
+    ) == (1, 2, 1)
     assert provider.assets[0].state is ImportAssetState.SUCCEEDED
     assert provider.assets[0].enabled is False
     PortabilityImportJobManager._project_progress(
@@ -201,7 +206,7 @@ async def test_scan_is_concurrent_and_persisted(tmp_path: Path) -> None:
     manager = PortabilityImportJobManager(service_factory=services.factory)
 
     created = await manager.create(workspace, ["codex", "qoder"])
-    await manager.wait(created.job_id)
+    await _wait_job(manager, workspace, created.job_id)
     snapshot = await manager.snapshot(workspace, created.job_id)
 
     assert services.max_active_scans == 2
@@ -238,7 +243,7 @@ async def test_apply_projects_progress_and_replays_terminal_event(
     workspace = _workspace(tmp_path)
     manager = PortabilityImportJobManager(service_factory=services.factory)
     created = await manager.create(workspace, ["codex"])
-    await manager.wait(created.job_id)
+    await _wait_job(manager, workspace, created.job_id)
 
     await manager.start(
         workspace,
@@ -250,7 +255,7 @@ async def test_apply_projects_progress_and_replays_terminal_event(
             ),
         },
     )
-    await manager.wait(created.job_id)
+    await _wait_job(manager, workspace, created.job_id)
     snapshot = await manager.snapshot(workspace, created.job_id)
     events = [
         event async for event in manager.subscribe(workspace, created.job_id)
@@ -288,7 +293,7 @@ async def test_empty_selection_is_rejected_and_active_job_can_cancel(
     workspace = _workspace(tmp_path)
     manager = PortabilityImportJobManager(service_factory=services.factory)
     created = await manager.create(workspace, ["codex"])
-    await manager.wait(created.job_id)
+    await _wait_job(manager, workspace, created.job_id)
 
     with pytest.raises(ValueError, match="select at least"):
         await manager.start(
@@ -322,7 +327,7 @@ async def test_shutdown_cancels_active_jobs_and_rejects_new_ones(
     workspace = _workspace(tmp_path)
     manager = PortabilityImportJobManager(service_factory=services.factory)
     created = await manager.create(workspace, ["codex"])
-    await manager.wait(created.job_id)
+    await _wait_job(manager, workspace, created.job_id)
     await manager.start(
         workspace,
         created.job_id,
@@ -348,7 +353,7 @@ async def test_cancel_with_rollback_failure_marks_job_failed(
     workspace = _workspace(tmp_path)
     manager = PortabilityImportJobManager(service_factory=services.factory)
     created = await manager.create(workspace, ["codex"])
-    await manager.wait(created.job_id)
+    await _wait_job(manager, workspace, created.job_id)
 
     services.block_apply.clear()
     await manager.start(
@@ -373,7 +378,7 @@ async def test_provider_failure_does_not_discard_other_result(
     workspace = _workspace(tmp_path)
     manager = PortabilityImportJobManager(service_factory=services.factory)
     created = await manager.create(workspace, ["codex", "qoder"])
-    await manager.wait(created.job_id)
+    await _wait_job(manager, workspace, created.job_id)
 
     await manager.start(
         workspace,
@@ -383,7 +388,7 @@ async def test_provider_failure_does_not_discard_other_result(
             "qoder": ImportSelection(skills=["qoder-skill"]),
         },
     )
-    await manager.wait(created.job_id)
+    await _wait_job(manager, workspace, created.job_id)
     snapshot = await manager.snapshot(workspace, created.job_id)
 
     assert snapshot.state == "completed_with_issues"
@@ -401,7 +406,7 @@ async def test_retry_creates_a_new_job_for_selected_failed_tools(
     workspace = _workspace(tmp_path)
     manager = PortabilityImportJobManager(service_factory=services.factory)
     original = await manager.create(workspace, ["codex", "qoder"])
-    await manager.wait(original.job_id)
+    await _wait_job(manager, workspace, original.job_id)
     await manager.start(
         workspace,
         original.job_id,
@@ -410,18 +415,17 @@ async def test_retry_creates_a_new_job_for_selected_failed_tools(
             for source in ("codex", "qoder")
         },
     )
-    await manager.wait(original.job_id)
+    await _wait_job(manager, workspace, original.job_id)
 
     retry = await manager.retry(
         workspace,
         original.job_id,
         {"qoder": ImportSelection(sessions=False, skills=["qoder-skill"])},
     )
-    await manager.wait(retry.job_id)
+    await _wait_job(manager, workspace, retry.job_id)
     snapshot = await manager.snapshot(workspace, retry.job_id)
 
     assert retry.job_id != original.job_id
-    assert (retry.mode, retry.retry_of_job_id) == ("retry", original.job_id)
     assert snapshot.state == "completed"
     assert len(snapshot.providers) == 2
     assert snapshot.providers[0].assets[0].state is ImportAssetState.SUCCEEDED

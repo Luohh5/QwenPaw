@@ -6,7 +6,7 @@ from fastapi import HTTPException
 
 from qwenpaw.app.routers import agent_scoped
 from qwenpaw.app.routers import portability_imports as routes
-from qwenpaw.portability.import_jobs import ImportJobSnapshot
+from qwenpaw.portability.import_jobs import ImportRun
 from qwenpaw.portability.models import ImportSelection, SourceLocation
 
 
@@ -24,11 +24,11 @@ class _Jobs:
 
     async def create(self, workspace, sources):
         self.calls.append(("create", workspace, sources))
-        return ImportJobSnapshot(job_id="import-" + "a" * 32, agent_id="paw")
+        return ImportRun(job_id="import-" + "a" * 32, agent_id="paw")
 
     async def snapshot(self, workspace, job_id):
         self.calls.append(("snapshot", workspace, job_id))
-        return ImportJobSnapshot(
+        return ImportRun(
             job_id=job_id,
             agent_id="paw",
             state="completed",
@@ -40,7 +40,7 @@ class _Jobs:
 
     async def start(self, workspace, job_id, selections):
         self.calls.append(("start", workspace, job_id, selections))
-        return ImportJobSnapshot(
+        return ImportRun(
             job_id=job_id,
             agent_id="paw",
             state="running",
@@ -48,11 +48,11 @@ class _Jobs:
 
     async def retry(self, workspace, job_id, selections):
         self.calls.append(("retry", workspace, job_id, selections))
-        return ImportJobSnapshot(job_id="import-" + "b" * 32, agent_id="paw")
+        return ImportRun(job_id="import-" + "b" * 32, agent_id="paw")
 
     async def cancel(self, workspace, job_id):
         self.calls.append(("cancel", workspace, job_id))
-        return ImportJobSnapshot(
+        return ImportRun(
             job_id=job_id,
             agent_id="paw",
             state="interrupted",

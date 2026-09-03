@@ -28,49 +28,6 @@ _MAX_SESSIONS = 500
 class ImportPlanningMixin:
     """Discover sources and manage replay-safe migration plans."""
 
-    async def import_from(
-        self,
-        source: str,
-        *,
-        source_home: Path | None = None,
-        progress: ProgressReporter | None = None,
-    ) -> ImportReceipt:
-        """Inventory, persist a plan, and commit one provider migration."""
-        started_at = datetime.now(timezone.utc)
-        lock_path = (
-            Path(self._workspace.workspace_dir) / ".qwenpaw" / "imports"
-        )
-        await _report(progress, "正在等待迁移锁，避免重复导入…")
-        async with get_path_lock(lock_path):
-            inventory = await self._inventory(
-                source,
-                source_home=source_home,
-                progress=progress,
-            )
-            plan = await build_migration_plan(
-                self._workspace,
-                inventory,
-                source_home=str(source_home or ""),
-            )
-            await self._write_plan(plan)
-            await _report(
-                progress,
-                "读取完成："
-                f"{len(inventory.sessions)} 个会话、"
-                f"{len(inventory.skills)} 个 Skill、"
-                f"{len(inventory.mcp_servers)} 个 MCP、"
-                f"{len(inventory.memory_projects)} 组 Memory、"
-                f"{len(inventory.plugins)} 个插件、"
-                f"{len(inventory.scheduled_tasks)} 个定时任务；"
-                "正在写入 QwenPaw…",
-            )
-            return await self._execute_plan(
-                plan,
-                inventory,
-                started_at=started_at,
-                progress=progress,
-            )
-
     async def _execute_plan(
         self,
         plan: MigrationPlan,
@@ -117,21 +74,6 @@ class ImportPlanningMixin:
                 logger.exception("Failed to clean completed import journal")
         return receipt
 
-    async def inspect(
-        self,
-        source: str,
-        *,
-        source_home: Path | None = None,
-        progress: ProgressReporter | None = None,
-    ) -> ProviderInventory:
-        """Read and normalize a source without changing QwenPaw state."""
-        return await self._inventory(
-            source,
-            source_home=source_home,
-            progress=progress,
-            require_detected=False,
-        )
-
     async def plan_from(
         self,
         source: str,
@@ -158,15 +100,6 @@ class ImportPlanningMixin:
             await self._write_plan(plan)
         await _report(progress, "迁移预演已生成；尚未导入任何内容。")
         return plan
-
-    async def apply_plan(
-        self,
-        plan_id: str,
-        *,
-        progress: ProgressReporter | None = None,
-    ) -> ImportReceipt:
-        """Revalidate a persisted plan and apply the unchanged source."""
-        return await self._apply_stored_plan(plan_id, progress=progress)
 
     async def apply_selection(
         self,

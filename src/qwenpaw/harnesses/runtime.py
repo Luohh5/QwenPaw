@@ -299,15 +299,7 @@ class HarnessRuntime:
         request: Any,
         session_id: str,
     ) -> AsyncGenerator[HarnessEvent, None]:
-        """Run a QwenPaw control command with transport-neutral progress."""
-        progress_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
-
-        async def _report(message: str) -> None:
-            await progress_queue.put(f"⏳ {message}\n")
-
-        def _delta(text: str) -> HarnessEvent:
-            return HarnessEvent(kind=HarnessEventKind.TEXT_DELTA, text=text)
-
+        """Run a QwenPaw control command before provider routing."""
         workspace = self._workspace
         if workspace is None:
             raise RuntimeError("QwenPaw workspace is unavailable.")
@@ -315,45 +307,24 @@ class HarnessRuntime:
         from ..runtime.commands.control import handle_control_command
         from ..runtime.commands.control.base import ControlContext
 
-        task = asyncio.create_task(
-            handle_control_command(
-                prompt,
-                ControlContext(
-                    workspace=workspace,
-                    payload=request,
-                    channel=None,
-                    session_id=session_id,
-                    user_id=str(
-                        getattr(request, "user_id", "") or session_id,
-                    ),
-                    agent_id=self._agent_id,
-                    args={},
-                    progress_reporter=_report,
-                ),
+        final_text = await handle_control_command(
+            prompt,
+            ControlContext(
+                workspace=workspace,
+                payload=request,
+                channel=None,
+                session_id=session_id,
+                user_id=str(getattr(request, "user_id", "") or session_id),
+                agent_id=self._agent_id,
+                args={},
             ),
         )
-        progress_started = False
-        try:
-            while not task.done():
-                try:
-                    text = await asyncio.wait_for(
-                        progress_queue.get(),
-                        timeout=0.1,
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                progress_started = True
-                yield _delta(text)
-            final_text = await task
-            while not progress_queue.empty():
-                progress_started = True
-                yield _delta(progress_queue.get_nowait())
-            if final_text:
-                yield _delta(("\n" if progress_started else "") + final_text)
-            yield HarnessEvent(kind=HarnessEventKind.COMPLETED)
-        finally:
-            if not task.done():
-                task.cancel()
+        if final_text:
+            yield HarnessEvent(
+                kind=HarnessEventKind.TEXT_DELTA,
+                text=final_text,
+            )
+        yield HarnessEvent(kind=HarnessEventKind.COMPLETED)
 
     async def stop(self) -> None:
         """Stop every initialized adapter."""

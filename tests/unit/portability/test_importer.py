@@ -31,7 +31,6 @@ from qwenpaw.portability.compatibility import (
 from qwenpaw.portability.models import (
     ImportSelection,
     ProviderInventory,
-    SourceLocation,
     SourceMarketplace,
     SourceMCPServer,
     SourceMemoryFile,
@@ -146,6 +145,46 @@ def _workspace(tmp_path: Path):
     )
 
 
+def _all_selection(plan) -> ImportSelection:
+    values = {
+        name: [] for name in ("memory", "cron", "skills", "mcp", "plugins")
+    }
+    fields = {
+        "memory": "memory",
+        "scheduled_task": "cron",
+        "skill": "skills",
+        "mcp": "mcp",
+        "plugin": "plugins",
+    }
+    for item in plan.actions:
+        if item.asset_type in fields:
+            values[fields[item.asset_type]].append(item.source_id)
+    return ImportSelection(sessions=True, **values)
+
+
+async def _import_from(
+    service,
+    source: str,
+    *,
+    source_home=None,
+    progress=None,
+):
+    plan = await service.plan_from(
+        source,
+        source_home=source_home,
+        progress=progress,
+    )
+    return await service.apply_selection(
+        plan.plan_id,
+        _all_selection(plan),
+        progress=progress,
+    )
+
+
+async def _apply_plan(service, plan):
+    return await service.apply_selection(plan.plan_id, _all_selection(plan))
+
+
 class _CronManager:
     def __init__(self) -> None:
         self.jobs = {}
@@ -196,13 +235,12 @@ async def test_provider_imports_scheduled_tasks_disabled_and_idempotent(
                 enabled=True,
             ),
         ],
-        discovered_scheduled_task_count=1,
     )
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
-    first = await ProviderImportService(workspace).import_from("codex")
-    second = await ProviderImportService(workspace).import_from("codex")
+    first = await _import_from(ProviderImportService(workspace), "codex")
+    second = await _import_from(ProviderImportService(workspace), "codex")
 
     assert not list((tmp_path / ".qwenpaw/imports/transactions").glob("*"))
     assert first.imported_scheduled_tasks == ["automation-1"]
@@ -252,7 +290,7 @@ async def test_heartbeat_without_source_chat_uses_new_cron_chat(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
-    receipt = await ProviderImportService(workspace).import_from("codex")
+    receipt = await _import_from(ProviderImportService(workspace), "codex")
 
     job = next(iter(workspace.cron_manager.jobs.values()))
     assert receipt.imported_scheduled_tasks == ["heartbeat-1"]
@@ -302,7 +340,7 @@ async def test_unfinished_mission_materializes_repair_items_disabled(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory, status="stopped_limit")
 
-    receipt = await ProviderImportService(workspace).import_from("codex")
+    receipt = await _import_from(ProviderImportService(workspace), "codex")
 
     assert receipt.imported_skills == ["bound-skill"]
     assert (workspace.workspace_dir / "skills/bound-skill").exists()
@@ -409,7 +447,8 @@ async def test_migrate_zone_materializes_assets(
     async def record(message: str) -> None:
         progress.append(message)
 
-    receipt = await ProviderImportService(workspace).import_from(
+    receipt = await _import_from(
+        ProviderImportService(workspace),
         "codex",
         progress=record,
     )
@@ -453,7 +492,6 @@ async def test_import_repairs_unreviewed_invalid_legacy_scheduled_task(
         provider_name="Codex",
         detected=True,
         scheduled_tasks=[task],
-        discovered_scheduled_task_count=1,
     )
     ghost = build_imported_job("codex", task)
     ghost.schedule = ghost.schedule.model_copy(
@@ -463,7 +501,7 @@ async def test_import_repairs_unreviewed_invalid_legacy_scheduled_task(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
-    receipt = await ProviderImportService(workspace).import_from("codex")
+    receipt = await _import_from(ProviderImportService(workspace), "codex")
 
     assert receipt.imported_scheduled_tasks == ["legacy-ghost"]
     repaired = workspace.cron_manager.jobs[ghost.id]
@@ -492,7 +530,6 @@ async def test_failed_import_restores_invalid_legacy_scheduled_task(
         provider_name="Codex",
         detected=True,
         scheduled_tasks=[task],
-        discovered_scheduled_task_count=1,
     )
     ghost = build_imported_job("codex", task)
     ghost.schedule = ghost.schedule.model_copy(
@@ -510,7 +547,7 @@ async def test_failed_import_restores_invalid_legacy_scheduled_task(
     )
 
     with pytest.raises(OSError, match="receipt unavailable"):
-        await ProviderImportService(workspace).import_from("codex")
+        await _import_from(ProviderImportService(workspace), "codex")
 
     restored = workspace.cron_manager.jobs[ghost.id]
     assert restored.schedule.cron == "30 9 * * *"
@@ -553,11 +590,12 @@ async def test_provider_import_is_additive_and_idempotent(
     async def record(message: str) -> None:
         progress.append(message)
 
-    first = await ProviderImportService(workspace).import_from(
+    first = await _import_from(
+        ProviderImportService(workspace),
         "codex",
         progress=record,
     )
-    second = await ProviderImportService(workspace).import_from("codex")
+    second = await _import_from(ProviderImportService(workspace), "codex")
 
     assert "\x1esessions\t1\t1\t1\t0" in progress
     assert first.imported_sessions == ["thread-1"]
@@ -593,11 +631,6 @@ async def test_dry_run_plan_can_be_revalidated_and_applied(
         provider_id="codex",
         provider_name="Codex",
         detected=True,
-        source_location=SourceLocation(
-            provider_id="codex",
-            data_home=str(tmp_path / ".codex"),
-            data_home_source="platform_default",
-        ),
         sessions=[
             SourceSession(
                 source_id="planned-thread",
@@ -625,7 +658,7 @@ async def test_dry_run_plan_can_be_revalidated_and_applied(
         receipt_root.glob("migration-*.json"),
     )
 
-    receipt = await service.apply_plan(plan.plan_id)
+    receipt = await _apply_plan(service, plan)
 
     assert receipt.plan_id == plan.plan_id
     assert receipt.imported_sessions == ["planned-thread"]
@@ -676,7 +709,7 @@ async def test_apply_plan_refuses_changed_source_files(
     memory.write_text("version two", encoding="utf-8")
 
     with pytest.raises(ValueError, match="来源数据.*发生了变化"):
-        await service.apply_plan(plan.plan_id)
+        await _apply_plan(service, plan)
 
     assert await workspace.chat_manager.list_chats(archived=None) == []
     persisted = json.loads(
@@ -718,10 +751,10 @@ async def test_codex_reimport_archives_previously_imported_guardian_chat(
     )
     _bind_inventory(monkeypatch, inventory)
 
-    await ProviderImportService(workspace).import_from("codex")
+    await _import_from(ProviderImportService(workspace), "codex")
     inventory.sessions = []
     inventory.ignored_session_ids = [guardian_id]
-    receipt = await ProviderImportService(workspace).import_from("codex")
+    receipt = await _import_from(ProviderImportService(workspace), "codex")
 
     assert receipt.ignored_source_sessions == [guardian_id]
     assert receipt.archived_internal_sessions == [guardian_id]
@@ -759,8 +792,8 @@ async def test_concurrent_imports_are_serialized_and_do_not_duplicate(
     _bind_inventory(monkeypatch, inventory)
 
     first, second = await asyncio.gather(
-        ProviderImportService(workspace).import_from("codex"),
-        ProviderImportService(workspace).import_from("codex"),
+        _import_from(ProviderImportService(workspace), "codex"),
+        _import_from(ProviderImportService(workspace), "codex"),
     )
 
     assert sum(bool(item.imported_sessions) for item in (first, second)) == 1
@@ -798,7 +831,7 @@ async def test_provider_skill_symbolic_link_is_skipped(
     )
     _bind_inventory(monkeypatch, inventory)
 
-    receipt = await ProviderImportService(workspace).import_from("codex")
+    receipt = await _import_from(ProviderImportService(workspace), "codex")
 
     assert receipt.imported_skills == []
     assert any("symbolic link" in warning for warning in receipt.warnings)
@@ -835,7 +868,7 @@ async def test_provider_skill_uses_existing_scanner_and_stays_disabled(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
-    receipt = await ProviderImportService(workspace).import_from("codex")
+    receipt = await _import_from(ProviderImportService(workspace), "codex")
 
     assert receipt.imported_skills == ["provider-demo"]
     skill_path = workspace.workspace_dir / "skills/provider-demo/SKILL.md"
@@ -856,7 +889,6 @@ async def test_provider_import_persists_disabled_mcp_with_encrypted_secret(
         provider_id="codex",
         provider_name="Codex",
         detected=True,
-        discovered_mcp_count=1,
         mcp_servers=[
             SourceMCPServer(
                 source_id="filesystem",
@@ -872,8 +904,8 @@ async def test_provider_import_persists_disabled_mcp_with_encrypted_secret(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
-    first = await ProviderImportService(workspace).import_from("codex")
-    second = await ProviderImportService(workspace).import_from("codex")
+    first = await _import_from(ProviderImportService(workspace), "codex")
+    second = await _import_from(ProviderImportService(workspace), "codex")
 
     assert first.imported_mcp_servers == ["filesystem"]
     assert any(
@@ -902,7 +934,6 @@ async def test_provider_import_encrypts_even_public_named_mcp_bindings(
         provider_id="codex",
         provider_name="Codex",
         detected=True,
-        discovered_mcp_count=2,
         mcp_servers=[
             SourceMCPServer(
                 source_id="stdio-public-name",
@@ -924,7 +955,7 @@ async def test_provider_import_encrypts_even_public_named_mcp_bindings(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
-    receipt = await ProviderImportService(workspace).import_from("codex")
+    receipt = await _import_from(ProviderImportService(workspace), "codex")
 
     assert receipt.imported_mcp_servers == [
         "stdio-public-name",
@@ -999,12 +1030,11 @@ async def test_provider_import_rejects_inline_mcp_argument_secret(
         provider_id="codex",
         provider_name="Codex",
         detected=True,
-        discovered_mcp_count=1,
         mcp_servers=[server],
     )
     _bind_inventory(monkeypatch, inventory)
 
-    receipt = await ProviderImportService(workspace).import_from("codex")
+    receipt = await _import_from(ProviderImportService(workspace), "codex")
 
     assert receipt.imported_mcp_servers == []
     assert any(server.name in item for item in receipt.warnings)
@@ -1044,9 +1074,9 @@ async def test_provider_import_sets_and_repairs_source_project_directory(
     )
     _bind_inventory(monkeypatch, inventory)
 
-    await ProviderImportService(workspace).import_from("codex")
+    await _import_from(ProviderImportService(workspace), "codex")
     session.cwd = str(project)
-    repaired = await ProviderImportService(workspace).import_from("codex")
+    repaired = await _import_from(ProviderImportService(workspace), "codex")
 
     assert repaired.skipped_sessions == ["thread-project"]
     chats = await workspace.chat_manager.list_chats(archived=None)
@@ -1083,8 +1113,8 @@ async def test_provider_memory_is_scoped_exact_and_idempotent(
     )
     _bind_inventory(monkeypatch, inventory)
 
-    first = await ProviderImportService(workspace).import_from("codex")
-    second = await ProviderImportService(workspace).import_from("codex")
+    first = await _import_from(ProviderImportService(workspace), "codex")
+    second = await _import_from(ProviderImportService(workspace), "codex")
 
     assert first.imported_memory_projects == ["project-a"]
     assert second.imported_memory_projects == []
@@ -1143,7 +1173,7 @@ async def test_cancel_after_memory_commit_keeps_asset(
     )
 
     task = asyncio.create_task(
-        ProviderImportService(workspace).import_from("codex"),
+        _import_from(ProviderImportService(workspace), "codex"),
     )
     assert await asyncio.to_thread(started.wait, 2)
     task.cancel()
@@ -1317,7 +1347,7 @@ async def test_provider_plugin_restores_marketplace_then_native_installs(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
-    receipt = await ProviderImportService(workspace).import_from("codex")
+    receipt = await _import_from(ProviderImportService(workspace), "codex")
 
     assert receipt.restored_marketplaces == ["local"]
     assert receipt.prepared_plugins == ["demo@local"]
@@ -1366,7 +1396,7 @@ async def test_provider_plugin_never_falls_back_to_installed_cache(
     )
     _bind_inventory(monkeypatch, inventory)
 
-    receipt = await ProviderImportService(workspace).import_from("qoder")
+    receipt = await _import_from(ProviderImportService(workspace), "qoder")
 
     assert receipt.installed_plugins == []
     assert receipt.prepared_plugins == ["demo@qoder-bundler"]
@@ -1473,7 +1503,7 @@ async def test_qoder_custom_skill_plugin_uses_native_adapter(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
-    receipt = await ProviderImportService(workspace).import_from("qoder")
+    receipt = await _import_from(ProviderImportService(workspace), "qoder")
 
     assert receipt.installed_plugins == ["test-report"]
     assert captured["manifest"]["id"] == "test-report"
@@ -1563,7 +1593,6 @@ async def test_codex_content_plugin_registers_skills_and_owned_mcp(
                 metadata={"adapter": "codex_content_bundle_v1"},
             ),
         ],
-        discovered_mcp_count=1,
         mcp_servers=[
             SourceMCPServer(
                 source_id=f"codex:plugin-mcp:{plugin_id}:creative",
@@ -1580,7 +1609,7 @@ async def test_codex_content_plugin_registers_skills_and_owned_mcp(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory, zone="migrate")
 
-    receipt = await ProviderImportService(workspace).import_from("codex")
+    receipt = await _import_from(ProviderImportService(workspace), "codex")
 
     assert receipt.installed_plugins == ["creative-production"]
     assert receipt.imported_mcp_servers == ["creative"]
@@ -1696,7 +1725,7 @@ async def test_receipt_failure_keeps_committed_assets(
     _mock_adaptation(monkeypatch, workspace, inventory, zone="migrate")
 
     with pytest.raises(OSError, match="receipt storage unavailable"):
-        await ProviderImportService(workspace).import_from("qoder")
+        await _import_from(ProviderImportService(workspace), "qoder")
 
     assert not uninstalled
     assert list(
@@ -1777,7 +1806,7 @@ async def test_receipt_failure_keeps_all_asset_writers(
     )
 
     with pytest.raises(OSError, match="receipt storage unavailable"):
-        await ProviderImportService(workspace).import_from("codex")
+        await _import_from(ProviderImportService(workspace), "codex")
 
     assert await workspace.chat_manager.list_chats(archived=None)
     assert (workspace.workspace_dir / "skills/rollback-skill").exists()

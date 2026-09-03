@@ -56,7 +56,6 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
             source_location.data_home_exists = qoder_home.is_dir()
         if qoder_user_data is not None:
             source_location.user_data_home = str(qoder_user_data.expanduser())
-            source_location.user_data_home_source = "injected"
             source_location.user_data_home_exists = qoder_user_data.is_dir()
         self._source_location = source_location
         self._qoder_home = Path(source_location.data_home)
@@ -109,7 +108,7 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
         (
             scheduled_tasks,
             scheduled_task_warnings,
-            discovered_scheduled_task_count,
+            _,
         ) = scheduled_task_state
 
         total_records = len(records)
@@ -290,7 +289,6 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
         projects = self._qoder_home / "projects"
         return make_inventory(
             self.provider_id,
-            self._source_location,
             detected=(
                 bool(records)
                 or projects.is_dir()
@@ -310,8 +308,6 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
             marketplaces=marketplaces,
             plugins=plugins,
             scheduled_tasks=scheduled_tasks,
-            discovered_mcp_count=discovered_mcp_count,
-            discovered_scheduled_task_count=(discovered_scheduled_task_count),
             warnings=warnings,
         )
 

@@ -457,7 +457,6 @@ def discover_qoder_skills(qoder_home: Path) -> list[SourceSkill]:
                     source_id=f"qoder-skill:{scope}:{resolved}",
                     name=directory.name,
                     directory=resolved,
-                    scope=scope,
                 ),
             )
     return skills

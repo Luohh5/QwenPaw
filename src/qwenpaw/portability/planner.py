@@ -318,7 +318,6 @@ def inventory_fingerprint(inventory: ProviderInventory) -> str:
         mode="json",
         exclude={
             "ignored_session_ids",
-            "source_location",
             "warnings",
         },
     )
@@ -341,9 +340,6 @@ def tool_asset_fingerprints(inventory: ProviderInventory) -> dict[str, str]:
         "ignored_session_ids": [],
         "marketplaces": [],
         "warnings": [],
-        "metadata": {},
-        "discovered_mcp_count": 0,
-        "discovered_scheduled_task_count": 0,
     }
     result = {}
     for kind, field in _TOOL_FIELDS:
@@ -401,12 +397,10 @@ async def build_migration_plan(
         plan_id=f"plan-{uuid4().hex}",
         source=inventory.provider_id,
         source_home=source_home,
-        source_location=inventory.source_location,
         agent_id=workspace.agent_id,
         created_at=datetime.now(timezone.utc),
         asset_fingerprints=tool_asset_fingerprints(inventory),
         actions=actions,
-        warnings=list(inventory.warnings),
     )
 
 

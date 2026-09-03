@@ -14,9 +14,7 @@
   "ignored_sessions": [
     "22222222-2222-4222-8222-222222222222"
   ],
-  "skills": [
-    {"name": "portable-qoder", "scope": "user"}
-  ],
+  "skills": ["portable-qoder"],
   "mcp": [
     {
       "id": "qoder:mcp:filesystem",
@@ -68,7 +66,5 @@
       "timezone": "Asia/Shanghai",
       "enabled_at_source": true
     }
-  ],
-  "discovered_mcp_count": 2,
-  "discovered_scheduled_task_count": 1
+  ]
 }

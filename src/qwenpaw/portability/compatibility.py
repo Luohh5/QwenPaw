@@ -41,7 +41,6 @@ class RunState(StrEnum):
     RUNNING = "running"
     COMPLETED = "completed"
     STOPPED_LIMIT = "stopped_limit"
-    FAILED_SAFE = "failed_safe"
 
 
 class PluginComponent(BaseModel):
@@ -217,17 +216,6 @@ def load_manifest(path: Path | str) -> CompatibilityManifest:
     if stat.S_IMODE(target.stat().st_mode) & 0o077:
         os.chmod(target, 0o600)
     value = json.loads(target.read_text(encoding="utf-8"))
-    # v3 stored revision-only bookkeeping; keep old reports readable.
-    if isinstance(value, dict) and value.get("schema_version") == "3":
-        value["schema_version"] = "4"
-        value.pop("total_tests", None)
-        for asset in value.get("assets", ()):
-            if isinstance(asset, dict):
-                asset.pop("revision", None)
-                asset.pop("repair_rounds", None)
-                test = asset.get("last_test")
-                if isinstance(test, dict):
-                    test.pop("revision", None)
     return CompatibilityManifest.model_validate(value)
 
 

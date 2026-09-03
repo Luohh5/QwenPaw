@@ -44,10 +44,8 @@ class ImportProviderSnapshot(BaseModel):
     sessions_total: int = 0
     sessions_processed: int = 0
     sessions_imported: int = 0
-    sessions_skipped: int = 0
     selection: ImportSelection = Field(default_factory=ImportSelection)
     assets: list[ImportAssetResult] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
     error: str = ""
 
 
@@ -57,22 +55,15 @@ class ImportRun(BaseModel):
     job_id: str
     agent_id: str
     state: str = "scanning"
-    phase: str = "scan"
-    mode: str = "import"
-    retry_of_job_id: str = ""
     seq: int = 0
     providers: list[ImportProviderSnapshot] = Field(default_factory=list)
     logs: list[str] = Field(default_factory=list)
 
 
-# Keep the wire/API name stable for existing clients.
-ImportJobSnapshot = ImportRun
-
-
 @dataclass
 class _LiveJob:
     workspace: Any
-    snapshot: ImportJobSnapshot
+    snapshot: ImportRun
     plans: dict[str, MigrationPlan] = dataclass_field(default_factory=dict)
     events: deque[dict[str, Any]] = dataclass_field(
         default_factory=lambda: deque(maxlen=64),
@@ -100,7 +91,7 @@ class PortabilityImportJobManager:
         self,
         workspace: Any,
         sources: list[str],
-    ) -> ImportJobSnapshot:
+    ) -> ImportRun:
         """Create a job and start source discovery in the background."""
         self._ensure_open()
         if await self.current(workspace):
@@ -111,7 +102,7 @@ class PortabilityImportJobManager:
         ):
             raise ValueError("sources must contain codex or qoder")
         job_id = f"import-{uuid4().hex}"
-        snapshot = ImportJobSnapshot(
+        snapshot = ImportRun(
             job_id=job_id,
             agent_id=workspace.agent_id,
             providers=[
@@ -129,7 +120,7 @@ class PortabilityImportJobManager:
         workspace: Any,
         job_id: str,
         selections: dict[str, ImportSelection],
-    ) -> ImportJobSnapshot:
+    ) -> ImportRun:
         """Apply the user selection for every successfully scanned source."""
         self._ensure_open()
         live = await self._live(workspace, job_id)
@@ -166,7 +157,6 @@ class PortabilityImportJobManager:
                 provider.selection,
             )
         live.snapshot.state = "running"
-        live.snapshot.phase = "import"
         await self._emit(live, persist=True)
         self._spawn(live, lambda: self._apply(live))
         return live.snapshot.model_copy(deep=True)
@@ -176,7 +166,7 @@ class PortabilityImportJobManager:
         workspace: Any,
         job_id: str,
         selections: dict[str, ImportSelection],
-    ) -> ImportJobSnapshot:
+    ) -> ImportRun:
         """Retry explicitly selected failed tools in a fresh import job."""
         self._ensure_open()
         previous = await self._live(workspace, job_id)
@@ -206,9 +196,6 @@ class PortabilityImportJobManager:
             update={
                 "job_id": retry_id,
                 "state": "running",
-                "phase": "retry",
-                "mode": "retry",
-                "retry_of_job_id": job_id,
                 "seq": 0,
             },
         )
@@ -259,7 +246,7 @@ class PortabilityImportJobManager:
         self,
         workspace: Any,
         job_id: str,
-    ) -> ImportJobSnapshot:
+    ) -> ImportRun:
         """Stop one active import and persist its terminal state."""
         live = await self._live(workspace, job_id)
         if live.snapshot.state in _TERMINAL:
@@ -275,7 +262,6 @@ class PortabilityImportJobManager:
                 cancel_error = redact_sensitive_text(exc, limit=500)
         if live.snapshot.state not in _TERMINAL:
             live.snapshot.state = "failed" if cancel_error else "interrupted"
-            live.snapshot.phase = "done"
             if cancel_error:
                 self._log(live, cancel_error)
                 for provider in live.snapshot.providers:
@@ -284,18 +270,6 @@ class PortabilityImportJobManager:
                         provider.error = cancel_error
             await self._emit(live, persist=True)
         return live.snapshot.model_copy(deep=True)
-
-    async def wait(self, job_id: str) -> None:
-        """Wait for the current scan or import task to finish."""
-        matches = [
-            item
-            for (_, current), item in self._jobs.items()
-            if current == job_id
-        ]
-        if not matches:
-            raise ValueError("import job not found")
-        if matches[0].task:
-            await matches[0].task
 
     def _ensure_open(self) -> None:
         if self._closing:
@@ -308,7 +282,6 @@ class PortabilityImportJobManager:
             except Exception as exc:  # pylint: disable=broad-except
                 if live.snapshot.state not in _TERMINAL:
                     live.snapshot.state = "failed"
-                    live.snapshot.phase = "done"
                     self._log(live, redact_sensitive_text(exc, limit=500))
                     for provider in live.snapshot.providers:
                         if provider.state == "running":
@@ -321,7 +294,7 @@ class PortabilityImportJobManager:
 
         live.task = asyncio.create_task(run())
 
-    async def snapshot(self, workspace: Any, job_id: str) -> ImportJobSnapshot:
+    async def snapshot(self, workspace: Any, job_id: str) -> ImportRun:
         """Return current state, restoring a persisted job when needed."""
         key = (workspace.agent_id, job_id)
         live = self._jobs.get(key)
@@ -329,19 +302,18 @@ class PortabilityImportJobManager:
             return live.snapshot.model_copy(deep=True)
         try:
             value = await read_json_async(self._path(workspace, job_id))
-            snapshot = ImportJobSnapshot.model_validate(value)
+            snapshot = ImportRun.model_validate(value)
         except (FileNotFoundError, OSError, ValueError, TypeError) as exc:
             raise ValueError("import job not found or invalid") from exc
         if snapshot.agent_id != workspace.agent_id:
             raise ValueError("import job belongs to another agent")
         if snapshot.state in {"scanning", "running"}:
             snapshot.state = "interrupted"
-            snapshot.phase = "done"
             await self._persist(workspace, snapshot)
         self._jobs[key] = _LiveJob(workspace=workspace, snapshot=snapshot)
         return snapshot.model_copy(deep=True)
 
-    async def current(self, workspace: Any) -> ImportJobSnapshot | None:
+    async def current(self, workspace: Any) -> ImportRun | None:
         """Return this agent's active or resumable import job."""
         active = [
             live
@@ -363,7 +335,7 @@ class PortabilityImportJobManager:
         for path in paths:
             try:
                 value = await read_json_async(path)
-                snapshot = ImportJobSnapshot.model_validate(value)
+                snapshot = ImportRun.model_validate(value)
             except (OSError, ValueError, TypeError):
                 continue
             if (
@@ -423,10 +395,6 @@ class PortabilityImportJobManager:
                     plan,
                     self._all_selection(plan),
                 )
-                provider.warnings = [
-                    redact_sensitive_text(item, limit=500)
-                    for item in plan.warnings[:20]
-                ]
                 provider.state = "ready"
             except Exception as exc:  # pylint: disable=broad-except
                 provider.state = "failed"
@@ -438,9 +406,6 @@ class PortabilityImportJobManager:
             "awaiting_selection"
             if any(item.state == "ready" for item in live.snapshot.providers)
             else "failed"
-        )
-        live.snapshot.phase = (
-            "select" if live.snapshot.state == "awaiting_selection" else "done"
         )
         await self._emit(live, persist=True)
 
@@ -503,19 +468,10 @@ class PortabilityImportJobManager:
                             ImportAssetState.FAILED,
                         }:
                             asset.state = ImportAssetState.FAILED
-                            asset.reason_code = "missing_result"
                             asset.message = "未收到资产导入结果，请重试。"
                 if retry_from is None:
                     provider.sessions_processed = provider.sessions_total
                     provider.sessions_imported = len(receipt.imported_sessions)
-                    provider.sessions_skipped = len(receipt.skipped_sessions)
-                provider.warnings = (
-                    provider.warnings
-                    + [
-                        redact_sensitive_text(item, limit=500)
-                        for item in receipt.warnings
-                    ]
-                )[:20]
                 provider.state = "completed"
             except Exception as exc:  # pylint: disable=broad-except
                 provider.error = redact_sensitive_text(exc, limit=500)
@@ -550,7 +506,6 @@ class PortabilityImportJobManager:
             )
             else "completed"
         )
-        live.snapshot.phase = "done"
         await self._emit(live, persist=True)
 
     async def _live(self, workspace: Any, job_id: str) -> _LiveJob:
@@ -597,7 +552,7 @@ class PortabilityImportJobManager:
     async def _persist(
         self,
         workspace: Any,
-        snapshot: ImportJobSnapshot,
+        snapshot: ImportRun,
     ) -> None:
         path = self._path(workspace, snapshot.job_id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -704,7 +659,7 @@ class PortabilityImportJobManager:
                 provider.sessions_processed,
                 provider.sessions_total,
                 provider.sessions_imported,
-                provider.sessions_skipped,
+                _,
             ) = map(int, result[1:])
             return
         if len(result) == 5 and result[0] == "\x1easset":
@@ -726,7 +681,6 @@ class PortabilityImportJobManager:
 
 __all__ = [
     "ImportRun",
-    "ImportJobSnapshot",
     "ImportProviderSnapshot",
     "PortabilityImportJobManager",
 ]

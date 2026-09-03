@@ -112,7 +112,6 @@ def test_qoder_dedicated_environment_variables_are_honored(
     assert location.data_home == str(qoder_home.resolve())
     assert location.user_data_home == str(user_data.resolve())
     assert location.data_home_source == "environment:QODER_HOME"
-    assert location.user_data_home_source == "environment:QODER_USER_DATA_HOME"
 
 
 def test_relative_explicit_source_is_rejected() -> None:

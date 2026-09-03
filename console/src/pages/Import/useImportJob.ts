@@ -16,7 +16,6 @@ const terminal = new Set([
   "interrupted",
 ]);
 const ACTIVE_JOBS = "qwenpaw.portability.activeImports";
-const LEGACY_ACTIVE_JOB = "qwenpaw.portability.activeImport";
 const RECONNECT_INITIAL_MS = 750;
 const RECONNECT_MAX_MS = 15_000;
 
@@ -44,15 +43,7 @@ function activeJobs(): Record<string, string> {
       ...parse(get(localStorage)),
       ...parse(get(sessionStorage)),
     } as Record<string, string>;
-    if (Object.keys(saved).length) return saved;
-    const legacy = JSON.parse(
-      sessionStorage.getItem(LEGACY_ACTIVE_JOB) ?? "null",
-    );
-    return Array.isArray(legacy) &&
-      legacy.length === 2 &&
-      legacy.every((item) => typeof item === "string")
-      ? { [legacy[0]]: legacy[1] }
-      : {};
+    return saved;
   } catch {
     return {};
   }
@@ -65,7 +56,6 @@ function saveActiveJob(agentId: string, jobId = "") {
   try {
     localStorage.setItem(ACTIVE_JOBS, JSON.stringify(jobs));
     sessionStorage.removeItem(ACTIVE_JOBS);
-    sessionStorage.removeItem(LEGACY_ACTIVE_JOB);
   } catch {
     try {
       sessionStorage.setItem(ACTIVE_JOBS, JSON.stringify(jobs));

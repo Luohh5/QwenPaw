@@ -26,7 +26,6 @@ const job = (agentId: string, jobId = `import-${agentId}`) => ({
   job_id: jobId,
   agent_id: agentId,
   state: "awaiting_selection" as const,
-  phase: "select",
   seq: 1,
   providers: [],
   logs: [],
@@ -139,19 +138,6 @@ describe("useImportJob", () => {
     selectedAgent = "agent-b";
     rerender();
     await waitFor(() => expect(result.current.job?.job_id).toBe("import-b"));
-  });
-
-  it("preserves a legacy active import during the storage upgrade", async () => {
-    sessionStorage.setItem(
-      "qwenpaw.portability.activeImport",
-      JSON.stringify(["agent-a", "import-a"]),
-    );
-    const { result } = renderHook(() => useImportJob());
-
-    await waitFor(() => expect(result.current.job?.job_id).toBe("import-a"));
-    expect(localStorage.getItem("qwenpaw.portability.activeImports")).toBe(
-      JSON.stringify({ "agent-a": "import-a" }),
-    );
   });
 
   it("recovers the current job when browser storage is empty", async () => {

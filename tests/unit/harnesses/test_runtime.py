@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import patch
@@ -433,51 +432,3 @@ async def test_runtime_handles_qwenpaw_control_before_provider_routing(
     assert not runtime._adapters
     assert output[-1].status == "completed"
     assert output[-1].output[-1].content[0].text == "Control ready"
-
-
-@pytest.mark.asyncio
-async def test_runtime_streams_qwenpaw_control_progress(
-    tmp_path: Path,
-) -> None:
-    runtime = HarnessRuntime(tmp_path, workspace=object())
-    request = AgentRequest(
-        session_id="chat-1",
-        user_id="user-1",
-        input=[
-            Message(
-                role=Role.USER,
-                content=[TextContent(text="/skills")],
-            ),
-        ],
-    )
-
-    async def _control(_query, context):
-        await context.report_progress("读取会话 1/2")
-        await asyncio.sleep(0)
-        await context.report_progress("读取会话 2/2")
-        return "Control complete"
-
-    with patch(
-        "qwenpaw.runtime.commands.control.handle_control_command",
-        side_effect=_control,
-    ):
-        output = [
-            item
-            async for item in runtime.stream(
-                backend="codex",
-                request=request,
-                cwd=tmp_path.resolve(),
-            )
-        ]
-
-    deltas = [
-        item.text
-        for item in output
-        if getattr(item, "object", None) == "content"
-        and getattr(item, "delta", False)
-    ]
-    assert any("读取会话 1/2" in item for item in deltas)
-    assert any("读取会话 2/2" in item for item in deltas)
-    final_text = output[-1].output[-1].content[0].text
-    assert "读取会话 1/2" in final_text
-    assert final_text.endswith("Control complete")

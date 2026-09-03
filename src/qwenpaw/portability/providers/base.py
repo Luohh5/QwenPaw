@@ -7,7 +7,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
-from ..models import ProviderInventory, SourceLocation
+from ..models import ProviderInventory
 
 ProgressReporter = Callable[[str], Awaitable[None]]
 logger = logging.getLogger(__name__)
@@ -44,13 +44,11 @@ def progress_milestone(index: int, total: int) -> bool:
 
 def make_inventory(
     provider_id: str,
-    source_location: SourceLocation,
     **values: Any,
 ) -> ProviderInventory:
     return ProviderInventory(
         provider_id=provider_id,
         provider_name=provider_id.title(),
-        source_location=source_location,
         **values,
     )
 

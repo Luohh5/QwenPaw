@@ -18,10 +18,7 @@ from ..agents.acp.meta import ACP_EPHEMERAL_META_KEY
 from ..agents.tools.agent_management import MAX_SPAWN_BATCH_CONCURRENCY
 from ..modes.mission import MissionMode
 from ..schemas import AgentRequest
-from ..utils.io_utils import (
-    get_sync_path_lock,
-    run_sync_io,
-)
+from ..utils.io_utils import run_sync_io
 from .adaptation_mission import prepare_mission, sync_mission
 from .adaptation_prompts import repair_prompt
 from .adaptation_staging import component_map, stage_local_assets
@@ -143,7 +140,6 @@ class ActiveAdaptationContext:
         store: CompatibilityStore,
         tester: CompatibilityTester,
         staging_root: Path,
-        audit_path: Path,
         manifest: CompatibilityManifest,
         progress: ProgressReporter | None = None,
     ) -> None:
@@ -151,7 +147,6 @@ class ActiveAdaptationContext:
         self.store = store
         self.tester = tester
         self.staging_root = staging_root.resolve()
-        self.audit_path = audit_path
         self.progress = progress
         self._activities: dict[str, str] = {}
         self.tool_calls = 0
@@ -223,32 +218,6 @@ class ActiveAdaptationContext:
 
     def _asset(self, key: str) -> CompatibilityAsset:
         return load_manifest(self.store.path).get_asset(key)
-
-    def _audit(self, action: str, key: str, detail: str = "") -> None:
-        with get_sync_path_lock(self.audit_path):
-            self.audit_path.parent.mkdir(
-                parents=True,
-                mode=0o700,
-                exist_ok=True,
-            )
-            record = {
-                "at": datetime.now().astimezone().isoformat(),
-                "action": action,
-                "asset_key": key,
-                "detail": detail[:200],
-            }
-            descriptor = os.open(
-                self.audit_path,
-                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                0o600,
-            )
-            try:
-                os.write(
-                    descriptor,
-                    (json.dumps(record, ensure_ascii=False) + "\n").encode(),
-                )
-            finally:
-                os.close(descriptor)
 
     def _asset_root(self, asset: CompatibilityAsset) -> Path:
         source = find_source(self.inventory, asset)
@@ -421,7 +390,6 @@ class ActiveAdaptationContext:
                 key,
                 f"写入 {relative_path}",
             )
-            await run_sync_io(self._audit, "write_file", key, relative_path)
             await self._publish(
                 f"已修改 {self._label(asset)}，等待重新兼容性测试。",
             )
@@ -504,7 +472,6 @@ class ActiveAdaptationContext:
                 key,
                 f"更新字段 {field_name}",
             )
-            await run_sync_io(self._audit, "update_asset", key, field_name)
             await self._publish(
                 f"已更新 {self._label(asset)}，等待重新兼容性测试。",
             )
@@ -524,12 +491,6 @@ class ActiveAdaptationContext:
                 f"正在测试 {self._label(asset)} 的 QwenPaw 兼容性…",
             )
             result = await run_sync_io(self.tester.test, asset)
-            await run_sync_io(
-                self._audit,
-                "test",
-                key,
-                "passed" if result.passed else "failed",
-            )
             manifest = await run_sync_io(
                 self.store.finalize,
                 key,
@@ -537,12 +498,6 @@ class ActiveAdaptationContext:
                 summary=result.summary,
                 reason=reason,
                 evidence=result.evidence,
-            )
-            await run_sync_io(
-                self._audit,
-                "finalize",
-                key,
-                AssetZone.MIGRATE.value if result.passed else "repair",
             )
             if not result.passed:
                 await self._publish(
@@ -836,7 +791,6 @@ async def run_adaptation_loop(
         store=store,
         tester=tester,
         staging_root=staging_root,
-        audit_path=root / "progress.jsonl",
         manifest=manifest,
         progress=progress,
     )

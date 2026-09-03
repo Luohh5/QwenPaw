@@ -14,9 +14,7 @@
   "ignored_sessions": [
     "01a02000-0000-7000-8000-000000000002"
   ],
-  "skills": [
-    {"name": "portable-skill", "scope": "local-fallback"}
-  ],
+  "skills": ["portable-skill"],
   "mcp": [
     {
       "id": "codex:plugin-mcp:expo@mini-market:expo-docs",
@@ -42,7 +40,5 @@
       "adapter": "codex_content_bundle_v1"
     }
   ],
-  "scheduled_tasks": [],
-  "discovered_mcp_count": 1,
-  "discovered_scheduled_task_count": 0
+  "scheduled_tasks": []
 }

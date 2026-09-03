@@ -223,7 +223,6 @@ export default function ImportPage() {
   }, [selectionKey]);
 
   const current = !job ? 0 : job.state === "awaiting_selection" ? 1 : 2;
-  const isRunning = job?.state === "running" || job?.state === "scanning";
   const isDone = Boolean(
     job &&
       ["completed", "completed_with_issues", "failed", "interrupted"].includes(
@@ -756,7 +755,7 @@ export default function ImportPage() {
               )}
               <Button
                 type="primary"
-                disabled={!isDone || isRunning}
+                disabled={!isDone}
                 onClick={() => {
                   reset();
                   navigate("/chat");

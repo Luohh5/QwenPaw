@@ -115,7 +115,6 @@ async def test_codex_provider_reuses_runtime_and_normalizes_inventory(
 
     assert inventory.detected is True
     assert inventory.locator == "/usr/local/bin/codex"
-    assert inventory.discovered_mcp_count == 1
     assert inventory.sessions[0].source_id == "thread-1"
     assert inventory.sessions[0].history[0].text == "Keep working"
     assert inventory.mcp_servers[0].command == "npx"
@@ -200,9 +199,6 @@ async def test_codex_provider_detects_portable_assets_without_cli_or_sessions(
     assert [item.source_id for item in inventory.memory_projects] == [
         "codex:global",
     ]
-    assert inventory.source_location is not None
-    assert inventory.source_location.data_home == str(codex_home.resolve())
-    assert inventory.source_location.data_home_source == "injected"
 
 
 @pytest.mark.asyncio
@@ -246,7 +242,6 @@ async def test_codex_explicit_source_home_is_local_only(
     assert [item.name for item in inventory.skills] == ["local"]
     assert [item.name for item in inventory.plugins] == ["demo"]
     assert [item.name for item in inventory.mcp_servers] == ["local-mcp"]
-    assert inventory.source_location.data_home_source == "explicit"
 
 
 @pytest.mark.asyncio
@@ -267,8 +262,6 @@ async def test_qoder_provider_detects_skill_only_custom_home(
     assert inventory.detected is True
     assert inventory.sessions == []
     assert [item.name for item in inventory.skills] == ["only-skill"]
-    assert inventory.source_location is not None
-    assert inventory.source_location.data_home_source == "injected"
 
 
 def test_provider_registry_is_explicit_and_rejects_unknown_sources(

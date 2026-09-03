@@ -161,7 +161,7 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
         (
             scheduled_tasks,
             scheduled_task_warnings,
-            discovered_scheduled_task_count,
+            _,
             automation_run_thread_ids,
         ) = scheduled_task_state
         warnings.extend(scheduled_task_warnings)
@@ -234,10 +234,8 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             )
             return make_inventory(
                 self.provider_id,
-                self._source_location,
                 detected=False,
                 locator=str(rollout_reader.codex_home),
-                metadata={"memory": memory_state},
                 warnings=[
                     *warnings,
                     detail
@@ -360,7 +358,6 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
         )
         return make_inventory(
             self.provider_id,
-            self._source_location,
             detected=True,
             locator=locator or str(rollout_reader.codex_home),
             sessions=sessions,
@@ -371,10 +368,7 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
             marketplaces=marketplaces,
             plugins=plugins,
             scheduled_tasks=scheduled_tasks,
-            discovered_mcp_count=len(mcp_servers),
-            discovered_scheduled_task_count=(discovered_scheduled_task_count),
             warnings=warnings,
-            metadata={"memory": memory_state},
         )
 
     async def _discover_skills(
@@ -437,7 +431,6 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
                     name=str(item.get("name") or directory.name),
                     directory=directory,
                     description=str(item.get("description") or ""),
-                    scope=str(item.get("scope") or "provider"),
                 ),
             )
         return skills

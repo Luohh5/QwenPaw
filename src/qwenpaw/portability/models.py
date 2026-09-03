@@ -20,11 +20,9 @@ class SourceLocation(BaseModel):
     data_home: str
     data_home_source: str = "default"
     user_data_home: str = ""
-    user_data_home_source: str = ""
     runtime_path: str = ""
     data_home_exists: bool = False
     user_data_home_exists: bool = False
-    evidence: list[str] = Field(default_factory=list)
 
 
 class SourceSkill(BaseModel):
@@ -34,7 +32,6 @@ class SourceSkill(BaseModel):
     name: str
     directory: Path
     description: str = ""
-    scope: str = "provider"
 
 
 class SourceMCPServer(BaseModel):
@@ -79,7 +76,6 @@ class SourceMarketplace(BaseModel):
     source: str = ""
     source_type: str = "unknown"
     ref_name: str = ""
-    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class SourcePlugin(BaseModel):
@@ -89,7 +85,6 @@ class SourcePlugin(BaseModel):
     name: str
     marketplace: str
     version: str = ""
-    enabled: bool = True
     install_source: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -128,7 +123,6 @@ class ProviderInventory(BaseModel):
     provider_name: str
     detected: bool
     locator: str = ""
-    source_location: SourceLocation | None = None
     sessions: list[SourceSession] = Field(default_factory=list)
     ignored_session_ids: list[str] = Field(default_factory=list)
     skills: list[SourceSkill] = Field(default_factory=list)
@@ -137,10 +131,7 @@ class ProviderInventory(BaseModel):
     marketplaces: list[SourceMarketplace] = Field(default_factory=list)
     plugins: list[SourcePlugin] = Field(default_factory=list)
     scheduled_tasks: list[SourceScheduledTask] = Field(default_factory=list)
-    discovered_mcp_count: int = 0
-    discovered_scheduled_task_count: int = 0
     warnings: list[str] = Field(default_factory=list)
-    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ImportAssetState(StrEnum):
@@ -180,7 +171,6 @@ class ImportAssetResult(BaseModel):
     name: str
     state: ImportAssetState = ImportAssetState.PENDING
     enabled: bool | None = None
-    reason_code: str = ""
     message: str = ""
     requires_sessions: bool = False
 
@@ -201,12 +191,10 @@ class MigrationPlan(BaseModel):
     schema_version: str = "1"
     source: str
     source_home: str = ""
-    source_location: SourceLocation | None = None
     agent_id: str
     created_at: datetime
     asset_fingerprints: dict[str, str] = Field(default_factory=dict)
     actions: list[MigrationAssetPlan] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
     state: str = "ready"
     migration_id: str = ""
 

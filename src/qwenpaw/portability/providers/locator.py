@@ -73,17 +73,11 @@ def resolve_source_location(
             variable="CODEX_HOME",
             fallback=home / ".codex",
         )
-        evidence = [
-            f"Codex data root ({data_source}): {data_home}",
-            f"sessions: {data_home / 'sessions'}",
-            f"memories: {data_home / 'memories'}",
-        ]
         return SourceLocation(
             provider_id=provider_id,
             data_home=str(data_home),
             data_home_source=data_source,
             data_home_exists=data_home.is_dir(),
-            evidence=evidence,
         )
 
     data_home, data_source = _configured_root(
@@ -102,26 +96,13 @@ def resolve_source_location(
             f"Qoder User data directory must be absolute: {user_data}",
         )
     user_data = user_data.resolve(strict=False)
-    user_data_source = (
-        "environment:QODER_USER_DATA_HOME"
-        if environment.get("QODER_USER_DATA_HOME")
-        else "platform_default"
-    )
-    evidence = [
-        f"Qoder data root ({data_source}): {data_home}",
-        f"projects: {data_home / 'projects'}",
-        f"IDE index ({user_data_source}): "
-        f"{user_data / 'globalStorage' / 'state.vscdb'}",
-    ]
     return SourceLocation(
         provider_id=provider_id,
         data_home=str(data_home),
         data_home_source=data_source,
         user_data_home=str(user_data),
-        user_data_home_source=user_data_source,
         data_home_exists=data_home.is_dir(),
         user_data_home_exists=user_data.is_dir(),
-        evidence=evidence,
     )
 
 

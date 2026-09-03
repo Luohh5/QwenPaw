@@ -75,13 +75,7 @@ def _inventory_contract(inventory: Any) -> dict[str, Any]:
             key=lambda item: item["id"],
         ),
         "ignored_sessions": sorted(inventory.ignored_session_ids),
-        "skills": sorted(
-            (
-                {"name": item.name, "scope": item.scope}
-                for item in inventory.skills
-            ),
-            key=lambda item: (item["name"], item["scope"]),
-        ),
+        "skills": sorted(item.name for item in inventory.skills),
         "mcp": sorted(
             (
                 {
@@ -146,10 +140,6 @@ def _inventory_contract(inventory: Any) -> dict[str, Any]:
                 for item in inventory.scheduled_tasks
             ),
             key=lambda item: item["id"],
-        ),
-        "discovered_mcp_count": inventory.discovered_mcp_count,
-        "discovered_scheduled_task_count": (
-            inventory.discovered_scheduled_task_count
         ),
     }
 

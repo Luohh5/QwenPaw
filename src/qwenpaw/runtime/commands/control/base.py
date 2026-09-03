@@ -8,7 +8,6 @@ immediate response and special handling outside the normal agent flow.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict
 
@@ -29,7 +28,6 @@ class ControlContext:
         user_id: User ID from request
         agent_id: Agent ID for permission checks
         args: Parsed command arguments (command-specific)
-        progress_reporter: Optional long-running command progress callback
     """
 
     workspace: "Workspace"
@@ -39,13 +37,6 @@ class ControlContext:
     user_id: str
     agent_id: str
     args: Dict[str, Any]
-    progress_reporter: Callable[[str], Awaitable[None]] | None = None
-
-    async def report_progress(self, message: str) -> None:
-        """Emit best-effort progress when the transport supports it."""
-        text = str(message or "").strip()
-        if self.progress_reporter is not None and text:
-            await self.progress_reporter(text)
 
 
 class BaseControlCommandHandler(ABC):
