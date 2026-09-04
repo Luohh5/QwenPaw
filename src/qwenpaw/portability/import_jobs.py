@@ -680,6 +680,7 @@ class PortabilityImportJobManager:
         )
         if not message.startswith("\x1e"):
             self._log(live, message)
+            await self._emit(live)
             return
         live.progress_updates += 1
         if live.progress_updates % live.progress_step == 0:

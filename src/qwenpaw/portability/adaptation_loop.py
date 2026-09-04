@@ -9,7 +9,6 @@ import os
 import secrets
 import stat
 import tempfile
-from contextlib import aclosing
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -608,18 +607,18 @@ async def _run_phase(
     _ACTIVE_CONTEXTS[session_id] = binding
     activity = asyncio.Event()
     task = asyncio.create_task(
-        _consume_query(
-            workspace,
-            request,
-            activity.set,
-            binding.completed,
-        ),
+        _consume_query(workspace, request, activity.set),
     )
+    completed = asyncio.create_task(binding.completed.wait())
     last_activity = asyncio.get_running_loop().time()
     try:
-        while not task.done():
-            await asyncio.wait({task}, timeout=_HEARTBEAT_SECONDS)
-            if not task.done():
+        while not task.done() and not completed.done():
+            done, _ = await asyncio.wait(
+                {task, completed},
+                timeout=_HEARTBEAT_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
                 await _report(
                     context.progress,
                     f"{label}仍在运行：{context.activity(session_id)}",
@@ -632,10 +631,19 @@ async def _run_phase(
                 raise TimeoutError(
                     f"compatibility worker was idle for {_IDLE_SECONDS}s",
                 )
-        await task
+        if task.done():
+            await task
+        else:
+            _ACTIVE_CONTEXTS.pop(session_id, None)
+            await _stop_worker(workspace, task)
     finally:
         _ACTIVE_CONTEXTS.pop(session_id, None)
         context.clear_activity(session_id)
+        completed.cancel()
+        try:
+            await completed
+        except asyncio.CancelledError:
+            pass
         await _stop_worker(workspace, task)
 
 
@@ -643,37 +651,9 @@ async def _consume_query(
     workspace: Any,
     request: AgentRequest,
     mark_activity: Any,
-    completed: asyncio.Event,
 ) -> None:
-    async with aclosing(workspace.stream_query(request)) as stream:
-        iterator = stream.__aiter__()
-        completion = asyncio.create_task(completed.wait())
-        try:
-            while True:
-                event = asyncio.create_task(anext(iterator))
-                done, _ = await asyncio.wait(
-                    {event, completion},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if completion in done:
-                    if not event.done():
-                        event.cancel()
-                    try:
-                        await event
-                    except (asyncio.CancelledError, StopAsyncIteration):
-                        pass
-                    return
-                mark_activity()
-                try:
-                    await event
-                except StopAsyncIteration:
-                    return
-        finally:
-            completion.cancel()
-            try:
-                await completion
-            except asyncio.CancelledError:
-                pass
+    async for _event in workspace.stream_query(request):
+        mark_activity()
 
 
 async def _bounded_parallel(keys: list[str], worker: Any) -> None:

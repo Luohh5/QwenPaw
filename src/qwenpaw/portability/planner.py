@@ -359,49 +359,12 @@ def inventory_fingerprint(
     return hasher.hexdigest()
 
 
-def _session_fingerprint(inventory: ProviderInventory) -> str:
-    """Fingerprint exactly the source data used to materialize chats."""
-    hasher = hashlib.sha256()
-    _hash_record(hasher, "provider", inventory.provider_id)
-    _hash_record(hasher, "locator", inventory.locator)
-    for session in sorted(inventory.sessions, key=lambda item: item.source_id):
-        values = session.model_dump(
-            mode="json",
-            exclude={"history", "metadata"},
-        )
-        _hash_record(
-            hasher,
-            "session",
-            json.dumps(
-                values,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-        )
-        for item in session.history:
-            _hash_record(
-                hasher,
-                "history",
-                json.dumps(
-                    item.model_dump(mode="json"),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            )
-    for source_id in sorted(inventory.ignored_session_ids):
-        _hash_record(hasher, "ignored", source_id)
-    return hasher.hexdigest()
-
-
 def tool_asset_fingerprints(
     inventory: ProviderInventory,
     *,
-    include_sessions: bool = False,
     file_payloads: dict[Path, bytes] | None = None,
 ) -> dict[str, str]:
-    """Fingerprint selected tools and, when requested, conversations."""
+    """Fingerprint selected tools without mutable conversation history."""
     updates = {field: [] for _kind, field in _TOOL_FIELDS} | {
         "sessions": [],
         "ignored_session_ids": [],
@@ -447,8 +410,6 @@ def tool_asset_fingerprints(
                 scoped,
                 file_payloads=file_payloads if kind == "memory" else None,
             )
-    if include_sessions:
-        result["sessions"] = _session_fingerprint(inventory)
     return result
 
 
@@ -498,10 +459,7 @@ def _build_migration_plan(
         source_home=source_home,
         agent_id=agent_id,
         created_at=datetime.now(timezone.utc),
-        asset_fingerprints=tool_asset_fingerprints(
-            inventory,
-            include_sessions=True,
-        ),
+        asset_fingerprints=tool_asset_fingerprints(inventory),
         actions=actions,
     )
 

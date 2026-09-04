@@ -270,10 +270,7 @@ class _PlanningService(ImportPlanningMixin):
             source="codex",
             agent_id="agent-1",
             created_at=datetime.now(timezone.utc),
-            asset_fingerprints=tool_asset_fingerprints(
-                inventory,
-                include_sessions=True,
-            ),
+            asset_fingerprints=tool_asset_fingerprints(inventory),
         )
 
     async def _read_plan(self, _plan_id: str) -> MigrationPlan:
@@ -333,48 +330,6 @@ async def test_apply_selection_rejects_changed_source(
         )
 
     assert service.executed is None
-
-
-@pytest.mark.asyncio
-async def test_apply_selection_rejects_changed_conversations(
-    tmp_path: Path,
-) -> None:
-    source = _inventory(tmp_path)
-    service = _PlanningService(tmp_path, source)
-    source.sessions[0].title = "Updated while the plan was open"
-
-    with pytest.raises(ValueError, match="来源数据在预演后发生了变化"):
-        await service.apply_selection(
-            service.plan.plan_id,
-            ImportSelection(sessions=True, skills=["skill-1"]),
-        )
-
-    assert service.executed is None
-
-
-@pytest.mark.asyncio
-async def test_apply_selection_rejects_added_or_removed_conversations(
-    tmp_path: Path,
-) -> None:
-    source = _inventory(tmp_path)
-    service = _PlanningService(tmp_path, source)
-    source.sessions.append(SourceSession(source_id="thread-2", title="Later"))
-
-    with pytest.raises(ValueError, match="来源数据在预演后发生了变化"):
-        await service.apply_selection(
-            service.plan.plan_id,
-            ImportSelection(sessions=True),
-        )
-
-    source = _inventory(tmp_path)
-    service = _PlanningService(tmp_path, source)
-    source.sessions.clear()
-
-    with pytest.raises(ValueError, match="来源数据在预演后发生了变化"):
-        await service.apply_selection(
-            service.plan.plan_id,
-            ImportSelection(sessions=True),
-        )
 
 
 @pytest.mark.asyncio

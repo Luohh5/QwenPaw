@@ -253,7 +253,6 @@ class ImportPlanningMixin:
             current = await io_utils.run_sync_io(
                 tool_asset_fingerprints,
                 inventory,
-                include_sessions=selection is None or selection.sessions,
                 file_payloads=file_payloads,
             )
             expected = _expected_fingerprints(
