@@ -139,8 +139,8 @@ class ScheduleSpec(BaseModel):
 
 
 class DispatchTarget(BaseModel):
-    user_id: str = Field(max_length=256)
-    session_id: str = Field(max_length=256)
+    user_id: str
+    session_id: str
 
 
 class DispatchSpec(BaseModel):

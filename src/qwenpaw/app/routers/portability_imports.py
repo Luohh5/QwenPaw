@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from ...config.config import load_agent_config_async
 from ...portability.import_jobs import PortabilityImportJobManager
 from ...portability.models import ImportSelection
 from ...portability.providers import provider_names, resolve_source_location
@@ -69,6 +70,16 @@ def _api_error(exc: Exception) -> HTTPException:
     )
 
 
+async def _require_qwenpaw_backend(workspace) -> None:
+    if (
+        await load_agent_config_async(workspace.agent_id)
+    ).backend != "qwenpaw":
+        raise RuntimeError(
+            "PawPort requires the destination Agent to use the qwenpaw "
+            "backend",
+        )
+
+
 @portability_import_router.get("/sources")
 async def list_import_sources(request: Request) -> list[dict]:
     """Report supported applications without exposing local source paths."""
@@ -99,6 +110,7 @@ async def create_import_job(
     _local_only(request)
     workspace = await get_agent_for_request(request)
     try:
+        await _require_qwenpaw_backend(workspace)
         return await PORTABILITY_IMPORT_JOBS.create(workspace, body.sources)
     except (ValueError, RuntimeError) as exc:
         raise _api_error(exc) from exc
@@ -133,6 +145,7 @@ async def start_import_job(
     _local_only(request)
     workspace = await get_agent_for_request(request)
     try:
+        await _require_qwenpaw_backend(workspace)
         if (
             _plugins_selected(body.selections)
             and not body.allow_plugin_execution
@@ -157,6 +170,7 @@ async def retry_import_job(
     _local_only(request)
     workspace = await get_agent_for_request(request)
     try:
+        await _require_qwenpaw_backend(workspace)
         if (
             _plugins_selected(body.selections)
             and not body.allow_plugin_execution

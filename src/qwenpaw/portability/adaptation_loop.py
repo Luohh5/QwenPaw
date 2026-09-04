@@ -49,6 +49,7 @@ from .providers.base import (
 _MAX_REACT_ITERATIONS = 4_000
 _HEARTBEAT_SECONDS = 12
 _IDLE_SECONDS = 300
+_MAX_WORKER_SECONDS = 30 * 60
 _WORKER_STOP_GRACE_SECONDS = 3
 _MAX_FILE_BYTES = 256 * 1024
 _EXCERPT_BYTES = 16 * 1024
@@ -608,7 +609,8 @@ async def _run_phase(
         _consume_query(workspace, request, activity.set),
     )
     completed = asyncio.create_task(binding.completed.wait())
-    last_activity = asyncio.get_running_loop().time()
+    loop = asyncio.get_running_loop()
+    started_at = last_activity = loop.time()
     try:
         while not task.done() and not completed.done():
             done, _ = await asyncio.wait(
@@ -621,11 +623,18 @@ async def _run_phase(
                     context.progress,
                     f"{label}仍在运行：{context.activity(session_id)}",
                 )
+            if task.done() or completed.done():
+                break
             if activity.is_set():
                 activity.clear()
-                last_activity = asyncio.get_running_loop().time()
-            idle_seconds = asyncio.get_running_loop().time() - last_activity
-            if not task.done() and idle_seconds >= _IDLE_SECONDS:
+                last_activity = loop.time()
+            elapsed_seconds = loop.time() - started_at
+            if elapsed_seconds >= _MAX_WORKER_SECONDS:
+                raise TimeoutError(
+                    "compatibility worker exceeded " f"{_MAX_WORKER_SECONDS}s",
+                )
+            idle_seconds = loop.time() - last_activity
+            if idle_seconds >= _IDLE_SECONDS:
                 raise TimeoutError(
                     f"compatibility worker was idle for {_IDLE_SECONDS}s",
                 )
@@ -650,8 +659,9 @@ async def _consume_query(
     request: AgentRequest,
     mark_activity: Any,
 ) -> None:
-    async for _event in workspace.stream_query(request):
-        mark_activity()
+    async for event in workspace.stream_query(request):
+        if getattr(event, "type", None) != "heartbeat":
+            mark_activity()
 
 
 async def _bounded_parallel(keys: list[str], worker: Any) -> None:
@@ -814,7 +824,8 @@ async def run_adaptation_loop(
     )
     await _report(
         progress,
-        f"各资产工具调用预算合计 {context.total_tool_budget} 次；" "不设总时长限制，推理上限按剩余预算动态分配。",
+        f"各资产工具调用预算合计 {context.total_tool_budget} 次；"
+        "单个修复 Agent 最长运行 30 分钟，推理上限按剩余预算动态分配。",
     )
     try:
         stopped_reason = await _repair_with_mission(

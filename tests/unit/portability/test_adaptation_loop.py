@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # pylint: disable=protected-access
 import asyncio
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sys
@@ -13,12 +14,15 @@ from qwenpaw.app.agent_context import scoped_session_id
 from qwenpaw.modes.mission import MissionMode
 from qwenpaw.portability.adaptation_loop import (
     _DRAINING_WORKERS,
+    _run_phase,
     _stop_worker,
     drain_adaptation_workers,
     get_active_adaptation_context,
     run_adaptation_loop,
 )
 from qwenpaw.portability.compatibility import (
+    CompatibilityAsset,
+    AssetType,
     AssetZone,
 )
 from qwenpaw.portability.compatibility_testing import (
@@ -105,6 +109,88 @@ async def test_stopping_an_uncooperative_worker_is_bounded(
     task.cancel()
     await task
     assert workspace.agent_id not in _DRAINING_WORKERS
+
+
+def _phase_context() -> SimpleNamespace:
+    return SimpleNamespace(
+        progress=None,
+        activity=lambda _session_id: "",
+        clear_activity=lambda _session_id: None,
+    )
+
+
+def _phase_asset() -> CompatibilityAsset:
+    return CompatibilityAsset(
+        asset_key="skills:demo",
+        asset_type=AssetType.SKILL,
+        source_id="demo",
+        name="demo",
+        updated_at=datetime.now(timezone.utc),
+    )
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_does_not_reset_mission_idle_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def stream_query(_request):
+        while True:
+            yield SimpleNamespace(type="heartbeat")
+            await asyncio.sleep(0.001)
+
+    workspace = SimpleNamespace(agent_id="agent", stream_query=stream_query)
+    monkeypatch.setattr(
+        "qwenpaw.portability.adaptation_loop._HEARTBEAT_SECONDS",
+        0.005,
+    )
+    monkeypatch.setattr(
+        "qwenpaw.portability.adaptation_loop._IDLE_SECONDS",
+        0.03,
+    )
+    with pytest.raises(TimeoutError, match="was idle"):
+        await _run_phase(
+            workspace,
+            _phase_context(),
+            session_id="test-heartbeat",
+            asset=_phase_asset(),
+            prompt="test",
+            tools=(),
+            label="test",
+        )
+
+
+@pytest.mark.asyncio
+async def test_mission_worker_has_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def stream_query(_request):
+        while True:
+            yield SimpleNamespace(type="message")
+            await asyncio.sleep(0.001)
+
+    workspace = SimpleNamespace(agent_id="agent", stream_query=stream_query)
+    monkeypatch.setattr(
+        "qwenpaw.portability.adaptation_loop._HEARTBEAT_SECONDS",
+        0.005,
+    )
+    monkeypatch.setattr(
+        "qwenpaw.portability.adaptation_loop._IDLE_SECONDS",
+        1,
+    )
+    monkeypatch.setattr(
+        "qwenpaw.portability.adaptation_loop._MAX_WORKER_SECONDS",
+        0.03,
+    )
+    with pytest.raises(TimeoutError, match="exceeded"):
+        await _run_phase(
+            workspace,
+            _phase_context(),
+            session_id="test-deadline",
+            asset=_phase_asset(),
+            prompt="test",
+            tools=(),
+            label="test",
+        )
 
 
 def _write_native_plugin(root: Path, backend: str) -> None:

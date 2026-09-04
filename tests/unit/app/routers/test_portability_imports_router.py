@@ -71,7 +71,11 @@ def _api(monkeypatch):
     async def get_workspace(_request):
         return workspace
 
+    async def load_config(_agent_id):
+        return SimpleNamespace(backend="qwenpaw")
+
     monkeypatch.setattr(routes, "get_agent_for_request", get_workspace)
+    monkeypatch.setattr(routes, "load_agent_config_async", load_config)
     monkeypatch.setattr(routes, "PORTABILITY_IMPORT_JOBS", jobs)
     return workspace, jobs
 
@@ -162,6 +166,37 @@ async def test_plugin_import_requires_explicit_confirmation(api):
         _request(),
     )
     assert jobs.calls[-1][-1] == selection
+
+
+@pytest.mark.asyncio
+async def test_third_party_agent_cannot_start_pawport(api, monkeypatch):
+    _workspace, jobs = api
+
+    async def load_config(_agent_id):
+        return SimpleNamespace(backend="codex")
+
+    monkeypatch.setattr(routes, "load_agent_config_async", load_config)
+    selection = {"codex": ImportSelection(skills=["skill-1"])}
+    with pytest.raises(HTTPException, match="destination Agent") as error:
+        await routes.create_import_job(
+            routes.CreateImportJobRequest(sources=["codex"]),
+            _request(),
+        )
+    assert error.value.status_code == 409
+
+    for operation in (routes.start_import_job, routes.retry_import_job):
+        with pytest.raises(HTTPException, match="destination Agent") as error:
+            await operation(
+                "import-" + "a" * 32,
+                routes.StartImportJobRequest(selections=selection),
+                _request(),
+            )
+        assert error.value.status_code == 409
+    assert jobs.calls == []
+
+    assert await routes.get_current_import_job(_request()) is None
+    await routes.cancel_import_job("import-" + "a" * 32, _request())
+    assert [call[0] for call in jobs.calls] == ["current", "cancel"]
 
 
 @pytest.mark.asyncio
