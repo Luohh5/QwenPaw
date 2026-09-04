@@ -164,6 +164,7 @@ class QoderMigrationProvider:  # pylint: disable=too-few-public-methods
         ) -> tuple[SourceSession | None, list[str], bool]:
             nonlocal completed
             try:
+                assert qoder_index is not None
                 result = await run_sync_io(
                     read_qoder_transcript,
                     record,

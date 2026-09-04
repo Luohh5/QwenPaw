@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
 from ..utils import io_utils
 from ..utils.io_utils import get_path_lock, read_json_async
 from .import_support import (
@@ -14,13 +15,9 @@ from .import_support import (
     _PLAN_ID_PATTERN,
     _prepare_memory_payloads,
 )
-from .models import (
-    ImportReceipt,
-    ImportSelection,
-    MigrationPlan,
-    ProviderInventory,
-)
+from .models import ImportSelection, MigrationPlan, ProviderInventory
 from .planner import build_migration_plan, tool_asset_fingerprints
+from .providers import create_migration_provider
 from .providers.base import ProgressReporter, report_progress as _report
 from .selection import select_inventory
 from .transaction_journal import ImportTransactionJournal
@@ -32,10 +29,6 @@ _MAX_SESSIONS = 500
 
 def _imports_root(workspace: Any) -> Path:
     return Path(workspace.workspace_dir) / ".qwenpaw" / "imports"
-
-
-def _source_home(value: str) -> Path | None:
-    return Path(value) if value else None
 
 
 def _expected_fingerprints(
@@ -55,9 +48,8 @@ class ImportPlanningMixin:
         *,
         started_at: datetime,
         progress: ProgressReporter | None,
-        retry_of_migration_id: str = "",
         memory_payloads: MemoryPayloads | None = None,
-    ) -> ImportReceipt:
+    ) -> list[str]:
         """Mark plan lifecycle around independent asset writes."""
         transaction = ImportTransactionJournal(
             Path(self._workspace.workspace_dir),
@@ -67,12 +59,10 @@ class ImportPlanningMixin:
             await transaction.begin()
             plan.state = "applying"
             await self._write_plan(plan)
-            receipt = await self._apply(
+            imported_sessions = await self._apply(
                 inventory,
                 started_at=started_at,
-                plan_id=plan.plan_id,
                 progress=progress,
-                retry_of_migration_id=retry_of_migration_id,
                 memory_payloads=memory_payloads or {},
             )
         except BaseException:
@@ -84,42 +74,29 @@ class ImportPlanningMixin:
                 logger.exception("Failed to restore migration plan state")
             raise
         plan.state = "applied"
-        plan.migration_id = receipt.migration_id
         try:
             await self._write_plan(plan)
-        except Exception as exc:  # pylint: disable=broad-except
+        except Exception:  # pylint: disable=broad-except
             logger.exception("Failed to finalize migration plan state")
-            receipt.warnings.append(
-                "迁移已成功，但计划状态回写失败：" f"{type(exc).__name__}: {exc}",
-            )
         else:
             try:
                 await transaction.discard()
             except Exception:  # pylint: disable=broad-except
                 logger.exception("Failed to clean completed import journal")
-        return receipt
+        return imported_sessions
 
     async def plan_from(
         self,
         source: str,
         *,
-        source_home: Path | None = None,
         progress: ProgressReporter | None = None,
     ) -> MigrationPlan:
         """Create and persist a dry-run migration plan without importing."""
         lock_path = _imports_root(self._workspace)
         await _report(progress, "正在生成迁移预演，不会修改现有数据…")
         async with get_path_lock(lock_path):
-            inventory = await self._inventory(
-                source,
-                source_home=source_home,
-                progress=progress,
-            )
-            plan = await build_migration_plan(
-                self._workspace,
-                inventory,
-                source_home=str(source_home or ""),
-            )
+            inventory = await self._inventory(source, progress=progress)
+            plan = await build_migration_plan(self._workspace, inventory)
             await self._write_plan(plan)
         await _report(progress, "迁移预演已生成；尚未导入任何内容。")
         return plan
@@ -130,7 +107,7 @@ class ImportPlanningMixin:
         selection: ImportSelection,
         *,
         progress: ProgressReporter | None = None,
-    ) -> ImportReceipt:
+    ) -> list[str]:
         """Revalidate a plan, then apply a dependency-complete subset."""
         return await self._apply_stored_plan(
             plan_id,
@@ -144,7 +121,7 @@ class ImportPlanningMixin:
         selection: ImportSelection,
         *,
         progress: ProgressReporter | None = None,
-    ) -> tuple[MigrationPlan, ImportReceipt]:
+    ) -> tuple[MigrationPlan, list[str]]:
         """Retry failed tools without replacing any existing QwenPaw asset."""
         if selection.sessions or not any(
             getattr(selection, field)
@@ -164,19 +141,13 @@ class ImportPlanningMixin:
                 )
             if parent.state != "applied":
                 raise ValueError("只能重试已完成迁移中的失败工具。")
-            source_home = _source_home(parent.source_home)
             await _report(progress, "正在重新读取来源并准备失败工具重试…")
             inventory = await self._inventory(
                 parent.source,
-                source_home=source_home,
                 progress=progress,
                 include_sessions=False,
             )
-            plan = await build_migration_plan(
-                self._workspace,
-                inventory,
-                source_home=str(source_home or ""),
-            )
+            plan = await build_migration_plan(self._workspace, inventory)
             await self._write_plan(plan)
             inventory = select_inventory(inventory, selection)
             memory_payloads, file_payloads = await io_utils.run_sync_io(
@@ -194,15 +165,14 @@ class ImportPlanningMixin:
                 raise ValueError(
                     "来源数据在预演后发生了变化。请重新扫描后重试。",
                 )
-            receipt = await self._execute_plan(
+            imported_sessions = await self._execute_plan(
                 plan,
                 inventory,
                 started_at=datetime.now(timezone.utc),
                 progress=progress,
-                retry_of_migration_id=parent.migration_id,
                 memory_payloads=memory_payloads,
             )
-        return plan, receipt
+        return plan, imported_sessions
 
     async def _apply_stored_plan(
         self,
@@ -210,7 +180,7 @@ class ImportPlanningMixin:
         *,
         progress: ProgressReporter | None,
         selection: ImportSelection | None = None,
-    ) -> ImportReceipt:
+    ) -> list[str]:
         if not _PLAN_ID_PATTERN.fullmatch(plan_id):
             raise ValueError("迁移计划编号格式无效。")
         lock_path = _imports_root(self._workspace)
@@ -225,7 +195,6 @@ class ImportPlanningMixin:
                 raise ValueError(
                     f"该迁移计划当前状态为 {plan.state!r}，不能重复执行。",
                 )
-            source_home = _source_home(plan.source_home)
             include_sessions = selection is None or selection.sessions
             session_ids = (
                 {
@@ -238,7 +207,6 @@ class ImportPlanningMixin:
             )
             inventory = await self._inventory(
                 plan.source,
-                source_home=source_home,
                 progress=progress,
                 include_sessions=include_sessions,
                 session_ids=session_ids,
@@ -275,22 +243,13 @@ class ImportPlanningMixin:
         self,
         source: str,
         *,
-        source_home: Path | None,
         progress: ProgressReporter | None,
         require_detected: bool = True,
         include_sessions: bool = True,
         session_ids: set[str] | None = None,
     ) -> ProviderInventory:
         await _report(progress, f"正在检测 {source} 并读取可迁移内容…")
-        # Keep compatibility with tests and integrations that patch the old
-        # two-argument factory while still supporting explicit source roots.
-        if source_home is None:
-            provider = self._create_provider(source)
-        else:
-            provider = self._create_provider(
-                source,
-                source_home=source_home,
-            )
+        provider = create_migration_provider(source, self._workspace)
         inventory = await provider.inventory(
             limit=_MAX_SESSIONS,
             progress=progress,

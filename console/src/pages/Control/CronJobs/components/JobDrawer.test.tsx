@@ -169,32 +169,6 @@ const TARGET_ITEMS: CronDispatchTargetItem[] = [
   { channel: "telegram", user_id: "u3", session_id: "s3" },
 ] as unknown as CronDispatchTargetItem[];
 
-function pendingImportedJob(remote: boolean): CronJobSpecOutput {
-  return {
-    id: remote ? "remote-imported" : "local-imported",
-    name: "Imported task",
-    enabled: false,
-    schedule: { type: "cron", cron: "0 9 * * *", timezone: "UTC" },
-    task_type: "agent",
-    request: {
-      input: [{ role: "user", content: "run report" }],
-      request_context: {},
-    },
-    dispatch: {
-      type: "channel",
-      channel: "console",
-      target: { user_id: "system", session_id: "isolated" },
-    },
-    meta: {
-      portability: {
-        requires_review: true,
-        safety: "disabled_until_explicit_promotion",
-        source_cwd_remote_or_unverified: remote,
-      },
-    },
-  };
-}
-
 interface DrawerOverrides {
   editingJob?: CronJobSpecOutput | null;
   targetItems?: CronDispatchTargetItem[];
@@ -543,25 +517,6 @@ describe("JobDrawer task type effects", () => {
         false,
       ),
     );
-  });
-});
-
-describe("JobDrawer imported project mapping", () => {
-  it("requires a local project mapping for remote imported jobs", () => {
-    renderDrawer({ editingJob: pendingImportedJob(true) });
-
-    const label = screen.getByText("cronJobs.importReviewProjectDirLabel");
-    expect(label.closest("label")).toHaveClass("ant-form-item-required");
-    expect(
-      screen.getByText("cronJobs.importReviewProjectDirExtra"),
-    ).toBeInTheDocument();
-  });
-
-  it("keeps the project mapping optional for local imported jobs", () => {
-    renderDrawer({ editingJob: pendingImportedJob(false) });
-
-    const label = screen.getByText("cronJobs.importReviewProjectDirLabel");
-    expect(label.closest("label")).not.toHaveClass("ant-form-item-required");
   });
 });
 

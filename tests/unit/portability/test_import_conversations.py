@@ -64,7 +64,6 @@ async def _import(
         inventory,
         sessions,
         existing_by_source or {},
-        [],
         datetime.now(timezone.utc),
         None,
         state,

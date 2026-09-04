@@ -25,11 +25,10 @@ from .providers.base import (
 
 @dataclass
 class ConversationState:
-    """Per-session receipt counters."""
+    """Per-session progress counters."""
 
     imported: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
-    archived_internal: list[str] = field(default_factory=list)
 
 
 # pylint: disable-next=too-many-branches,too-many-statements
@@ -38,7 +37,6 @@ async def import_conversations(
     inventory: ProviderInventory,
     sessions: list[SourceSession],
     existing_by_source: dict[tuple[str, str], Any],
-    warnings: list[str],
     started_at: datetime,
     progress: ProgressReporter | None,
     state: ConversationState,
@@ -51,15 +49,7 @@ async def import_conversations(
         chat = existing_by_source.get((inventory.provider_id, source_id))
         if chat is None or chat.archived:
             continue
-        archived = await workspace.chat_manager.archive_chat(chat.id)
-        if archived is not None:
-            state.archived_internal.append(source_id)
-    if state.archived_internal:
-        warnings.append(
-            f"Archived {len(state.archived_internal)} previously imported "
-            f"{inventory.provider_name} non-root/internal execution traces. "
-            "They remain recoverable from the archived chat list.",
-        )
+        await workspace.chat_manager.archive_chat(chat.id)
 
     total = len(sessions)
 
@@ -81,7 +71,7 @@ async def import_conversations(
             )
         source_key = (inventory.provider_id, session.source_id)
         existing = existing_by_source.get(source_key)
-        project_dir = _project_directory(session, warnings)
+        project_dir = _project_directory(session)
         if existing is not None:
             if project_dir:
                 runtime = existing.meta.get("runtime_context") or {}
@@ -96,10 +86,6 @@ async def import_conversations(
             continue
         if not session.history:
             state.skipped.append(session.source_id)
-            warnings.append(
-                f"Session {session.source_id} contained no readable "
-                "conversation history.",
-            )
             await report_session(index)
             continue
 
@@ -113,12 +99,8 @@ async def import_conversations(
                 backend=inventory.provider_id,
                 history=session.history,
             )
-        except Exception as exc:  # pylint: disable=broad-except
+        except Exception:  # pylint: disable=broad-except
             state.skipped.append(session.source_id)
-            warnings.append(
-                f"Session {session.source_id} could not be materialized: "
-                f"{exc}",
-            )
             await report_session(index)
             continue
         portability = {
@@ -149,7 +131,7 @@ async def import_conversations(
         )
         try:
             await workspace.chat_manager.create_chat(spec)
-        except Exception as exc:  # pylint: disable=broad-except
+        except Exception:  # pylint: disable=broad-except
             try:
                 await bridge.clear(
                     session_id=session_id,
@@ -159,9 +141,6 @@ async def import_conversations(
             except Exception:  # pylint: disable=broad-except
                 pass
             state.skipped.append(session.source_id)
-            warnings.append(
-                f"Session {session.source_id} could not be registered: {exc}",
-            )
             await report_session(index)
             continue
         existing_by_source[source_key] = spec

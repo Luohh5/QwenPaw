@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Tests for ADBPG memory manager behavior."""
+
 # pylint: disable=protected-access
 
 import threading
@@ -38,28 +39,6 @@ def _memory_config(
             max_results=max_results,
         ),
     )
-
-
-def test_local_memory_search_includes_nested_imports(tmp_path):
-    imported_dir = tmp_path / "memory/imports/codex/project-a"
-    imported_dir.mkdir(parents=True)
-    (imported_dir / "topic.md").write_text(
-        "Durable imported preference: use compact reports.",
-        encoding="utf-8",
-    )
-
-    manager = ADBPGMemoryManager(str(tmp_path), "agent-1")
-
-    results = manager._search_local_memory_files(
-        "durable imported preference",
-    )
-
-    assert results == [
-        (
-            "memory/imports/codex/project-a/topic.md",
-            "Durable imported preference: use compact reports.",
-        ),
-    ]
 
 
 @pytest.mark.parametrize(

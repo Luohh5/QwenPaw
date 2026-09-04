@@ -49,7 +49,6 @@ def _chat_id(provider_id: str, source_id: str) -> str:
 
 def _project_directory(
     session: SourceSession,
-    warnings: list[str],
 ) -> str | None:
     """Return a safe existing source cwd for the QwenPaw session override."""
     raw = str(session.cwd or "").strip()
@@ -57,10 +56,6 @@ def _project_directory(
         return None
     path = Path(raw).expanduser()
     if not path.is_absolute() or not path.is_dir():
-        warnings.append(
-            f"Session {session.source_id} source project directory is no "
-            f"longer available; retained it as provenance only: {raw}",
-        )
         return None
     return str(path.resolve())
 

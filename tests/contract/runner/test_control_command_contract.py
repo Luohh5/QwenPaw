@@ -10,7 +10,7 @@ Specifically:
 
 - every subclass has a non-empty ``command_name`` starting with ``/``;
 - every subclass implements an *async* ``handle`` returning ``str``;
-- the global registry includes every expected default handler;
+- the global registry includes all six default handlers;
 - the registry rejects empty ``command_name`` registrations.
 """
 
@@ -60,14 +60,13 @@ def _concrete_handlers() -> list[type[BaseControlCommandHandler]]:
     return [cls for cls in subs if not inspect.isabstract(cls)]
 
 
-def test_all_expected_concrete_handlers_are_discoverable():
+def test_at_least_six_concrete_handlers_are_discoverable():
     # Sanity guard: if a refactor accidentally drops a default handler,
     # this assertion catches it before the runtime dispatch does.
     handlers = _concrete_handlers()
 
-    assert len(handlers) >= len(_EXPECTED_DEFAULTS), (
-        f"Expected at least {len(_EXPECTED_DEFAULTS)} default control "
-        "command handlers; "
+    assert len(handlers) >= 6, (
+        "Expected at least 6 default control command handlers; "
         f"found {len(handlers)}: "
         f"{sorted(c.__name__ for c in handlers)}"
     )
@@ -133,7 +132,7 @@ def test_handler_handle_is_async_and_takes_context(handler_cls):
 # ---------------------------------------------------------------------------
 
 
-def test_registry_contains_all_expected_default_commands():
+def test_registry_contains_all_six_default_commands():
     registered = set(control_commands._COMMAND_REGISTRY.keys())
 
     missing = _EXPECTED_DEFAULTS - registered

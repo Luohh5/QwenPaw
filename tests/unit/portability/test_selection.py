@@ -9,8 +9,6 @@ import pytest
 
 from qwenpaw.portability.import_planning import ImportPlanningMixin
 from qwenpaw.portability.models import (
-    ImportAssetResult,
-    ImportAssetState,
     ImportSelection,
     MigrationPlan,
     ProviderInventory,
@@ -172,7 +170,6 @@ async def test_retry_rejects_a_bound_mcp_without_plugin(
     inventory.mcp_servers[1].metadata["source_plugin_relative_cwd"] = "."
     service = _PlanningService(tmp_path, inventory)
     service.plan.state = "applied"
-    service.plan.migration_id = "migration-1"
 
     with pytest.raises(ValueError, match="plugin-mcp.*plugin-1"):
         await service.retry_selection(
@@ -181,28 +178,6 @@ async def test_retry_rejects_a_bound_mcp_without_plugin(
         )
 
     assert service.executed is None
-
-
-def test_select_individual_asset_groups(tmp_path: Path) -> None:
-    selected = select_inventory(
-        _inventory(tmp_path),
-        ImportSelection(
-            memory=["memory-1"],
-            skills=["skill-1"],
-            mcp=["mcp-1"],
-            cron=["cron-1"],
-        ),
-    )
-
-    assert len(selected.sessions) == 1
-    assert [item.source_id for item in selected.memory_projects] == [
-        "memory-1",
-    ]
-    assert [item.source_id for item in selected.skills] == ["skill-1"]
-    assert [item.source_id for item in selected.mcp_servers] == ["mcp-1"]
-    assert [item.source_id for item in selected.scheduled_tasks] == ["cron-1"]
-    assert selected.plugins == []
-    assert selected.marketplaces == []
 
 
 def test_selection_rejects_unknown_or_duplicate_ids(tmp_path: Path) -> None:
@@ -215,45 +190,6 @@ def test_selection_rejects_unknown_or_duplicate_ids(tmp_path: Path) -> None:
             inventory,
             ImportSelection(plugins=["plugin-1", "plugin-1"]),
         )
-
-
-def test_heartbeat_can_use_a_previously_imported_conversation(
-    tmp_path: Path,
-) -> None:
-    selected = select_inventory(
-        _inventory(tmp_path),
-        ImportSelection(sessions=False, cron=["heartbeat-1"]),
-    )
-
-    assert [item.source_id for item in selected.scheduled_tasks] == [
-        "heartbeat-1",
-    ]
-
-
-@pytest.mark.parametrize(
-    "state",
-    list(ImportAssetState),
-)
-def test_asset_result_accepts_all_public_states(
-    state: ImportAssetState,
-) -> None:
-    result = ImportAssetResult(
-        asset_type="plugin",
-        source_id="plugin-1",
-        name="Plugin",
-        state=state,
-        enabled=False,
-    )
-
-    assert result.state is state
-    assert {item.value for item in ImportAssetState} == {
-        "pending",
-        "repairing",
-        "ready",
-        "failed",
-        "succeeded",
-        "existing",
-    }
 
 
 class _PlanningService(ImportPlanningMixin):
@@ -285,7 +221,7 @@ class _PlanningService(ImportPlanningMixin):
 
     async def _execute_plan(self, _plan, inventory, **_kwargs):
         self.executed = inventory
-        return SimpleNamespace(migration_id="migration-1")
+        return []
 
 
 @pytest.mark.asyncio
@@ -303,7 +239,6 @@ async def test_apply_selection_filters_before_execution(
     assert [item.source_id for item in service.executed.skills] == ["skill-1"]
     assert service.executed.plugins == []
     assert service.inventory_options == {
-        "source_home": None,
         "progress": None,
         "include_sessions": False,
         "session_ids": None,
@@ -330,28 +265,3 @@ async def test_apply_selection_rejects_changed_source(
         )
 
     assert service.executed is None
-
-
-@pytest.mark.asyncio
-async def test_apply_selection_ignores_unselected_tool_changes(
-    tmp_path: Path,
-) -> None:
-    source = _inventory(tmp_path)
-    memory = tmp_path / "memory.md"
-    skill = source.skills[0].directory / "SKILL.md"
-    memory.write_text("memory", encoding="utf-8")
-    skill.parent.mkdir()
-    skill.write_text("before", encoding="utf-8")
-    source.memory_projects[0].files = [
-        SourceMemoryFile(source_path=memory, relative_path=Path("memory.md")),
-    ]
-    service = _PlanningService(tmp_path, source)
-    skill.write_text("after", encoding="utf-8")
-    source.sessions[0].title = "Changed but not selected"
-
-    await service.apply_selection(
-        service.plan.plan_id,
-        ImportSelection(sessions=False, memory=["memory-1"]),
-    )
-
-    assert service.executed is not None

@@ -18,7 +18,6 @@ from qwenpaw.portability.import_jobs import (
 from qwenpaw.portability.models import (
     ImportAssetResult,
     ImportAssetState,
-    ImportReceipt,
     ImportSelection,
     MigrationAssetPlan,
     MigrationPlan,
@@ -46,7 +45,6 @@ class _FakeServices:
         self.block_apply.set()
         self.apply_started = asyncio.Event()
         self.fail_apply: set[str] = set()
-        self.fail_rollback = False
         self.retries: list[tuple[str, ImportSelection]] = []
 
     def factory(self, workspace):
@@ -97,12 +95,7 @@ class _FakeServices:
                 source = "codex" if _plan_id.endswith("c" * 32) else "qoder"
                 assert isinstance(selection, ImportSelection)
                 owner.apply_started.set()
-                try:
-                    await owner.block_apply.wait()
-                except asyncio.CancelledError as exc:
-                    if owner.fail_rollback:
-                        raise RuntimeError("cleanup unavailable") from exc
-                    raise
+                await owner.block_apply.wait()
                 if source in owner.fail_apply:
                     raise RuntimeError(f"{source} failed")
                 if progress:
@@ -112,17 +105,7 @@ class _FakeServices:
                         f"\x1easset\tskill\tsucceeded\t0\t{source}-skill",
                     )
                     await progress("api_key=sk-test-secret-1234567890")
-                now = datetime.now(timezone.utc)
-                return ImportReceipt(
-                    migration_id=f"migration-{source}",
-                    plan_id=_plan_id,
-                    source=source,
-                    agent_id=workspace.agent_id,
-                    started_at=now,
-                    completed_at=now,
-                    imported_sessions=[f"{source}-thread"],
-                    imported_skills=[f"{source.title()} Skill"],
-                )
+                return [f"{source}-thread"]
 
             async def retry_selection(
                 self,
@@ -138,67 +121,12 @@ class _FakeServices:
                     await progress(
                         f"\x1easset\tskill\tsucceeded\t0\t{source}-skill",
                     )
-                now = datetime.now(timezone.utc)
                 return (
                     await self.plan_from(source),
-                    ImportReceipt(
-                        migration_id=f"migration-retry-{source}",
-                        plan_id=f"plan-{source[0] * 32}",
-                        source=source,
-                        agent_id=workspace.agent_id,
-                        started_at=now,
-                        completed_at=now,
-                        imported_skills=[f"{source.title()} Skill"],
-                        retry_of_migration_id=f"migration-{source}",
-                    ),
+                    [],
                 )
 
         return Service()
-
-
-def test_only_materialization_milestone_updates_session_progress() -> None:
-    provider = ImportProviderSnapshot(
-        source="qoder",
-        sessions_total=2,
-        assets=[
-            ImportAssetResult(
-                asset_type="skill",
-                source_id="qoder-skill",
-                name="Qoder Skill",
-            ),
-        ],
-    )
-
-    PortabilityImportJobManager._project_progress(
-        provider,
-        "正在扫描 Qoder 会话：2/2",
-    )
-    assert (provider.sessions_processed, provider.sessions_total) == (0, 2)
-
-    PortabilityImportJobManager._project_progress(
-        provider,
-        "\x1esessions\t1\t2\t1\t0",
-    )
-    PortabilityImportJobManager._project_progress(
-        provider,
-        "\x1easset\tskill\tsucceeded\t0\tqoder-skill",
-    )
-    PortabilityImportJobManager._project_progress(
-        provider,
-        "正在修复 Skill「Qoder Skill」",
-    )
-    assert (
-        provider.sessions_processed,
-        provider.sessions_total,
-        provider.sessions_imported,
-    ) == (1, 2, 1)
-    assert provider.assets[0].state is ImportAssetState.SUCCEEDED
-    assert provider.assets[0].enabled is False
-    PortabilityImportJobManager._project_progress(
-        provider,
-        "\x1easset\tskill\tready\t-\tqoder-skill",
-    )
-    assert provider.assets[0].state is ImportAssetState.READY
 
 
 @pytest.mark.asyncio
@@ -352,39 +280,6 @@ async def test_only_one_active_import_runs_per_agent(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="already active"):
         await manager.create(workspace, ["qoder"])
     await manager.cancel(workspace, first.job_id)
-
-
-@pytest.mark.asyncio
-async def test_empty_selection_is_rejected_and_active_job_can_cancel(
-    tmp_path: Path,
-) -> None:
-    services = _FakeServices()
-    workspace = _workspace(tmp_path)
-    manager = PortabilityImportJobManager(service_factory=services.factory)
-    created = await manager.create(workspace, ["codex"])
-    await _wait_job(manager, workspace, created.job_id)
-
-    with pytest.raises(ValueError, match="select at least"):
-        await manager.start(
-            workspace,
-            created.job_id,
-            {"codex": ImportSelection(sessions=False)},
-        )
-    assert (await manager.snapshot(workspace, created.job_id)).state == (
-        "awaiting_selection"
-    )
-
-    services.block_apply.clear()
-    await manager.start(
-        workspace,
-        created.job_id,
-        {"codex": ImportSelection(skills=["codex-skill"])},
-    )
-    await services.apply_started.wait()
-
-    assert (await manager.cancel(workspace, created.job_id)).state == (
-        "interrupted"
-    )
 
 
 @pytest.mark.asyncio
@@ -548,59 +443,6 @@ async def test_shutdown_cancels_active_jobs_and_rejects_new_ones(
     ).state == "interrupted"
     with pytest.raises(RuntimeError, match="shutting down"):
         await manager.create(workspace, ["qoder"])
-
-
-@pytest.mark.asyncio
-async def test_cancel_with_rollback_failure_marks_job_failed(
-    tmp_path: Path,
-) -> None:
-    services = _FakeServices()
-    services.fail_rollback = True
-    workspace = _workspace(tmp_path)
-    manager = PortabilityImportJobManager(service_factory=services.factory)
-    created = await manager.create(workspace, ["codex"])
-    await _wait_job(manager, workspace, created.job_id)
-
-    services.block_apply.clear()
-    await manager.start(
-        workspace,
-        created.job_id,
-        {"codex": ImportSelection(skills=["codex-skill"])},
-    )
-    await services.apply_started.wait()
-
-    snapshot = await manager.cancel(workspace, created.job_id)
-
-    assert snapshot.state == "completed_with_issues"
-    assert snapshot.providers[0].state == "failed"
-
-
-@pytest.mark.asyncio
-async def test_provider_failure_does_not_discard_other_result(
-    tmp_path: Path,
-) -> None:
-    services = _FakeServices()
-    services.fail_apply.add("qoder")
-    workspace = _workspace(tmp_path)
-    manager = PortabilityImportJobManager(service_factory=services.factory)
-    created = await manager.create(workspace, ["codex", "qoder"])
-    await _wait_job(manager, workspace, created.job_id)
-
-    await manager.start(
-        workspace,
-        created.job_id,
-        {
-            "codex": ImportSelection(skills=["codex-skill"]),
-            "qoder": ImportSelection(skills=["qoder-skill"]),
-        },
-    )
-    await _wait_job(manager, workspace, created.job_id)
-    snapshot = await manager.snapshot(workspace, created.job_id)
-
-    assert snapshot.state == "completed_with_issues"
-    assert snapshot.providers[0].assets[0].state is ImportAssetState.SUCCEEDED
-    assert snapshot.providers[1].assets[0].state is ImportAssetState.FAILED
-    assert "qoder failed" in snapshot.providers[1].error
 
 
 @pytest.mark.asyncio

@@ -545,7 +545,7 @@ class PortabilityImportJobManager:
                 service = self._service_factory(live.workspace)
                 if retry_from is None:
                     plan = live.plans[provider.source]
-                    receipt = await service.apply_selection(
+                    imported_sessions = await service.apply_selection(
                         provider.plan_id,
                         provider.selection,
                         progress=partial(
@@ -555,7 +555,7 @@ class PortabilityImportJobManager:
                         ),
                     )
                 else:
-                    plan, receipt = await service.retry_selection(
+                    plan, imported_sessions = await service.retry_selection(
                         retry_from.plans[provider.source].plan_id,
                         retry_selection,
                         progress=partial(
@@ -588,7 +588,7 @@ class PortabilityImportJobManager:
                             asset.message = "未收到资产导入结果，请重试。"
                 if retry_from is None:
                     provider.sessions_processed = provider.sessions_total
-                    provider.sessions_imported = len(receipt.imported_sessions)
+                    provider.sessions_imported = len(imported_sessions)
                 provider.state = "completed"
             except Exception as exc:  # pylint: disable=broad-except
                 provider.error = redact_sensitive_text(exc, limit=500)

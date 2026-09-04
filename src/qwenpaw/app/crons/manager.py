@@ -447,11 +447,6 @@ class CronManager(ManagerBase):
         return not explicitly_promoted
 
     @classmethod
-    def requires_portability_review(cls, job: CronJobSpec) -> bool:
-        """Public read-only review check used by migration repair logic."""
-        return cls._requires_portability_review(job)
-
-    @classmethod
     def canonicalize_imported_job_for_review(
         cls,
         job: CronJobSpec,
@@ -463,28 +458,6 @@ class CronManager(ManagerBase):
         ):
             return job
         return cls._with_portability_review(job, pending=True)
-
-    async def restore_imported_job_snapshot(self, job: CronJobSpec) -> None:
-        """Restore a disabled imported snapshot without registering it."""
-        async with self._lock:
-            restored = self.canonicalize_imported_job_for_review(job)
-            portability = self._portability_metadata(restored)
-            if (
-                portability is None
-                or not self._has_imported_provenance(portability)
-                or not self._requires_portability_review(restored)
-            ):
-                raise PermissionError(
-                    "Only review-gated imported cron snapshots may be "
-                    "restored",
-                )
-            if restored.id is None:
-                raise ValueError("Imported cron snapshot must have an id")
-            await self._repo.upsert_job(restored)
-            if self._started and self._scheduler.get_job(restored.id):
-                self._scheduler.remove_job(restored.id)
-            self._rt.pop(restored.id, None)
-            self._states.pop(restored.id, None)
 
     @classmethod
     def _assert_review_complete(cls, job: CronJobSpec) -> None:

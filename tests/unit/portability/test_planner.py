@@ -11,7 +11,6 @@ from qwenpaw.portability.models import (
     ProviderInventory,
     SourceMemoryFile,
     SourceMemoryProject,
-    SourcePlugin,
     SourceSkill,
 )
 from qwenpaw.portability.planner import inventory_fingerprint
@@ -132,21 +131,3 @@ def test_memory_relative_path_must_stay_in_declared_scope(
 
     with pytest.raises(ValueError, match="relative path escapes"):
         inventory_fingerprint(inventory)
-
-
-def test_missing_remote_plugin_source_remains_fingerprintable() -> None:
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        plugins=[
-            SourcePlugin(
-                source_id="plugin-1",
-                name="remote-plugin",
-                marketplace="community",
-                install_source="https://example.invalid/plugin.git",
-            ),
-        ],
-    )
-
-    assert inventory_fingerprint(inventory) == inventory_fingerprint(inventory)

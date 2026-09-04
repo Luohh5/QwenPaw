@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from .base import MigrationProvider
@@ -20,15 +19,10 @@ def provider_names() -> tuple[str, ...]:
 def create_migration_provider(
     source: str,
     workspace: Any,
-    *,
-    source_home: Path | None = None,
 ) -> MigrationProvider:
     """Create one read-only provider or raise a user-actionable error."""
     provider_id = canonical_provider_id(source)
-    location = resolve_source_location(
-        provider_id,
-        source_home=source_home,
-    )
+    location = resolve_source_location(provider_id)
     if provider_id == "codex":
         return CodexMigrationProvider(workspace, source_location=location)
     if provider_id == "qoder":

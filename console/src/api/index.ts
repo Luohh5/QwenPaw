@@ -28,7 +28,6 @@ import { languageApi } from "./modules/language";
 import { backupApi } from "./modules/backup";
 import { consoleApi } from "./modules/console";
 import { accessControlApi } from "./modules/accessControl";
-import { portabilityImportApi } from "./modules/import";
 
 export const api = {
   // Root
@@ -100,13 +99,9 @@ export const api = {
 
   // Access Control
   ...accessControlApi,
-
-  // Portability imports use explicit Agent URLs.
-  portabilityImport: portabilityImportApi,
 };
 
 export default api;
 
 // Export individual APIs for direct access
 export { agentsApi };
-export { portabilityImportApi };

@@ -72,32 +72,6 @@ def test_hard_stop_preserves_repair_items(
     assert manifest.stop_reason == "mission limit"
 
 
-def test_asset_budget_reserves_final_classification_call(
-    tmp_path: Path,
-) -> None:
-    store = CompatibilityStore(tmp_path / "manifest.json")
-    manifest = store.prepare(
-        migration_id="migration-budget-reserve",
-        source="qoder",
-        skills=[_skill(tmp_path)],
-    )
-    budget = manifest.assets[0].tool_budget
-    for _ in range(budget - 1):
-        store.consume("demo", reserve=1)
-    with pytest.raises(RuntimeError, match="tool-call budget"):
-        store.consume("demo", reserve=1)
-
-    store.consume("demo")
-    result = store.finalize(
-        "demo",
-        passed=True,
-        summary="native loader passed",
-        reason="ready",
-    )
-    assert result.assets[0].tool_calls == budget
-    assert result.assets[0].zone is AssetZone.MIGRATE
-
-
 def test_manifest_and_summary_are_owner_only_and_secret_free(
     tmp_path: Path,
 ) -> None:

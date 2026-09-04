@@ -1,11 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-
 import pytest
 
-from qwenpaw.app.crons.manager import CronManager
 from qwenpaw.portability.models import SourceScheduledTask
 from qwenpaw.portability.scheduled_tasks import (
     build_imported_job,
@@ -46,46 +43,7 @@ def test_build_imported_job_is_stable_disabled_and_safe(tmp_path) -> None:
     assert "promoted_at" not in first.meta["portability"]
     assert "promoted_by" not in first.meta["portability"]
     assert first.request.request_context["portability_review_required"] is True
-    assert CronManager.requires_portability_review(first) is True
-
-
-def test_build_imported_job_rejects_unsupported_and_expired_tasks() -> None:
-    unsupported = SourceScheduledTask(
-        source_id="complex",
-        name="Complex",
-        schedule_type="unsupported",
-        prompt="Run",
-        metadata={"unsupported_reason": "RRULE contains BYSECOND"},
-    )
-    expired = SourceScheduledTask(
-        source_id="past",
-        name="Past",
-        schedule_type="once",
-        run_at=datetime.now(timezone.utc) - timedelta(days=1),
-        prompt="Run once",
-    )
-
-    with pytest.raises(ValueError, match="BYSECOND"):
-        build_imported_job("codex", unsupported)
-    with pytest.raises(ValueError, match="已经过期"):
-        build_imported_job("qoder", expired)
-
-
-def test_build_imported_job_does_not_bind_missing_source_cwd(tmp_path) -> None:
-    task = SourceScheduledTask(
-        source_id="missing-cwd",
-        name="Missing cwd",
-        schedule_type="cron",
-        cron="*/30 * * * *",
-        prompt="Check status",
-        cwd=str(tmp_path / "gone"),
-    )
-
-    job = build_imported_job("qoder", task)
-
-    assert job.request is not None
-    assert "project_dir" not in job.request.model_dump()["request_context"]
-    assert job.meta["portability"]["source_cwd_available"] is False
+    assert first.meta["portability"]["requires_review"] is True
 
 
 @pytest.mark.parametrize(
@@ -123,26 +81,3 @@ def test_build_imported_job_never_binds_remote_cwd_that_exists_locally(
         "omitted_remote_or_unverified"
     )
     assert portability["requires_review"] is True
-
-
-def test_build_imported_job_keeps_provenance_bounded(tmp_path) -> None:
-    task = SourceScheduledTask(
-        source_id="bounded",
-        name="Bounded provenance",
-        schedule_type="cron",
-        cron="0 9 * * *",
-        prompt="Run",
-        cwd=str(tmp_path),
-        metadata={
-            "long": "x" * 5000,
-            "controls": "before\x00after",
-            "many": list(range(100)),
-        },
-    )
-
-    job = build_imported_job("codex", task)
-    source_metadata = job.meta["portability"]["source_metadata"]
-
-    assert len(source_metadata["long"]) == 2048
-    assert "\x00" not in source_metadata["controls"]
-    assert len(source_metadata["many"]) == 64

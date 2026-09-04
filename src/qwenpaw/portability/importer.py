@@ -9,7 +9,7 @@ import logging
 import shutil
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -23,7 +23,6 @@ from ..plugins.marketplace_registry import ExternalMarketplaceRegistry
 from ..utils.io_utils import (
     run_async_to_completion,
     run_sync_io,
-    write_json_atomic_async,
 )
 from .adaptation_loop import run_adaptation_loop
 from .compatibility import mcp_inline_secret_risks
@@ -31,13 +30,7 @@ from .codex_plugin_adapter import (
     ADAPTER as CODEX_PLUGIN_ADAPTER,
     stage_codex_content_plugin,
 )
-from .doctor import run_migration_doctor
-from .models import (
-    ImportReceipt,
-    MigrationDoctorReport,
-    ProviderInventory,
-)
-from .providers import create_migration_provider
+from .models import ProviderInventory
 from .providers.base import (
     ProgressReporter,
     report_progress as _report,
@@ -126,24 +119,17 @@ class ProviderImportService(ImportPlanningMixin):
         """Bind the importer to one already-started Agent workspace."""
         self._workspace = workspace
 
-    def _create_provider(self, source: str, **kwargs: Any) -> Any:
-        """Keep provider construction local for stable integrations/mocks."""
-        return create_migration_provider(source, self._workspace, **kwargs)
-
     # pylint: disable-next=R0912,R0915,R0914,W0640
     async def _apply(
         self,
         inventory: ProviderInventory,
         *,
         started_at: datetime,
-        plan_id: str = "",
         progress: ProgressReporter | None = None,
-        retry_of_migration_id: str = "",
         memory_payloads: MemoryPayloads | None = None,
-    ) -> ImportReceipt:
+    ) -> list[str]:
         """Apply assets independently; a failed asset does not undo others."""
         migration_id = f"migration-{uuid4().hex}"
-        warnings = list(inventory.warnings)
         sessions = [_bounded_session(item) for item in inventory.sessions]
         memory_payloads = memory_payloads or {}
         existing_chats = await self._workspace.chat_manager.list_chats(
@@ -159,17 +145,7 @@ class ProviderImportService(ImportPlanningMixin):
 
         conversations = ConversationState()
         imported_sessions = conversations.imported
-        skipped_sessions = conversations.skipped
-        archived_internal_sessions = conversations.archived_internal
-        imported_skills: list[str] = []
-        imported_mcp_servers: list[str] = []
-        imported_memory_projects: list[str] = []
-        restored_marketplaces: list[str] = []
-        prepared_plugins: list[str] = []
-        installed_plugins: list[str] = []
         installed_plugin_paths: dict[str, Path] = {}
-        imported_scheduled_tasks: list[str] = []
-        skipped_scheduled_tasks: list[str] = []
         asset_states: dict[str, dict[str, str]] = {
             "plugin": {},
             "memory": {},
@@ -177,8 +153,6 @@ class ProviderImportService(ImportPlanningMixin):
             "mcp": {},
             "cron": {},
         }
-        adaptation_manifest = ""
-        adaptation_summary = ""
         adaptation_asset_zones: dict[str, str] = {}
         plugin_app = None
         skill_service = SkillService(self._workspace.workspace_dir)
@@ -189,7 +163,6 @@ class ProviderImportService(ImportPlanningMixin):
                 inventory,
                 sessions,
                 existing_by_source,
-                warnings,
                 started_at,
                 progress,
                 conversations,
@@ -206,26 +179,9 @@ class ProviderImportService(ImportPlanningMixin):
                     item.asset_key: item.zone.value
                     for item in adaptation.manifest.assets
                 }
-                try:
-                    adaptation_manifest = str(
-                        adaptation.manifest_path.relative_to(
-                            Path(self._workspace.workspace_dir),
-                        ),
-                    )
-                except ValueError:
-                    adaptation_manifest = str(adaptation.manifest_path)
-                try:
-                    adaptation_summary = str(
-                        adaptation.summary_path.relative_to(
-                            Path(self._workspace.workspace_dir),
-                        ),
-                    )
-                except ValueError:
-                    adaptation_summary = str(adaptation.summary_path)
-                warnings.extend(adaptation.warnings)
             except Exception as exc:  # pylint: disable=broad-except
                 logger.exception("Portability adaptation loop failed")
-                warnings.append(
+                logger.warning(
                     "工具和设置自动兼容 Loop 运行失败；迁移将继续，并保持"
                     "相关资产禁用："
                     f"{type(exc).__name__}: {exc}",
@@ -262,28 +218,26 @@ class ProviderImportService(ImportPlanningMixin):
                         ),
                     )
                 except Exception as exc:  # pylint: disable=broad-except
-                    warnings.append(
+                    logger.warning(
                         f"Marketplace {marketplace.name!r} failed: {exc}",
                     )
                     continue
                 marketplace_status[marketplace.source_id] = status
                 marketplace_status[marketplace.name] = status
                 if credentials_removed:
-                    warnings.append(
+                    logger.warning(
                         f"Marketplace {marketplace.name!r} contained URL "
                         "credentials/query parameters; they were removed and "
                         "must be configured again.",
                     )
                 if not marketplace.source:
-                    warnings.append(
+                    logger.warning(
                         f"Marketplace {marketplace.name!r} is built-in or its "
                         "independent source is unavailable. Its provenance "
                         "was recorded, but no source checkout was copied.",
                     )
-                elif status == "created":
-                    restored_marketplaces.append(marketplace.name)
-                elif status == "conflict":
-                    warnings.append(
+                if status == "conflict":
+                    logger.warning(
                         f"Marketplace {marketplace.name!r} already exists "
                         "with different settings; kept the QwenPaw copy.",
                     )
@@ -333,13 +287,13 @@ class ProviderImportService(ImportPlanningMixin):
                         f"{plugin_index}/{plugin_total}",
                     )
                 if marketplace_status.get(plugin.marketplace) == "conflict":
-                    warnings.append(
+                    logger.warning(
                         f"Plugin {plugin.source_id!r} was not installed "
                         "because its Marketplace conflicts with QwenPaw.",
                     )
                     continue
                 if not plugin.install_source:
-                    warnings.append(
+                    logger.warning(
                         f"Plugin {plugin.source_id!r} has no independent "
                         "QwenPaw-compatible install source. Its installed "
                         f"{inventory.provider_name} cache was not copied; "
@@ -351,7 +305,7 @@ class ProviderImportService(ImportPlanningMixin):
                     "failed_safe",
                 )
                 if compatibility_zone not in {"migrate", "repair"}:
-                    warnings.append(
+                    logger.warning(
                         f"Plugin {plugin.source_id!r} was not installed: "
                         f"compatibility zone is {compatibility_zone!r}. "
                         "Its Marketplace provenance remains available for "
@@ -363,15 +317,14 @@ class ProviderImportService(ImportPlanningMixin):
                     and plugin.metadata.get("adapter")
                     not in _GENERATED_PLUGIN_ADAPTERS
                 ):
-                    prepared_plugins.append(plugin.source_id)
-                    warnings.append(
+                    logger.warning(
                         f"Plugin {plugin.source_id!r} remains in the repair "
                         "zone. Its source was preserved but executable code "
                         "was not loaded.",
                     )
                     continue
                 if plugin_app is None:
-                    warnings.append(
+                    logger.warning(
                         f"Plugin {plugin.source_id!r} is compatible, but the "
                         "QwenPaw native plugin loader is not ready. Retry "
                         "from the Import page after startup completes.",
@@ -403,8 +356,7 @@ class ProviderImportService(ImportPlanningMixin):
                     source_path = Path(install_source).resolve()
                     plugin_id = _plugin_id(source_path)
 
-                    def record_plugin(value: Any) -> None:
-                        installed_plugins.append(value.manifest.id)
+                    def record_plugin(_value: Any) -> None:
                         asset_states["plugin"][plugin.source_id] = "succeeded"
 
                     record = await _commit_mutation(
@@ -428,7 +380,7 @@ class ProviderImportService(ImportPlanningMixin):
                             source_path,
                         ).resolve()
                     if staged_plugin is not None:
-                        warnings.append(
+                        logger.warning(
                             f"Adapted content plugin {plugin.source_id!r} "
                             "into a QwenPaw native wrapper; its Skills remain "
                             "disabled pending explicit review.",
@@ -459,7 +411,7 @@ class ProviderImportService(ImportPlanningMixin):
                                     plugin.source_id
                                 ] = candidate
                                 break
-                    warnings.append(
+                    logger.warning(
                         f"Plugin {plugin.source_id!r} failed native "
                         f"installation: {type(exc).__name__}: {exc}",
                     )
@@ -470,13 +422,6 @@ class ProviderImportService(ImportPlanningMixin):
                             staged_plugin.parent,
                             True,
                         )
-            if installed_plugins:
-                warnings.append(
-                    "兼容流程批准的插件已通过 QwenPaw 原生安装流程"
-                    "写入；外部内容插件使用 QwenPaw 生成的原生包装器。"
-                    "需要时请在迁移后重载智能体。",
-                )
-
             memory_total = len(inventory.memory_projects)
             async for memory_index, project in _asset_items(
                 inventory.memory_projects,
@@ -496,7 +441,6 @@ class ProviderImportService(ImportPlanningMixin):
                     def record_memory(result: Any) -> None:
                         _target, changed = result
                         if changed:
-                            imported_memory_projects.append(project.source_id)
                             asset_states["memory"][
                                 project.source_id
                             ] = "succeeded"
@@ -516,7 +460,7 @@ class ProviderImportService(ImportPlanningMixin):
                         record_memory,
                     )
                 except Exception as exc:  # pylint: disable=broad-except
-                    warnings.append(
+                    logger.warning(
                         f"Memory project {project.project_key!r} was "
                         f"quarantined/skipped: {type(exc).__name__}: {exc}",
                     )
@@ -541,7 +485,7 @@ class ProviderImportService(ImportPlanningMixin):
                     "failed_safe",
                 )
                 if compatibility_zone not in {"migrate", "repair"}:
-                    warnings.append(
+                    logger.warning(
                         f"Skill {skill.name!r} 未写入 QwenPaw：兼容状态为 "
                         f"{compatibility_zone!r}；源文件仍保留在兼容清单/"
                         "隔离暂存区，可修复后重试。",
@@ -554,7 +498,6 @@ class ProviderImportService(ImportPlanningMixin):
                         names = [
                             str(name) for name in value.get("imported", [])
                         ]
-                        imported_skills.extend(names)
                         asset_states["skill"][skill.source_id] = (
                             "succeeded"
                             if names
@@ -580,12 +523,12 @@ class ProviderImportService(ImportPlanningMixin):
                     )
                     names = [str(name) for name in result.get("imported", [])]
                     if not names and result.get("conflicts"):
-                        warnings.append(
+                        logger.warning(
                             f"Skill {skill.name!r} already exists; kept the "
                             "QwenPaw copy.",
                         )
                 except Exception as exc:  # pylint: disable=broad-except
-                    warnings.append(
+                    logger.warning(
                         f"Skill {skill.name!r} was quarantined/skipped: {exc}",
                     )
 
@@ -612,7 +555,7 @@ class ProviderImportService(ImportPlanningMixin):
                     "failed_safe",
                 )
                 if compatibility_zone not in {"migrate", "repair"}:
-                    warnings.append(
+                    logger.warning(
                         f"MCP {server.name!r} 未写入 DriverCard：兼容状态"
                         f"为 {compatibility_zone!r}；请根据兼容清单修复"
                         "后重试。",
@@ -620,7 +563,7 @@ class ProviderImportService(ImportPlanningMixin):
                     continue
                 if server.name in existing_driver_names:
                     asset_states["mcp"][server.source_id] = "existing"
-                    warnings.append(
+                    logger.warning(
                         f"MCP {server.name!r} conflicts with an existing "
                         "QwenPaw Driver; kept the QwenPaw copy.",
                     )
@@ -630,7 +573,7 @@ class ProviderImportService(ImportPlanningMixin):
                     "streamable_http",
                     "sse",
                 }:
-                    warnings.append(
+                    logger.warning(
                         f"MCP {server.name!r} uses unsupported transport "
                         f"{server.transport!r} and was skipped.",
                     )
@@ -644,7 +587,7 @@ class ProviderImportService(ImportPlanningMixin):
                     server.cwd,
                 )
                 if inline_secret_risks:
-                    warnings.append(
+                    logger.warning(
                         f"MCP {server.name!r} 的命令参数或 URL 可能包含"
                         "无法安全绑定的明文凭据，已拒绝写入 DriverCard；"
                         "请改用环境变量/请求头凭据或在 QwenPaw 中重新配置。",
@@ -766,16 +709,15 @@ class ProviderImportService(ImportPlanningMixin):
                     await run_async_to_completion(save_mcp())
                     existing_driver_names.add(card.name)
                     existing_cards[card.name] = card
-                    imported_mcp_servers.append(card.name)
                     if server.metadata.get("source_runtime_bound"):
-                        warnings.append(
+                        logger.warning(
                             f"MCP {server.name!r} references Codex/ChatGPT "
                             "runtime files. Its disabled card was preserved "
                             "for review, but it may stop working if that "
                             "source plugin/runtime is removed.",
                         )
                     if server.auth_status not in {"", "unsupported"}:
-                        warnings.append(
+                        logger.warning(
                             f"MCP {server.name!r} authentication state was "
                             "not copied; authorize it again before enabling.",
                         )
@@ -797,7 +739,7 @@ class ProviderImportService(ImportPlanningMixin):
                         "DriverCard" in str(exc)
                     ):
                         asset_states["mcp"][server.source_id] = "existing"
-                    warnings.append(
+                    logger.warning(
                         f"MCP {server.name!r} could not be translated and "
                         f"was skipped: {type(exc).__name__}: {exc}",
                     )
@@ -833,7 +775,7 @@ class ProviderImportService(ImportPlanningMixin):
                         if (key := imported_job_source(job)) is not None
                     }
                 except Exception as exc:  # pylint: disable=broad-except
-                    warnings.append(
+                    logger.warning(
                         "无法读取 QwenPaw 定时任务列表；本次定时任务迁移已"
                         f"安全跳过：{type(exc).__name__}: {exc}",
                     )
@@ -858,8 +800,7 @@ class ProviderImportService(ImportPlanningMixin):
                     "failed_safe",
                 )
                 if compatibility_zone not in {"migrate", "repair"}:
-                    skipped_scheduled_tasks.append(task.source_id)
-                    warnings.append(
+                    logger.warning(
                         f"定时任务 {task.name!r} 未写入 Cron：兼容状态"
                         f"为 {compatibility_zone!r}；它只保留在兼容清单"
                         "中，不会被“立即运行”绕过。",
@@ -868,16 +809,14 @@ class ProviderImportService(ImportPlanningMixin):
                 key = (inventory.provider_id, task.source_id)
                 existing_task = existing_task_jobs.get(key)
                 if cron_manager is None:
-                    skipped_scheduled_tasks.append(task.source_id)
-                    warnings.append(
+                    logger.warning(
                         f"定时任务 {task.name!r} 未写入：目标智能体的 Cron "
                         "服务尚未初始化。聊天记录和其他资产不受影响。",
                     )
                     continue
                 if existing_task is not None:
                     asset_states["cron"][task.source_id] = "existing"
-                    skipped_scheduled_tasks.append(task.source_id)
-                    warnings.append(
+                    logger.warning(
                         f"定时任务 {task.name!r} already exists; kept the "
                         "QwenPaw copy.",
                     )
@@ -896,7 +835,7 @@ class ProviderImportService(ImportPlanningMixin):
                             (inventory.provider_id, target_thread_id),
                         )
                         if target_chat is None:
-                            warnings.append(
+                            logger.warning(
                                 f"Codex heartbeat {task.name!r} requires its"
                                 " source conversation; import that"
                                 " conversation before retrying the task.",
@@ -919,86 +858,39 @@ class ProviderImportService(ImportPlanningMixin):
                     async def save_task() -> None:
                         if not await cron_manager.create_job_if_absent(job):
                             raise FileExistsError("Cron job already exists")
-                        imported_scheduled_tasks.append(task.source_id)
                         existing_task_jobs[key] = job
                         asset_states["cron"][task.source_id] = "succeeded"
 
                     await run_async_to_completion(save_task())
                 except Exception as exc:  # pylint: disable=broad-except
-                    skipped_scheduled_tasks.append(task.source_id)
                     if isinstance(exc, FileExistsError):
                         asset_states["cron"][task.source_id] = "existing"
-                    warnings.append(
+                    logger.warning(
                         f"定时任务 {task.name!r} 已保留在迁移清单中，但未"
                         f"启用或写入：{type(exc).__name__}: {exc}",
                     )
 
-            completed_at = datetime.now(timezone.utc)
-            await _report(progress, "正在生成迁移回执并完成一致性检查…")
-            receipt = ImportReceipt(
-                migration_id=migration_id,
-                plan_id=plan_id,
-                source=inventory.provider_id,
-                source_locator=inventory.locator,
-                agent_id=self._workspace.agent_id,
-                started_at=started_at,
-                completed_at=completed_at,
-                imported_sessions=imported_sessions,
-                skipped_sessions=skipped_sessions,
-                ignored_source_sessions=list(inventory.ignored_session_ids),
-                archived_internal_sessions=archived_internal_sessions,
-                imported_skills=imported_skills,
-                imported_mcp_servers=imported_mcp_servers,
-                imported_memory_projects=imported_memory_projects,
-                restored_marketplaces=restored_marketplaces,
-                prepared_plugins=prepared_plugins,
-                installed_plugins=installed_plugins,
-                imported_scheduled_tasks=imported_scheduled_tasks,
-                skipped_scheduled_tasks=skipped_scheduled_tasks,
-                adaptation_manifest=adaptation_manifest,
-                adaptation_summary=adaptation_summary,
-                retry_of_migration_id=retry_of_migration_id,
-                warnings=warnings,
-            )
-            receipt_dir = Path(self._workspace.workspace_dir) / ".qwenpaw"
-            receipt_dir = receipt_dir / "imports"
-            receipt_dir.mkdir(parents=True, exist_ok=True)
-            receipt_path = receipt_dir / f"{migration_id}.json"
-            await write_json_atomic_async(
-                receipt_path,
-                receipt.model_dump(mode="json"),
-                sort_keys=True,
-                new_file_mode=0o600,
-            )
-            await _report(progress, "正在执行迁移后体检…")
-            try:
-                receipt.doctor_report = await run_migration_doctor(
-                    self._workspace,
-                    receipt,
-                )
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.exception("Migration Doctor failed")
-                warnings.append(
-                    "迁移内容已写入，但自动体检运行失败：" f"{type(exc).__name__}: {exc}",
-                )
-                receipt.warnings = list(warnings)
-                receipt.doctor_report = MigrationDoctorReport(
-                    status="fail",
-                    summary_zh="迁移已完成，但自动体检未能正常运行，请查看日志。",
-                    checked_at=datetime.now(timezone.utc),
-                    checks=[],
-                )
-            await write_json_atomic_async(
-                receipt_path,
-                receipt.model_dump(mode="json"),
-                sort_keys=True,
-                new_file_mode=0o600,
-            )
             await _report(progress, "迁移事务已安全提交。")
-            return receipt
+            return imported_sessions
         except BaseException:
             logger.exception("Import stopped after committed assets were kept")
             raise
+        finally:
+            adaptation_root = (
+                Path(self._workspace.workspace_dir)
+                / ".qwenpaw"
+                / "imports"
+                / migration_id
+                / "adaptation"
+            )
+            await run_sync_io(shutil.rmtree, adaptation_root / "staging", True)
+            try:
+                await run_sync_io((adaptation_root / "manifest.json").unlink)
+            except OSError:
+                logger.debug(
+                    "Could not remove adaptation manifest",
+                    exc_info=True,
+                )
 
 
 __all__ = ["ProviderImportService"]

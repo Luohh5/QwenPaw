@@ -9,7 +9,7 @@ import os
 import secrets
 import stat
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -71,9 +71,7 @@ _PUBLIC_TYPES = {
 @dataclass(frozen=True)
 class AdaptationResult:
     manifest: CompatibilityManifest
-    manifest_path: Path
     summary_path: Path
-    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -802,7 +800,6 @@ async def run_adaptation_loop(
         await run_sync_io(write_summary, summary_path, manifest)
         return AdaptationResult(
             manifest,
-            manifest_path,
             summary_path,
         )
 
@@ -849,7 +846,5 @@ async def run_adaptation_loop(
     )
     return AdaptationResult(
         manifest=manifest,
-        manifest_path=manifest_path,
         summary_path=summary_path,
-        warnings=warnings,
     )

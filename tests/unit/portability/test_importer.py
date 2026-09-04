@@ -5,15 +5,13 @@ import asyncio
 import json
 import shutil
 import sys
-import threading
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from qwenpaw.app.chats.manager import ChatManager
-from qwenpaw.app.chats.models import ChatSpec
 from qwenpaw.app.chats.repo import JsonChatRepository
 from qwenpaw.app.chats.session import SafeJSONSession
 from qwenpaw.app.crons.manager import CronManager
@@ -29,7 +27,6 @@ from qwenpaw.portability.import_support import (
 )
 from qwenpaw.portability.adaptation_loop import AdaptationResult
 from qwenpaw.portability.compatibility import (
-    AssetZone,
     CompatibilityStore,
     load_manifest,
 )
@@ -45,7 +42,6 @@ from qwenpaw.portability.models import (
     SourceSkill,
     SourceScheduledTask,
 )
-from qwenpaw.portability.scheduled_tasks import build_imported_job
 from qwenpaw.plugins.marketplace_registry import ExternalMarketplaceRegistry
 
 
@@ -72,7 +68,7 @@ class _Provider:
 
 def _bind_inventory(monkeypatch, inventory: ProviderInventory) -> None:
     monkeypatch.setattr(
-        "qwenpaw.portability.importer.create_migration_provider",
+        "qwenpaw.portability.import_planning.create_migration_provider",
         lambda _source, _workspace, **_kwargs: _Provider(inventory),
     )
 
@@ -130,9 +126,7 @@ def _mock_adaptation(
             store.finish(stopped=True, reason="test fixture")
         return AdaptationResult(
             manifest=load_manifest(manifest_path),
-            manifest_path=manifest_path,
             summary_path=workspace.workspace_dir / "missing-summary.md",
-            warnings=[],
         )
 
     monkeypatch.setattr(
@@ -175,12 +169,10 @@ async def _import_from(
     service,
     source: str,
     *,
-    source_home=None,
     progress=None,
 ):
     plan = await service.plan_from(
         source,
-        source_home=source_home,
         progress=progress,
     )
     return await service.apply_selection(
@@ -217,15 +209,9 @@ class _CronManager:
     async def delete_job(self, job_id):
         return self.jobs.pop(job_id, None) is not None
 
-    requires_portability_review = staticmethod(
-        CronManager.requires_portability_review,
-    )
     canonicalize_imported_job_for_review = staticmethod(
         CronManager.canonicalize_imported_job_for_review,
     )
-
-    async def restore_imported_job_snapshot(self, spec):
-        self.jobs[spec.id] = spec
 
 
 @pytest.mark.asyncio
@@ -254,13 +240,10 @@ async def test_provider_imports_scheduled_tasks_disabled_and_idempotent(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
-    first = await _import_from(ProviderImportService(workspace), "codex")
-    second = await _import_from(ProviderImportService(workspace), "codex")
+    await _import_from(ProviderImportService(workspace), "codex")
+    await _import_from(ProviderImportService(workspace), "codex")
 
     assert not list((tmp_path / ".qwenpaw/imports/transactions").glob("*"))
-    assert first.imported_scheduled_tasks == ["automation-1"]
-    assert second.imported_scheduled_tasks == []
-    assert second.skipped_scheduled_tasks == ["automation-1"]
     assert len(workspace.cron_manager.jobs) == 1
     job = next(iter(workspace.cron_manager.jobs.values()))
     assert job.enabled is False
@@ -268,161 +251,6 @@ async def test_provider_imports_scheduled_tasks_disabled_and_idempotent(
     assert job.runtime.share_session is False
     assert job.meta["portability"]["source_enabled"] is True
     assert job.meta["portability"]["requires_review"] is True
-    assert first.doctor_report is not None
-    schedule_check = next(
-        item
-        for item in first.doctor_report.checks
-        if item.category == "scheduled_tasks"
-    )
-    assert schedule_check.status == "pass", schedule_check
-
-
-@pytest.mark.asyncio
-async def test_heartbeat_without_source_chat_is_not_imported(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    workspace = _workspace(tmp_path)
-    workspace.cron_manager = _CronManager()
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        scheduled_tasks=[
-            SourceScheduledTask(
-                source_id="heartbeat-1",
-                name="Release monitor",
-                schedule_type="cron",
-                cron="30 9 * * *",
-                prompt="Check releases",
-                metadata={
-                    "source_kind": "heartbeat",
-                    "target_thread_id": "unavailable-thread",
-                },
-            ),
-        ],
-    )
-    _bind_inventory(monkeypatch, inventory)
-    _mock_adaptation(monkeypatch, workspace, inventory)
-
-    receipt = await _import_from(ProviderImportService(workspace), "codex")
-
-    assert receipt.imported_scheduled_tasks == []
-    assert workspace.cron_manager.jobs == {}
-    assert await workspace.chat_manager.list_chats(archived=None) == []
-    assert any(
-        "requires its source conversation" in item for item in receipt.warnings
-    )
-
-
-@pytest.mark.asyncio
-async def test_heartbeat_retry_uses_a_previously_imported_conversation(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    workspace = _workspace(tmp_path)
-    workspace.cron_manager = _CronManager()
-    await workspace.chat_manager.create_chat(
-        ChatSpec(
-            name="Imported chat",
-            session_id="console:imported",
-            user_id="imported",
-            meta={
-                "portability": {"source": "codex", "source_id": "thread-1"},
-            },
-        ),
-    )
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        scheduled_tasks=[
-            SourceScheduledTask(
-                source_id="heartbeat-1",
-                name="Release monitor",
-                schedule_type="cron",
-                cron="30 9 * * *",
-                prompt="Check releases",
-                metadata={
-                    "source_kind": "heartbeat",
-                    "target_thread_id": "thread-1",
-                },
-            ),
-        ],
-    )
-    _bind_inventory(monkeypatch, inventory)
-    _mock_adaptation(monkeypatch, workspace, inventory)
-    service = ProviderImportService(workspace)
-    plan = await service.plan_from("codex")
-
-    receipt = await service.apply_selection(
-        plan.plan_id,
-        ImportSelection(sessions=False, cron=["heartbeat-1"]),
-    )
-
-    assert receipt.imported_scheduled_tasks == ["heartbeat-1"]
-    job = next(iter(workspace.cron_manager.jobs.values()))
-    assert job.runtime.share_session is True
-    assert job.dispatch.target.session_id == "console:imported"
-
-
-@pytest.mark.asyncio
-async def test_unfinished_mission_materializes_repair_items_disabled(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    workspace = _workspace(tmp_path)
-    workspace.cron_manager = _CronManager()
-    skill_source = tmp_path / "bound-skill"
-    skill_source.mkdir()
-    (skill_source / "SKILL.md").write_text(
-        "---\nname: bound-skill\ndescription: Bound test\n---\n\n"
-        "Run codex exec for this task.\n",
-        encoding="utf-8",
-    )
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        skills=[
-            SourceSkill(
-                source_id="bound-skill",
-                name="bound-skill",
-                directory=skill_source,
-            ),
-        ],
-        scheduled_tasks=[
-            SourceScheduledTask(
-                source_id="bound-automation",
-                name="Bound automation",
-                schedule_type="cron",
-                cron="30 9 * * *",
-                timezone="Asia/Shanghai",
-                prompt="Run codex exec for the daily report.",
-                enabled=True,
-            ),
-        ],
-    )
-    _bind_inventory(monkeypatch, inventory)
-    _mock_adaptation(monkeypatch, workspace, inventory, status="stopped_limit")
-
-    receipt = await _import_from(ProviderImportService(workspace), "codex")
-
-    assert receipt.imported_skills == ["bound-skill"]
-    assert (workspace.workspace_dir / "skills/bound-skill").exists()
-    skill_manifest = json.loads(
-        (workspace.workspace_dir / "skill.json").read_text(encoding="utf-8"),
-    )
-    assert skill_manifest["skills"]["bound-skill"]["enabled"] is False
-    assert receipt.imported_scheduled_tasks == ["bound-automation"]
-    assert receipt.skipped_scheduled_tasks == []
-    job = next(iter(workspace.cron_manager.jobs.values()))
-    assert job.enabled is False
-    assert job.meta["portability"]["requires_review"] is True
-    adaptation = load_manifest(
-        workspace.workspace_dir / receipt.adaptation_manifest,
-    )
-    assert len(adaptation.by_zone(AssetZone.REPAIR)) == 2
 
 
 @pytest.mark.asyncio
@@ -498,9 +326,7 @@ async def test_migrate_zone_materializes_assets(
         summary.write_text("approved", encoding="utf-8")
         return AdaptationResult(
             manifest=load_manifest(manifest_path),
-            manifest_path=manifest_path,
             summary_path=summary,
-            warnings=[],
         )
 
     monkeypatch.setattr(
@@ -513,7 +339,7 @@ async def test_migrate_zone_materializes_assets(
     async def record(message: str) -> None:
         progress.append(message)
 
-    receipt = await _import_from(
+    await _import_from(
         ProviderImportService(workspace),
         "codex",
         progress=record,
@@ -539,84 +365,7 @@ async def test_migrate_zone_materializes_assets(
         job.meta["portability"]["safety"]
         == "disabled_until_explicit_promotion"
     )
-    assert receipt.adaptation_summary == "compatibility-summary.md"
-
-
-@pytest.mark.asyncio
-async def test_import_keeps_unreviewed_invalid_legacy_scheduled_task(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    workspace = _workspace(tmp_path)
-    workspace.cron_manager = _CronManager()
-    task = SourceScheduledTask(
-        source_id="legacy-ghost",
-        name="Legacy ghost",
-        schedule_type="cron",
-        cron="30 9 * * *",
-        prompt="Create a safe report",
-    )
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        scheduled_tasks=[task],
-    )
-    ghost = build_imported_job("codex", task)
-    ghost.schedule = ghost.schedule.model_copy(
-        update={"cron": "99 99 * * *"},
-    )
-    workspace.cron_manager.jobs[ghost.id] = ghost
-    _bind_inventory(monkeypatch, inventory)
-    _mock_adaptation(monkeypatch, workspace, inventory)
-
-    receipt = await _import_from(ProviderImportService(workspace), "codex")
-
-    assert receipt.imported_scheduled_tasks == []
-    assert workspace.cron_manager.jobs[ghost.id].schedule.cron == "99 99 * * *"
-    assert any("already exists" in warning for warning in receipt.warnings)
-
-
-@pytest.mark.asyncio
-async def test_failed_import_keeps_existing_scheduled_task(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    workspace = _workspace(tmp_path)
-    workspace.cron_manager = _CronManager()
-    task = SourceScheduledTask(
-        source_id="rollback-ghost",
-        name="Rollback ghost",
-        schedule_type="cron",
-        cron="30 9 * * *",
-        prompt="Create a safe report",
-    )
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        scheduled_tasks=[task],
-    )
-    ghost = build_imported_job("codex", task)
-    ghost.schedule = ghost.schedule.model_copy(
-        update={"cron": "99 99 * * *"},
-    )
-    workspace.cron_manager.jobs[ghost.id] = ghost
-    _bind_inventory(monkeypatch, inventory)
-
-    async def _fail_receipt(*_args, **_kwargs):
-        raise OSError("receipt unavailable")
-
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.write_json_atomic_async",
-        _fail_receipt,
-    )
-
-    with pytest.raises(OSError, match="receipt unavailable"):
-        await _import_from(ProviderImportService(workspace), "codex")
-
-    existing = workspace.cron_manager.jobs[ghost.id]
-    assert existing.schedule.cron == "99 99 * * *"
+    assert (workspace.workspace_dir / "compatibility-summary.md").is_file()
 
 
 @pytest.mark.asyncio
@@ -663,9 +412,8 @@ async def test_provider_import_is_additive_and_idempotent(
     second = await _import_from(ProviderImportService(workspace), "codex")
 
     assert "\x1esessions\t1\t1\t1\t0" in progress
-    assert first.imported_sessions == ["thread-1"]
-    assert second.imported_sessions == []
-    assert second.skipped_sessions == ["thread-1"]
+    assert first == ["thread-1"]
+    assert second == []
     chats = await workspace.chat_manager.list_chats(archived=None)
     assert len(chats) == 1
     portability = chats[0].meta["portability"]
@@ -680,10 +428,6 @@ async def test_provider_import_is_additive_and_idempotent(
     )
     context = state["agent"]["state"]["context"]
     assert [message["role"] for message in context] == ["user", "assistant"]
-    receipts = list(
-        (workspace.workspace_dir / ".qwenpaw/imports").glob("*.json"),
-    )
-    assert len(receipts) == 2
 
 
 @pytest.mark.asyncio
@@ -715,22 +459,11 @@ async def test_dry_run_plan_can_be_revalidated_and_applied(
     plan = await service.plan_from("codex")
 
     assert plan.state == "ready"
-    assert plan.source_home == ""
     assert sum(item.asset_type == "session" for item in plan.actions) == 1
     assert await workspace.chat_manager.list_chats(archived=None) == []
-    receipt_root = workspace.workspace_dir / ".qwenpaw/imports"
-    assert not list(
-        receipt_root.glob("migration-*.json"),
-    )
+    imported_sessions = await _apply_plan(service, plan)
 
-    receipt = await _apply_plan(service, plan)
-
-    assert receipt.plan_id == plan.plan_id
-    assert receipt.imported_sessions == ["planned-thread"]
-    assert receipt.doctor_report is not None
-    assert receipt.doctor_report.status == "pass"
-    expected_summary = "迁移完成，已检查的项目全部通过。"
-    assert receipt.doctor_report.summary_zh == expected_summary
+    assert imported_sessions == ["planned-thread"]
     persisted = json.loads(
         (
             workspace.workspace_dir
@@ -739,7 +472,6 @@ async def test_dry_run_plan_can_be_revalidated_and_applied(
         ).read_text(encoding="utf-8"),
     )
     assert persisted["state"] == "applied"
-    assert persisted["migration_id"] == receipt.migration_id
 
 
 @pytest.mark.asyncio
@@ -788,51 +520,6 @@ async def test_apply_plan_refuses_changed_source_files(
 
 
 @pytest.mark.asyncio
-async def test_codex_reimport_archives_previously_imported_guardian_chat(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    workspace = _workspace(tmp_path)
-    guardian_id = "guardian-review-1"
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        sessions=[
-            SourceSession(
-                source_id=guardian_id,
-                title=(
-                    "The following is the Codex agent history whose request "
-                    "action you are assessing"
-                ),
-                history=[
-                    HarnessHistoryItem(
-                        kind=HarnessHistoryKind.USER,
-                        text="Internal approval transcript",
-                    ),
-                ],
-            ),
-        ],
-    )
-    _bind_inventory(monkeypatch, inventory)
-
-    await _import_from(ProviderImportService(workspace), "codex")
-    inventory.sessions = []
-    inventory.ignored_session_ids = [guardian_id]
-    receipt = await _import_from(ProviderImportService(workspace), "codex")
-
-    assert receipt.ignored_source_sessions == [guardian_id]
-    assert receipt.archived_internal_sessions == [guardian_id]
-    assert await workspace.chat_manager.list_chats(archived=False) == []
-    archived = await workspace.chat_manager.list_chats(archived=True)
-    assert len(archived) == 1
-    assert archived[0].meta["portability"]["source_id"] == guardian_id
-    assert any(
-        "Codex non-root/internal" in warning for warning in receipt.warnings
-    )
-
-
-@pytest.mark.asyncio
 async def test_concurrent_imports_are_serialized_and_do_not_duplicate(
     tmp_path: Path,
     monkeypatch,
@@ -861,7 +548,7 @@ async def test_concurrent_imports_are_serialized_and_do_not_duplicate(
         _import_from(ProviderImportService(workspace), "codex"),
     )
 
-    assert sum(bool(item.imported_sessions) for item in (first, second)) == 1
+    assert sum(bool(item) for item in (first, second)) == 1
     assert len(await workspace.chat_manager.list_chats(archived=None)) == 1
 
 
@@ -896,10 +583,9 @@ async def test_provider_skill_symbolic_link_is_skipped(
     )
     _bind_inventory(monkeypatch, inventory)
 
-    receipt = await _import_from(ProviderImportService(workspace), "codex")
+    await _import_from(ProviderImportService(workspace), "codex")
 
-    assert receipt.imported_skills == []
-    assert any("symbolic link" in warning for warning in receipt.warnings)
+    assert not (workspace.workspace_dir / "skills/linked").exists()
 
 
 @pytest.mark.asyncio
@@ -933,9 +619,8 @@ async def test_provider_skill_uses_existing_scanner_and_stays_disabled(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
-    receipt = await _import_from(ProviderImportService(workspace), "codex")
+    await _import_from(ProviderImportService(workspace), "codex")
 
-    assert receipt.imported_skills == ["provider-demo"]
     skill_path = workspace.workspace_dir / "skills/provider-demo/SKILL.md"
     assert skill_path.is_file()
     manifest = json.loads(
@@ -969,13 +654,9 @@ async def test_provider_import_persists_disabled_mcp_with_encrypted_secret(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
-    first = await _import_from(ProviderImportService(workspace), "codex")
-    second = await _import_from(ProviderImportService(workspace), "codex")
+    await _import_from(ProviderImportService(workspace), "codex")
+    await _import_from(ProviderImportService(workspace), "codex")
 
-    assert first.imported_mcp_servers == ["filesystem"]
-    assert any(
-        "conflicts with an existing" in item for item in second.warnings
-    )
     card_path = workspace.workspace_dir / "drivers/mcp/filesystem.yaml"
     assert card_path.is_file()
     card_text = card_path.read_text(encoding="utf-8")
@@ -1030,9 +711,8 @@ async def test_mcp_retry_reuses_its_prepared_credential(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
-    receipt = await _import_from(ProviderImportService(workspace), "codex")
+    await _import_from(ProviderImportService(workspace), "codex")
 
-    assert receipt.imported_mcp_servers == ["filesystem"]
     restored = await DriverConfigService(workspace).credential_store.get(
         credential.ref,
     )
@@ -1072,12 +752,9 @@ async def test_provider_import_encrypts_even_public_named_mcp_bindings(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
-    receipt = await _import_from(ProviderImportService(workspace), "codex")
+    await _import_from(ProviderImportService(workspace), "codex")
 
-    assert receipt.imported_mcp_servers == [
-        "stdio-public-name",
-        "http-public-name",
-    ]
+    assert len(await DriverConfigService(workspace).list_cards()) == 2
     persisted = "\n".join(
         path.read_text(encoding="utf-8", errors="replace")
         for path in workspace.workspace_dir.rglob("*")
@@ -1151,10 +828,8 @@ async def test_provider_import_rejects_inline_mcp_argument_secret(
     )
     _bind_inventory(monkeypatch, inventory)
 
-    receipt = await _import_from(ProviderImportService(workspace), "codex")
+    await _import_from(ProviderImportService(workspace), "codex")
 
-    assert receipt.imported_mcp_servers == []
-    assert any(server.name in item for item in receipt.warnings)
     assert not (
         workspace.workspace_dir / f"drivers/mcp/{server.name}.yaml"
     ).exists()
@@ -1164,42 +839,6 @@ async def test_provider_import_rejects_inline_mcp_argument_secret(
         if path.is_file()
     )
     assert secret not in persisted
-
-
-@pytest.mark.asyncio
-async def test_provider_import_sets_and_repairs_source_project_directory(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    workspace = _workspace(tmp_path)
-    project = tmp_path / "source-project"
-    project.mkdir()
-    session = SourceSession(
-        source_id="thread-project",
-        history=[
-            HarnessHistoryItem(
-                kind=HarnessHistoryKind.USER,
-                text="Continue here",
-            ),
-        ],
-    )
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        sessions=[session],
-    )
-    _bind_inventory(monkeypatch, inventory)
-
-    await _import_from(ProviderImportService(workspace), "codex")
-    session.cwd = str(project)
-    repaired = await _import_from(ProviderImportService(workspace), "codex")
-
-    assert repaired.skipped_sessions == ["thread-project"]
-    chats = await workspace.chat_manager.list_chats(archived=None)
-    assert chats[0].meta["runtime_context"]["project_dir"] == str(
-        project.resolve(),
-    )
 
 
 @pytest.mark.asyncio
@@ -1230,11 +869,8 @@ async def test_provider_memory_is_scoped_exact_and_idempotent(
     )
     _bind_inventory(monkeypatch, inventory)
 
-    first = await _import_from(ProviderImportService(workspace), "codex")
-    second = await _import_from(ProviderImportService(workspace), "codex")
-
-    assert first.imported_memory_projects == ["project-a"]
-    assert second.imported_memory_projects == []
+    await _import_from(ProviderImportService(workspace), "codex")
+    await _import_from(ProviderImportService(workspace), "codex")
     imported = list(
         (workspace.workspace_dir / "memory/imports/codex").glob(
             "*/MEMORY.md",
@@ -1302,112 +938,6 @@ def test_memory_snapshot_rejects_symbolic_link(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancel_after_memory_commit_keeps_asset(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    workspace = _workspace(tmp_path)
-    source = tmp_path / "source-memory/MEMORY.md"
-    source.parent.mkdir()
-    source.write_text("cancel me", encoding="utf-8")
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        memory_projects=[
-            SourceMemoryProject(
-                source_id="project-a",
-                project_key="Project A",
-                files=[
-                    SourceMemoryFile(
-                        source_path=source,
-                        relative_path=Path("MEMORY.md"),
-                    ),
-                ],
-            ),
-        ],
-    )
-    started = threading.Event()
-    release = threading.Event()
-
-    def blocked_create(*args):
-        started.set()
-        release.wait(timeout=2)
-        return create_memory_project(*args)
-
-    _bind_inventory(monkeypatch, inventory)
-    _mock_adaptation(monkeypatch, workspace, inventory)
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer._create_memory_project",
-        blocked_create,
-    )
-
-    task = asyncio.create_task(
-        _import_from(ProviderImportService(workspace), "codex"),
-    )
-    assert await asyncio.to_thread(started.wait, 2)
-    task.cancel()
-    release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    root = workspace.workspace_dir / "memory/imports/codex"
-    assert any(root.iterdir())
-
-
-@pytest.mark.asyncio
-async def test_retry_selection_keeps_an_existing_skill(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    workspace = _workspace(tmp_path)
-    source = tmp_path / "source-skill"
-    source.mkdir()
-    skill_file = source / "SKILL.md"
-    skill_file.write_text(
-        "---\nname: portable-skill\ndescription: test\n---\n\nbefore\n",
-        encoding="utf-8",
-    )
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        skills=[
-            SourceSkill(
-                source_id="portable-skill",
-                name="portable-skill",
-                directory=source,
-            ),
-        ],
-    )
-    _bind_inventory(monkeypatch, inventory)
-    _mock_adaptation(monkeypatch, workspace, inventory, zone="migrate")
-    service = ProviderImportService(workspace)
-    plan = await service.plan_from("codex")
-    await service.apply_selection(
-        plan.plan_id,
-        ImportSelection(sessions=False, skills=["portable-skill"]),
-    )
-    skill_file.write_text(
-        "---\nname: portable-skill\ndescription: test\n---\n\nafter\n",
-        encoding="utf-8",
-    )
-
-    retry_plan, retry = await service.retry_selection(
-        plan.plan_id,
-        ImportSelection(sessions=False, skills=["portable-skill"]),
-    )
-
-    assert retry.plan_id == retry_plan.plan_id
-    assert retry.retry_of_migration_id
-    assert (
-        (workspace.workspace_dir / "skills/portable-skill/SKILL.md")
-        .read_text(encoding="utf-8")
-        .endswith("before\n")
-    )
-
-
-@pytest.mark.asyncio
 async def test_skill_retry_never_deletes_the_existing_skill(
     tmp_path: Path,
     monkeypatch,
@@ -1442,9 +972,8 @@ async def test_skill_retry_never_deletes_the_existing_skill(
         "---\nname: portable-skill\ndescription: test\n---\n\nafter\n",
         encoding="utf-8",
     )
-    _plan, receipt = await service.retry_selection(plan.plan_id, selection)
+    await service.retry_selection(plan.plan_id, selection)
 
-    assert any("portable-skill" in item for item in receipt.warnings)
     assert (
         (workspace.workspace_dir / "skills/portable-skill/SKILL.md")
         .read_text(encoding="utf-8")
@@ -1478,9 +1007,12 @@ async def test_provider_plugin_restores_marketplace_then_native_installs(
         "qwenpaw.plugins.registry.PluginRegistry.get_plugin_http_app",
         lambda _self: app,
     )
-    monkeypatch.setattr(
-        "qwenpaw.app.routers.plugins.install_plugin_source",
-        _install,
+    plugins_router = ModuleType("qwenpaw.app.routers.plugins")
+    plugins_router.install_plugin_source = _install
+    monkeypatch.setitem(
+        sys.modules,
+        "qwenpaw.app.routers.plugins",
+        plugins_router,
     )
     inventory = ProviderInventory(
         provider_id="codex",
@@ -1506,19 +1038,9 @@ async def test_provider_plugin_restores_marketplace_then_native_installs(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
-    receipt = await _import_from(ProviderImportService(workspace), "codex")
+    await _import_from(ProviderImportService(workspace), "codex")
 
-    assert receipt.restored_marketplaces == ["local"]
-    assert receipt.prepared_plugins == ["demo@local"]
-    assert receipt.installed_plugins == []
     assert not calls
-    assert receipt.doctor_report is not None
-    pending_check = next(
-        item
-        for item in receipt.doctor_report.checks
-        if item.category == "plugins_prepared"
-    )
-    assert pending_check.status == "warning"
     registry = json.loads(workspace.marketplace_registry_path.read_text())
     assert registry["sources"]["codex:codex:local"]["source"] == str(
         plugin_source.parent.parent,
@@ -1567,14 +1089,9 @@ async def test_marketplace_conflict_does_not_prepare_its_plugin(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
-    receipt = await _import_from(ProviderImportService(workspace), "codex")
+    await _import_from(ProviderImportService(workspace), "codex")
 
-    assert receipt.restored_marketplaces == []
-    assert receipt.prepared_plugins == []
-    assert any(
-        "because its Marketplace conflicts with QwenPaw" in item
-        for item in receipt.warnings
-    )
+    assert not (workspace.workspace_dir / "plugins").exists()
 
 
 @pytest.mark.asyncio
@@ -1607,10 +1124,8 @@ async def test_provider_plugin_never_falls_back_to_installed_cache(
     )
     _bind_inventory(monkeypatch, inventory)
 
-    receipt = await _import_from(ProviderImportService(workspace), "qoder")
+    await _import_from(ProviderImportService(workspace), "qoder")
 
-    assert receipt.installed_plugins == []
-    assert receipt.prepared_plugins == ["demo@qoder-bundler"]
     assert not (workspace.workspace_dir / "plugins").exists()
 
 
@@ -1674,13 +1189,12 @@ async def test_qoder_custom_skill_plugin_uses_native_adapter(
         "qwenpaw.plugins.registry.PluginRegistry.get_plugin_http_app",
         lambda _self: app,
     )
-    monkeypatch.setattr(
-        "qwenpaw.app.routers.plugins.install_plugin_source",
-        _install,
-    )
-    monkeypatch.setattr(
-        "qwenpaw.portability.doctor.get_plugins_dir",
-        lambda: installed_plugins_root,
+    plugins_router = ModuleType("qwenpaw.app.routers.plugins")
+    plugins_router.install_plugin_source = _install
+    monkeypatch.setitem(
+        sys.modules,
+        "qwenpaw.app.routers.plugins",
+        plugins_router,
     )
     inventory = ProviderInventory(
         provider_id="qoder",
@@ -1714,21 +1228,12 @@ async def test_qoder_custom_skill_plugin_uses_native_adapter(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory)
 
-    receipt = await _import_from(ProviderImportService(workspace), "qoder")
+    await _import_from(ProviderImportService(workspace), "qoder")
 
-    assert receipt.installed_plugins == ["test-report"]
     assert captured["manifest"]["id"] == "test-report"
     assert captured["manifest"]["meta"]["migration"]["harness_bound"] is True
     assert "enabled_by_default=False" in captured["backend"]
     assert captured["skill"] == "Read ~/.qoder/mcp.json"
-    assert any("disabled" in warning for warning in receipt.warnings)
-    assert receipt.doctor_report is not None
-    plugin_check = next(
-        item
-        for item in receipt.doctor_report.checks
-        if item.category == "plugins"
-    )
-    assert plugin_check.status == "warning"
 
 
 @pytest.mark.asyncio
@@ -1782,13 +1287,12 @@ async def test_codex_content_plugin_registers_skills_and_owned_mcp(
         "qwenpaw.plugins.registry.PluginRegistry.get_plugin_http_app",
         lambda _self: app,
     )
-    monkeypatch.setattr(
-        "qwenpaw.app.routers.plugins.install_plugin_source",
-        _install,
-    )
-    monkeypatch.setattr(
-        "qwenpaw.portability.doctor.get_plugins_dir",
-        lambda: installed_root,
+    plugins_router = ModuleType("qwenpaw.app.routers.plugins")
+    plugins_router.install_plugin_source = _install
+    monkeypatch.setitem(
+        sys.modules,
+        "qwenpaw.app.routers.plugins",
+        plugins_router,
     )
     plugin_id = "creative-production@openai-curated-remote"
     inventory = ProviderInventory(
@@ -1820,209 +1324,10 @@ async def test_codex_content_plugin_registers_skills_and_owned_mcp(
     _bind_inventory(monkeypatch, inventory)
     _mock_adaptation(monkeypatch, workspace, inventory, zone="migrate")
 
-    receipt = await _import_from(ProviderImportService(workspace), "codex")
+    await _import_from(ProviderImportService(workspace), "codex")
 
-    assert receipt.installed_plugins == ["creative-production"]
-    assert receipt.imported_mcp_servers == ["creative"]
     backend = (installed_root / "creative-production/plugin.py").read_text()
     assert "register_skill_provider" in backend
     assert "enabled_by_default=False" in backend
     card = (workspace.workspace_dir / "drivers/mcp/creative.yaml").read_text()
     assert str(installed_root / "creative-production") in card
-
-
-@pytest.mark.asyncio
-async def test_receipt_failure_keeps_committed_assets(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    workspace = _workspace(tmp_path)
-    workspace.marketplace_registry_path = tmp_path / "marketplaces.json"
-    original_registry = b'{"schema_version":"1","sources":{"keep":{}}}'
-    workspace.marketplace_registry_path.write_bytes(original_registry)
-    memory_source = tmp_path / "source-memory/topic.md"
-    memory_source.parent.mkdir()
-    memory_source.write_text("temporary memory", encoding="utf-8")
-    custom_root = tmp_path / ".qoder/plugins/custom"
-    plugin_source = custom_root / "demo-0.1.0"
-    skill_dir = plugin_source / "skills/demo"
-    manifest_dir = plugin_source / ".qoder-plugin"
-    skill_dir.mkdir(parents=True)
-    manifest_dir.mkdir()
-    (skill_dir / "SKILL.md").write_text(
-        "---\nname: demo\n---\nSafe imported Skill.\n",
-        encoding="utf-8",
-    )
-    (manifest_dir / "plugin.json").write_text(
-        json.dumps(
-            {
-                "name": "qwen-demo",
-                "version": "0.1.0",
-                "skills": "./skills/",
-            },
-        ),
-        encoding="utf-8",
-    )
-    app = SimpleNamespace(state=SimpleNamespace(plugin_loader=object()))
-    uninstalled = []
-
-    async def _install(_source, *, app, force, reload_agents, **_kwargs):
-        del app, force, reload_agents
-        return SimpleNamespace(manifest=SimpleNamespace(id="qwen-demo"))
-
-    async def _uninstall(plugin_id, *, app, reload_agents):
-        del app, reload_agents
-        uninstalled.append(plugin_id)
-
-    async def _fail_receipt(*_args, **_kwargs):
-        raise OSError("receipt storage unavailable")
-
-    monkeypatch.setattr(
-        "qwenpaw.plugins.registry.PluginRegistry.get_plugin_http_app",
-        lambda _self: app,
-    )
-    monkeypatch.setattr(
-        "qwenpaw.app.routers.plugins.install_plugin_source",
-        _install,
-    )
-    monkeypatch.setattr(
-        "qwenpaw.app.routers.plugins.uninstall_plugin_source",
-        _uninstall,
-    )
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.write_json_atomic_async",
-        _fail_receipt,
-    )
-    inventory = ProviderInventory(
-        provider_id="qoder",
-        provider_name="Qoder",
-        detected=True,
-        memory_projects=[
-            SourceMemoryProject(
-                source_id="project-a",
-                project_key="project-a",
-                files=[
-                    SourceMemoryFile(
-                        source_path=memory_source,
-                        relative_path=Path("topic.md"),
-                    ),
-                ],
-            ),
-        ],
-        marketplaces=[
-            SourceMarketplace(
-                source_id="qoder:local-custom",
-                name="local-custom",
-                source=str(custom_root),
-                source_type="local_custom",
-            ),
-        ],
-        plugins=[
-            SourcePlugin(
-                source_id="demo-0.1.0@local-custom",
-                name="demo-0.1.0",
-                marketplace="local-custom",
-                install_source=str(plugin_source),
-                metadata={
-                    "adapter": "qoder_skill_only_v1",
-                    "canonical_custom_root": str(custom_root.resolve()),
-                    "skills_relative_path": "skills",
-                    "harness_bound": False,
-                    "skills_enabled_by_default": True,
-                },
-            ),
-        ],
-    )
-    _bind_inventory(monkeypatch, inventory)
-    _mock_adaptation(monkeypatch, workspace, inventory, zone="migrate")
-
-    with pytest.raises(OSError, match="receipt storage unavailable"):
-        await _import_from(ProviderImportService(workspace), "qoder")
-
-    assert not uninstalled
-    assert list(
-        (workspace.workspace_dir / "memory/imports/qoder").glob("*/topic.md"),
-    )
-    assert (
-        workspace.marketplace_registry_path.read_bytes() != original_registry
-    )
-
-
-@pytest.mark.asyncio
-async def test_receipt_failure_keeps_all_asset_writers(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    workspace = _workspace(tmp_path)
-    workspace.cron_manager = _CronManager()
-    skill_source = tmp_path / "rollback-skill"
-    skill_source.mkdir()
-    (skill_source / "SKILL.md").write_text(
-        "---\n"
-        "name: rollback-skill\n"
-        "description: Rollback fixture\n"
-        "---\n\n"
-        "Use ordinary QwenPaw tools.\n",
-        encoding="utf-8",
-    )
-    inventory = ProviderInventory(
-        provider_id="codex",
-        provider_name="Codex",
-        detected=True,
-        sessions=[
-            SourceSession(
-                source_id="rollback-session",
-                title="Rollback session",
-                history=[
-                    HarnessHistoryItem(
-                        kind=HarnessHistoryKind.USER,
-                        text="Do rollback work",
-                        item_id="rollback-message",
-                    ),
-                ],
-            ),
-        ],
-        skills=[
-            SourceSkill(
-                source_id="rollback-skill",
-                name="rollback-skill",
-                directory=skill_source,
-            ),
-        ],
-        mcp_servers=[
-            SourceMCPServer(
-                source_id="rollback-mcp",
-                name="rollback-mcp",
-                command=sys.executable,
-            ),
-        ],
-        scheduled_tasks=[
-            SourceScheduledTask(
-                source_id="rollback-task",
-                name="Rollback task",
-                schedule_type="cron",
-                cron="30 9 * * *",
-                prompt="Review rollback state",
-            ),
-        ],
-    )
-    _bind_inventory(monkeypatch, inventory)
-    _mock_adaptation(monkeypatch, workspace, inventory, zone="migrate")
-
-    async def _fail_receipt(*_args, **_kwargs):
-        raise OSError("receipt storage unavailable")
-
-    monkeypatch.setattr(
-        "qwenpaw.portability.importer.write_json_atomic_async",
-        _fail_receipt,
-    )
-
-    with pytest.raises(OSError, match="receipt storage unavailable"):
-        await _import_from(ProviderImportService(workspace), "codex")
-
-    assert await workspace.chat_manager.list_chats(archived=None)
-    assert (workspace.workspace_dir / "skills/rollback-skill").exists()
-    assert (workspace.workspace_dir / "drivers/mcp/rollback-mcp.yaml").exists()
-    assert workspace.cron_manager.jobs
-    imports = workspace.workspace_dir / ".qwenpaw/imports"
-    assert not list(imports.glob("migration-*.json"))

@@ -7,10 +7,7 @@ from pathlib import Path
 import pytest
 
 import qwenpaw.harnesses.codex.rollout_reader as rollout_module
-from qwenpaw.harnesses.codex.rollout_reader import (
-    CodexRolloutReader,
-    codex_non_root_session_kind,
-)
+from qwenpaw.harnesses.codex.rollout_reader import CodexRolloutReader
 from qwenpaw.harnesses.events import HarnessHistoryKind
 
 
@@ -123,70 +120,6 @@ def test_rollout_reader_indexes_and_normalizes_visible_history(
     assert history[-1].text == "passed"
 
 
-def test_rollout_reader_stitches_compacted_lineage(tmp_path: Path) -> None:
-    thread_id = "019fe9ac-2e78-7a10-a196-27b001cdf1f5"
-    embedded_alias = "019ff100-0000-7000-8000-000000000000"
-    root = tmp_path / ".codex/sessions/2026/08/12"
-    root.mkdir(parents=True)
-    first = root / f"rollout-2026-08-12T00-00-00-{thread_id}.jsonl"
-    continuation = root / (
-        "rollout-2026-08-12T01-00-00-"
-        "019ff000-0000-7000-8000-000000000000.jsonl"
-    )
-    first.write_text(
-        "\n".join(
-            [
-                _line(
-                    "session_meta",
-                    {"id": thread_id, "timestamp": "2026-08-12T00:00:00Z"},
-                    "2026-08-12T00:00:00Z",
-                ),
-                _line(
-                    "session_meta",
-                    {
-                        "id": embedded_alias,
-                        "timestamp": "2026-08-12T00:00:00Z",
-                    },
-                    "2026-08-12T00:00:00Z",
-                ),
-                _line(
-                    "event_msg",
-                    {"type": "user_message", "message": "First part"},
-                    "2026-08-12T00:00:01Z",
-                ),
-            ],
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    continuation.write_text(
-        "\n".join(
-            [
-                _line(
-                    "session_meta",
-                    {"id": thread_id, "timestamp": "2026-08-12T01:00:00Z"},
-                    "2026-08-12T01:00:00Z",
-                ),
-                _line(
-                    "event_msg",
-                    {"type": "agent_message", "message": "Continued part"},
-                    "2026-08-12T01:00:01Z",
-                ),
-            ],
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    reader = CodexRolloutReader(tmp_path / ".codex")
-
-    threads = reader.list_threads(limit=10)
-    history = reader.read_thread(thread_id)
-
-    assert len(threads) == 1
-    assert threads[0]["rolloutLineageLength"] == 2
-    assert [item.text for item in history] == ["First part", "Continued part"]
-
-
 def test_oversized_history_remains_visible(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -273,75 +206,3 @@ def test_rollout_reader_excludes_structured_non_root_sessions(
     # Classification is structural: identical Guardian text in a root user
     # conversation remains visible.
     assert reader.list_threads(limit=10)[0]["preview"] == internal_prompt
-
-
-def test_rollout_reader_keeps_legacy_session_without_source_metadata(
-    tmp_path: Path,
-) -> None:
-    root = tmp_path / ".codex/sessions/2026/08/18"
-    legacy_id = "01a01000-0000-7000-8000-000000000004"
-    _rollout(root, legacy_id, {}, "Legacy user conversation")
-
-    reader = CodexRolloutReader(tmp_path / ".codex")
-
-    assert [item["id"] for item in reader.list_threads(limit=10)] == [
-        legacy_id,
-    ]
-    assert reader.list_non_root_thread_ids() == []
-
-
-def test_rollout_reader_filters_before_applying_visible_limit(
-    tmp_path: Path,
-) -> None:
-    root = tmp_path / ".codex/sessions/2026/08/18"
-    visible_id = "01a01000-0000-7000-8000-000000000005"
-    _rollout(root, visible_id, {"source": "vscode"}, "Visible root")
-    for index in range(6, 16):
-        thread_id = f"01a01000-0000-7000-8000-{index:012d}"
-        _rollout(
-            root,
-            thread_id,
-            {
-                "source": {"subagent": {"other": "guardian"}},
-                "thread_source": "subagent",
-                "parent_thread_id": visible_id,
-            },
-            "Internal review",
-        )
-
-    reader = CodexRolloutReader(tmp_path / ".codex")
-
-    assert [item["id"] for item in reader.list_threads(limit=1)] == [
-        visible_id,
-    ]
-
-
-@pytest.mark.parametrize(
-    "metadata",
-    [
-        {"source": {"subAgent": {"other": "guardian"}}},
-        {"source": {"subagent": "review"}},
-        {"source": {"subagent": "compact"}},
-        {"source": {"internal": "memory_consolidation"}},
-        {"threadSource": "memoryConsolidation"},
-    ],
-)
-def test_non_root_classifier_accepts_codex_serialization_variants(
-    metadata: dict,
-) -> None:
-    assert codex_non_root_session_kind(metadata)
-
-
-@pytest.mark.parametrize(
-    "metadata",
-    [
-        {},
-        {"source": "vscode", "thread_source": "user"},
-        {"source": {"future_root_source": {"version": 1}}},
-        {"source": 42, "thread_source": None},
-    ],
-)
-def test_non_root_classifier_keeps_unknown_legacy_root_metadata(
-    metadata: dict,
-) -> None:
-    assert codex_non_root_session_kind(metadata) == ""

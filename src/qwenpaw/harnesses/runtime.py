@@ -53,7 +53,6 @@ class HarnessRuntime:
         self._adapters: dict[str, HarnessAdapter] = {}
         self._adapter_keys: dict[str, tuple[Any, ...]] = {}
         self._adapter_lock = asyncio.Lock()
-        self._workspace = workspace
         self._session_bridge = (
             HarnessSessionBridge(session) if session is not None else None
         )
@@ -121,23 +120,15 @@ class HarnessRuntime:
         """Run a harness turn and emit the established QwenPaw protocol."""
         settings = dict(settings or {})
         request_context = dict(settings.get("_request_context") or {})
+        settings[
+            "_runtime_capabilities"
+        ] = await self._capability_resolver.resolve(request_context)
+        adapter = await self.adapter(backend, settings)
         session_id = str(getattr(request, "session_id", "") or "default")
         prompt, attachments = self._content_from_request(request)
         command, arguments = (
             self._parse_command(prompt) if not attachments else ("", "")
         )
-        # pylint: disable=import-outside-toplevel
-        from ..runtime.commands.control import (
-            is_control_command,
-        )
-
-        local_control = not attachments and is_control_command(prompt)
-        adapter: HarnessAdapter | None = None
-        if not local_control:
-            settings[
-                "_runtime_capabilities"
-            ] = await self._capability_resolver.resolve(request_context)
-            adapter = await self.adapter(backend, settings)
         response = AgentResponse(
             id=f"response_{uuid.uuid4().hex}",
             output=[],
@@ -167,14 +158,7 @@ class HarnessRuntime:
         task_cancelled = False
 
         try:
-            if local_control:
-                event_stream = self._stream_local_control(
-                    prompt=prompt,
-                    request=request,
-                    session_id=session_id,
-                )
-            elif command in {"new", "clear"}:
-                assert adapter is not None
+            if command in {"new", "clear"}:
                 await adapter.reset_session(session_id)
                 events = [
                     HarnessEvent(
@@ -185,7 +169,6 @@ class HarnessRuntime:
                 ]
                 event_stream = self._iter_events(events)
             elif command:
-                assert adapter is not None
                 provider = get_provider(backend)
                 supported = {
                     item.name for item in provider.capabilities.commands
@@ -203,7 +186,6 @@ class HarnessRuntime:
                 )
                 event_stream = self._iter_events(events)
             else:
-                assert adapter is not None
                 event_stream = adapter.run_turn(
                     session_id=session_id,
                     prompt=prompt,
@@ -265,66 +247,37 @@ class HarnessRuntime:
         response.completed_at = datetime.now(timezone.utc).isoformat(
             timespec="seconds",
         )
-        if not local_control and self._session_bridge is not None:
+        if self._session_bridge is not None and clear_history:
             try:
-                if clear_history:
-                    await self._session_bridge.clear(
-                        session_id=session_id,
-                        user_id=str(
-                            getattr(request, "user_id", "") or session_id,
-                        ),
-                        channel=str(getattr(request, "channel", "") or ""),
-                    )
-                else:
-                    await self._session_bridge.append_turn(
-                        request=request,
-                        response=response,
-                        backend=backend,
-                    )
+                await self._session_bridge.clear(
+                    session_id=session_id,
+                    user_id=str(
+                        getattr(request, "user_id", "") or session_id,
+                    ),
+                    channel=str(getattr(request, "channel", "") or ""),
+                )
             except Exception:
                 logger.warning(
-                    "Failed to %s third-party session %s",
-                    "clear" if clear_history else "persist",
+                    "Failed to clear third-party session %s",
+                    session_id,
+                    exc_info=True,
+                )
+        elif self._session_bridge is not None:
+            try:
+                await self._session_bridge.append_turn(
+                    request=request,
+                    response=response,
+                    backend=backend,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to persist third-party session %s",
                     session_id,
                     exc_info=True,
                 )
         if task_cancelled:
             raise asyncio.CancelledError
         yield tagged(response)
-
-    async def _stream_local_control(
-        self,
-        *,
-        prompt: str,
-        request: Any,
-        session_id: str,
-    ) -> AsyncGenerator[HarnessEvent, None]:
-        """Run a QwenPaw control command before provider routing."""
-        workspace = self._workspace
-        if workspace is None:
-            raise RuntimeError("QwenPaw workspace is unavailable.")
-        # pylint: disable=import-outside-toplevel
-        from ..runtime.commands.control import handle_control_command
-        from ..runtime.commands.control.base import ControlContext
-
-        final_text = await handle_control_command(
-            prompt,
-            ControlContext(
-                workspace=workspace,
-                payload=request,
-                channel=None,
-                session_id=session_id,
-                user_id=str(getattr(request, "user_id", "") or session_id),
-                agent_id=self._agent_id,
-                args={},
-            ),
-        )
-        if final_text:
-            yield HarnessEvent(
-                kind=HarnessEventKind.TEXT_DELTA,
-                text=final_text,
-            )
-        yield HarnessEvent(kind=HarnessEventKind.COMPLETED)
 
     async def stop(self) -> None:
         """Stop every initialized adapter."""

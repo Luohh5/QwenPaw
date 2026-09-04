@@ -12,20 +12,6 @@ const locales = { en, id, ja, "pt-BR": ptBR, ru, vi, zh };
 
 const requiredPaths = [
   "common.saving",
-  "nav.import",
-  "portabilityImport.title",
-  "portabilityImport.description",
-  "portabilityImport.steps.sources",
-  "portabilityImport.steps.inventory",
-  "portabilityImport.steps.progress",
-  "portabilityImport.states.pending",
-  "portabilityImport.states.repairing",
-  "portabilityImport.states.ready",
-  "portabilityImport.states.failed",
-  "portabilityImport.states.succeeded",
-  "portabilityImport.hints.failed",
-  "portabilityImport.hints.disabled",
-  "portabilityImport.hints.cronReview",
   "harnesses.connected",
   "harnesses.disconnected",
   "harnesses.notConnected",
@@ -144,23 +130,7 @@ function getTranslation(
   }, locale);
 }
 
-function translationKeys(value: unknown, prefix = ""): string[] {
-  if (typeof value !== "object" || value === null) return [prefix];
-  return Object.entries(value).flatMap(([key, child]) =>
-    translationKeys(child, prefix ? `${prefix}.${key}` : key),
-  );
-}
-
 describe("third-party agent locale coverage", () => {
-  it.each(Object.entries(locales))(
-    "%s has the complete import workflow locale tree",
-    (_localeName, locale) => {
-      expect(translationKeys(locale.portabilityImport).sort()).toEqual(
-        translationKeys(en.portabilityImport).sort(),
-      );
-    },
-  );
-
   it.each(Object.entries(locales))(
     "%s includes every required translation",
     (_localeName, locale) => {

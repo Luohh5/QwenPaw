@@ -205,10 +205,6 @@ class CodexRolloutReader:
             reverse=True,
         )
 
-    def has_thread(self, thread_id: str) -> bool:
-        """Return whether a local rollout exists for ``thread_id``."""
-        return thread_id in self._index()
-
     def read_thread(self, thread_id: str) -> list[HarnessHistoryItem]:
         """Normalize visible chat and tool events from one rollout."""
         record = self._index().get(thread_id)

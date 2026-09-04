@@ -165,7 +165,7 @@ class ImportSelection(BaseModel):
 
 
 class ImportAssetResult(BaseModel):
-    """Stable per-asset result used by receipts and the Console."""
+    """Stable per-asset result used by the Console."""
 
     asset_type: str
     source_id: str
@@ -191,71 +191,18 @@ class MigrationPlan(BaseModel):
     plan_id: str
     schema_version: str = "1"
     source: str
-    source_home: str = ""
     agent_id: str
     created_at: datetime
     asset_fingerprints: dict[str, str] = Field(default_factory=dict)
     actions: list[MigrationAssetPlan] = Field(default_factory=list)
     state: str = "ready"
-    migration_id: str = ""
-
-
-class MigrationDoctorCheck(BaseModel):
-    """One Chinese post-import verification result."""
-
-    category: str
-    status: str
-    title_zh: str
-    detail_zh: str
-
-
-class MigrationDoctorReport(BaseModel):
-    """Post-import health report attached to an import receipt."""
-
-    status: str
-    summary_zh: str
-    checked_at: datetime
-    checks: list[MigrationDoctorCheck] = Field(default_factory=list)
-
-
-class ImportReceipt(BaseModel):
-    """Durable receipt for one additive provider migration."""
-
-    migration_id: str
-    plan_id: str = ""
-    schema_version: str = "1"
-    source: str
-    source_locator: str = ""
-    agent_id: str
-    started_at: datetime
-    completed_at: datetime
-    imported_sessions: list[str] = Field(default_factory=list)
-    skipped_sessions: list[str] = Field(default_factory=list)
-    ignored_source_sessions: list[str] = Field(default_factory=list)
-    archived_internal_sessions: list[str] = Field(default_factory=list)
-    imported_skills: list[str] = Field(default_factory=list)
-    imported_mcp_servers: list[str] = Field(default_factory=list)
-    imported_memory_projects: list[str] = Field(default_factory=list)
-    restored_marketplaces: list[str] = Field(default_factory=list)
-    prepared_plugins: list[str] = Field(default_factory=list)
-    installed_plugins: list[str] = Field(default_factory=list)
-    imported_scheduled_tasks: list[str] = Field(default_factory=list)
-    skipped_scheduled_tasks: list[str] = Field(default_factory=list)
-    adaptation_manifest: str = ""
-    adaptation_summary: str = ""
-    retry_of_migration_id: str = ""
-    warnings: list[str] = Field(default_factory=list)
-    doctor_report: MigrationDoctorReport | None = None
 
 
 __all__ = [
     "ImportAssetResult",
     "ImportAssetState",
-    "ImportReceipt",
     "ImportSelection",
     "MigrationAssetPlan",
-    "MigrationDoctorCheck",
-    "MigrationDoctorReport",
     "MigrationPlan",
     "ProviderInventory",
     "SourceMarketplace",

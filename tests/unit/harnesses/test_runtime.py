@@ -396,39 +396,3 @@ async def test_runtime_handles_host_clear_for_every_backend(
 
     assert adapter.reset_session_id == "chat-1"
     assert output[-1].output[-1].metadata["clear_history"] is True
-
-
-@pytest.mark.asyncio
-async def test_runtime_handles_qwenpaw_control_before_provider_routing(
-    tmp_path: Path,
-) -> None:
-    workspace = object()
-    runtime = HarnessRuntime(tmp_path, workspace=workspace)
-    request = AgentRequest(
-        session_id="chat-1",
-        user_id="user-1",
-        input=[
-            Message(
-                role=Role.USER,
-                content=[TextContent(text="/skills")],
-            ),
-        ],
-    )
-
-    with patch(
-        "qwenpaw.runtime.commands.control.handle_control_command",
-        return_value="Control ready",
-    ) as control:
-        output = [
-            item
-            async for item in runtime.stream(
-                backend="codex",
-                request=request,
-                cwd=tmp_path.resolve(),
-            )
-        ]
-
-    control.assert_awaited_once()
-    assert not runtime._adapters
-    assert output[-1].status == "completed"
-    assert output[-1].output[-1].content[0].text == "Control ready"

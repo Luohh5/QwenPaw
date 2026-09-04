@@ -426,8 +426,6 @@ _PLAN_TYPES = (
 def _build_migration_plan(
     agent_id: str,
     inventory: ProviderInventory,
-    *,
-    source_home: str = "",
 ) -> MigrationPlan:
     """Build a selectable plan without changing runtime assets."""
     actions = []
@@ -456,7 +454,6 @@ def _build_migration_plan(
     return MigrationPlan(
         plan_id=f"plan-{uuid4().hex}",
         source=inventory.provider_id,
-        source_home=source_home,
         agent_id=agent_id,
         created_at=datetime.now(timezone.utc),
         asset_fingerprints=tool_asset_fingerprints(inventory),
@@ -467,15 +464,12 @@ def _build_migration_plan(
 async def build_migration_plan(
     workspace: Any,
     inventory: ProviderInventory,
-    *,
-    source_home: str = "",
 ) -> MigrationPlan:
     """Build a selectable plan without blocking the event loop."""
     return await run_sync_io(
         _build_migration_plan,
         workspace.agent_id,
         inventory,
-        source_home=source_home,
     )
 
 

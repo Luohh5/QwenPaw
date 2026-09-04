@@ -1,6 +1,6 @@
 ---
 name: cron
-description: Use this skill only for scheduled or recurring tasks. Manage jobs with qwenpaw cron list/create/get/state/update/pause/resume/promote/delete/run, and always pass --agent-id explicitly.
+description: Use this skill only for scheduled or recurring tasks. Manage jobs with qwenpaw cron list/create/get/state/update/pause/resume/delete/run, and always pass --agent-id explicitly.
 metadata:
   builtin_skill_version: "1.8"
   qwenpaw:
@@ -32,7 +32,7 @@ Use this skill only when you need to **automatically execute something at a futu
 4. **All cron commands must explicitly include `--agent-id`**
 5. **Do not rely on the default agent, or the task may end up in the default workspace**
 6. **For an agent task that should run without channel output, add `--silent`; execution, session history, trace, and optional Inbox recording still continue**
-7. **Never run or resume an imported job while `requires_review` is set; review it first, then use the separate `promote` command**
+7. **Never run or resume an imported job while `requires_review` is set; review and approve it in Console first**
 
 ---
 
@@ -72,9 +72,6 @@ qwenpaw cron delete <job_id> --agent-id <agent_id>
 # Pause / Resume a task
 qwenpaw cron pause <job_id> --agent-id <agent_id>
 qwenpaw cron resume <job_id> --agent-id <agent_id>
-
-# Approve a reviewed imported task (it remains disabled and does not run)
-qwenpaw cron promote <job_id> --agent-id <agent_id>
 
 # Run an existing task once immediately
 qwenpaw cron run <job_id> --agent-id <agent_id>
@@ -226,16 +223,7 @@ qwenpaw cron create --agent-id <agent_id> -f job_spec.json
 
 Jobs imported by PawPort are disabled and protected by a non-bypassable review gate.
 
-1. Use `get` to inspect the prompt, timezone, cadence, model semantics, tool permissions, and project directory.
-2. For a remote/container source workspace, first update `project_dir` to an explicitly confirmed local project.
-3. Run `promote` only after the user explicitly approves. Promotion records review but leaves the job disabled.
-4. Run `resume` separately only if the user also explicitly asks to enable it.
-
-```bash
-qwenpaw cron get <job_id> --agent-id <agent_id>
-qwenpaw cron promote <job_id> --agent-id <agent_id>
-qwenpaw cron resume <job_id> --agent-id <agent_id>
-```
+Review and approve imported jobs in the Console Cron Jobs page. Approval records the review but leaves the job disabled. Enable it there separately only if the user explicitly asks.
 
 ---
 

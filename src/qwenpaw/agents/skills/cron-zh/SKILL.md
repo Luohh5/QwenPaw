@@ -1,6 +1,6 @@
 ---
 name: cron
-description: 仅在需要未来定时执行或周期执行任务时，使用本 skill。使用 qwenpaw cron list/create/get/state/update/pause/resume/promote/delete/run 管理任务，并始终显式传入 --agent-id。
+description: 仅在需要未来定时执行或周期执行任务时，使用本 skill。使用 qwenpaw cron list/create/get/state/update/pause/resume/delete/run 管理任务，并始终显式传入 --agent-id。
 metadata:
   builtin_skill_version: "1.8"
   qwenpaw:
@@ -32,7 +32,7 @@ metadata:
 4. **所有 cron 命令都必须显式传 `--agent-id`**
 5. **不要依赖默认 agent，否则任务可能落到 default workspace**
 6. **如果 agent 任务只需后台执行、不向渠道输出，添加 `--silent`；执行、会话历史、追踪和可选收件箱记录仍会继续**
-7. **迁入任务的 `requires_review` 未清除时，不得运行或恢复；必须先完成人工复核，再单独执行 `promote`**
+7. **迁入任务的 `requires_review` 未清除时，不得运行或恢复；必须先在 Console 中完成人工复核和批准**
 
 ---
 
@@ -72,9 +72,6 @@ qwenpaw cron delete <job_id> --agent-id <agent_id>
 # 暂停 / 恢复任务
 qwenpaw cron pause <job_id> --agent-id <agent_id>
 qwenpaw cron resume <job_id> --agent-id <agent_id>
-
-# 审核通过一个迁入任务（仍保持禁用，不会立即运行）
-qwenpaw cron promote <job_id> --agent-id <agent_id>
 
 # 立即执行一次已有任务
 qwenpaw cron run <job_id> --agent-id <agent_id>
@@ -225,16 +222,7 @@ qwenpaw cron create --agent-id <agent_id> -f job_spec.json
 
 通过 PawPort 导入的定时任务默认禁用，并带有不可绕过的审核门。
 
-1. 先用 `get` 检查 prompt、时区、频率、模型语义、工具权限和项目目录。
-2. 如果来源是远程/容器工作区，先把 `project_dir` 显式更新为已确认的本地项目。
-3. 只在用户明确同意后执行 `promote`。该步仅记录审核通过，任务仍然禁用。
-4. 如果用户还明确要求启用，再单独执行 `resume`。
-
-```bash
-qwenpaw cron get <job_id> --agent-id <agent_id>
-qwenpaw cron promote <job_id> --agent-id <agent_id>
-qwenpaw cron resume <job_id> --agent-id <agent_id>
-```
+请在 Console 的定时任务页面中检查并批准迁入任务。批准只记录审核结果，任务仍保持禁用；仅在用户明确要求时，再在该页面中单独启用。
 
 ---
 

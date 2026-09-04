@@ -790,19 +790,12 @@ class Envelope:
     # ------------------------------------------------------------------
 
     async def from_msg(self, cmd_msg: Any) -> AsyncGenerator[Any, None]:
-        """Translate a completed slash-command message."""
-        async for item in self._finish_command(
-            cmd_msg,
-            cmd_msg.get_text_content() or "",
-        ):
-            yield item
-
-    async def _finish_command(
-        self,
-        cmd_msg: Any,
-        text: str,
-    ) -> AsyncGenerator[Any, None]:
+        """Translate a completed ``Msg`` from a slash
+        command into a full envelope sequence.
+        """
         from ..schemas import ContentType, RunStatus, TextContent
+
+        cmd_text = cmd_msg.get_text_content() or ""
 
         if not self._message_started:
             yield self._tag_seq(self._completed_message)
@@ -810,7 +803,7 @@ class Envelope:
 
         tc = TextContent(
             type=ContentType.TEXT,
-            text=text,
+            text=cmd_text,
             delta=False,
             index=0,
         )
