@@ -1,0 +1,59 @@
+{
+  "name": "QwenPaw GitHub Review Harness",
+  "root": "../..",
+  "targets": [
+    {
+      "id": "review.task_prompt",
+      "kind": "prompt",
+      "path": "scripts/review-bot/prompts.py",
+      "scope": "QwenPaw GitHub Review",
+      "change_mode": "text_only",
+      "allowed_changes": "仅任务提示词中的调查步骤、证据要求和输出规范；不能修改 Python 执行逻辑。",
+      "edit_rules": {"function_returns": ["_build_enhanced_prompt", "_build_fallback_prompt"]}
+    },
+    {
+      "id": "review.skill",
+      "kind": "skill",
+      "path": "scripts/review-bot/skills/code_review/SKILL.md",
+      "scope": "QwenPaw GitHub Review",
+      "change_mode": "add_file",
+      "allowed_changes": "候选新增审查 Skill，提炼通用核查步骤；目前尚未接入加载链，提案必须说明启用和触发方式。不能假定历史任务缺少所有 Skill。",
+      "edit_rules": {"sections": ["*"]}
+    },
+    {
+      "id": "review.project_knowledge",
+      "kind": "knowledge",
+      "path": "scripts/review-bot/references/project_conventions.md",
+      "scope": "QwenPaw 项目约定",
+      "change_mode": "add_file",
+      "allowed_changes": "候选新增带依据及适用范围的项目约定；需说明如何从审查流程引用，不能把单次偏好写成全局规则。",
+      "edit_rules": {"sections": ["*"]}
+    },
+    {
+      "id": "review.context",
+      "kind": "context",
+      "path": "scripts/review-bot/review_runner.py",
+      "scope": "Review change map",
+      "change_mode": "config_only",
+      "allowed_changes": "仅 MAP_CONTEXT、MAP_PER_FILE_LINES、MAP_MAX_LINE_CHARS、MAP_MAX_LINES 的预算建议；算法和上下文获取方式的变化需另行工程改造。",
+      "edit_rules": {"env_defaults": ["MAP_CONTEXT", "MAP_PER_FILE_LINES", "MAP_MAX_LINE_CHARS", "MAP_MAX_LINES"]}
+    },
+    {
+      "id": "review.tools",
+      "kind": "tools",
+      "path": "scripts/review-bot/setup_review_workspace.py",
+      "scope": "Review 只读证据获取工具",
+      "change_mode": "engineering",
+      "allowed_changes": "仅提出受控只读工具的能力缺口、接口及接入方案，或 AGENTS_MD 中已批准工具的使用说明；禁止降低权限、修改凭证或 harden_governance_policy。"
+    },
+    {
+      "id": "review.verification",
+      "kind": "verification",
+      "path": "scripts/review-bot/setup_review_workspace.py",
+      "scope": "Review 任务内核查",
+      "change_mode": "text_only",
+      "allowed_changes": "仅 SOUL_MD/AGENTS_MD 中的证据核查、严重程度和结束前自检要求；不改变执行代码、安全边界、独立评测和人工审批。",
+      "edit_rules": {"string_sections": {"SOUL_MD": ["Review Methodology"], "AGENTS_MD": ["Review Methodology"]}}
+    }
+  ]
+}

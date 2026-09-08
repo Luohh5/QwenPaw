@@ -71,6 +71,14 @@ class TaskTracker:
             return "idle"
         return "running"
 
+    async def get_run_started_at(self, run_key: str) -> str | None:
+        """Identify the active run even when a chat key is reused later."""
+        async with self._lock:
+            state = self._runs.get(run_key)
+            if state and not state.task.done() and state.start_time:
+                return state.start_time.isoformat()
+        return None
+
     async def get_global_status(self) -> dict:
         """Get global agent status summary.
 

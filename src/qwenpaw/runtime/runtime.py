@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from contextlib import aclosing
 from typing import Any, AsyncGenerator
 
 from ..exceptions import ConfigurationException
@@ -26,6 +27,7 @@ from .executor import AgentExecutor
 from .hooks import HookAction, HookContext
 from .message_convert import _get_last_user_text, _request_input_to_msgs
 from .phases import Phase
+from .slash_command_registry import CommandStream
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +76,34 @@ class Runtime:
             text = _get_last_user_text(ctx.input_msgs)
             cmd_registry = self.workspace.plugins.slash_command_registry
             cmd_msg = await cmd_registry.dispatch(text or "", ctx)
-            if cmd_msg is not None:
+            if isinstance(cmd_msg, CommandStream):
+                from agentscope.message import Msg
+                from .heartbeat import (
+                    _iter_with_heartbeat,
+                    _HEARTBEAT_TICK,
+                    HEARTBEAT_INTERVAL_SECONDS,
+                )
+
+                async for ev in envelope.emit_response_created():
+                    yield ev
+                async with aclosing(cmd_msg.events), aclosing(
+                    _iter_with_heartbeat(
+                        cmd_msg.events,
+                        HEARTBEAT_INTERVAL_SECONDS,
+                    ),
+                ) as stream:
+                    async for item in stream:
+                        events = (
+                            envelope.heartbeat()
+                            if item is _HEARTBEAT_TICK
+                            else envelope.append_msg(item)
+                            if isinstance(item, Msg)
+                            else envelope.translate_event(item)
+                        )
+                        async for ev in events:
+                            yield ev
+                skip_agent = True
+            elif cmd_msg is not None:
                 async for ev in envelope.from_msg(cmd_msg):
                     yield ev
                 skip_agent = True

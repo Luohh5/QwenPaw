@@ -716,7 +716,13 @@ def collect_builtin_command_specs() -> list[CommandSpec]:
     These are registered into each workspace's :class:`SlashCommandRegistry`
     via ``bootstrap_plugins(builtin_command_specs=...)``.
     """
-    specs: list[CommandSpec] = []
+    from ..selflearn.command import analyze_command_spec
+    from ..selflearn.optimize_command import optimize_command_spec
+
+    specs: list[CommandSpec] = [
+        analyze_command_spec(),
+        optimize_command_spec(),
+    ]
     specs.extend(_collect_daemon_specs())
     specs.extend(_collect_control_specs())
     specs.extend(_collect_conversation_specs())

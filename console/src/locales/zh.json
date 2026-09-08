@@ -3087,6 +3087,12 @@
       "skills": {
         "description": "列出当前对话可用的技能，并显示可显式调用的技能命令"
       },
+      "analyze": {
+        "description": "分析指定 JSONL 中的用户反馈：/analyze 文件路径"
+      },
+      "optimize": {
+        "description": "生成及管理本地 Harness 候选：/optimize proposal.json"
+      },
       "agents": {
         "description": "列出当前运行时可用的智能体"
       },

@@ -11,6 +11,7 @@ Unifies the four previously-parallel command mechanisms
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -20,7 +21,17 @@ if TYPE_CHECKING:
     from .hooks import HookContext
 
 
-CommandHandler = Callable[["HookContext", str], Awaitable["Msg | None"]]
+@dataclass
+class CommandStream:
+    """A command running in the current chat, yielding Msg or agent events."""
+
+    events: AsyncGenerator[Any, None]
+
+
+CommandHandler = Callable[
+    ["HookContext", str],
+    Awaitable["Msg | CommandStream | None"],
+]
 FallbackHandler = Callable[[str, "HookContext"], Awaitable["Msg | None"]]
 
 
@@ -141,7 +152,7 @@ class SlashCommandRegistry:
         self,
         raw_text: str,
         ctx: "HookContext",
-    ) -> "Msg | None":
+    ) -> "Msg | CommandStream | None":
         """Resolve and execute. Returns ``None`` if nothing matched."""
         match = self.resolve(raw_text)
         if match is not None:
@@ -158,6 +169,7 @@ class SlashCommandRegistry:
 
 __all__ = [
     "CommandHandler",
+    "CommandStream",
     "CommandSpec",
     "FallbackHandler",
     "SlashCommandRegistry",

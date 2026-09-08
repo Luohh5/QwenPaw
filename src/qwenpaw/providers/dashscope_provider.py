@@ -19,6 +19,7 @@ from agentscope.model import ChatModelBase
 from pydantic import Field
 
 from .provider import ModelInfo
+from . import stream_diagnostics
 from .capping_formatter import MAX_INLINE_MEDIA_BYTES
 from .capping_formatter import _CappingDashScopeFormatter
 from .openai_chat_model_compat import _sanitize_nullable_tool_schemas
@@ -315,6 +316,18 @@ class _DashScopeChatModelCompat:
             _qp_default_headers = default_headers
             _qp_thinking_explicit = thinking_explicitly_set
             _qp_extra_generate_kwargs = extra_generate_kwargs or {}
+
+            def _parse_stream_response(self, start_datetime, response):
+                parse = super()._parse_stream_response
+                if not stream_diagnostics.enabled():
+                    return parse(start_datetime, response)
+                timing = stream_diagnostics.StreamTiming(self.model)
+                timing.record("stream_start")
+                raw = stream_diagnostics.RawStream(response, timing)
+                return stream_diagnostics.parsed_stream(
+                    parse(start_datetime, raw),
+                    timing,
+                )
 
             def _format_tools(self, tools, tool_choice):
                 if tools:

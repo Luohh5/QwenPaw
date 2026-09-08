@@ -107,6 +107,7 @@ include-package-data = true
     "browser/control_link/injected/*.js",
     "providers/data/**",
     "docs/*.md",
+    "selflearn/*.md",
     "app/channels/yuanbao/proto/**",
 ]
 

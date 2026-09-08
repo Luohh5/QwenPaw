@@ -3230,6 +3230,12 @@
       "skills": {
         "description": "List chat-available skills and expose explicit skill commands"
       },
+      "analyze": {
+        "description": "Analyze feedback from a JSONL file: /analyze path"
+      },
+      "optimize": {
+        "description": "Generate and manage local Harness candidates: /optimize proposal.json"
+      },
       "agents": {
         "description": "List agents available to the current runtime"
       },

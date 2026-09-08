@@ -40,3 +40,4 @@ async def _iter_with_heartbeat(source_iter, interval: float):
     finally:
         if pending is not None and not pending.done():
             pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)

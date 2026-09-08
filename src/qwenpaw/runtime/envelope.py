@@ -789,6 +789,42 @@ class Envelope:
     # Command short-circuit
     # ------------------------------------------------------------------
 
+    async def append_msg(self, msg: Any) -> AsyncGenerator[Any, None]:
+        """Append a chat command's input or notice without ending the turn."""
+        from ..schemas import (
+            ContentType,
+            Message,
+            MessageType,
+            Role,
+            RunStatus,
+            TextContent,
+        )
+
+        if self._should_finalize_text_message():
+            async for event in self._finalize_text_message():
+                yield event
+        message = Message(
+            id=msg.id,
+            type=MessageType.MESSAGE,
+            role=Role(msg.role),
+            content=[],
+            status=RunStatus.InProgress,
+        )
+        message.name, message.object = msg.name, "message"
+        yield self._tag_seq(message)
+        content = TextContent(
+            type=ContentType.TEXT,
+            text=msg.get_text_content() or "",
+            delta=False,
+            index=0,
+        )
+        content.msg_id = message.id
+        yield self._tag_seq(content)
+        message.content.append(content)
+        message.status = RunStatus.Completed
+        self._response.output.append(message)
+        yield self._tag_seq(message)
+
     async def from_msg(self, cmd_msg: Any) -> AsyncGenerator[Any, None]:
         """Translate a completed ``Msg`` from a slash
         command into a full envelope sequence.

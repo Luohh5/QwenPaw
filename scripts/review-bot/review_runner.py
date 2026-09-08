@@ -1147,6 +1147,9 @@ def main():
     print(f"Response length: {len(response)} chars")
 
     write_outputs(verdict_info, response)
+    if head_sha and base_sha:
+        with open("/tmp/review_meta.json", "w", encoding="utf-8") as f:
+            json.dump({"head_sha": head_sha, "base_sha": base_sha}, f)
     print("\n✅ Done! Results written to /tmp/review_result.md")
 
 
