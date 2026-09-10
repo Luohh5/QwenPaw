@@ -108,6 +108,7 @@ include-package-data = true
     "providers/data/**",
     "docs/*.md",
     "selflearn/*.md",
+    "selflearn/skills/*/SKILL.md",
     "app/channels/yuanbao/proto/**",
 ]
 

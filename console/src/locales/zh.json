@@ -3093,6 +3093,9 @@
       "optimize": {
         "description": "生成及管理本地 Harness 候选：/optimize proposal.json"
       },
+      "selflearn": {
+        "description": "分析答疑历史并导出知识 TXT：/selflearn qa episodes.jsonl"
+      },
       "agents": {
         "description": "列出当前运行时可用的智能体"
       },

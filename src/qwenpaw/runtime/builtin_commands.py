@@ -718,10 +718,12 @@ def collect_builtin_command_specs() -> list[CommandSpec]:
     """
     from ..selflearn.command import analyze_command_spec
     from ..selflearn.optimize_command import optimize_command_spec
+    from ..selflearn.qa_command import selflearn_command_spec
 
     specs: list[CommandSpec] = [
         analyze_command_spec(),
         optimize_command_spec(),
+        selflearn_command_spec(),
     ]
     specs.extend(_collect_daemon_specs())
     specs.extend(_collect_control_specs())

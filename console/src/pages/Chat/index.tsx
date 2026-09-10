@@ -2828,6 +2828,11 @@ export default function ChatPage() {
             value: "optimize",
             description: t("chat.commands.optimize.description"),
           },
+          {
+            command: "/selflearn",
+            value: "selflearn",
+            description: t("chat.commands.selflearn.description"),
+          },
         ]
       : backendCommands.map((item) => ({
           command: `/${item.name}`,

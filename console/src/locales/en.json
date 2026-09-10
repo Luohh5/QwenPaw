@@ -3236,6 +3236,9 @@
       "optimize": {
         "description": "Generate and manage local Harness candidates: /optimize proposal.json"
       },
+      "selflearn": {
+        "description": "Analyze QA history and export FAQ TXT: /selflearn qa episodes.jsonl"
+      },
       "agents": {
         "description": "List agents available to the current runtime"
       },
