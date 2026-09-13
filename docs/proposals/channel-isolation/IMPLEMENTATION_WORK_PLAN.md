@@ -957,7 +957,7 @@ Desktop bundled Python、完整安装形态以及 OS/Python ABI/架构发布矩�
 
 ### CH-1-003：Environment Installer 和原子发布
 
-- 状态：[-] 实施中或等待 Review
+- 状态：[x] 独立 Review 和最终验证通过
 
 - [x] 实现 staging venv、只读/不可变安装、原子 rename 和安装锁。
 - [x] 按 lock 和 wheel hash 安装，不解析未锁定依赖或现场构建 sdist。
@@ -971,6 +971,11 @@ Desktop bundled Python、完整安装形态以及 OS/Python ABI/架构发布矩�
 - [x] 验证已有 environment 不被原地覆盖或升级。
 - [x] 不提供预建 venv 作为核心安装路径；Desktop/offline bundle 只可预置经 hash 校验的
   artifact/wheel cache，并继续走相同本地 environment 创建和验证流程。
+
+验证证据：实现与修复提交为 `89ed40e5`、`c45e3021`、`2f063ca7`、`ff0637cc` 和
+`347bcded`。独立 Review 已通过（用户确认）。CH-1-003 聚焦测试 `17 passed`，
+CH-1-001/002/003 联合测试 `79 passed`，`tests/unit/channel_isolation` 全量测试
+`479 passed`；全仓 `pre-commit --all-files` 和 `git diff --check` 均通过。
 
 验收：安装失败不产生可启动 environment；并发安装只发布一个完整、严格匹配的不可变
 environment。
