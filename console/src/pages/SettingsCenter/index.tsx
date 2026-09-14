@@ -12,6 +12,7 @@ import {
   Bot,
   Bug,
   Cpu,
+  Download,
   Gauge,
   Globe,
   HeartPulse,
@@ -146,6 +147,16 @@ const SETTINGS_GROUPS: SettingsGroupDefinition[] = [
         descriptionFallback: "Configure ACP agents",
         routeId: "core.acp",
         Icon: ScanLine,
+      },
+      {
+        key: "import",
+        labelKey: "nav.import",
+        fallback: "Import",
+        descriptionKey: "portabilityImport.description",
+        descriptionFallback:
+          "Bring conversations and tool settings from other AI applications into QwenPaw.",
+        routeId: "core.import",
+        Icon: Download,
       },
       {
         key: "agent-config",

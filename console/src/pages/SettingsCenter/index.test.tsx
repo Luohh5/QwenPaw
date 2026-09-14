@@ -265,6 +265,7 @@ describe("SettingsCenter", () => {
 
   it("expands agent pages and keeps their sidebar controls", async () => {
     const EmptyPage = () => null;
+    const ImportPage = () => <div>PawPort import workflow</div>;
     const agentPages = [
       ["core.channels", "/channels", "Channels"],
       ["core.heartbeat", "/heartbeat", "Heartbeat"],
@@ -272,6 +273,7 @@ describe("SettingsCenter", () => {
       ["core.tools", "/tools", "Tools"],
       ["core.mcp", "/mcp", "MCP"],
       ["core.acp", "/acp", "ACP"],
+      ["core.import", "/imports", "Import"],
       ["core.agent-config", "/agent-config", "Configuration"],
     ] as const;
     const operationalPages = [
@@ -286,7 +288,7 @@ describe("SettingsCenter", () => {
       ...agentPages.map(([id, path]) => ({
         id,
         path,
-        Component: EmptyPage,
+        Component: id === "core.import" ? ImportPage : EmptyPage,
       })),
       ...operationalPages.map(([id, path]) => ({
         id,
@@ -333,6 +335,14 @@ describe("SettingsCenter", () => {
       ).toBeVisible();
     }
     expect(
+      within(agentGroup!)
+        .getAllByRole("button", { name: /^(ACP|Import|Configuration)$/ })
+        .map((button) => button.textContent),
+    ).toEqual(["ACP", "Import", "Configuration"]);
+    expect(useSidebarStore.getState().focusItemIds).not.toContain(
+      "core.import",
+    );
+    expect(
       screen.queryByRole("button", { name: "Marketplace" }),
     ).not.toBeInTheDocument();
     for (const label of [
@@ -351,6 +361,22 @@ describe("SettingsCenter", () => {
       within(agentGroup!).getByRole("button", { name: "Tools" }),
     );
     expect(screen.getByTestId("location")).toHaveTextContent("/settings/tools");
+
+    await userEvent.click(
+      within(agentGroup!).getByRole("button", { name: "Import" }),
+    );
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      "/settings/import",
+    );
+    expect(screen.getByText("PawPort import workflow")).toBeVisible();
+
+    const search = screen.getByPlaceholderText("Search settings");
+    await userEvent.type(search, "other AI applications");
+    expect(screen.getByRole("button", { name: "Import" })).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "ACP" }),
+    ).not.toBeInTheDocument();
+    await userEvent.clear(search);
 
     await userEvent.click(screen.getByRole("button", { name: "Sidebar" }));
 
