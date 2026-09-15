@@ -119,6 +119,7 @@
     "cliAuthenticated": "{{type}} CLI 已认证"
   },
   "portabilityImport": {
+    "qwenpawOnly": "导入仅适用于使用 QwenPaw 原生后端的智能体。请选择 QwenPaw 智能体后继续。",
     "title": "导入",
     "description": "将其他 AI 应用中的聊天记录、工具和设置迁移到 QwenPaw，并自动完成兼容性修复。",
     "steps": {

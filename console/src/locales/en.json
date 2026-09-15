@@ -119,6 +119,7 @@
     "cliAuthenticated": "{{type}} CLI authenticated"
   },
   "portabilityImport": {
+    "qwenpawOnly": "Import is only available for agents using the QwenPaw backend. Select a QwenPaw agent to continue.",
     "title": "Import",
     "description": "Bring conversations and tool settings from other AI applications into QwenPaw.",
     "steps": {

@@ -36,6 +36,8 @@ import { useTheme } from "@/contexts/ThemeContext";
 import { useMenuItems, useRoutes } from "@/plugins/registry/hooks";
 import { usePlugins } from "@/plugins/PluginContext";
 import { findMenuItem, flattenMenu } from "@/layouts/registry/adapter";
+import { useAgentStore } from "@/stores/agentStore";
+import { supportsPortabilityImport } from "@/utils/agentBackend";
 import GeneralSettings from "./GeneralSettings";
 import NavigationSettings from "./NavigationSettings";
 import SettingsAgentSelector from "./SettingsAgentSelector";
@@ -281,6 +283,11 @@ export default function SettingsCenter() {
   const routes = useRoutes();
   const { loading: pluginsLoading } = usePlugins();
   const rawSettingsMenu = useMenuItems("primary.settings");
+  const canImport = useAgentStore(({ selectedAgent, agents }) =>
+    supportsPortabilityImport(
+      agents.find((agent) => agent.id === selectedAgent),
+    ),
+  );
   const [query, setQuery] = useState("");
 
   const componentByRouteId = useMemo(() => {
@@ -353,17 +360,21 @@ export default function SettingsCenter() {
   };
 
   const normalizedQuery = query.trim().toLocaleLowerCase();
-  const visibleGroups = normalizedQuery
+  const filterNavigation = normalizedQuery !== "" || !canImport;
+  const visibleGroups = filterNavigation
     ? availableGroups
         .map((group) => ({
           ...group,
-          pages: group.pages.filter((page) =>
-            `${searchablePageLabel(page)} ${t(
-              page.descriptionKey,
-              page.descriptionFallback,
-            )}`
-              .toLocaleLowerCase()
-              .includes(normalizedQuery),
+          pages: group.pages.filter(
+            (page) =>
+              (page.routeId !== "core.import" || canImport) &&
+              (!normalizedQuery ||
+                `${searchablePageLabel(page)} ${t(
+                  page.descriptionKey,
+                  page.descriptionFallback,
+                )}`
+                  .toLocaleLowerCase()
+                  .includes(normalizedQuery)),
           ),
         }))
         .filter((group) => group.pages.length > 0)

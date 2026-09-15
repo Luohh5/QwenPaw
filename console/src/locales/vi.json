@@ -67,6 +67,7 @@
     "reload": "Tải lại"
   },
   "portabilityImport": {
+    "qwenpawOnly": "Chỉ các tác tử sử dụng backend QwenPaw mới có thể nhập dữ liệu. Hãy chọn tác tử QwenPaw để tiếp tục.",
     "title": "Nhập dữ liệu",
     "description": "Chuyển cuộc trò chuyện và thiết lập công cụ từ ứng dụng AI khác vào QwenPaw.",
     "steps": {

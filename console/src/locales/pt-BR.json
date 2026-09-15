@@ -67,6 +67,7 @@
     "reload": "Recarregar"
   },
   "portabilityImport": {
+    "qwenpawOnly": "A importação está disponível apenas para agentes que usam o backend QwenPaw. Selecione um agente QwenPaw para continuar.",
     "title": "Importar",
     "description": "Traga conversas e configurações de ferramentas de outros aplicativos de IA para o QwenPaw.",
     "steps": {

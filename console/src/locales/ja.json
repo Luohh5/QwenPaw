@@ -65,6 +65,7 @@
     "reload": "再読み込み"
   },
   "portabilityImport": {
+    "qwenpawOnly": "インポートは QwenPaw バックエンドを使用するエージェントでのみ利用できます。QwenPaw エージェントを選択して続行してください。",
     "title": "インポート",
     "description": "他の AI アプリの会話とツール設定を QwenPaw に移行します。",
     "steps": {

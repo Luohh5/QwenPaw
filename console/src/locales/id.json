@@ -67,6 +67,7 @@
     "reload": "Muat ulang"
   },
   "portabilityImport": {
+    "qwenpawOnly": "Impor hanya tersedia untuk agen yang menggunakan backend QwenPaw. Pilih agen QwenPaw untuk melanjutkan.",
     "title": "Impor",
     "description": "Pindahkan percakapan dan pengaturan alat dari aplikasi AI lain ke QwenPaw.",
     "steps": {
