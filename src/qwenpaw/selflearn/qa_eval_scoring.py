@@ -74,9 +74,18 @@ def source_tool(reference, repo, folder):
         source = sources[source_id]
         if source_id not in cache:
             text, origin = None, ""
+            if "snapshot_text" in source:
+                import hashlib
+
+                snapshot = source["snapshot_text"]
+                if not isinstance(snapshot, str) or hashlib.sha256(
+                    snapshot.encode()
+                ).hexdigest() != source.get("file_sha256"):
+                    raise ValueError("冻结的评分来源内容与校验值不一致")
+                text, origin = snapshot, "frozen-reference"
             path = source.get("path")
             commit = source.get("commit")
-            if repo and path and commit:
+            if text is None and repo and path and commit:
                 result = await asyncio.to_thread(
                     subprocess.run,
                     ["git", "-C", str(repo), "show", f"{commit}:{path}"],
@@ -182,7 +191,13 @@ async def score_pair(
             "new_answer": answer.get("new_answer", ""),
             "run_status": answer.get("status"),
             "run_error": answer.get("error"),
-            "reference": reference,
+            "reference": {
+                **reference,
+                "sources": [
+                    {k: v for k, v in s.items() if k != "snapshot_text"}
+                    for s in reference.get("sources", [])
+                ],
+            },
         }
         if previous:
             task["reviews_to_reconcile"] = previous

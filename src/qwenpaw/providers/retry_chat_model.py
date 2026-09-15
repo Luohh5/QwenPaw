@@ -415,6 +415,28 @@ class RetryChatModel(ChatModelBase):
         )
         self._pending_provider_cleanup_tasks: set[asyncio.Future[Any]] = set()
 
+    def with_minimum_stream_timeouts(self, seconds: float) -> "RetryChatModel":
+        """Return a scoped wrapper; keep disabled or longer user timeouts.
+
+        Useful for large structured responses without changing chat defaults
+        or mutating a model already serving other calls.
+        """
+        return RetryChatModel(
+            self._inner,
+            retry_config=self._retry_config,
+            rate_limit_config=self._rate_limit_config,
+            stream_first_content_timeout=(
+                max(seconds, self._stream_first_content_timeout)
+                if self._stream_first_content_timeout
+                else 0
+            ),
+            stream_idle_timeout=(
+                max(seconds, self._stream_idle_timeout)
+                if self._stream_idle_timeout
+                else 0
+            ),
+        )
+
     @property
     def formatter(self) -> Any:
         """Expose the wrapped model's formatter to AgentScope."""

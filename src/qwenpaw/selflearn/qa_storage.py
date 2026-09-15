@@ -191,7 +191,7 @@ class ArtifactStore:
                 self.db.close()
 
 
-def transcript_event(label, text, force=False):
+def transcript_event(label, text, force=False, display=True):
     """Persist a readable event once and send the same text to Console."""
     from .qa_pipeline import PROGRESS
 
@@ -203,7 +203,10 @@ def transcript_event(label, text, force=False):
         store.append(value)
     if sink := PROGRESS.get():
         sink(
-            json.dumps({"event": "session", "text": value}, ensure_ascii=False)
+            json.dumps(
+                {"event": "session", "text": value, "display": display},
+                ensure_ascii=False,
+            )
         )
 
 

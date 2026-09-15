@@ -17,6 +17,7 @@ def run_qa(**kwargs):
 
 RUN_KEY = "selflearn:qa"
 HELP = """/selflearn qa "日期范围.jsonl" [--name 日期范围] [--concurrency 3]
+/selflearn qa-skip "日期范围.txt" [--all | --topic 主题ID] [--accept-edited-txt]
 /selflearn eval-init --alias-root "Alias 项目/alias" --collection qwenpaw_faq_old
   --model qwen3.8-max --thinking false [--cases 题集.jsonl] [--references 标准目录]
 /selflearn prepare "日期范围.txt" [--name 日期范围]
@@ -24,10 +25,14 @@ HELP = """/selflearn qa "日期范围.jsonl" [--name 日期范围] [--concurrenc
 /selflearn score "回答.jsonl" [--references 标准目录] [--name 评分目录名]
   [--concurrency 4]
 /selflearn evaluate "日期范围.txt" [--name 日期范围] [--concurrency 4]
+/selflearn train_eval "日期范围.txt" [--old-collection 旧库 --new-collection 新库]
+  [--name 评测名称] [--concurrency 4]
 /selflearn status
 /selflearn stop
 所有步骤默认在当前 session 可见；过程同时保存为一份 session.md。
-qa：history_jsonl 和 txt 位于工作区 analyze 下，同一日期名称对应。
+qa：原始 A.jsonl、A_train.jsonl、A_test.jsonl 位于 analyze/history_jsonl/A/；
+约 8:2 切分后，训练历史生成 TXT 与测试标准生成独立进行。
+evaluate：generalized 和 specialized 成绩都不下降且无新增关键错误才更新基线。
 batch：工作区 eval 下只保存回答 JSONL。
 score：selflearn/score/回答文件名 下保存评分、报告和 session。
 score/index.json 登记成绩；selflearn/baseline.json 指向当前基线。
@@ -61,6 +66,40 @@ def parser():
 
 
 def options(tokens, base):
+    if tokens and tokens[0] == "qa-skip":
+        cli = Parser(add_help=False)
+        cli.add_argument("source")
+        cli.add_argument("--accept-edited-txt", action="store_true")
+        group = cli.add_mutually_exclusive_group()
+        group.add_argument("--all", dest="skip_all", action="store_true")
+        group.add_argument("--topic", action="append", default=[])
+        values = vars(cli.parse_args(tokens[1:]))
+        values["source"] = (
+            Path(base) / Path(values["source"]).expanduser()
+        ).resolve()
+        return {"workflow": "qa-skip", **values}
+    if tokens and tokens[0] == "train_eval":
+        cli = Parser(add_help=False)
+        cli.add_argument("source")
+        cli.add_argument("--old-collection")
+        cli.add_argument("--new-collection")
+        cli.add_argument("--name")
+        cli.add_argument("--concurrency", type=int, default=4)
+        cli.add_argument("--skills-dir")
+        cli.add_argument("--background", action="store_true")
+        values = vars(cli.parse_args(tokens[1:]))
+        if bool(values["old_collection"]) != bool(values["new_collection"]):
+            raise ValueError(
+                "请同时指定旧库和新库，或同时省略以使用本批原比较记录"
+            )
+        if not 1 <= values["concurrency"] <= 8:
+            raise ValueError("--concurrency 必须为 1–8")
+        for key in ("source", "skills_dir"):
+            if values[key]:
+                values[key] = (
+                    Path(base) / Path(values[key]).expanduser()
+                ).resolve()
+        return {"workflow": "train_eval", **values}
     if tokens and tokens[0] in {"prepare", "batch", "score"}:
         cli = Parser(add_help=False)
         mode = tokens[0]
@@ -161,6 +200,15 @@ def format_status(status):
             f"{status.get('detail') or ''}\n"
             f"本步骤已用 {status['elapsed_seconds']} 秒。"
         )
+    if status.get("branches"):
+        return (
+            f"TXT：{status['branches'].get('txt')}；"
+            f"测试标准：{status['branches'].get('benchmark')}\n"
+            f"{status.get('output') or ''}\n"
+            + "\n".join(status.get("errors", {}).values())
+        )
+    if status.get("phase") == "benchmark" and status.get("progress"):
+        return f"准备专用测试标准\n{status['progress']}\n{status.get('current', '')}"
     if status.get("phase") == "evaluate":
         return "\n".join(
             str(status[k])
@@ -169,6 +217,8 @@ def format_status(status):
         )
     phases = {
         "prepare": "准备输入",
+        "split": "切分训练与测试历史",
+        "benchmark": "准备专用测试标准",
         "analyze": "分析问答",
         "propose": "归纳知识任务",
         "research": "查证答案",
@@ -246,6 +296,12 @@ async def handle_selflearn(ctx, args):
         )
         workflow = settings.pop("workflow", "qa")
         background = settings.pop("background", False)
+        if workflow == "qa-skip":
+            from .qa_skip import skip_topics
+
+            return reply(
+                await asyncio.to_thread(skip_topics, root, **settings)
+            )
         if workflow == "eval-init":
             from .qa_evaluate import initialize
 
@@ -262,7 +318,11 @@ async def handle_selflearn(ctx, args):
             raise ValueError("请先配置可用模型")
         config = config.model_copy(deep=True, update={"active_model": active})
     except (ValueError, OSError, ConfigurationException) as exc:
-        return reply(str(exc) + "\n" + HELP)
+        return reply(
+            str(exc)
+            if args.lstrip().startswith("qa-skip ")
+            else str(exc) + "\n" + HELP
+        )
 
     async def stream(_payload):
         from .qa_evaluate import run_evaluate
@@ -326,18 +386,16 @@ async def _make_chat_recorder(ctx, config):
 
 async def _qa_in_chat(ctx, config, tracker, queue):
     from agentscope.message import Msg, TextBlock
-    from time import monotonic
 
     finished = False
-    started = monotonic()
-    current = "准备执行"
+    phase = None
     try:
         recorder = await _make_chat_recorder(ctx, config)
         while True:
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=20)
             except asyncio.TimeoutError:
-                text = f"仍在执行：{current}。本轮已用 {int(monotonic() - started)} 秒。"
+                continue
             else:
                 if event is None:
                     finished = True
@@ -345,6 +403,25 @@ async def _qa_in_chat(ctx, config, tracker, queue):
                 if not event.startswith("data: "):
                     continue
                 status = json.loads(event[6:].strip())
+                phase = status.get("phase", phase)
+                if (
+                    status.get("event") == "activity"
+                    or status.get("display") is False
+                    or (
+                        phase
+                        in {
+                            "analyze",
+                            "split",
+                            "benchmark",
+                            "branches",
+                            "evaluate",
+                            "score",
+                            "batch",
+                        }
+                        and status.get("state") == "running"
+                    )
+                ):
+                    continue
                 if status.get("event") == "replay_end":
                     continue
                 if "state" not in status and status.get("event") not in {
@@ -354,9 +431,6 @@ async def _qa_in_chat(ctx, config, tracker, queue):
                     text = str(status.get("error", status))
                 else:
                     text = format_status(status)
-                current = (
-                    status.get("label") or status.get("current") or current
-                )
             message = Msg(
                 name="assistant",
                 role="assistant",
@@ -409,13 +483,18 @@ def main():
             ).expanduser()
             / "selflearn"
         )
+        if workflow == "qa-skip":
+            from .qa_skip import skip_topics
+
+            print(skip_topics(root, **settings))
+            return 0
         if workflow == "eval-init":
             from .qa_evaluate import initialize
 
             print(initialize(root, **settings))
             return 0
         config = load_agent_config(args.agent)
-        if workflow in {"evaluate", "score", "qa"}:
+        if workflow in {"evaluate", "score", "qa", "train_eval"}:
             from ..providers.provider_manager import ProviderManager
 
             active = (

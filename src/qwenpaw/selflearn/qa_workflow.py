@@ -494,10 +494,10 @@ async def prepare_collection(root, source, profile, name):
         return result
 
 
-async def analyze(root, source, config, name=None, **kwargs):
-    name = period_name(source, name)
+async def _analyze_training(root, source, config, name=None, **kwargs):
+    name = safe_name(name or Path(source).stem)
     workspace = root.parent
-    history = workspace / "analyze/history_jsonl" / (name + ".jsonl")
+    history = Path(source).resolve()
     output = Path(
         kwargs.pop("output", None)
         or workspace / "analyze/txt" / (name + ".txt")
@@ -505,7 +505,7 @@ async def analyze(root, source, config, name=None, **kwargs):
     immutable_copy(source, history)
     transcript = workspace / "analyze/sessions" / (name + ".md")
     store = ArtifactStore(
-        workspace / "analyze/.state" / (name + ".sqlite"), transcript
+        workspace / "analyze/.state" / (name + "-train.sqlite"), transcript
     )
     with store.working() as work:
         imported = store.get("imported_export")
@@ -573,7 +573,7 @@ async def analyze(root, source, config, name=None, **kwargs):
         yield json.dumps(final, ensure_ascii=False)
 
 
-async def evaluate(
+async def _evaluate_single_suite(
     root, source, config, name=None, concurrency=4, skills_dir=None, model=None
 ):
     profile = profile_for(root)
@@ -815,6 +815,22 @@ async def evaluate(
     return completed_path
 
 
+async def analyze(root, source, config, name=None, **kwargs):
+    from .qa_rounds import analyze as run
+
+    async with aclosing(
+        run(root, source, config, name=name, **kwargs)
+    ) as events:
+        async for event in events:
+            yield event
+
+
+async def evaluate(root, source, config, **kwargs):
+    from .qa_rounds import evaluate as run
+
+    return await run(root, source, config, **kwargs)
+
+
 async def run_workflow(root, config, workflow="qa", live=True, **settings):
     root = Path(root)
 
@@ -862,6 +878,10 @@ async def run_workflow(root, config, workflow="qa", live=True, **settings):
                     and v.get("answers_sha256") == value["source"]["sha256"]
                     and v.get("method_hash") == value["method_hash"]
                 )
+            elif workflow == "train_eval":
+                from .qa_train_eval import train_evaluate
+
+                result = await train_evaluate(root, config=config, **settings)
             elif workflow == "batch":
                 result = await publish_answers(
                     root, profile_for(root), **settings
@@ -880,7 +900,18 @@ async def run_workflow(root, config, workflow="qa", live=True, **settings):
                 state="completed", current="执行完成", output=str(result)
             )
         except Exception as exc:
-            state = {"state": "failed", "phase": "evaluate", "error": str(exc)}
+            phase = read(root / "qa_status.json", {}).get("phase", workflow)
+            state = {
+                "state": "failed",
+                "phase": phase,
+                "error": str(exc)
+                or (
+                    "执行超时，请重试；已完成的结果会保留"
+                    if isinstance(exc, TimeoutError)
+                    else type(exc).__name__
+                ),
+                "error_type": type(exc).__name__,
+            }
         finally:
             PROGRESS.reset(token)
         write_json(root / "qa_status.json", state)

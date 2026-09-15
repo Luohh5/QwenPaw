@@ -166,7 +166,7 @@ async def test_two_rounds_reuse_promoted_baseline_without_rescoring(setup):
     root, config, profile, calls, stages, _ = setup
     a = root.parent / "2026-08-20.txt"
     a.write_text("FAQ one")
-    result = await flow.evaluate(root, a, config, model=object())
+    result = await flow._evaluate_single_suite(root, a, config, model=object())
     assert flow.read(result)["promoted"]
     baseline = flow.read(root / "baseline.json")
     assert baseline["collection"] == "qwenpaw_faq_2026-08-20"
@@ -175,7 +175,7 @@ async def test_two_rounds_reuse_promoted_baseline_without_rescoring(setup):
     before = len(stages)
     b = root.parent / "2026-08-21.txt"
     b.write_text("FAQ two")
-    result = await flow.evaluate(root, b, config, model=object())
+    result = await flow._evaluate_single_suite(root, b, config, model=object())
     assert not flow.read(result)["promoted"]
     assert flow.read(root / "baseline.json") == baseline
     assert len([x for x in calls if x[0] == "run"]) == 3
@@ -185,7 +185,7 @@ async def test_two_rounds_reuse_promoted_baseline_without_rescoring(setup):
         if f.is_dir():
             assert not list(f.rglob("result.meta.json"))
     before = len(stages)
-    await flow.evaluate(root, b, config, model=object())
+    await flow._evaluate_single_suite(root, b, config, model=object())
     assert len(stages) == before
 
 
@@ -286,14 +286,16 @@ async def test_failed_promotion_commit_resumes_without_rebuilding(
 
     monkeypatch.setattr(flow, "write_json", fail_report)
     with pytest.raises(OSError):
-        await flow.evaluate(root, source, config, model=object())
+        await flow._evaluate_single_suite(root, source, config, model=object())
     assert (
         flow.read(root / "baseline.json")["collection"]
         == "qwenpaw_faq_2026-08-20"
     )
     before = len(stages)
     monkeypatch.setattr(flow, "write_json", original)
-    path = await flow.evaluate(root, source, config, model=object())
+    path = await flow._evaluate_single_suite(
+        root, source, config, model=object()
+    )
     assert flow.read(path)["promoted"]
     assert len(stages) == before
     assert len([c for c in calls if c[0] == "prepare"]) == 1
@@ -313,7 +315,9 @@ async def test_lower_score_retains_original_baseline(setup, monkeypatch):
     monkeypatch.setattr(scoring, "stage_call", stage)
     source = root.parent / "2026-08-20.txt"
     source.write_text("FAQ")
-    path = await flow.evaluate(root, source, config, model=object())
+    path = await flow._evaluate_single_suite(
+        root, source, config, model=object()
+    )
     assert flow.read(path)["delta"] < 0
     assert flow.read(root / "baseline.json")["collection"] == "qwenpaw_faq_old"
     assert len(flow.registry(root)["scores"]) == 2
@@ -425,38 +429,58 @@ async def test_named_analysis_real_agent_loop_then_resume(
     root = tmp_path / "workspace/selflearn"
     events = [
         json.loads(e)
-        async for e in flow.run_workflow(
-            root,
-            config,
-            source=path,
-            name="2026-08-20",
-            model=model,
-            offline=True,
+        async for e in qa_pipeline.stream_progress(
+            flow._analyze_training(
+                root,
+                config=config,
+                source=path,
+                name="2026-08-20",
+                model=model,
+                offline=True,
+            ),
+            live=True,
         )
     ]
     assert events[-1]["state"] == "completed", events[-1]
     assert events[-1]["exported"] == 1
+    visible_results = [
+        e
+        for e in events
+        if e.get("event") == "session"
+        and e.get("text", "").startswith("### 分析结果 ·")
+        and e.get("display") is not False
+    ]
+    assert len(visible_results) == 1
+    assert "需要确认版本" in visible_results[0]["text"]
+    assert any(e.get("display") is False for e in events)
     txt = Path(events[-1]["output"]).read_text()
     assert "X=2" in txt
     assert model.calls == 8
     second = [
         json.loads(e)
-        async for e in flow.run_workflow(
-            root,
-            config,
-            source=path,
-            name="2026-08-20",
-            model=model,
-            offline=True,
+        async for e in qa_pipeline.stream_progress(
+            flow._analyze_training(
+                root,
+                config=config,
+                source=path,
+                name="2026-08-20",
+                model=model,
+                offline=True,
+            ),
+            live=True,
         )
     ]
     assert second[-1]["state"] == "completed"
     assert second[-1]["reused"] == 1 and model.calls == 8
+    assert (
+        sum(
+            e.get("text", "").startswith("### 分析结果（复用）")
+            for e in second
+        )
+        == 1
+    )
     assert Path(second[-1]["output"]).read_text() == txt
 
-    assert sorted(
-        p.name for p in (root.parent / "analyze/history_jsonl").iterdir()
-    ) == ["2026-08-20.jsonl"]
     assert sorted(p.name for p in (root.parent / "analyze/txt").iterdir()) == [
         "2026-08-20.txt"
     ]
@@ -466,3 +490,21 @@ async def test_named_analysis_real_agent_loop_then_resume(
         and "read_source" in transcript.read_text()
     )
     assert not list(root.parent.rglob("input.json"))
+
+
+async def test_empty_timeout_has_visible_workflow_error(tmp_path, monkeypatch):
+    async def failing(*args, **kwargs):
+        raise TimeoutError()
+        yield
+
+    monkeypatch.setattr(flow, "analyze", failing)
+    events = [
+        json.loads(e)
+        async for e in flow.run_workflow(root=tmp_path, config=None)
+    ]
+    assert events[-1]["state"] == "failed"
+    assert events[-1]["error"]
+    assert events[-1]["error_type"] == "TimeoutError"
+    from qwenpaw.selflearn.qa_command import format_status
+
+    assert "超时" in format_status(events[-1])

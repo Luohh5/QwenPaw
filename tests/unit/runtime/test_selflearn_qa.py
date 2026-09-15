@@ -679,6 +679,9 @@ async def test_qa_runs_in_current_chat_without_status_polling(
             }
         )
         yield json.dumps(
+            {"event": "session", "text": "分析结果 · Q：证据不足"}
+        )
+        yield json.dumps(
             {"state": "completed", "phase": "done", "exported": 0}
         )
 
@@ -972,7 +975,9 @@ async def test_runtime_streams_and_saves_qa_progress(
     ]
     assert events[-1]["status"] == "completed"
     rendered = json.dumps(events, ensure_ascii=False)
-    assert "read_history" in rendered and "/example/additions.txt" in rendered
+    assert (
+        "read_history" not in rendered and "/example/additions.txt" in rendered
+    )
     saved = ctx.workspace.session.save_session_state.call_args.kwargs[
         "agent"
     ].data
@@ -980,7 +985,239 @@ async def test_runtime_streams_and_saves_qa_progress(
     for text in (
         "EARLIER_CHAT",
         f"/selflearn {workflow}",
-        "read_history",
         "additions.txt",
     ):
         assert text in saved_text
+
+
+async def test_chat_shows_only_record_results_during_analysis(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    recorder = SimpleNamespace(observe=AsyncMock())
+    monkeypatch.setattr(
+        qa_command, "_make_chat_recorder", AsyncMock(return_value=recorder)
+    )
+    entries = iter(
+        [
+            {"state": "running", "phase": "analyze"},
+            {"event": "activity", "display": False, "activity": "调用工具"},
+            {"event": "session", "display": False, "text": "中间输出"},
+            "timeout",
+            {"event": "session", "text": "分析结果：需要确认版本"},
+            {"state": "running", "phase": "analyze", "completed": 1},
+            {"event": "session", "text": "分析失败：来源不可读"},
+            {"event": "session", "text": "分析结果（复用）：已有证据"},
+            {"state": "running", "phase": "propose"},
+            {"event": "session", "text": "后续归纳结论"},
+            {"state": "completed", "phase": "done", "exported": 1},
+            None,
+        ]
+    )
+
+    async def get():
+        value = next(entries)
+        if value == "timeout":
+            raise asyncio.TimeoutError
+        return None if value is None else "data: " + json.dumps(value)
+
+    tracker = SimpleNamespace(
+        detach_subscriber=AsyncMock(), request_stop=AsyncMock()
+    )
+    messages = [
+        m
+        async for m in qa_command._qa_in_chat(
+            None, None, tracker, SimpleNamespace(get=get)
+        )
+    ]
+    texts = [m.get_text_content() for m in messages]
+    assert texts[:3] == [
+        "分析结果：需要确认版本",
+        "分析失败：来源不可读",
+        "分析结果（复用）：已有证据",
+    ]
+    assert len(texts) == 6
+    assert "归纳知识任务" in texts[3]
+    assert texts[4] == "后续归纳结论"
+    assert "导出结束" in texts[5]
+    assert recorder.observe.await_count == 6
+    tracker.request_stop.assert_not_awaited()
+
+
+async def test_stage_timeout_records_stage_and_last_tool(
+    tmp_path, monkeypatch
+):
+    from agentscope.event import EventType
+    from types import SimpleNamespace
+    from qwenpaw.selflearn.qa_storage import ArtifactStore
+
+    class SlowAgent:
+        closed = False
+
+        async def reply_stream(self, **kwargs):
+            yield SimpleNamespace(
+                type=EventType.TOOL_CALL_START,
+                tool_call_id="read-1",
+                tool_call_name="read_history",
+            )
+            await asyncio.Event().wait()
+
+        async def close(self):
+            self.closed = True
+
+    agent = SlowAgent()
+    monkeypatch.setattr(
+        qa_pipeline, "build_readonly_agent", lambda *a, **kw: agent
+    )
+    updates = []
+    token = qa_pipeline.PROGRESS.set(updates.append)
+    transcript = tmp_path / "session.md"
+    store = ArtifactStore(tmp_path / "state.sqlite", transcript)
+    try:
+        with store.working():
+            folder = store.work / "grouping"
+            with pytest.raises(TimeoutError, match="grouping.*超时"):
+                await qa_pipeline.stage_call(
+                    None,
+                    None,
+                    "分组",
+                    {},
+                    QAAnalysis,
+                    [],
+                    folder,
+                    lambda value: None,
+                    timeout=0.01,
+                )
+            trace = json.loads((folder / "trace.json").read_text())
+            assert trace["error_type"] == "TimeoutError"
+            assert "read_history" in trace["error"]
+            assert trace["elapsed_seconds"] < 1
+    finally:
+        qa_pipeline.PROGRESS.reset(token)
+    assert agent.closed
+    assert "超时" in transcript.read_text()
+
+
+async def test_stage_preserves_upstream_timeout_and_partial_output(
+    tmp_path, monkeypatch
+):
+    from agentscope.event import EventType
+    from qwenpaw.providers.retry_chat_model import StreamIdleTimeoutError
+
+    class InterruptedAgent:
+        async def reply_stream(self, **kwargs):
+            yield SimpleNamespace(
+                type=EventType.TOOL_CALL_START,
+                tool_call_id="result-1",
+                tool_call_name="GenerateStructuredOutput",
+            )
+            yield SimpleNamespace(
+                type=EventType.TOOL_CALL_DELTA,
+                tool_call_id="result-1",
+                delta='{ "links": [',
+            )
+            raise StreamIdleTimeoutError("test/model", 60)
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(
+        qa_pipeline,
+        "build_readonly_agent",
+        lambda *a, **kw: InterruptedAgent(),
+    )
+    token = qa_pipeline.PROGRESS.set(lambda event: None)
+    try:
+        with pytest.raises(TimeoutError, match="60"):
+            await qa_pipeline.stage_call(
+                None,
+                None,
+                "分组",
+                {},
+                QAAnalysis,
+                [],
+                tmp_path / "grouping",
+                lambda value: None,
+            )
+    finally:
+        qa_pipeline.PROGRESS.reset(token)
+    trace = json.loads((tmp_path / "grouping/trace.json").read_text())
+    assert trace["exception"]["type"] == "StreamIdleTimeoutError"
+    assert "60s" in trace["exception"]["message"]
+    assert trace["exception"]["stack"][-1]["function"] == "reply_stream"
+    assert trace["tool_progress"] == [
+        {
+            "name": "GenerateStructuredOutput",
+            "argument_chars": len('{ "links": ['),
+            "arguments_complete": False,
+            "result_complete": False,
+        }
+    ]
+
+
+async def test_research_budget_caps_execution_but_allows_final_answer():
+    from agentscope.tool import FunctionTool
+
+    executed = []
+
+    async def read_source(path: str):
+        executed.append(path)
+        return "frozen source text"
+
+    budget = qa_pipeline.ResearchBudget(2)
+    tool = budget.wrap([FunctionTool(read_source, is_read_only=True)])[0]
+    first = await tool(path="a")
+    second = await tool(path="b")
+    third = await tool(path="c")
+    assert executed == ["a", "b"]
+    assert "frozen source text" in first.content[0].text
+    assert "剩余 0" in second.content[-1].text
+    assert "生成结构化结果" in third.content[0].text
+    assert budget.blocked
+    assert tool.input_schema["properties"]["path"]["type"] == "string"
+
+
+async def test_evaluate_chat_suppresses_ticks_and_tools(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    recorder = SimpleNamespace(observe=AsyncMock())
+    monkeypatch.setattr(
+        qa_command, "_make_chat_recorder", AsyncMock(return_value=recorder)
+    )
+    entries = iter(
+        [
+            {"state": "running", "phase": "evaluate", "current": "生成回答"},
+            *[
+                {"event": "activity", "activity": "调用工具"}
+                for _ in range(20)
+            ],
+            "timeout",
+            {"event": "session", "text": "工具原文", "display": False},
+            {"event": "session", "text": "本题评分完成：3 分"},
+            {"event": "session", "text": "评分失败：连接中断"},
+            {
+                "state": "completed",
+                "phase": "evaluate",
+                "output": "comparison.json",
+            },
+            None,
+        ]
+    )
+
+    async def get():
+        value = next(entries)
+        if value == "timeout":
+            raise asyncio.TimeoutError
+        return None if value is None else "data: " + json.dumps(value)
+
+    tracker = SimpleNamespace(
+        detach_subscriber=AsyncMock(), request_stop=AsyncMock()
+    )
+    texts = [
+        m.get_text_content()
+        async for m in qa_command._qa_in_chat(
+            None, None, tracker, SimpleNamespace(get=get)
+        )
+    ]
+    assert len(texts) == 3
+    assert texts[:2] == ["本题评分完成：3 分", "评分失败：连接中断"]
+    assert "comparison.json" in texts[2]

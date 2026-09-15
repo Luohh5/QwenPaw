@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import traceback
 from contextlib import aclosing, suppress
 from contextvars import ContextVar
 from time import monotonic
@@ -153,8 +154,65 @@ def history_tools(rows, analyses=None, scanned=None):
     return [FunctionTool(fn, is_read_only=True) for fn in functions]
 
 
+class ResearchBudget:
+    """Cap source access while allowing the agent to finish its answer."""
+
+    def __init__(self, limit):
+        self.remaining = limit
+        self.blocked = False
+
+    def wrap(self, tools):
+        from agentscope.message import TextBlock
+        from agentscope.tool import FunctionTool
+
+        def wrap_one(tool):
+            async def call(**kwargs):
+                if self.remaining <= 0:
+                    self.blocked = True
+                    return (
+                        "查证预算已用完，工具未执行。请立即使用已取得的原文"
+                        "生成结构化结果；不要继续搜索或编造证据。"
+                    )
+                self.remaining -= 1
+                result = await tool(**kwargs)
+                return result.model_copy(
+                    update={
+                        "content": [
+                            *result.content,
+                            TextBlock(
+                                text=(
+                                    f"本阶段剩余 {self.remaining} 次查证机会。"
+                                    "本题必要事实已覆盖时立即生成结构化结果，"
+                                    "不扩展背景研究。"
+                                )
+                            ),
+                        ]
+                    }
+                )
+
+            return FunctionTool(
+                call,
+                name=tool.name,
+                description=tool.description,
+                input_schema=tool.input_schema,
+                is_read_only=True,
+            )
+
+        return [wrap_one(tool) for tool in tools]
+
+
 async def stage_call(
-    config, model, skill, task, schema, tools, folder, validate, timeout=1200
+    config,
+    model,
+    skill,
+    task,
+    schema,
+    tools,
+    folder,
+    validate,
+    timeout=1200,
+    max_iters=64,
+    max_tool_calls=None,
 ):
     """Fresh QwenPaw loop per stage with bounded validation repair."""
     from agentscope.event import EventType
@@ -163,6 +221,7 @@ async def stage_call(
     folder.mkdir(parents=True, exist_ok=True)
     trace = {"replies": [], "corrections": []}
     agent = None
+    deadline = None
     started = monotonic()
     label = (
         task.get("question")
@@ -174,6 +233,7 @@ async def stage_call(
     )
     sink = PROGRESS.get()
     tool_names = {}
+    arguments_complete, results_complete = set(), set()
     text_parts, argument_parts, result_parts = {}, {}, {}
 
     def emit(activity, detail=""):
@@ -191,8 +251,13 @@ async def stage_call(
                 )
             )
 
+    budget = (
+        ResearchBudget(max_tool_calls) if max_tool_calls is not None else None
+    )
+    if budget:
+        tools = budget.wrap(tools)
     emit("开始执行")
-    transcript_event(str(label), "开始执行本阶段。")
+    transcript_event(str(label), "开始执行本阶段。", display=False)
     try:
         agent = await asyncio.to_thread(
             build_readonly_agent,
@@ -203,17 +268,18 @@ async def stage_call(
             "qa-" + digest(str(folder))[:20],
             tools,
             workspace_dir=folder / "context",
-            max_iters=64,
+            max_iters=max_iters,
             name="SelfLearnQA",
         )
         message = json.dumps(task, ensure_ascii=False, indent=2)
         write_json(folder / "input.json", {"skill": skill, "task": task})
-        async with asyncio.timeout(timeout):
+        deadline = asyncio.timeout(timeout)
+        async with deadline:
             for attempt in range(3):
                 request = Msg(
                     name="user", role="user", content=[TextBlock(text=message)]
                 )
-                if sink:
+                if sink or max_tool_calls is not None:
                     response = None
                     async with aclosing(
                         agent.reply_stream(
@@ -240,6 +306,7 @@ async def stage_call(
                                         text_parts.pop(
                                             getattr(event, "block_id", ""), ""
                                         ),
+                                        display=False,
                                     )
                                 elif kind == EventType.TOOL_CALL_DELTA.value:
                                     argument_parts[event_key] = (
@@ -255,6 +322,7 @@ async def stage_call(
                                         + event.delta
                                     )
                                 elif kind == EventType.TOOL_CALL_END.value:
+                                    arguments_complete.add(event_key)
                                     name = tool_names.get(event_key, "工具")
                                     if name != "GenerateStructuredOutput":
                                         transcript_event(
@@ -262,6 +330,7 @@ async def stage_call(
                                             "参数：\n```json\n"
                                             + argument_parts.get(event_key, "")
                                             + "\n```",
+                                            display=False,
                                         )
                                 elif kind == EventType.TOOL_CALL_START.value:
                                     name = getattr(event, "tool_call_name", "")
@@ -270,6 +339,7 @@ async def stage_call(
                                     ] = name
                                     emit("调用工具", name)
                                 elif kind == EventType.TOOL_RESULT_END.value:
+                                    results_complete.add(event_key)
                                     if (
                                         tool_names.get(event_key)
                                         != "GenerateStructuredOutput"
@@ -277,6 +347,7 @@ async def stage_call(
                                         transcript_event(
                                             str(label) + " · 工具结果",
                                             result_parts.pop(event_key, ""),
+                                            display=False,
                                         )
                                     emit(
                                         "工具完成",
@@ -297,6 +368,18 @@ async def stage_call(
                 try:
                     result = schema.model_validate(response.structured_output)
                     validate(result)
+                    if (
+                        budget
+                        and budget.blocked
+                        and (
+                            getattr(result, "status", None) == "needs_review"
+                            or getattr(result, "decision", None)
+                            in {"reject", "needs_evidence"}
+                        )
+                    ):
+                        raise ValueError(
+                            "查证预算用尽且未完成核验，请重试；不能据此排除测试题"
+                        )
                     emit(
                         "完成",
                         (
@@ -314,8 +397,59 @@ async def stage_call(
                     message = f"结构或证据校验失败，请回读并修正，不放宽证据要求：{exc}"
                     trace["corrections"].append(message)
                     emit("修正证据", str(exc)[:240])
-                    transcript_event(str(label) + " · 修正", str(exc))
+                    transcript_event(
+                        str(label) + " · 修正", str(exc), display=False
+                    )
+    except Exception as exc:
+        # Keep upstream details: a local deadline and an interrupted provider
+        # stream require different recovery. Do not log partial model text.
+        trace["exception"] = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "stack": [
+                {"file": f.filename, "line": f.lineno, "function": f.name}
+                for f in traceback.extract_tb(exc.__traceback__)
+            ],
+        }
+        if isinstance(exc, TimeoutError):
+            if deadline is not None and deadline.expired():
+                reason = (
+                    f"{label} 阶段超时（上限 {timeout:g} 秒），未获得完整结果"
+                )
+            elif hasattr(exc, "timeout_seconds"):
+                reason = (
+                    f"{label} 的模型连续 {exc.timeout_seconds:g} 秒未返回内容，"
+                    "输出未完成"
+                )
+            else:
+                reason = f"{label} 的模型或工具请求超时，未获得完整结果"
+            if tool_names:
+                reason += "；最后调用：" + list(tool_names.values())[-1]
+            error = TimeoutError(reason)
+        else:
+            error = exc
+        trace["error_type"] = type(error).__name__
+        trace["error"] = str(error) or type(error).__name__
+        transcript_event(str(label) + " · 失败", trace["error"])
+        if error is not exc:
+            raise error from exc
+        raise
     finally:
+        trace["tool_progress"] = [
+            {
+                "name": name,
+                "argument_chars": len(argument_parts.get(key, "")),
+                "arguments_complete": key in arguments_complete,
+                "result_complete": key in results_complete,
+            }
+            for key, name in tool_names.items()
+        ]
+        if budget:
+            trace["research_budget"] = {
+                "limit": max_tool_calls,
+                "used": max_tool_calls - budget.remaining,
+                "blocked_extra_calls": budget.blocked,
+            }
         trace["elapsed_seconds"] = round(monotonic() - started, 3)
         write_json(folder / "trace.json", trace)
         if agent is not None:
@@ -559,16 +693,29 @@ async def _run_qa(
                                 "不是原始 request_id。缺失关联字段不是阻断条件。"
                             ),
                         }
-                        analysis = await stage_call(
-                            config,
-                            model,
-                            skills["analyze"],
-                            task,
-                            QAAnalysis,
-                            history_tools(rows),
-                            stage_folder,
-                            lambda r: validate_analysis(r, key, rows),
-                        )
+                        # Preserve detailed evidence, but publish only the
+                        # record's final result to the conversation.
+                        sink = PROGRESS.get()
+
+                        def quiet_progress(raw):
+                            event = json.loads(raw)
+                            event["display"] = False
+                            sink(json.dumps(event, ensure_ascii=False))
+
+                        token = PROGRESS.set(quiet_progress if sink else None)
+                        try:
+                            analysis = await stage_call(
+                                config,
+                                model,
+                                skills["analyze"],
+                                task,
+                                QAAnalysis,
+                                history_tools(rows),
+                                stage_folder,
+                                lambda r: validate_analysis(r, key, rows),
+                            )
+                        finally:
+                            PROGRESS.reset(token)
                         write_json(result_file, analysis.model_dump())
                         reused = False
                     return key, analysis.model_dump(), reused, None
@@ -591,6 +738,20 @@ async def _run_qa(
                 else:
                     analyses[key] = value
                     status["reused" if reused else "completed"] += 1
+                question = rows[key]["input"]["question"]
+                label = "分析失败" if error is not None else "分析结果"
+                if reused:
+                    label += "（复用）"
+                transcript_event(
+                    f"{label} · {question}",
+                    f"记录：{key}\n\n"
+                    + (
+                        error
+                        if error is not None
+                        else result_text(QAAnalysis.model_validate(value))
+                    ),
+                    force=True,
+                )
                 status.update(
                     current=rows[key]["input"]["question"][:160],
                     current_record_id=key,
