@@ -877,9 +877,9 @@ class ProviderImportService(ImportPlanningMixin):
             if cron_manager is not None:
                 try:
                     existing_task_jobs = {
-                        key: job
+                        source_key: job
                         for job in await cron_manager.list_jobs()
-                        if (key := imported_job_source(job)) is not None
+                        if (source_key := imported_job_source(job)) is not None
                     }
                 except Exception as exc:  # pylint: disable=broad-except
                     cron_error = failure_message(
@@ -916,8 +916,8 @@ class ProviderImportService(ImportPlanningMixin):
                         or "定时任务未完成兼容性检查，请核对任务配置后重试。",
                     )
                     continue
-                key = (inventory.provider_id, task.source_id)
-                existing_task = existing_task_jobs.get(key)
+                task_key = (inventory.provider_id, task.source_id)
+                existing_task = existing_task_jobs.get(task_key)
                 if cron_manager is None:
                     fail(f"scheduled_tasks:{task.source_id}", cron_error)
                     continue
@@ -965,7 +965,7 @@ class ProviderImportService(ImportPlanningMixin):
                     async def save_task() -> None:
                         if not await cron_manager.create_job_if_absent(job):
                             raise FileExistsError("Cron job already exists")
-                        existing_task_jobs[key] = job
+                        existing_task_jobs[task_key] = job
                         asset_states["cron"][task.source_id] = "succeeded"
 
                     await run_async_to_completion(save_task())
@@ -980,16 +980,16 @@ class ProviderImportService(ImportPlanningMixin):
                         )
 
             if adaptation is not None:
-                failures = {}
-                for key, message in asset_messages.items():
-                    kind, source_id = key.split(":", 1)
+                failures: dict[str, str] = {}
+                for asset_key, message in asset_messages.items():
+                    kind, source_id = asset_key.split(":", 1)
                     kind = {
                         "skills": "skill",
                         "plugins": "plugin",
                         "scheduled_tasks": "cron",
                     }.get(kind, kind)
                     if asset_states[kind].get(source_id, "failed") == "failed":
-                        failures[key] = message
+                        failures[asset_key] = message
                 try:
                     await run_sync_io(
                         write_summary,
