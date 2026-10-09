@@ -93,7 +93,7 @@ def test_host_runtime_requests_a_capability_only_when_needed(
     assert capability == runtime_module.RuntimeCapability(
         "pipe-1",
         "secret-1",
-        1,
+        runtime_module.COMPUTER_USE_PROTOCOL_VERSION,
     )
     assert received == {
         "token": token,
@@ -104,6 +104,7 @@ def test_host_runtime_requests_a_capability_only_when_needed(
 def test_coordinate_input_leaves_observation_context_to_client() -> None:
     method, params, include_images = _native_request(
         "click",
+        screenshot_id="screenshot-7",
         x=40,
         y=60,
         button="left",
@@ -113,11 +114,28 @@ def test_coordinate_input_leaves_observation_context_to_client() -> None:
     assert method == "click"
     assert include_images is False
     assert params == {
+        "screenshot_id": "screenshot-7",
         "x": 40,
         "y": 60,
         "button": "left",
         "count": 1,
     }
+
+
+def test_observe_window_requests_current_visual_and_semantic_state() -> None:
+    method, params, include_images = _native_request(
+        "observe_window",
+        window_id="42",
+    )
+
+    assert method == "observe_window"
+    assert params == {"window_id": "42"}
+    assert include_images is True
+
+
+def test_coordinate_input_requires_a_current_screenshot() -> None:
+    with pytest.raises(ValueError):
+        _native_request("click", x=40, y=60, button="left", count=1)
 
 
 def test_close_window_maps_to_the_native_method() -> None:
@@ -223,8 +241,8 @@ def test_client_rejects_action_before_observe() -> None:
     assert refusal.value.code == "observation_required"
 
 
-def test_screenshot_data_stays_out_of_the_text_block() -> None:
-    """Inline screenshot data must not be duplicated into the JSON text."""
+def test_screenshot_data_uses_base64_source_and_stays_out_of_text() -> None:
+    """Inline screenshots use the standard media representation once."""
     data_url = "data:image/jpeg;base64," + "A" * 4096
     payload = {
         "ok": True,
@@ -245,7 +263,9 @@ def test_screenshot_data_stays_out_of_the_text_block() -> None:
     ]
     text_blocks = [block for block in response.content if block.type == "text"]
     assert len(image_blocks) == 1
-    assert str(image_blocks[0].source.url) == data_url
+    assert image_blocks[0].source.type == "base64"
+    assert image_blocks[0].source.media_type == "image/jpeg"
+    assert image_blocks[0].source.data == "A" * 4096
     assert len(text_blocks) == 1
     assert data_url not in text_blocks[0].text
     assert "screenshot-1" in text_blocks[0].text
@@ -257,6 +277,8 @@ def test_native_error_marks_the_tool_call_as_failed() -> None:
     assert isinstance(response, ToolChunk)
     assert response.state == ToolResultState.ERROR
     assert '"ok":false' in response.content[-1].text
+    assert '"requires_observe":true' in response.content[-1].text
+    assert '"next_action":"observe_window"' in response.content[-1].text
 
 
 def test_sequence_steps_count_against_the_action_rate_limit(
@@ -389,10 +411,13 @@ class _FakeTransport(ComputerUseTransport):
         payload = dict(message)
         self.messages.append(payload)
         if payload["method"] == "hello":
+            protocol_version = runtime_module.COMPUTER_USE_PROTOCOL_VERSION
             return {
                 "request_id": payload["request_id"],
                 "ok": True,
-                "result": {"protocol_version": 1},
+                "result": {
+                    "protocol_version": protocol_version,
+                },
             }
         result = {}
         if payload["method"] in client_module._OBSERVED_METHODS:
@@ -411,6 +436,33 @@ class _FakeTransport(ComputerUseTransport):
         handler: ReverseRequestHandler,
     ) -> None:
         self.handler = handler
+
+
+@pytest.mark.asyncio
+async def test_failed_action_invalidates_the_private_observation() -> None:
+    class _ActionFailureTransport(_FakeTransport):
+        async def request(self, message: Mapping[str, Any]) -> dict[str, Any]:
+            if message["method"] == "hello":
+                return await super().request(message)
+            return {
+                "request_id": message["request_id"],
+                "ok": False,
+                "error": {
+                    "code": "target_not_at_point",
+                    "message": "Observe again.",
+                },
+            }
+
+    client = ComputerUseClient("session-1", lambda: _ActionFailureTransport())
+    client._observation_id = "observation-1"
+    set_current_computer_use_turn_id("turn-1")
+    try:
+        with pytest.raises(ComputerUseProtocolError):
+            await client.execute("click", {})
+    finally:
+        set_current_computer_use_turn_id(None)
+
+    assert client._observation_id is None
 
 
 @pytest.mark.asyncio
@@ -438,7 +490,11 @@ async def test_acquire_capability_retries_cold_start_misses(
 ) -> None:
     """A transient acquire miss must be retried before giving up."""
     attempts: list[int] = []
-    capability = runtime_module.RuntimeCapability("pipe-1", "secret-1", 1)
+    capability = runtime_module.RuntimeCapability(
+        "pipe-1",
+        "secret-1",
+        runtime_module.COMPUTER_USE_PROTOCOL_VERSION,
+    )
 
     def _flaky_acquire():
         attempts.append(len(attempts))
@@ -464,7 +520,11 @@ async def test_acquire_capability_rejects_an_incompatible_desktop(
     monkeypatch.setattr(
         client_module.HostRuntimeProvider,
         "acquire_capability",
-        lambda: runtime_module.RuntimeCapability("pipe-1", "secret-1", 2),
+        lambda: runtime_module.RuntimeCapability(
+            "pipe-1",
+            "secret-1",
+            runtime_module.COMPUTER_USE_PROTOCOL_VERSION + 1,
+        ),
     )
 
     with pytest.raises(ComputerUseProtocolError) as refusal:
@@ -531,8 +591,8 @@ def test_the_approval_coordinator_holds_no_exemption_state() -> None:
     )
 
 
-def test_element_line_uses_bounds_centre_on_windows() -> None:
-    """Windows elements expose pixel bounds, rendered as a centre point."""
+def test_element_line_omits_windows_screen_bounds() -> None:
+    """Desktop UIA bounds do not map to screenshot coordinates."""
     line = _element_line(
         {
             "id": "uia-1",
@@ -543,7 +603,7 @@ def test_element_line_uses_bounds_centre_on_windows() -> None:
             "offscreen": False,
         },
     )
-    assert line == 'uia-1 Edit "text editor" screen@200,300'
+    assert line == 'uia-1 Edit "text editor"'
 
 
 def test_element_line_uses_value_on_macos() -> None:
@@ -560,6 +620,49 @@ def test_element_line_uses_value_on_macos() -> None:
     assert line == 'ax-2 Edit "note" =hello'
 
 
+def test_element_line_preserves_accessibility_depth() -> None:
+    """Native hierarchy remains visible in the compact model contract."""
+    line = _element_line(
+        {
+            "id": "uia-2",
+            "control_type_name": "ListItem",
+            "name": "餐饮",
+            "depth": 3,
+        },
+    )
+    assert line == '      uia-2 ListItem "餐饮"'
+
+
+def test_element_line_preserves_application_identifier() -> None:
+    """Stable command identities disambiguate localized menu labels."""
+    line = _element_line(
+        {
+            "id": "ax-3",
+            "control_type_name": "MenuItem",
+            "name": "复制",
+            "identifier": "cmdDuplicate:",
+        },
+    )
+    assert line == 'ax-3 MenuItem "复制" [identifier=cmdDuplicate:]'
+
+
+def test_element_line_normalizes_windows_semantic_capabilities() -> None:
+    """Windows UIA metadata uses the same compact contract as macOS AX."""
+    line = _element_line(
+        {
+            "id": "uia-4",
+            "control_type_name": "Button",
+            "name": "Continue",
+            "automation_id": "continue-button",
+            "actions": ["Invoke"],
+        },
+    )
+    assert line == (
+        'uia-4 Button "Continue" [identifier=continue-button] '
+        "[actions=Invoke]"
+    )
+
+
 def test_element_line_keeps_disabled_and_offscreen_visible() -> None:
     """Both states stay in the listing: they inform the next decision."""
     line = _element_line(
@@ -572,7 +675,7 @@ def test_element_line_keeps_disabled_and_offscreen_visible() -> None:
             "offscreen": True,
         },
     )
-    assert line == 'uia-9 Button "Save" screen@5,5 [disabled] [offscreen]'
+    assert line == 'uia-9 Button "Save" [disabled] [offscreen]'
 
 
 def test_compact_elements_preserves_protocol_fields() -> None:
@@ -595,6 +698,7 @@ def test_compact_elements_preserves_protocol_fields() -> None:
                     "id": "uia-1",
                     "control_type_name": "Button",
                     "name": "OK",
+                    "depth": 1,
                     "bounds": [10, 10, 30, 30],
                 },
             ],
@@ -606,7 +710,7 @@ def test_compact_elements_preserves_protocol_fields() -> None:
     assert result["window"] == {"id": "42", "title": "Editor"}
     assert result["accessibility"]["available"] is True
     assert result["accessibility"]["elements"] == (
-        'uia-0 Window "Editor" screen@50,50\n' 'uia-1 Button "OK" screen@20,20'
+        'uia-0 Window "Editor"\n' '  uia-1 Button "OK"'
     )
     # The original payload must not be mutated.
     accessibility = payload["accessibility"]
@@ -627,7 +731,7 @@ def test_response_text_is_compact_and_carries_summary_fields() -> None:
         "action": "observe_window",
         "accessibility": {
             "available": True,
-            "focused_element": 'uia-1 Edit "text editor" screen@200,300',
+            "focused_element": 'uia-1 Edit "text editor"',
             "document_text": "hello world",
             "elements": [
                 {
@@ -644,10 +748,6 @@ def test_response_text_is_compact_and_carries_summary_fields() -> None:
     assert "\n  " not in text
     decoded = json.loads(text)
     accessibility = decoded["accessibility"]
-    assert accessibility["focused_element"] == (
-        'uia-1 Edit "text editor" screen@200,300'
-    )
+    assert accessibility["focused_element"] == 'uia-1 Edit "text editor"'
     assert accessibility["document_text"] == "hello world"
-    assert accessibility["elements"] == (
-        'uia-1 Edit "text editor" screen@200,300'
-    )
+    assert accessibility["elements"] == 'uia-1 Edit "text editor"'

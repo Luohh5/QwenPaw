@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import time
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
+import pytest
 from agentscope.model import OpenAIResponseModel
+from agentscope.tool import ToolChoice
 from openai import BadRequestError
 
 from qwenpaw.providers.multimodal_prober import _PROBE_VIDEO_URL
 from qwenpaw.providers.openai_response_provider import (
+    OpenAIResponseModelCompat,
     OpenAIResponseProvider,
     _extract_reasoning_text,
     _extract_response_text,
@@ -54,6 +59,193 @@ def _bad_request(message: str) -> BadRequestError:
         ),
         body=None,
     )
+
+
+def _make_response_model() -> OpenAIResponseModelCompat:
+    model = _make_provider().get_chat_model_instance("gpt-5")
+    assert isinstance(model, OpenAIResponseModelCompat)
+    return model
+
+
+def test_format_tools_defaults_to_non_strict_after_sanitizing() -> None:
+    tools: list[dict[str, Any]] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "demo",
+                "description": "Demo tool",
+                "parameters": {
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": {"type": "string"},
+                        "created_on": {
+                            "anyOf": [
+                                {"type": "string"},
+                                {"type": "null"},
+                            ],
+                            "default": None,
+                        },
+                    },
+                },
+            },
+        },
+    ]
+    choice = ToolChoice(mode="required", tools=["demo"])
+
+    formatted, tool_choice = _make_response_model()._format_tools(
+        tools,
+        choice,
+    )
+
+    assert formatted == [
+        {
+            "type": "function",
+            "name": "demo",
+            "description": "Demo tool",
+            "parameters": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {"type": "string"},
+                    "created_on": {
+                        "type": "string",
+                        "default": None,
+                    },
+                },
+            },
+            "strict": False,
+        },
+    ]
+    assert tool_choice == {
+        "type": "allowed_tools",
+        "mode": "required",
+        "tools": [{"type": "function", "name": "demo"}],
+    }
+    assert tools[0]["function"]["parameters"]["properties"]["created_on"] == {
+        "anyOf": [
+            {"type": "string"},
+            {"type": "null"},
+        ],
+        "default": None,
+    }
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_format_tools_preserves_explicit_strict(strict: bool) -> None:
+    tools: list[dict[str, Any]] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "demo",
+                "description": "Demo tool",
+                "strict": strict,
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        },
+    ]
+
+    formatted, tool_choice = _make_response_model()._format_tools(
+        tools,
+        None,
+    )
+
+    assert formatted == [
+        {
+            "type": "function",
+            "name": "demo",
+            "description": "Demo tool",
+            "strict": strict,
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    ]
+    assert tool_choice is None
+
+
+async def test_check_model_connection_closes_stream_and_client(
+    monkeypatch,
+) -> None:
+    provider = _make_provider()
+    captured: list[dict] = []
+
+    class FakeStream:
+        def __init__(self):
+            self.closed = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def close(self):
+            self.closed = True
+
+    stream = FakeStream()
+
+    class FakeResponses:
+        async def create(self, **kwargs):
+            captured.append(kwargs)
+            return stream
+
+    close = AsyncMock()
+    fake_client = SimpleNamespace(responses=FakeResponses(), close=close)
+    monkeypatch.setattr(provider, "_client", lambda timeout=5: fake_client)
+
+    ok, message = await provider.check_model_connection("gpt-5", timeout=4)
+
+    assert ok is True
+    assert message == ""
+    assert captured == [
+        {
+            "model": "gpt-5",
+            "input": "ping",
+            "timeout": 4,
+            "max_output_tokens": 20,
+            "stream": True,
+        },
+    ]
+    assert stream.closed is True
+    close.assert_awaited_once()
+
+
+async def test_check_model_connection_closes_resources_on_error(
+    monkeypatch,
+) -> None:
+    provider = _make_provider()
+
+    class FailingStream:
+        def __init__(self):
+            self.closed = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise RuntimeError("stream failed")
+
+        async def close(self):
+            self.closed = True
+
+    stream = FailingStream()
+    close = AsyncMock()
+    fake_client = SimpleNamespace(
+        responses=SimpleNamespace(create=AsyncMock(return_value=stream)),
+        close=close,
+    )
+    monkeypatch.setattr(provider, "_client", lambda timeout=5: fake_client)
+
+    result = await provider.check_model_connection("gpt-5")
+
+    assert result.success is False
+    assert stream.closed is True
+    close.assert_awaited_once()
 
 
 # ------ _extract_response_text ----------------------------
@@ -359,7 +551,109 @@ async def test_video_probe_reasoning_fallback(
 # ------ existing test -----------------------------------
 
 
-async def test_summary_limit_is_adapted_for_responses_api(
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "gpt-5.2-pro",
+        "gpt-5.3-codex",
+        "gpt-5.4-pro",
+        "gpt-5.5-pro",
+        "gpt-5.5-pro-2026-04-23",
+        "gpt-5.6-codex-2026-07-16",
+        "gpt-5.7",
+        "custom-reasoner",
+    ],
+)
+async def test_summary_call_removes_reasoning_when_none_is_unsupported(
+    monkeypatch,
+    model_name: str,
+) -> None:
+    captured: dict = {}
+
+    async def fake_call_api(self, *args, **kwargs):
+        del self, args
+        captured.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(
+        OpenAIResponseModel,
+        "_call_api",
+        fake_call_api,
+    )
+    provider = OpenAIResponseProvider(
+        id="openai-response",
+        name="OpenAI Responses",
+        base_url="https://api.openai.com/v1",
+        api_key="sk-test",
+        chat_model="OpenAIResponseModel",
+        generate_kwargs={
+            "reasoning": {"effort": "xhigh"},
+            "max_output_tokens": 100_000,
+        },
+    )
+    model = provider.get_chat_model_instance(model_name)
+
+    result = await model._call_api(
+        model_name,
+        [],
+        max_tokens=256,
+        disable_thinking=True,
+    )
+
+    assert result == "ok"
+    assert captured["max_output_tokens"] == 256
+    assert "max_tokens" not in captured
+    assert "reasoning" not in captured
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "gpt-5.5",
+        "gpt-5.5-2026-04-23",
+        "gpt-5.6",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "openai/gpt-5.6-luna",
+    ],
+)
+async def test_summary_call_explicitly_disables_known_reasoning(
+    monkeypatch,
+    model_name: str,
+) -> None:
+    captured: dict = {}
+
+    async def fake_call_api(self, *args, **kwargs):
+        del self, args
+        captured.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(
+        OpenAIResponseModel,
+        "_call_api",
+        fake_call_api,
+    )
+    provider = OpenAIResponseProvider(
+        id="openai-response",
+        name="OpenAI Responses",
+        base_url="https://api.openai.com/v1",
+        api_key="sk-test",
+        chat_model="OpenAIResponseModel",
+        generate_kwargs={"reasoning": {"effort": "xhigh"}},
+    )
+    model = provider.get_chat_model_instance(model_name)
+
+    result = await model._call_api(
+        model_name,
+        [],
+        disable_thinking=True,
+    )
+
+    assert result == "ok"
+    assert captured["reasoning"] == {"effort": "none"}
+
+
+async def test_reasoning_is_preserved_when_thinking_is_enabled(
     monkeypatch,
 ) -> None:
     captured: dict = {}
@@ -374,16 +668,17 @@ async def test_summary_limit_is_adapted_for_responses_api(
         "_call_api",
         fake_call_api,
     )
-    provider = _make_provider()
+    provider = OpenAIResponseProvider(
+        id="openai-response",
+        name="OpenAI Responses",
+        base_url="https://api.openai.com/v1",
+        api_key="sk-test",
+        chat_model="OpenAIResponseModel",
+        generate_kwargs={"reasoning": {"effort": "xhigh"}},
+    )
     model = provider.get_chat_model_instance("gpt-5")
 
-    result = await model._call_api(
-        "gpt-5",
-        [],
-        max_tokens=256,
-        disable_thinking=True,
-    )
+    result = await model._call_api("gpt-5", [])
 
     assert result == "ok"
-    assert captured["max_output_tokens"] == 256
-    assert "max_tokens" not in captured
+    assert captured["reasoning"] == {"effort": "xhigh"}

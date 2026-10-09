@@ -344,6 +344,54 @@ class PluginApi:  # pylint: disable=too-many-public-methods
         """
         self._registry = registry
 
+    def register_memory_backend(
+        self,
+        *,
+        backend_id: str,
+        factory: Type,
+        label: str = "",
+        config_schema: Type | None = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Register a plugin-owned memory backend before workspaces start."""
+        from qwenpaw.memory import memory_registry
+
+        memory_registry.register_backend(
+            plugin_id=self.plugin_id,
+            backend_id=backend_id,
+            factory=factory,
+            label=label or backend_id,
+            config_schema=config_schema,
+            metadata=metadata,
+        )
+        for tool_name, governance in (metadata or {}).get("tools", {}).items():
+            if not isinstance(governance, dict):
+                continue
+            from qwenpaw.governance.tool_registry import (
+                DEFAULT_REGISTRY as GOVERNANCE_REGISTRY,
+                register_tool_governance,
+            )
+
+            register_tool_governance(
+                GOVERNANCE_REGISTRY,
+                python_name=governance.get(
+                    "python_name",
+                    f"{backend_id}_{tool_name}",
+                ),
+                policy_name=governance.get("policy_name", ""),
+                tool_type=governance.get("tool_type", "internal"),
+                target_param=governance.get("target_param", ""),
+                sandbox_required=bool(
+                    governance.get("sandbox_required", False),
+                ),
+                owner=self.plugin_id,
+            )
+        logger.info(
+            "Plugin '%s' registered memory backend '%s'",
+            self.plugin_id,
+            backend_id,
+        )
+
     def register_provider(
         self,
         provider_id: str,
@@ -502,6 +550,7 @@ class PluginApi:  # pylint: disable=too-many-public-methods
         hook_name: str,
         callback: Callable,
         priority: int = 100,
+        reload_safe: bool = False,
     ):
         """Register a hook that fires when a new workspace is created.
 
@@ -513,6 +562,10 @@ class PluginApi:  # pylint: disable=too-many-public-methods
             callback: Sync or async function to call on workspace creation.
                 Signature: ``(workspace_info: dict) -> None``
             priority: Execution priority (lower = earlier, default=100)
+            reload_safe: Also use this callback to restore in-memory state
+                before publishing a reloaded workspace. Reload-safe callbacks
+                must not perform workspace filesystem provisioning. During
+                reload, ``workspace_info`` also contains ``workspace``.
 
         Example:
             >>> api.register_workspace_created_hook(
@@ -526,6 +579,7 @@ class PluginApi:  # pylint: disable=too-many-public-methods
                 hook_name=hook_name,
                 callback=callback,
                 priority=priority,
+                reload_safe=reload_safe,
             )
             logger.info(
                 f"Plugin '{self.plugin_id}' registered "
@@ -932,6 +986,7 @@ class PluginApi:  # pylint: disable=too-many-public-methods
             category=category,
             help_text=help_text,
             metadata=metadata or {},
+            owner_id=self.plugin_id,
         )
 
         def _register_to_workspaces():
@@ -949,6 +1004,7 @@ class PluginApi:  # pylint: disable=too-many-public-methods
             hook_name=(f"slash_cmd_ws_{self.plugin_id}_{name}"),
             callback=_on_workspace_created,
             priority=60,
+            reload_safe=True,
         )
         logger.info(
             f"Plugin '{self.plugin_id}' scheduled slash command "
@@ -991,6 +1047,7 @@ class PluginApi:  # pylint: disable=too-many-public-methods
             hook_name=(f"mode_ws_{self.plugin_id}_{mode_name}"),
             callback=_on_workspace_created,
             priority=70,
+            reload_safe=True,
         )
         logger.info(
             f"Plugin '{self.plugin_id}' scheduled mode "
@@ -1030,6 +1087,7 @@ class PluginApi:  # pylint: disable=too-many-public-methods
             hook_name=(f"rt_hook_ws_{self.plugin_id}_{hook.name}"),
             callback=_on_workspace_created,
             priority=65,
+            reload_safe=True,
         )
         logger.info(
             f"Plugin '{self.plugin_id}' scheduled runtime hook "
@@ -1083,6 +1141,7 @@ class PluginApi:  # pylint: disable=too-many-public-methods
             hook_name=(f"stop_ws_{self.plugin_id}_{reg.name}"),
             callback=_on_workspace_created,
             priority=55,
+            reload_safe=True,
         )
         logger.info(
             f"Plugin '{self.plugin_id}' scheduled stop handler "
@@ -1174,6 +1233,9 @@ class PluginApi:  # pylint: disable=too-many-public-methods
         workspace_info: dict,
     ):
         """Get workspace instance from workspace_info dict."""
+        workspace = workspace_info.get("workspace")
+        if workspace is not None:
+            return workspace
         try:
             from .registry import PluginRegistry
 
@@ -1192,15 +1254,41 @@ class PluginApi:  # pylint: disable=too-many-public-methods
             )
             return None
 
+    def _register_spec_with_workspace(
+        self,
+        spec,
+        workspace,
+        *,
+        validate_only: bool = False,
+    ) -> None:
+        registry = workspace.plugins.slash_command_registry
+        try:
+            if validate_only:
+                registry.validate(spec)
+            else:
+                registry.register(spec)
+        except ValueError:
+            logger.error(
+                "Plugin '%s' failed to register slash command '/%s' "
+                "in workspace '%s'",
+                self.plugin_id,
+                spec.name,
+                getattr(workspace, "agent_id", "?"),
+                exc_info=True,
+            )
+            raise
+
     def _register_spec_to_all_workspaces(self, spec):
         """Register a CommandSpec to all existing workspaces."""
-        for ws in self._get_all_workspaces():
-            try:
-                ws.plugins.slash_command_registry.register(spec)
-            except ValueError as exc:
-                logger.debug(
-                    f"Slash cmd already registered: {exc}",
-                )
+        workspaces = self._get_all_workspaces()
+        for workspace in workspaces:
+            self._register_spec_with_workspace(
+                spec,
+                workspace,
+                validate_only=True,
+            )
+        for workspace in workspaces:
+            self._register_spec_with_workspace(spec, workspace)
 
     def _register_spec_to_workspace(
         self,
@@ -1208,15 +1296,9 @@ class PluginApi:  # pylint: disable=too-many-public-methods
         workspace_info: dict,
     ):
         """Register a CommandSpec to a specific workspace."""
-        ws = self._get_workspace_from_info(workspace_info)
-        if ws is None:
-            return
-        try:
-            ws.plugins.slash_command_registry.register(spec)
-        except ValueError as exc:
-            logger.debug(
-                f"Slash cmd already registered: {exc}",
-            )
+        workspace = self._get_workspace_from_info(workspace_info)
+        if workspace is not None:
+            self._register_spec_with_workspace(spec, workspace)
 
     def _register_mode_cls_to_all_workspaces(self, mode_cls: Type) -> None:
         """Instantiate and register *mode_cls* on every workspace."""

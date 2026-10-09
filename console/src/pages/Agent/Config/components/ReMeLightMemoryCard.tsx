@@ -1,13 +1,18 @@
-import { useState } from "react";
+import { useConfigAutoSave } from "../configAutoSaveContext";
+import { isValidDreamCronShape } from "./dreamCron";
+import { SchedulePicker } from "@/components/interaction/SchedulePicker";
+import { NumberStepper as InputNumber } from "@/components/interaction/NumberStepper";
+import { SettingsField } from "@/components/interaction/SettingsField";
+import { useEffect, useState } from "react";
+import { Form, Card, Switch, Input } from "@agentscope-ai/design";
 import {
-  Form,
-  Card,
-  Switch,
-  InputNumber,
-  Input,
-  Button,
-} from "@agentscope-ai/design";
-import { AlertTriangle, ChevronRight, ExternalLink } from "lucide-react";
+  AlertTriangle,
+  ChevronRight,
+  ExternalLink,
+  Gauge,
+  HeartPulse,
+  ListTodo,
+} from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { agentsApi } from "@/api";
 import type { ReMeLightMemoryConfig } from "@/api/types/agent";
@@ -17,64 +22,122 @@ import styles from "../index.module.less";
 import { useMemoryMaintenance } from "../memoryMaintenanceContext";
 import { ReMeStatusModal } from "./ReMeStatusModal";
 
-export function isValidDreamCronShape(value?: string) {
-  if (!value?.trim()) {
-    return false;
-  }
-  const fields = value.trim().split(/\s+/);
-  if (
-    fields.length !== 5 ||
-    !fields.every((field) => /^[a-z0-9*/,-]+$/i.test(field))
-  ) {
-    return false;
-  }
-
-  // Catch numeric values outside the ranges accepted by APScheduler before
-  // submitting the form. The backend remains authoritative for the complete
-  // cron grammar (named months/weekdays, ranges, lists, and steps).
-  const numericRanges = [
-    [0, 59],
-    [0, 23],
-    [1, 31],
-    [1, 12],
-    [0, 6],
-  ] as const;
-  return fields.every((field, index) => {
-    const [minimum, maximum] = numericRanges[index];
-    return [...field.matchAll(/\d+/g)].every(({ 0: token }) => {
-      const number = Number(token);
-      return number >= minimum && number <= maximum;
-    });
-  });
-}
+const AUTO_FIN_MAX_WINDOW_HOURS = 168;
 
 export function ReMeLightMemoryCard() {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const { message, modal } = useAppMessage();
   const form = Form.useFormInstance();
+  const scheduleSave = useConfigAutoSave();
   const { selectedAgent } = useAgentStore();
   const {
-    setNeedsReindex,
     reindexing,
     setReindexing,
     runtimeStatus,
+    diagnosticsStatus,
     checkMemoryStatus,
+    rerankerExpanded,
+    setRerankerExpanded,
+    configLoadRevision,
   } = useMemoryMaintenance();
-  const [statusOpen, setStatusOpen] = useState(false);
+  const [statusView, setStatusView] = useState<"tasks" | "diagnostics" | null>(
+    null,
+  );
   const [dailyPaperExpanded, setDailyPaperExpanded] = useState(false);
+  const [autoFinExpanded, setAutoFinExpanded] = useState(() =>
+    Boolean(
+      form.getFieldValue(["reme_light_memory_config", "auto_fin_cron_enabled"]),
+    ),
+  );
+
+  const remeConfig = Form.useWatch(["reme_light_memory_config"], form) as
+    | ReMeLightMemoryConfig
+    | undefined;
+  const rerankerEnabled = remeConfig?.reranker_config?.enabled ?? false;
+
+  // Reset to the default expansion state whenever the enable/disable signal,
+  // the selected Agent, or a config load changes. This keeps the details
+  // collapsed after disabling reranking and prevents the page-level
+  // rerankerExpanded state from leaking across Agent switches or Reset.
+  // configLoadRevision is needed because Reset reloads the persisted config,
+  // so rerankerEnabled may come back unchanged and the effect would not run.
+  useEffect(() => {
+    setRerankerExpanded(rerankerEnabled);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rerankerEnabled, selectedAgent, configLoadRevision]);
+
+  const rerankerPath = (field: string): string[] => [
+    "reme_light_memory_config",
+    "reranker_config",
+    field,
+  ];
+
+  // base_url and model_name only become required once reranking is enabled, and
+  // the rules carrying that condition are re-created by the render that follows
+  // the Switch flip. Validating inside the onChange would run against the
+  // previous render's rules (required: false) and pass silently, so the same
+  // validation is re-run after that render commits instead.
+  useEffect(() => {
+    if (!rerankerEnabled) {
+      return;
+    }
+    void form
+      .validateFields([rerankerPath("base_url"), rerankerPath("model_name")])
+      .catch(() => {
+        // Rejection is the point: it records the field errors.
+      });
+    // rerankerPath is re-created every render, so only re-run on enablement.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rerankerEnabled]);
+
+  const normalizeRerankerNumbersOnDisable = () => {
+    const multiplier = form.getFieldValue(rerankerPath("candidate_multiplier"));
+    const timeout = form.getFieldValue(rerankerPath("timeout"));
+
+    const validMultiplier =
+      typeof multiplier === "number" &&
+      Number.isFinite(multiplier) &&
+      multiplier >= 1 &&
+      Number.isInteger(multiplier);
+    const validTimeout =
+      typeof timeout === "number" && Number.isFinite(timeout) && timeout >= 1;
+
+    form.setFields([
+      {
+        name: rerankerPath("base_url"),
+        errors: [],
+      },
+      {
+        name: rerankerPath("model_name"),
+        errors: [],
+      },
+      {
+        name: rerankerPath("candidate_multiplier"),
+        value: validMultiplier ? multiplier : 3,
+        errors: [],
+      },
+      {
+        name: rerankerPath("timeout"),
+        value: validTimeout ? timeout : 10,
+        errors: [],
+      },
+    ]);
+  };
 
   const rebuildMemoryIndex = () => {
     modal.confirm({
-      title: t("agentConfig.rebuildMemoryIndexConfirmTitle"),
-      content: t("agentConfig.rebuildMemoryIndexConfirm"),
-      okText: t("agentConfig.rebuildMemoryIndex"),
+      title: t("agentConfig.rebuildBm25IndexConfirmTitle"),
+      content: t("agentConfig.rebuildBm25IndexConfirm"),
+      okText: t("agentConfig.rebuildBm25Index"),
       cancelText: t("common.cancel"),
       onOk: async () => {
         setReindexing(true);
         try {
-          await agentsApi.rebuildMemoryIndex(selectedAgent || "default");
-          setNeedsReindex(false);
-          message.success(t("agentConfig.rebuildMemoryIndexSuccess"));
+          await agentsApi.rebuildMemoryIndex(
+            selectedAgent || "default",
+            "bm25",
+          );
+          message.success(t("agentConfig.rebuildBm25IndexSuccess"));
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
           message.error(
@@ -89,22 +152,25 @@ export function ReMeLightMemoryCard() {
     });
   };
 
-  const inspectMemoryStatus = () => {
-    setStatusOpen(true);
-    void checkMemoryStatus();
+  const inspectMemoryStatus = (view: "tasks" | "diagnostics") => {
+    setStatusView(view);
+    void checkMemoryStatus(view === "diagnostics");
   };
   const statusLoading = runtimeStatus.type === "checking";
-  const memoryStatus =
-    runtimeStatus.type === "healthy" ? runtimeStatus.data : null;
+  const runtime = runtimeStatus.type === "healthy" ? runtimeStatus.data : null;
+  const diagnostics =
+    diagnosticsStatus.type === "healthy" ? diagnosticsStatus.data : null;
   const statusError =
     runtimeStatus.type === "error" ? runtimeStatus.message : "";
-  const backendStatus = memoryStatus?.runtime.worker.status;
+  const diagnosticsError =
+    diagnosticsStatus.type === "error" ? diagnosticsStatus.message : "";
+  const backendStatus = runtime?.worker.status;
   const statusBadgeType =
     backendStatus === "error"
       ? "error"
       : backendStatus === "busy" ||
         backendStatus === "stopping" ||
-        memoryStatus?.runtime.reindexing
+        runtime?.reindexing
       ? "checking"
       : runtimeStatus.type;
   const statusBadge = {
@@ -128,7 +194,7 @@ export function ReMeLightMemoryCard() {
   const statusBadgeLabel =
     backendStatus === "error"
       ? t("agentConfig.memoryStatusNeedsAttention")
-      : backendStatus === "busy" || memoryStatus?.runtime.reindexing
+      : backendStatus === "busy" || runtime?.reindexing
       ? t("agentConfig.memoryStatusBusy")
       : backendStatus === "stopping"
       ? t("agentConfig.memoryStatusStopping")
@@ -137,33 +203,32 @@ export function ReMeLightMemoryCard() {
   const workerStatusLabel = backendStatus
     ? t(`agentConfig.memoryWorkerStatus.${backendStatus}`)
     : "—";
-  const queueHint = memoryStatus
+  const queueHint = runtime
     ? t("agentConfig.memoryQueueSummary", {
-        running: memoryStatus.runtime.worker.tasks_running,
-        pending: memoryStatus.runtime.worker.queue_pending,
+        running: runtime.worker.tasks_running,
+        pending: runtime.worker.queue_pending,
       })
     : "—";
-  const autoMemoryStatus = memoryStatus?.runtime.auto_memory;
-  const remeConfig = Form.useWatch(["reme_light_memory_config"], form) as
-    | ReMeLightMemoryConfig
-    | undefined;
   const autoMemoryInterval = Number(remeConfig?.auto_memory_interval ?? 0);
   const autoMemoryEnabled = autoMemoryInterval > 0;
   const dreamCronEnabled = remeConfig?.dream_cron_enabled ?? true;
   const dailyPaperCronEnabled = remeConfig?.daily_paper_cron_enabled ?? false;
+  const autoFinCronEnabled = remeConfig?.auto_fin_cron_enabled ?? false;
   const autoSearchEnabled =
     remeConfig?.auto_memory_search_config?.enabled ?? false;
-  const dailyPaperDocsUrl = (i18n?.resolvedLanguage || i18n?.language || "en")
-    .toLowerCase()
-    .startsWith("zh")
-    ? "https://github.com/agentscope-ai/ReMe/blob/main/cookbook/daily_paper/README_ZH.md"
-    : "https://github.com/agentscope-ai/ReMe/blob/main/cookbook/daily_paper/README.md";
+
+  useEffect(() => {
+    if (autoFinCronEnabled) {
+      setAutoFinExpanded(true);
+    }
+  }, [autoFinCronEnabled]);
 
   const toggleAutoMemory = (enabled: boolean) => {
     form.setFieldValue(
       ["reme_light_memory_config", "auto_memory_interval"],
       enabled ? Math.max(autoMemoryInterval, 1) : 0,
     );
+    scheduleSave();
   };
 
   return (
@@ -173,115 +238,116 @@ export function ReMeLightMemoryCard() {
           <div>
             <h3>{t("agentConfig.memoryOverviewTitle")}</h3>
             <p>{t("agentConfig.memoryPageDescription")}</p>
-            <div className={styles.memoryReferences}>
-              <span>{t("agentConfig.memoryPoweredBy")}</span>
-              <a
-                href="https://github.com/agentscope-ai/ReMe"
-                target="_blank"
-                rel="noreferrer"
-              >
-                ReMe
-              </a>
-              <i />
-              <a
-                href="https://qwenpaw.agentscope.io/docs/memory"
-                target="_blank"
-                rel="noreferrer"
-              >
-                {t("agentConfig.memoryDocumentation")}
-              </a>
-            </div>
           </div>
         </div>
         <div className={styles.memoryOverviewGrid}>
           <div
-            className={`${styles.memoryOverviewItem} ${styles.memoryOverviewActionItem}`}
+            className={`${styles.memoryOverviewItem} ${styles.memoryServiceStatusItem}`}
           >
-            <div>
-              <span>{t("agentConfig.memoryRuntimeStatus")}</span>
+            <span className={styles.memoryOverviewLabel}>
+              <HeartPulse size={14} aria-hidden="true" />
+              {t("agentConfig.memoryRuntimeStatus")}
+            </span>
+            <div className={styles.memoryServiceStatusLine}>
               <strong
                 className={`${styles.memoryStatusBadge} ${statusBadge.className}`}
               >
                 <i />
                 {statusBadgeLabel}
               </strong>
+              <div className={styles.memoryReferences}>
+                <span>{t("agentConfig.memoryPoweredBy")}</span>
+                <a
+                  href="https://github.com/agentscope-ai/ReMe"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  ReMe
+                </a>
+                <i />
+                <a
+                  href="https://qwenpaw.agentscope.io/docs/memory"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {t("agentConfig.memoryDocumentation")}
+                </a>
+              </div>
             </div>
-            <Button
-              className={styles.memoryStatusButton}
-              onClick={inspectMemoryStatus}
-              loading={statusLoading}
-            >
-              {t("agentConfig.remeStatusView")}
-            </Button>
           </div>
-          <div className={styles.memoryOverviewItem}>
-            <span>{t("agentConfig.memoryBackgroundTasks")}</span>
+
+          <button
+            type="button"
+            className={`${styles.memoryOverviewItem} ${styles.memoryOverviewClickableItem}`}
+            onClick={() => inspectMemoryStatus("tasks")}
+          >
+            <span className={styles.memoryOverviewLabel}>
+              <ListTodo size={14} aria-hidden="true" />
+              {t("agentConfig.memoryBackgroundTasks")}
+            </span>
             <strong>{workerStatusLabel}</strong>
             <small>{queueHint}</small>
-          </div>
-          <div className={styles.memoryOverviewItem}>
-            <span>{t("agentConfig.memoryPendingTurns")}</span>
-            <strong>
-              {autoMemoryStatus
-                ? autoMemoryStatus.enabled
-                  ? autoMemoryStatus.pending_turns
-                  : t("agentConfig.memoryStatusDisabled")
-                : "—"}
-            </strong>
-            <small>
-              {autoMemoryStatus?.enabled
-                ? t("agentConfig.memoryPendingTurnsHint", {
-                    sessions: autoMemoryStatus.sessions_with_pending,
-                    interval: autoMemoryStatus.interval,
-                  })
-                : t("agentConfig.memoryAutoRecordDisabledHint")}
-            </small>
-          </div>
-          <div
-            className={`${styles.memoryOverviewItem} ${styles.memoryOverviewMaintenance}`}
+            <ChevronRight size={16} aria-hidden="true" />
+          </button>
+
+          <button
+            type="button"
+            className={`${styles.memoryOverviewItem} ${styles.memoryOverviewClickableItem}`}
+            onClick={() => inspectMemoryStatus("diagnostics")}
+          >
+            <span className={styles.memoryOverviewLabel}>
+              <Gauge size={14} aria-hidden="true" />
+              {t("agentConfig.memoryDiagnostics")}
+            </span>
+            <div className={styles.memoryOverviewMetrics}>
+              <div>
+                <small>{t("agentConfig.memoryComponentsMetric")}</small>
+                <strong>{diagnostics?.components_total ?? "—"}</strong>
+              </div>
+              <div>
+                <small>{t("agentConfig.memoryProcessMetric")}</small>
+                <strong>{diagnostics?.process_rss ?? "—"}</strong>
+              </div>
+            </div>
+            <small>{t("agentConfig.memoryDiagnosticsHint")}</small>
+            <ChevronRight size={16} aria-hidden="true" />
+          </button>
+
+          <button
+            type="button"
+            className={`${styles.memoryOverviewItem} ${styles.memoryOverviewClickableItem} ${styles.memoryOverviewMaintenance}`}
+            onClick={rebuildMemoryIndex}
+            disabled={reindexing}
+            aria-busy={reindexing}
           >
             <div>
               <span>
-                <AlertTriangle size={16} aria-hidden="true" />
+                <AlertTriangle size={14} aria-hidden="true" />
                 {t("agentConfig.memoryMaintenanceEyebrow")}
               </span>
-              <strong>{t("agentConfig.memoryMaintenanceTitle")}</strong>
-              <small>{t("agentConfig.memoryMaintenanceDescription")}</small>
+              <strong>{t("agentConfig.rebuildBm25Index")}</strong>
+              <small>{t("agentConfig.rebuildBm25IndexDescription")}</small>
             </div>
-            <Button onClick={rebuildMemoryIndex} loading={reindexing}>
-              {t("agentConfig.rebuildMemoryIndex")}
-            </Button>
-          </div>
+            <ChevronRight size={16} aria-hidden="true" />
+          </button>
         </div>
       </section>
 
       <div className={styles.memoryConfigGrid}>
         <section className={styles.memoryConfigPanel}>
           <div className={styles.memorySectionHeader}>
-            <div
-              className={`${styles.memorySectionIcon} ${styles.memorySectionIconPrimary}`}
-            >
-              01
-            </div>
             <div>
               <h3>{t("agentConfig.memoryJournalTitle")}</h3>
-              <p>{t("agentConfig.memoryJournalDescription")}</p>
+              <p>{t("agentConfig.memoryAutoRecordDescription")}</p>
             </div>
+            <Switch
+              aria-label={t("agentConfig.memoryAutoRecordTitle")}
+              checked={autoMemoryEnabled}
+              onChange={toggleAutoMemory}
+            />
           </div>
 
-          <div className={styles.memoryCapabilityHeader}>
-            <h4>{t("agentConfig.memoryConversationJournalTitle")}</h4>
-            <code>auto-memory</code>
-          </div>
-          <div className={styles.memoryToggleRow}>
-            <div>
-              <strong>{t("agentConfig.memoryAutoRecordTitle")}</strong>
-              <span>{t("agentConfig.memoryAutoRecordDescription")}</span>
-            </div>
-            <Switch checked={autoMemoryEnabled} onChange={toggleAutoMemory} />
-          </div>
-
-          <Form.Item
+          <SettingsField
             label={t("agentConfig.memoryAutoRecordFrequency")}
             name={["reme_light_memory_config", "auto_memory_interval"]}
             rules={[
@@ -304,14 +370,14 @@ export function ReMeLightMemoryCard() {
               disabled={!autoMemoryEnabled}
               placeholder={t("agentConfig.autoMemoryIntervalPlaceholder")}
             />
-          </Form.Item>
+          </SettingsField>
 
           <div className={styles.memoryToggleRow}>
             <div>
               <strong>{t("agentConfig.memoryNotifyTitle")}</strong>
               <span>{t("agentConfig.memoryNotifyDescription")}</span>
             </div>
-            <Form.Item
+            <SettingsField
               name={[
                 "reme_light_memory_config",
                 "auto_memory_inbox_push_enabled",
@@ -321,7 +387,7 @@ export function ReMeLightMemoryCard() {
               noStyle
             >
               <Switch />
-            </Form.Item>
+            </SettingsField>
           </div>
 
           <div className={styles.memoryCapabilityDivider} />
@@ -356,12 +422,16 @@ export function ReMeLightMemoryCard() {
                 </span>
               </button>
               <div className={styles.memorySourceActions}>
-                <a href={dailyPaperDocsUrl} target="_blank" rel="noreferrer">
+                <a
+                  href="https://qwenpaw.agentscope.io/docs/memory"
+                  target="_blank"
+                  rel="noreferrer"
+                >
                   {t("agentConfig.dailyPaperDocumentation")}
                   <ExternalLink size={14} aria-hidden="true" />
                 </a>
                 <code>daily-paper</code>
-                <Form.Item
+                <SettingsField
                   name={[
                     "reme_light_memory_config",
                     "daily_paper_cron_enabled",
@@ -374,13 +444,13 @@ export function ReMeLightMemoryCard() {
                       if (enabled) setDailyPaperExpanded(true);
                     }}
                   />
-                </Form.Item>
+                </SettingsField>
               </div>
             </div>
 
             {dailyPaperExpanded && (
               <div className={styles.memorySourceContent}>
-                <Form.Item
+                <SettingsField
                   label={t("agentConfig.dailyPaperCron")}
                   name={["reme_light_memory_config", "daily_paper_cron"]}
                   tooltip={t("agentConfig.dailyPaperCronTooltip")}
@@ -411,13 +481,10 @@ export function ReMeLightMemoryCard() {
                       : []
                   }
                 >
-                  <Input
-                    disabled={!dailyPaperCronEnabled}
-                    placeholder={t("agentConfig.dailyPaperCronPlaceholder")}
-                  />
-                </Form.Item>
+                  <SchedulePicker disabled={!dailyPaperCronEnabled} />
+                </SettingsField>
 
-                <Form.Item
+                <SettingsField
                   label={t("agentConfig.dailyPaperTopics")}
                   name={["reme_light_memory_config", "daily_paper_topics"]}
                   tooltip={t("agentConfig.dailyPaperTopicsTooltip")}
@@ -426,7 +493,7 @@ export function ReMeLightMemoryCard() {
                     disabled={!dailyPaperCronEnabled}
                     placeholder={t("agentConfig.dailyPaperTopicsPlaceholder")}
                   />
-                </Form.Item>
+                </SettingsField>
 
                 <div className={styles.memoryToggleRow}>
                   <div>
@@ -435,7 +502,7 @@ export function ReMeLightMemoryCard() {
                       {t("agentConfig.dailyPaperUseHfMirrorDescription")}
                     </span>
                   </div>
-                  <Form.Item
+                  <SettingsField
                     name={[
                       "reme_light_memory_config",
                       "daily_paper_use_hf_mirror",
@@ -444,7 +511,7 @@ export function ReMeLightMemoryCard() {
                     noStyle
                   >
                     <Switch disabled={!dailyPaperCronEnabled} />
-                  </Form.Item>
+                  </SettingsField>
                 </div>
 
                 <div className={styles.memoryToggleRow}>
@@ -452,7 +519,7 @@ export function ReMeLightMemoryCard() {
                     <strong>{t("agentConfig.memoryNotifyTitle")}</strong>
                     <span>{t("agentConfig.dailyPaperNotifyDescription")}</span>
                   </div>
-                  <Form.Item
+                  <SettingsField
                     name={[
                       "reme_light_memory_config",
                       "daily_paper_inbox_push_enabled",
@@ -462,8 +529,162 @@ export function ReMeLightMemoryCard() {
                     noStyle
                   >
                     <Switch />
-                  </Form.Item>
+                  </SettingsField>
                 </div>
+              </div>
+            )}
+          </div>
+
+          <div className={styles.memorySourceCard}>
+            <div className={styles.memorySourceHeader}>
+              <button
+                type="button"
+                className={styles.memorySourceToggle}
+                aria-expanded={autoFinExpanded}
+                onClick={() => setAutoFinExpanded((expanded) => !expanded)}
+              >
+                <span
+                  className={`${styles.memorySourceChevron} ${
+                    autoFinExpanded ? styles.memorySourceChevronExpanded : ""
+                  }`}
+                  aria-hidden="true"
+                >
+                  <ChevronRight size={18} />
+                </span>
+                <span>
+                  <strong>{t("agentConfig.memoryAutoFinTitle")}</strong>
+                  <small>{t("agentConfig.memoryAutoFinDescription")}</small>
+                </span>
+              </button>
+              <div className={styles.memorySourceActions}>
+                <a
+                  href="https://qwenpaw.agentscope.io/docs/memory"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {t("agentConfig.autoFinDocumentation")}
+                  <ExternalLink size={14} aria-hidden="true" />
+                </a>
+                <code>auto-fin</code>
+                <SettingsField
+                  name={["reme_light_memory_config", "auto_fin_cron_enabled"]}
+                  valuePropName="checked"
+                  noStyle
+                >
+                  <Switch
+                    onChange={(enabled) => {
+                      if (enabled) setAutoFinExpanded(true);
+                    }}
+                  />
+                </SettingsField>
+              </div>
+            </div>
+
+            {autoFinExpanded && (
+              <div className={styles.memorySourceContent}>
+                <SettingsField
+                  label={t("agentConfig.autoFinCron")}
+                  name={["reme_light_memory_config", "auto_fin_cron"]}
+                  tooltip={t("agentConfig.autoFinCronTooltip")}
+                  rules={
+                    autoFinCronEnabled
+                      ? [
+                          {
+                            required: true,
+                            whitespace: true,
+                            message: t("agentConfig.autoFinCronRequired"),
+                          },
+                          {
+                            validator: (_, value?: string) => {
+                              if (
+                                !value?.trim() ||
+                                isValidDreamCronShape(value)
+                              ) {
+                                return Promise.resolve();
+                              }
+                              return Promise.reject(
+                                new Error(t("agentConfig.autoFinCronInvalid")),
+                              );
+                            },
+                          },
+                        ]
+                      : []
+                  }
+                >
+                  <SchedulePicker disabled={!autoFinCronEnabled} />
+                </SettingsField>
+
+                <SettingsField
+                  label={t("agentConfig.autoFinTopics")}
+                  name={["reme_light_memory_config", "auto_fin_topics"]}
+                  tooltip={t("agentConfig.autoFinTopicsTooltip")}
+                >
+                  <Input
+                    disabled={!autoFinCronEnabled}
+                    placeholder={t("agentConfig.autoFinTopicsPlaceholder")}
+                  />
+                </SettingsField>
+
+                <SettingsField
+                  label={t("agentConfig.autoFinWindowHours")}
+                  name={["reme_light_memory_config", "auto_fin_window_hours"]}
+                  tooltip={t("agentConfig.autoFinWindowHoursTooltip")}
+                  rules={
+                    autoFinCronEnabled
+                      ? [
+                          {
+                            required: true,
+                            message: t(
+                              "agentConfig.autoFinWindowHoursRequired",
+                            ),
+                          },
+                          {
+                            type: "number",
+                            min: 1,
+                            message: t("agentConfig.autoFinWindowHoursMin"),
+                          },
+                          {
+                            type: "number",
+                            max: AUTO_FIN_MAX_WINDOW_HOURS,
+                            message: t("agentConfig.autoFinWindowHoursMax", {
+                              max: AUTO_FIN_MAX_WINDOW_HOURS,
+                            }),
+                          },
+                        ]
+                      : []
+                  }
+                >
+                  <InputNumber
+                    style={{ width: "100%" }}
+                    min={1}
+                    max={AUTO_FIN_MAX_WINDOW_HOURS}
+                    step={1}
+                    disabled={!autoFinCronEnabled}
+                    placeholder={t("agentConfig.autoFinWindowHoursPlaceholder")}
+                  />
+                </SettingsField>
+
+                <div className={styles.memoryToggleRow}>
+                  <div>
+                    <strong>{t("agentConfig.memoryNotifyTitle")}</strong>
+                    <span>{t("agentConfig.autoFinNotifyDescription")}</span>
+                  </div>
+                  <SettingsField
+                    name={[
+                      "reme_light_memory_config",
+                      "auto_fin_inbox_push_enabled",
+                    ]}
+                    initialValue
+                    valuePropName="checked"
+                    noStyle
+                  >
+                    <Switch />
+                  </SettingsField>
+                </div>
+
+                <p className={styles.memorySourceDisclaimer}>
+                  {t("agentConfig.autoFinDisclaimer")}
+                </p>
               </div>
             )}
           </div>
@@ -472,37 +693,21 @@ export function ReMeLightMemoryCard() {
         <div className={styles.memoryConfigStack}>
           <section className={styles.memoryConfigPanel}>
             <div className={styles.memorySectionHeader}>
-              <div
-                className={`${styles.memorySectionIcon} ${styles.memorySectionIconSecondary}`}
-              >
-                02
-              </div>
               <div>
                 <h3>{t("agentConfig.memoryOrganizeSectionTitle")}</h3>
-                <p>{t("agentConfig.memoryOrganizeSectionDescription")}</p>
+                <p>{t("agentConfig.memoryScheduledOrganizeDescription")}</p>
               </div>
-            </div>
-
-            <div className={styles.memoryCapabilityHeader}>
-              <h4>{t("agentConfig.memoryOrganizeTitle")}</h4>
-              <code>auto-dream</code>
-            </div>
-            <div className={styles.memoryToggleRow}>
-              <div>
-                <strong>{t("agentConfig.memoryScheduledOrganizeTitle")}</strong>
-                <span>
-                  {t("agentConfig.memoryScheduledOrganizeDescription")}
-                </span>
-              </div>
-              <Form.Item
+              <SettingsField
                 name={["reme_light_memory_config", "dream_cron_enabled"]}
                 valuePropName="checked"
                 noStyle
               >
-                <Switch />
-              </Form.Item>
+                <Switch
+                  aria-label={t("agentConfig.memoryScheduledOrganizeTitle")}
+                />
+              </SettingsField>
             </div>
-            <Form.Item
+            <SettingsField
               label={t("agentConfig.dreamCron")}
               name={["reme_light_memory_config", "dream_cron"]}
               tooltip={t("agentConfig.dreamCronTooltip")}
@@ -528,17 +733,14 @@ export function ReMeLightMemoryCard() {
                   : []
               }
             >
-              <Input
-                disabled={!dreamCronEnabled}
-                placeholder={t("agentConfig.dreamCronPlaceholder")}
-              />
-            </Form.Item>
+              <SchedulePicker disabled={!dreamCronEnabled} />
+            </SettingsField>
             <div className={styles.memoryToggleRow}>
               <div>
                 <strong>{t("agentConfig.memoryNotifyTitle")}</strong>
                 <span>{t("agentConfig.autoDreamNotifyDescription")}</span>
               </div>
-              <Form.Item
+              <SettingsField
                 name={[
                   "reme_light_memory_config",
                   "auto_dream_inbox_push_enabled",
@@ -548,46 +750,37 @@ export function ReMeLightMemoryCard() {
                 noStyle
               >
                 <Switch />
-              </Form.Item>
+              </SettingsField>
             </div>
           </section>
 
           <section className={styles.memoryRecallPanel}>
             <div className={styles.memorySectionHeader}>
-              <div
-                className={`${styles.memorySectionIcon} ${styles.memorySectionIconTertiary}`}
-              >
-                03
-              </div>
               <div>
                 <h3>{t("agentConfig.memorySearchSectionTitle")}</h3>
                 <p>{t("agentConfig.memorySearchSectionDescription")}</p>
               </div>
-            </div>
-            <div className={styles.memoryCapabilityHeader}>
-              <h4>{t("agentConfig.memoryRecallTitle")}</h4>
-              <code>memory-search</code>
             </div>
             <div className={styles.memoryToggleRow}>
               <div>
                 <strong>{t("agentConfig.memorySearchToolTitle")}</strong>
                 <span>{t("agentConfig.memorySearchToolDescription")}</span>
               </div>
-              <Form.Item
+              <SettingsField
                 name={["reme_light_memory_config", "memory_search_enabled"]}
                 initialValue
                 valuePropName="checked"
                 noStyle
               >
                 <Switch />
-              </Form.Item>
+              </SettingsField>
             </div>
             <div className={styles.memoryToggleRow}>
               <div>
                 <strong>{t("agentConfig.memoryAutoRecallTitle")}</strong>
                 <span>{t("agentConfig.memoryAutoRecallDescription")}</span>
               </div>
-              <Form.Item
+              <SettingsField
                 name={[
                   "reme_light_memory_config",
                   "auto_memory_search_config",
@@ -598,7 +791,7 @@ export function ReMeLightMemoryCard() {
                 noStyle
               >
                 <Switch />
-              </Form.Item>
+              </SettingsField>
             </div>
             <div className={styles.memorySettingRow}>
               <div>
@@ -608,7 +801,7 @@ export function ReMeLightMemoryCard() {
                 </strong>
                 <span>{t("agentConfig.autoMaxResultsTooltip")}</span>
               </div>
-              <Form.Item
+              <SettingsField
                 className={styles.memoryInlineField}
                 name={[
                   "reme_light_memory_config",
@@ -633,23 +826,233 @@ export function ReMeLightMemoryCard() {
                   step={1}
                   disabled={!autoSearchEnabled}
                 />
-              </Form.Item>
+              </SettingsField>
+            </div>
+          </section>
+
+          <section className={styles.memoryRecallPanel}>
+            <div className={styles.memorySectionHeader}>
+              <div>
+                <h3>{t("agentConfig.rerankerConfigCollapseLabel")}</h3>
+                <p>{t("agentConfig.rerankerEnableHint")}</p>
+              </div>
+              <button
+                type="button"
+                className={styles.memoryRerankerToggle}
+                onClick={() => setRerankerExpanded(!rerankerExpanded)}
+                aria-expanded={rerankerExpanded}
+                aria-controls="reranker-details"
+                aria-label={
+                  rerankerExpanded
+                    ? t("agentConfig.rerankerCollapseDetails")
+                    : t("agentConfig.rerankerExpandDetails")
+                }
+              >
+                <ChevronRight
+                  size={16}
+                  style={{
+                    transform: rerankerExpanded ? "rotate(90deg)" : undefined,
+                  }}
+                  aria-hidden="true"
+                />
+              </button>
+            </div>
+
+            <div className={styles.memoryCapabilityHeader}>
+              <h4>{t("agentConfig.rerankerTitle")}</h4>
+              <code>reranker-search</code>
+            </div>
+
+            <SettingsField
+              label={t("agentConfig.rerankerEnabled")}
+              name={["reme_light_memory_config", "reranker_config", "enabled"]}
+              initialValue={false}
+              valuePropName="checked"
+              tooltip={t("agentConfig.rerankerEnabledTooltip")}
+            >
+              <Switch
+                onChange={(checked) => {
+                  if (checked) {
+                    // Validation is driven by the rerankerEnabled effect above:
+                    // at this point the form still holds enabled: false, so the
+                    // required rules are still inactive.
+                    setRerankerExpanded(true);
+                  } else {
+                    // Normalize invalid/empty numeric values back to valid
+                    // defaults and clear their errors. The backend schema
+                    // validates candidate_multiplier/timeout even when
+                    // reranking is disabled, so null must never be submitted.
+                    normalizeRerankerNumbersOnDisable();
+                  }
+                }}
+              />
+            </SettingsField>
+
+            <div
+              id="reranker-details"
+              style={{ display: rerankerExpanded ? undefined : "none" }}
+            >
+              <SettingsField
+                label={t("agentConfig.rerankerBaseUrl")}
+                name={[
+                  "reme_light_memory_config",
+                  "reranker_config",
+                  "base_url",
+                ]}
+                rules={[
+                  {
+                    required: rerankerEnabled,
+                    whitespace: true,
+                    message: t("agentConfig.rerankerBaseUrlRequired"),
+                  },
+                ]}
+                tooltip={t("agentConfig.rerankerBaseUrlTooltip")}
+              >
+                <Input
+                  placeholder={t("agentConfig.rerankerBaseUrlPlaceholder")}
+                  disabled={!rerankerEnabled}
+                />
+              </SettingsField>
+
+              <SettingsField
+                label={t("agentConfig.rerankerModelName")}
+                name={[
+                  "reme_light_memory_config",
+                  "reranker_config",
+                  "model_name",
+                ]}
+                rules={[
+                  {
+                    required: rerankerEnabled,
+                    whitespace: true,
+                    message: t("agentConfig.rerankerModelNameRequired"),
+                  },
+                ]}
+                tooltip={t("agentConfig.rerankerModelNameTooltip")}
+              >
+                <Input
+                  placeholder={t("agentConfig.rerankerModelNamePlaceholder")}
+                  disabled={!rerankerEnabled}
+                />
+              </SettingsField>
+
+              <SettingsField
+                label={t("agentConfig.rerankerApiKey")}
+                name={[
+                  "reme_light_memory_config",
+                  "reranker_config",
+                  "api_key",
+                ]}
+                tooltip={t("agentConfig.rerankerApiKeyTooltip")}
+              >
+                <Input.Password
+                  placeholder={t("agentConfig.rerankerApiKeyPlaceholder")}
+                  disabled={!rerankerEnabled}
+                />
+              </SettingsField>
+
+              <SettingsField
+                label={t("agentConfig.rerankerCandidateMultiplier")}
+                name={[
+                  "reme_light_memory_config",
+                  "reranker_config",
+                  "candidate_multiplier",
+                ]}
+                initialValue={3}
+                rules={[
+                  {
+                    required: true,
+                    message: t(
+                      "agentConfig.rerankerCandidateMultiplierRequired",
+                    ),
+                  },
+                  {
+                    type: "number",
+                    min: 1,
+                    message: t("agentConfig.rerankerCandidateMultiplierMin"),
+                  },
+                  {
+                    validator: (_, value) => {
+                      if (value == null) {
+                        return Promise.resolve();
+                      }
+                      const num = Number(value);
+                      if (!Number.isFinite(num) || Number.isNaN(num)) {
+                        return Promise.reject(
+                          new Error(
+                            t("agentConfig.rerankerCandidateMultiplierInteger"),
+                          ),
+                        );
+                      }
+                      if (!Number.isInteger(num)) {
+                        return Promise.reject(
+                          new Error(
+                            t("agentConfig.rerankerCandidateMultiplierInteger"),
+                          ),
+                        );
+                      }
+                      return Promise.resolve();
+                    },
+                  },
+                ]}
+                tooltip={t("agentConfig.rerankerCandidateMultiplierTooltip")}
+              >
+                <InputNumber
+                  style={{ width: "100%" }}
+                  min={1}
+                  step={1}
+                  precision={0}
+                  disabled={!rerankerEnabled}
+                />
+              </SettingsField>
+
+              <SettingsField
+                label={t("agentConfig.rerankerTimeout")}
+                name={[
+                  "reme_light_memory_config",
+                  "reranker_config",
+                  "timeout",
+                ]}
+                initialValue={10.0}
+                rules={[
+                  {
+                    required: true,
+                    message: t("agentConfig.rerankerTimeoutRequired"),
+                  },
+                  {
+                    type: "number",
+                    min: 1,
+                    message: t("agentConfig.rerankerTimeoutMin"),
+                  },
+                ]}
+                tooltip={t("agentConfig.rerankerTimeoutTooltip")}
+              >
+                <InputNumber
+                  style={{ width: "100%" }}
+                  min={1}
+                  step={1}
+                  disabled={!rerankerEnabled}
+                />
+              </SettingsField>
             </div>
           </section>
         </div>
       </div>
 
       <ReMeStatusModal
-        open={statusOpen}
-        loading={statusLoading}
-        error={statusError}
-        memoryStatus={memoryStatus}
+        view={statusView}
+        loading={
+          statusView === "diagnostics"
+            ? diagnosticsStatus.type === "checking"
+            : statusLoading
+        }
+        error={statusView === "diagnostics" ? diagnosticsError : statusError}
+        runtime={runtime}
+        diagnostics={diagnostics}
         statusBadge={statusBadge}
         statusBadgeLabel={statusBadgeLabel}
-        workerStatusLabel={workerStatusLabel}
-        queueHint={queueHint}
-        onRefresh={inspectMemoryStatus}
-        onClose={() => setStatusOpen(false)}
+        onRefresh={() => void checkMemoryStatus(statusView === "diagnostics")}
+        onClose={() => setStatusView(null)}
       />
     </Card>
   );

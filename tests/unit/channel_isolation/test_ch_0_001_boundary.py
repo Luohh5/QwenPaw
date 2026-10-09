@@ -315,7 +315,7 @@ def test_base_channel_methods_have_one_matrix_row() -> None:
         "| method | declaration | owner | isolated mapping | notes |",
     )
     documented = [row[0] for row in rows]
-    assert len(documented) == 77
+    assert len(documented) == 80
     assert len(set(documented)) == len(documented)
     assert set(documented) == set(_base_methods())
     assert all(len(row) == 5 for row in rows)

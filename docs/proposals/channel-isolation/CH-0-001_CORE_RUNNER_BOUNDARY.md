@@ -41,7 +41,7 @@ Runner 不依赖 `Workspace` 类型自行推断媒体目录；Core 传入的 `me
 
 ## 3. BaseChannel 接口盘点和迁移映射
 
-以下矩阵来自当前 `BaseChannel` 的 AST 直接定义，共 77 个方法。每个方法只出现一次。
+以下矩阵来自当前 `BaseChannel` 的 AST 直接定义，共 80 个方法。每个方法只出现一次。
 `Core` 表示隔离后由 Host/Proxy 保留，`Runner` 表示平台驱动实现，`Split` 表示
 Core 语义和 Runner 平台操作各保留一半，`Compatibility` 表示只为现有 in-process
 调用面保留的兼容入口。
@@ -102,6 +102,9 @@ Core 语义和 Runner 平台操作各保留一半，`Compatibility` 表示只为
 | `on_streaming_delta` | async/public | Split | Host lifecycle + Driver effect | Core 保留聚合；平台消息更新在 Runner |
 | `on_streaming_end` | async/public | Split | Host lifecycle + Driver effect | Core 保留收束；平台状态恢复在 Runner |
 | `on_event_message_completed` | async/public | Split | Host fallback + Driver render | Core 保留 fallback；平台卡片/发送在 Runner |
+| `_model_fallback_events` | sync/protected | Core | Host helper | 提取并去重模型回退事件 |
+| `_format_model_fallback_notice` | sync/protected | Core | Host helper | 生成平台无关的模型回退提示 |
+| `_send_model_fallback_notice` | async/protected | Core | Host dispatch via `send_content_parts` | Core 决定提示时机和内容，复用既有平台发送边界 |
 | `on_event_response` | async/public | Core | Host hook | Agent response |
 | `_on_process_completed` | async/protected | Split | Host lifecycle + Driver effect | Core 保留完成语义；平台清理在 Runner |
 | `_finish_response_cycle` | async/protected | Core | Host helper | response cycle |

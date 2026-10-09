@@ -1,3 +1,7 @@
+import {
+  prepareBrowserSession,
+  usesBrowserSession,
+} from "./pawapp-sdk/browserSession";
 /**
  * hostExternals.ts
  *
@@ -30,6 +34,12 @@ import type {
   HostThemeMode,
   QwenPawChatNamespace,
 } from "./types/qwenpaw";
+import { pawSdkFactory } from "./pawapp-sdk";
+import type { PawSdkFactory } from "./pawapp-sdk/types";
+import {
+  memoryBackendNamespace,
+  type MemoryBackendNamespace,
+} from "./memoryBackends";
 
 declare const VITE_API_BASE_URL: string;
 
@@ -46,6 +56,8 @@ export interface HostExternals {
   apiBaseUrl: string;
   getApiUrl: typeof getApiUrl;
   getApiToken: typeof getApiToken;
+  prepareBrowserSession: typeof prepareBrowserSession;
+  usesBrowserSession: typeof usesBrowserSession;
   // ── Hooks + helpers attached later by installHostSdk() ─────────────────────
   useTheme?: () => HostThemeMode;
   useLocale?: () => string;
@@ -103,6 +115,10 @@ class PluginSystem {
     if (options?.isBuiltin) rec.isBuiltin = true;
     Object.assign(rec.toolRenderers, renderers);
     this._notify();
+  }
+
+  removePlugin(pluginId: string): void {
+    if (this.records.delete(pluginId)) this._notify();
   }
 
   // ── Read API (consumed by PluginContext / usePlugins) ────────────────────
@@ -187,6 +203,10 @@ export interface WindowNamespace {
   chat?: QwenPawChatNamespace;
   /** Override audit log (debug). Attached by installHostExternals(). */
   audit?: QwenPawAuditNamespace;
+  /** App-scoped PawApp SDK. */
+  paw?: PawSdkFactory;
+  /** Memory backend configuration UI contributed by memory plugins. */
+  memoryBackends?: MemoryBackendNamespace;
 }
 
 declare global {
@@ -239,6 +259,8 @@ export function installHostExternals(): void {
       apiBaseUrl,
       getApiUrl,
       getApiToken,
+      prepareBrowserSession,
+      usesBrowserSession,
     };
   }
 
@@ -247,6 +269,10 @@ export function installHostExternals(): void {
   if (!window.QwenPaw.route) window.QwenPaw.route = buildRouteNamespace();
   if (!window.QwenPaw.slot) window.QwenPaw.slot = buildSlotNamespace();
   if (!window.QwenPaw.audit) window.QwenPaw.audit = buildAuditNamespace();
+  if (!window.QwenPaw.paw) window.QwenPaw.paw = pawSdkFactory;
+  if (!window.QwenPaw.memoryBackends) {
+    window.QwenPaw.memoryBackends = memoryBackendNamespace;
+  }
 
   // ── Back-compat shim ───────────────────────────────────────────────────
   // Legacy registerRoutes(pluginId, routes[]) fans out to:

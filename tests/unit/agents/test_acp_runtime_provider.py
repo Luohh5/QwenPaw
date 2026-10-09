@@ -12,6 +12,7 @@ import pytest
 from acp import RequestError, text_block
 
 from qwenpaw.agents.acp.runtime_provider import (
+    QWENPAW_MODEL_INFO_ENV,
     RUNTIME_OPENAI_PROVIDER_ID,
     OpenAIRuntimeProviderConfig,
 )
@@ -109,6 +110,58 @@ def test_runtime_provider_builds_openai_provider():
     assert provider.base_url == "https://policy.example.test/v1"
     assert provider.api_key == "execution-secret"
     assert provider.has_model("policy")
+
+
+def test_runtime_provider_applies_model_info():
+    config = OpenAIRuntimeProviderConfig.from_env(
+        {
+            "OPENAI_BASE_URL": "https://policy.example.test/v1",
+            "OPENAI_API_KEY": "execution-secret",
+            "OPENAI_MODEL": "policy",
+            QWENPAW_MODEL_INFO_ENV: (
+                '{"max_input_tokens":32768,"max_output_tokens":4096}'
+            ),
+        },
+    )
+
+    provider = config.build_provider()
+    model = provider.models[0]
+
+    assert config.max_input_tokens == 32768
+    assert config.max_output_tokens == 4096
+    assert model.max_input_length == 32768
+    assert model.max_input_length_configured is True
+    assert model.generate_kwargs["max_tokens"] == 4096
+    assert provider.get_context_size("policy") == 32768
+    assert (
+        provider.get_effective_generate_kwargs("policy")["max_tokens"] == 4096
+    )
+
+
+@pytest.mark.parametrize(
+    "model_info",
+    [
+        "[]",
+        "not-json",
+        '{"max_input_tokens":0}',
+        '{"max_input_tokens":999}',
+        '{"max_input_tokens":1.0}',
+        '{"max_input_tokens":"1000"}',
+        '{"max_input_tokens":Infinity}',
+        '{"max_output_tokens":NaN}',
+        '{"max_output_tokens":true}',
+    ],
+)
+def test_runtime_provider_rejects_invalid_model_info(model_info):
+    with pytest.raises(ValueError, match=QWENPAW_MODEL_INFO_ENV):
+        OpenAIRuntimeProviderConfig.from_env(
+            {
+                "OPENAI_BASE_URL": "https://policy.example.test/v1",
+                "OPENAI_API_KEY": "execution-secret",
+                "OPENAI_MODEL": "policy",
+                QWENPAW_MODEL_INFO_ENV: model_info,
+            },
+        )
 
 
 async def test_runtime_provider_is_registered_only_in_memory(monkeypatch):
@@ -333,3 +386,26 @@ async def test_cancel_stops_active_prompt(monkeypatch):
 
     assert cancelled.is_set()
     assert result.stop_reason == "cancelled"
+
+
+@pytest.mark.parametrize(f"protocol", [f"chat", f"responses", f"anthropic"])
+def test_acp_protocol_and_overrides_are_private(protocol):
+    config = OpenAIRuntimeProviderConfig(
+        base_url=f"https://custom.example/v1",
+        api_key=f"test",
+        model=f"deployment",
+        protocol=protocol,
+        max_output_tokens=128,
+        model_overrides={
+            f"template_id": f"openai/gpt-5.6",
+            f"supports_image": False,
+            f"generate_kwargs": {f"temperature": 0.2},
+        },
+    )
+    first = config.build_provider()
+    second = config.build_provider()
+    assert first.wire_protocol == protocol
+    assert first.resolve_model_info(f"deployment").supports_image is False
+    assert config.model_overrides[f"generate_kwargs"] == {f"temperature": 0.2}
+    first.models[0].generate_kwargs[f"temperature"] = 0.9
+    assert second.models[0].generate_kwargs[f"temperature"] == 0.2

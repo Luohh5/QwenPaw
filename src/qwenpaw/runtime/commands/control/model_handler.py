@@ -8,7 +8,10 @@ The /model command manages model configuration for the current agent.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
+from ....utils.io_utils import run_sync_io
+from ....utils.logging import sanitize_log_value
 from .base import BaseControlCommandHandler, ControlContext
 
 logger = logging.getLogger(__name__)
@@ -118,7 +121,7 @@ class ModelCommandHandler(BaseControlCommandHandler):
             from ....providers.provider_manager import ProviderManager
 
             manager = ProviderManager.get_instance()
-            active_model = manager.get_active_model()
+            active_model = await run_sync_io(manager.get_active_model)
 
             if active_model is None or not active_model.provider_id:
                 return (
@@ -155,7 +158,7 @@ class ModelCommandHandler(BaseControlCommandHandler):
         # Get current active model
         active_model = workspace.config.active_model
         if active_model is None:
-            active_model = manager.get_active_model()
+            active_model = await run_sync_io(manager.get_active_model)
 
         # Get all provider infos
         all_provider_infos = await manager.list_provider_info()
@@ -288,20 +291,27 @@ class ModelCommandHandler(BaseControlCommandHandler):
             )
 
         # Update agent config
-        from ....config.config import save_agent_config
+        from ....config.config import update_agent_config_async
         from ....config.config import ModelSlotConfig as ModelSlot
 
         workspace = context.workspace
         agent_config = workspace.config
 
-        agent_config.active_model = ModelSlot(
+        new_slot = ModelSlot(
             provider_id=provider_id,
             model=model_id,
         )
+        agent_config.active_model = new_slot
 
-        # Save to agent.json
+        def apply_active_model(persisted: Any) -> None:
+            persisted.active_model = new_slot
+
+        # Save to agent.json off the event loop (chat hot path)
         try:
-            save_agent_config(agent_config.id, agent_config)
+            await update_agent_config_async(
+                agent_config.id,
+                apply_active_model,
+            )
         except Exception as e:
             logger.exception(f"Failed to save agent config: {e}")
             return (
@@ -311,7 +321,8 @@ class ModelCommandHandler(BaseControlCommandHandler):
 
         logger.info(
             f"/model switch: agent={agent_config.id} "
-            f"provider={provider_id} model={model_id}",
+            f"provider={sanitize_log_value(provider_id)} "
+            f"model={sanitize_log_value(model_id)}",
         )
 
         return (
@@ -330,7 +341,7 @@ class ModelCommandHandler(BaseControlCommandHandler):
         Returns:
             Success message
         """
-        from ....config.config import save_agent_config
+        from ....config.config import update_agent_config_async
         from ....providers.provider_manager import ProviderManager
 
         workspace = context.workspace
@@ -338,7 +349,7 @@ class ModelCommandHandler(BaseControlCommandHandler):
 
         # Get global active model
         manager = ProviderManager.get_instance()
-        global_model = manager.get_active_model()
+        global_model = await run_sync_io(manager.get_active_model)
 
         if global_model is None or not global_model.provider_id:
             return (
@@ -350,9 +361,12 @@ class ModelCommandHandler(BaseControlCommandHandler):
         # Clear agent-specific model (use None to indicate using global)
         agent_config.active_model = None
 
-        # Save to agent.json
+        def apply_reset(persisted: Any) -> None:
+            persisted.active_model = None
+
+        # Save to agent.json off the event loop (chat hot path)
         try:
-            save_agent_config(agent_config.id, agent_config)
+            await update_agent_config_async(agent_config.id, apply_reset)
         except Exception as e:
             logger.exception(f"Failed to save agent config: {e}")
             return (
@@ -403,7 +417,7 @@ class ModelCommandHandler(BaseControlCommandHandler):
         from ....providers.provider_manager import ProviderManager
 
         manager = ProviderManager.get_instance()
-        provider = manager.get_provider(provider_id)
+        provider = await run_sync_io(manager.get_provider, provider_id)
 
         if not provider:
             return (
@@ -414,7 +428,7 @@ class ModelCommandHandler(BaseControlCommandHandler):
 
         # Find model
         model_info = None
-        for model in provider.models + provider.extra_models:
+        for model in provider.all_models():
             if model.id == model_id:
                 model_info = model
                 break
@@ -487,7 +501,7 @@ class ModelCommandHandler(BaseControlCommandHandler):
         manager = ProviderManager.get_instance()
 
         # Validate provider
-        provider = manager.get_provider(provider_id)
+        provider = await run_sync_io(manager.get_provider, provider_id)
         if not provider:
             return False, f"Provider `{provider_id}` not found."
 

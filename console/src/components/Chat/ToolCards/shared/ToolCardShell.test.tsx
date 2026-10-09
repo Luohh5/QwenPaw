@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -10,18 +10,27 @@ vi.mock("./ToolCallSessionContext", () => ({
   useToolCallSessionId: () => "",
 }));
 
+const hookState = vi.hoisted(() => ({ lastIsCalling: false }));
+
 vi.mock("../../../../hooks/useToolCallControl", () => ({
-  useToolCallControl: () => ({
-    bannerVisible: false,
-    offloadRemaining: null,
-    killRemaining: null,
-    defaultPolicy: "keep_foreground",
-    maxInternalTimeoutSecs: null,
-    elapsed: 0,
-    toggleBanner: vi.fn(),
-    closeBanner: vi.fn(),
-    updateRemaining: vi.fn(),
-  }),
+  useToolCallControl: (
+    _sessionId: string,
+    _toolCallId: string | undefined,
+    isCalling: boolean,
+  ) => {
+    hookState.lastIsCalling = isCalling;
+    return {
+      bannerVisible: false,
+      offloadRemaining: 12,
+      killRemaining: 30,
+      defaultPolicy: "keep_foreground",
+      maxInternalTimeoutSecs: null,
+      elapsed: 0,
+      toggleBanner: vi.fn(),
+      closeBanner: vi.fn(),
+      updateRemaining: vi.fn(),
+    };
+  },
 }));
 
 vi.mock("./ToolCallControlPopover", () => ({
@@ -40,7 +49,26 @@ const content: ToolCallContent = {
   status: "done",
 };
 
+const runningContent: ToolCallContent = {
+  ...content,
+  params: { command: "python verbose_script.py" },
+  status: "calling",
+};
+
+const streamingInputContent: ToolCallContent = {
+  ...runningContent,
+  inputProgress: {
+    preview: '{"path":"notes.txt"}',
+    truncated: false,
+  },
+};
+
 describe("ToolCardShell lazy body", () => {
+  beforeEach(() => {
+    localStorage.removeItem("qwenpaw_tool_calls_default_expanded");
+    localStorage.removeItem("qwenpaw_tool_display_mode");
+  });
+
   it("opens file-facing results by default when requested", () => {
     render(
       <ToolCardShell
@@ -66,6 +94,52 @@ describe("ToolCardShell lazy body", () => {
 
     expect(container.querySelector("details")).not.toHaveAttribute("open");
     expect(screen.queryByText("raw output")).not.toBeInTheDocument();
+  });
+
+  it("shows raw input and output after opening a raw-mode card", () => {
+    localStorage.setItem("qwenpaw_tool_display_mode", "raw-input-output");
+    const rawContent: ToolCallContent = {
+      ...content,
+      rawInput: '{"command":"pwd"}',
+      params: { command: "pwd" },
+      result: { stdout: "/workspace" },
+    };
+
+    const { container } = render(
+      <ToolCardShell content={rawContent} icon={<span />} title="Ordinary tool">
+        <div>processed output</div>
+      </ToolCardShell>,
+    );
+
+    const details = container.querySelector("details");
+    expect(details).not.toHaveAttribute("open");
+    expect(screen.queryByText("Input")).not.toBeInTheDocument();
+
+    details!.open = true;
+    fireEvent(details!, new Event("toggle"));
+
+    expect(screen.getByText("Input")).toBeInTheDocument();
+    expect(screen.getByText("Output")).toBeInTheDocument();
+    expect(screen.getByText(/command/)).toBeInTheDocument();
+    expect(screen.getByText(/workspace/)).toBeInTheDocument();
+    expect(screen.queryByText("processed output")).not.toBeInTheDocument();
+  });
+
+  it("does not auto-open media cards in raw mode", () => {
+    localStorage.setItem("qwenpaw_tool_display_mode", "raw-input-output");
+
+    const { container } = render(
+      <ToolCardShell
+        content={content}
+        icon={<span />}
+        title="Send file"
+        defaultExpanded
+      >
+        <div>hello.txt</div>
+      </ToolCardShell>,
+    );
+
+    expect(container.querySelector("details")).not.toHaveAttribute("open");
   });
 
   it("does not toggle the tool when its summary action is clicked", () => {
@@ -105,6 +179,32 @@ describe("ToolCardShell lazy body", () => {
     expect(label).toHaveTextContent(title.trim());
   });
 
+  it("replaces the spinner node when the tool finishes", () => {
+    const { container, rerender } = render(
+      <ToolCardShell
+        content={runningContent}
+        icon={<span data-testid="completion-icon" />}
+        title="Shell"
+        isStreaming
+      />,
+    );
+    const spinner = container.querySelector('[class*="toolCallSpinner"]');
+
+    expect(spinner).not.toBeNull();
+
+    rerender(
+      <ToolCardShell
+        content={content}
+        icon={<span data-testid="completion-icon" />}
+        title="Shell"
+      />,
+    );
+
+    const completionIcon = screen.getByTestId("completion-icon");
+    expect(spinner).not.toBeInTheDocument();
+    expect(completionIcon.parentElement).not.toBe(spinner);
+  });
+
   it("mounts the body only after the first expansion", () => {
     const { container } = render(
       <ToolCardShell content={content} icon={<span />} title="Shell">
@@ -124,5 +224,72 @@ describe("ToolCardShell lazy body", () => {
     details!.open = false;
     fireEvent(details!, new Event("toggle"));
     expect(screen.getByText("Expensive output")).toBeInTheDocument();
+  });
+
+  it("groups Parameters and Runtime in one metadata panel", () => {
+    const { container } = render(
+      <ToolCardShell
+        content={runningContent}
+        icon={<span />}
+        title="Shell"
+        isStreaming
+        defaultExpanded
+      />,
+    );
+
+    const metadata = container.querySelector('[class*="toolCallMetadata"]');
+    expect(metadata).not.toBeNull();
+    expect(metadata).toHaveTextContent("Parameters");
+    expect(metadata).toHaveTextContent("Runtime");
+  });
+
+  it("keeps streaming input quiet in the summary and preserves its preview", () => {
+    const { container } = render(
+      <ToolCardShell
+        content={streamingInputContent}
+        icon={<span />}
+        title="Read file"
+        isStreaming
+        defaultExpanded
+      />,
+    );
+
+    const summary = container.querySelector("summary");
+    expect(summary).toHaveTextContent("tool.loading");
+    expect(summary).not.toHaveTextContent("tool.inputProgress");
+    const previewTitle = screen.getByText("tool.rawInputPreview");
+    const previewBlock = previewTitle.parentElement?.parentElement;
+    expect(previewBlock).toHaveTextContent("path");
+    expect(previewBlock).toHaveTextContent("notes.txt");
+  });
+});
+
+describe("ToolCardShell execution gating", () => {
+  it("does not treat a pending call as executing", () => {
+    // Arguments completed but not dispatched yet — lifecycle queries
+    // would only collect 404s.
+    render(
+      <ToolCardShell
+        content={runningContent}
+        icon={<span />}
+        title="Shell"
+        isStreaming
+      />,
+    );
+
+    expect(hookState.lastIsCalling).toBe(false);
+  });
+
+  it("treats a dispatched call as executing", () => {
+    render(
+      <ToolCardShell
+        content={{ ...runningContent, executionStarted: true }}
+        icon={<span />}
+        title="Shell"
+        isStreaming
+      />,
+    );
+
+    expect(hookState.lastIsCalling).toBe(true);
   });
 });
