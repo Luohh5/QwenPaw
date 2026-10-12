@@ -1,16 +1,29 @@
 # -*- coding: utf-8 -*-
-"""QwenPaw Plugin System."""
+# pylint: disable=undefined-all-variable
+# -*- coding: utf-8 -*-
+"""QwenPaw plugin system with import-safe execution primitives."""
 
-from .loader import PluginLoader
-from .registry import PluginRegistry
-from .api import PluginApi, get_tool_config
-from .architecture import PluginManifest, PluginRecord
+from importlib import import_module
 
-__all__ = [
-    "PluginLoader",
-    "PluginRegistry",
-    "PluginApi",
-    "PluginManifest",
-    "PluginRecord",
-    "get_tool_config",
-]
+_EXPORTS = {
+    "PluginLoader": "loader",
+    "PluginRegistry": "registry",
+    "PluginApi": "api",
+    "get_tool_config": "api",
+    "PluginManifest": "architecture",
+    "PluginRecord": "architecture",
+}
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name):
+    module = _EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(f"{__name__}.{module}"), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

@@ -11,6 +11,21 @@ from enum import StrEnum
 from typing import Any, Mapping
 
 from .errors import DescriptorValidationError, ProtocolValidationError
+from ..plugins.execution.models import (  # pylint: disable=unused-import
+    _error,
+    _object,
+    _closed,
+    _string,
+    _integer,
+    _optional_string,
+    _request_id,
+    RpcErrorObject,
+    RpcRequest,
+    RpcNotification,
+    RpcResponse,
+    parse_rpc_message,
+    CancelParams,
+)
 from .identifiers import validate_channel_key, validate_digest
 
 JSONRPC_VERSION = "2.0"
@@ -18,49 +33,6 @@ PROTOCOL_VERSION = 1
 MAX_METHOD_LENGTH = 128
 MAX_SECRET_HANDLE_LENGTH = 256
 MAX_RESPONSE_HANDLE_LENGTH = 512
-
-
-def _error(
-    message: str,
-    *,
-    path: tuple[str | int, ...] = (),
-    reason_code: str = "INVALID_PARAMS",
-) -> ProtocolValidationError:
-    """Create a stable DTO validation error."""
-    return ProtocolValidationError(
-        message,
-        path=path,
-        reason_code=reason_code,
-    )
-
-
-def _object(
-    value: object,
-    *,
-    path: tuple[str | int, ...] = (),
-) -> dict[str, Any]:
-    """Require a JSON object and copy it to a mutable mapping."""
-    if not isinstance(value, Mapping):
-        raise _error("value must be an object", path=path)
-    if any(not isinstance(key, str) for key in value):
-        raise _error("object keys must be strings", path=path)
-    return dict(value)
-
-
-def _closed(
-    value: Mapping[str, Any],
-    allowed: set[str],
-    *,
-    path: tuple[str | int, ...] = (),
-) -> None:
-    """Reject fields not declared by a v1 closed DTO."""
-    unknown = sorted(set(value) - allowed)
-    if unknown:
-        raise _error(
-            f"unknown field: {unknown[0]}",
-            path=path + (unknown[0],),
-            reason_code="SCHEMA_MISMATCH",
-        )
 
 
 def _required(
@@ -79,26 +51,6 @@ def _required(
     return value[name]
 
 
-def _string(
-    value: object,
-    name: str,
-    *,
-    path: tuple[str | int, ...] = (),
-    non_empty: bool = True,
-) -> str:
-    """Require a JSON string."""
-    if not isinstance(value, str) or (non_empty and not value):
-        raise _error(
-            (
-                f"{name} must be a non-empty string"
-                if non_empty
-                else f"{name} must be a string"
-            ),
-            path=path + (name,),
-        )
-    return value
-
-
 def validate_response_handle(value: object) -> str:
     """Validate one opaque request-scoped response handle."""
     handle = _string(value, "response_handle")
@@ -115,24 +67,6 @@ def validate_response_handle(value: object) -> str:
             path=("response_handle",),
         )
     return handle
-
-
-def _integer(
-    value: object,
-    name: str,
-    *,
-    path: tuple[str | int, ...] = (),
-    minimum: int | None = None,
-) -> int:
-    """Require a JSON integer, excluding booleans."""
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise _error(f"{name} must be an integer", path=path + (name,))
-    if minimum is not None and value < minimum:
-        raise _error(
-            f"{name} must be at least {minimum}",
-            path=path + (name,),
-        )
-    return value
 
 
 def _boolean(
@@ -194,24 +128,6 @@ def _absolute_path(value: object, name: str) -> str:
     return result
 
 
-def _optional_string(
-    value: Mapping[str, Any],
-    name: str,
-    *,
-    path: tuple[str | int, ...] = (),
-    non_empty: bool = True,
-) -> str | None:
-    """Read an optional nullable string."""
-    if name not in value or value[name] is None:
-        return None
-    return _string(
-        value[name],
-        name,
-        path=path,
-        non_empty=non_empty,
-    )
-
-
 def _optional_integer(
     value: Mapping[str, Any],
     name: str,
@@ -225,203 +141,7 @@ def _optional_integer(
     return _integer(value[name], name, path=path, minimum=minimum)
 
 
-def _request_id(value: object) -> str | int:
-    """Validate a JSON-RPC request identifier."""
-    if isinstance(value, bool) or not isinstance(value, (str, int)):
-        raise _error("request id must be a string or integer", path=("id",))
-    if isinstance(value, str) and not value:
-        raise _error("request id must not be empty", path=("id",))
-    return value
-
-
-@dataclass(frozen=True)
-class RpcErrorObject:
-    """JSON-RPC error object with a stable string reason in data."""
-
-    code: int
-    message: str
-    data: object = None
-
-    def to_mapping(self) -> dict[str, Any]:
-        """Encode the error object."""
-        result: dict[str, Any] = {
-            "code": self.code,
-            "message": self.message,
-        }
-        if self.data is not None:
-            result["data"] = self.data
-        return result
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "RpcErrorObject":
-        """Validate a JSON-RPC error object."""
-        data = _object(value, path=("error",))
-        _closed(data, {"code", "message", "data"}, path=("error",))
-        code = _integer(data.get("code"), "code", path=("error",))
-        message = _string(data.get("message"), "message", path=("error",))
-        return cls(code=code, message=message, data=data.get("data"))
-
-
-@dataclass(frozen=True)
-class RpcRequest:
-    """JSON-RPC request envelope."""
-
-    id: str | int
-    method: str
-    params: Mapping[str, Any] | list[Any] | None = None
-
-    def to_mapping(self) -> dict[str, Any]:
-        """Encode the request envelope."""
-        result: dict[str, Any] = {
-            "jsonrpc": JSONRPC_VERSION,
-            "id": self.id,
-            "method": self.method,
-        }
-        if self.params is not None:
-            result["params"] = self.params
-        return result
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "RpcRequest":
-        """Validate a request envelope."""
-        data = _object(value)
-        _closed(data, {"jsonrpc", "id", "method", "params"})
-        if data.get("jsonrpc") != JSONRPC_VERSION:
-            raise _error(
-                "jsonrpc must be '2.0'",
-                path=("jsonrpc",),
-                reason_code="PROTOCOL_MISMATCH",
-            )
-        if "id" not in data:
-            raise _error(
-                "request must contain id",
-                path=("id",),
-                reason_code="SCHEMA_MISMATCH",
-            )
-        request_id = _request_id(data["id"])
-        method = _string(data.get("method"), "method")
-        if len(method) > MAX_METHOD_LENGTH:
-            raise _error("method is too long", path=("method",))
-        params = data.get("params")
-        if params is not None and not isinstance(params, (Mapping, list)):
-            raise _error("params must be an object or array", path=("params",))
-        return cls(id=request_id, method=method, params=params)
-
-
-@dataclass(frozen=True)
-class RpcNotification:
-    """JSON-RPC notification envelope."""
-
-    method: str
-    params: Mapping[str, Any] | list[Any] | None = None
-
-    def to_mapping(self) -> dict[str, Any]:
-        """Encode the notification envelope."""
-        result: dict[str, Any] = {
-            "jsonrpc": JSONRPC_VERSION,
-            "method": self.method,
-        }
-        if self.params is not None:
-            result["params"] = self.params
-        return result
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "RpcNotification":
-        """Validate a notification envelope."""
-        data = _object(value)
-        _closed(data, {"jsonrpc", "method", "params"})
-        if data.get("jsonrpc") != JSONRPC_VERSION:
-            raise _error(
-                "jsonrpc must be '2.0'",
-                path=("jsonrpc",),
-                reason_code="PROTOCOL_MISMATCH",
-            )
-        method = _string(data.get("method"), "method")
-        params = data.get("params")
-        if params is not None and not isinstance(params, (Mapping, list)):
-            raise _error("params must be an object or array", path=("params",))
-        return cls(method=method, params=params)
-
-
-@dataclass(frozen=True)
-class RpcResponse:
-    """JSON-RPC response envelope."""
-
-    id: str | int | None
-    result: object = None
-    error: RpcErrorObject | None = None
-
-    def __post_init__(self) -> None:
-        """Require exactly one of result or error semantically."""
-        if self.error is not None and self.result is not None:
-            raise ValueError("response cannot contain both result and error")
-        if self.id is None and self.error is None:
-            raise ValueError("only error responses may use a null id")
-
-    def to_mapping(self) -> dict[str, Any]:
-        """Encode the response envelope."""
-        result: dict[str, Any] = {
-            "jsonrpc": JSONRPC_VERSION,
-            "id": self.id,
-        }
-        if self.error is not None:
-            result["error"] = self.error.to_mapping()
-        else:
-            result["result"] = self.result
-        return result
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "RpcResponse":
-        """Validate a response envelope."""
-        data = _object(value)
-        _closed(data, {"jsonrpc", "id", "result", "error"})
-        if data.get("jsonrpc") != JSONRPC_VERSION:
-            raise _error(
-                "jsonrpc must be '2.0'",
-                path=("jsonrpc",),
-                reason_code="PROTOCOL_MISMATCH",
-            )
-        if "id" not in data:
-            raise _error("response must contain id", path=("id",))
-        has_result = "result" in data
-        has_error = "error" in data
-        if has_result == has_error:
-            raise _error(
-                "response must contain exactly one result or error",
-                reason_code="SCHEMA_MISMATCH",
-            )
-        if data["id"] is None:
-            if not has_error:
-                raise _error(
-                    "only error responses may use a null id",
-                    path=("id",),
-                    reason_code="SCHEMA_MISMATCH",
-                )
-            response_id = None
-        else:
-            response_id = _request_id(data["id"])
-        return cls(
-            id=response_id,
-            result=data.get("result"),
-            error=(
-                RpcErrorObject.from_mapping(data["error"])
-                if has_error
-                else None
-            ),
-        )
-
-
 RpcMessage = RpcRequest | RpcResponse | RpcNotification
-
-
-def parse_rpc_message(value: object) -> RpcMessage:
-    """Parse one JSON-RPC request, response, or notification mapping."""
-    data = _object(value)
-    if "method" in data and "id" in data:
-        return RpcRequest.from_mapping(data)
-    if "method" in data:
-        return RpcNotification.from_mapping(data)
-    return RpcResponse.from_mapping(data)
 
 
 @dataclass(frozen=True)
@@ -1775,36 +1495,6 @@ class VoiceEvent:
         }
 
 
-@dataclass(frozen=True)
-class CancelParams:
-    """Notification parameters for request cancellation."""
-
-    request_id: str | int
-    reason: str | None = None
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "CancelParams":
-        """Validate cancellation parameters."""
-        data = _object(value)
-        _closed(data, {"request_id", "reason"})
-        if "request_id" not in data:
-            raise _error(
-                "missing required field: request_id",
-                path=("request_id",),
-            )
-        return cls(
-            request_id=_request_id(data["request_id"]),
-            reason=_optional_string(data, "reason"),
-        )
-
-    def to_mapping(self) -> dict[str, Any]:
-        """Encode cancellation parameters."""
-        result: dict[str, Any] = {"request_id": self.request_id}
-        if self.reason is not None:
-            result["reason"] = self.reason
-        return result
-
-
 class ResponseOutcome(StrEnum):
     """Stable terminal outcomes for one request-scoped response."""
 
@@ -2161,6 +1851,14 @@ METHOD_SCHEMAS: dict[str, type[Any]] = {
 
 def validate_method_params(method: str, params: object) -> Any:
     """Validate params for a registered method, if one has a DTO."""
+    if (
+        method == "runner.hello"
+        and isinstance(params, Mapping)
+        and params.get("dependency_mode") == "shared"
+    ):
+        from .shared import SharedHelloParams
+
+        return SharedHelloParams.from_mapping(params)
     dto_type = METHOD_SCHEMAS.get(method)
     if dto_type is None:
         if params is None:

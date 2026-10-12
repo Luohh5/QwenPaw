@@ -291,3 +291,38 @@ def test_zip_plugin_without_manifest_packs_everything(
         names = set(zf.namelist())
     assert "demo-plugin/backend/tests/test_api.py" in names
     assert "demo-plugin/ui/src/App.tsx" in names
+
+
+def test_private_channel_zip_preserves_runtime_and_source_manifest(tmp_path):
+    """Local zipper supports private previews while honoring exclusions."""
+    plugin_dir = tmp_path / "channel-preview"
+    plugin_dir.mkdir()
+    manifest = {
+        "id": "channel-preview",
+        "version": "0.1.0",
+        "type": "channel",
+        "publish": False,
+        "entry": {"backend": "plugin.py"},
+        "pack_exclude": ["tests"],
+    }
+    manifest_bytes = json.dumps(manifest).encode()
+    (plugin_dir / "plugin.json").write_bytes(manifest_bytes)
+    (plugin_dir / "plugin.py").write_text("from .channel import Channel\n")
+    (plugin_dir / "channel.py").write_text("class Channel: pass\n")
+    (plugin_dir / "requirements.txt").write_text("example-sdk>=1.0\n")
+    (plugin_dir / "tests").mkdir()
+    (plugin_dir / "tests/test_channel.py").write_text("assert True\n")
+    archive = tmp_path / "preview.zip"
+
+    _zip_plugin(plugin_dir, archive, manifest)
+
+    with zipfile.ZipFile(archive) as zipped:
+        assert zipped.testzip() is None
+        assert set(zipped.namelist()) == {
+            "channel-preview/plugin.json",
+            "channel-preview/plugin.py",
+            "channel-preview/channel.py",
+            "channel-preview/requirements.txt",
+        }
+        assert zipped.read("channel-preview/plugin.json") == manifest_bytes
+    assert (plugin_dir / "plugin.json").read_bytes() == manifest_bytes

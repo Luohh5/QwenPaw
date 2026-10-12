@@ -87,6 +87,15 @@ def _copy_runner_support(directory: Path) -> Path:
         protocol_target,
         ignore=ignore,
     )
+    plugin_source = PROTOCOL_SOURCE_ROOT.parent / "plugins"
+    plugin_target = support_root / "qwenpaw" / "plugins"
+    plugin_target.mkdir()
+    shutil.copy2(plugin_source / "__init__.py", plugin_target / "__init__.py")
+    shutil.copytree(
+        plugin_source / "execution",
+        plugin_target / "execution",
+        ignore=ignore,
+    )
     return support_root.resolve()
 
 
