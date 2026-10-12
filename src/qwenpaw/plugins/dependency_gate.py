@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import re
+import shlex
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -84,6 +86,18 @@ def parse_requirements_file(requirements_file: Path) -> ParsedRequirements:
         if not line or line.startswith("#"):
             continue
         if line.startswith("-"):
+            try:
+                # Match pip's comment rules; '#' inside a URL is not a comment.
+                args = shlex.split(re.split(r"\s+#", line, maxsplit=1)[0])
+            except ValueError:
+                args = []
+            value = ""
+            if len(args) == 2 and args[0] == "--index-url":
+                value = args[1]
+            elif len(args) == 1 and args[0].startswith("--index-url="):
+                value = args[0].partition("=")[2]
+            if value and not value.startswith("-"):
+                continue
             parsed.unsupported.append(line)
             continue
         try:

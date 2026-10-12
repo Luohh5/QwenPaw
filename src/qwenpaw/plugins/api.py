@@ -278,7 +278,11 @@ def _unbridge_from_runtime(
             funcs[:] = [
                 fn
                 for fn in funcs
-                if not _tool_func_matches_name(fn, tool_name)
+                if not (
+                    getattr(fn, "_tool_descriptor", None) is expected
+                    if expected is not None
+                    else _tool_func_matches_name(fn, tool_name)
+                )
             ]
 
 
@@ -400,29 +404,26 @@ def _remove_tool_config(
         return
     if tool_name not in owned_names:
         return
-    try:
-        from ..config.utils import load_config
-        from ..config.config import load_agent_config, save_agent_config
+    from ..config.utils import load_config
+    from ..config.config import load_agent_config, save_agent_config
 
-        config = load_config()
-        if not config.agents or not config.agents.profiles:
-            return
-        for agent_id in config.agents.profiles:
-            try:
-                agent_cfg = load_agent_config(agent_id)
-                if tool_name not in agent_cfg.tools.builtin_tools:
-                    continue
-                del agent_cfg.tools.builtin_tools[tool_name]
-                save_agent_config(agent_id, agent_cfg)
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "Tool config '%s' already gone from agent '%s'",
-                    tool_name,
-                    agent_id,
-                    exc_info=True,
-                )
-    except Exception:  # noqa: BLE001
-        logger.debug("Tool config teardown skipped", exc_info=True)
+    config = load_config()
+    if not config.agents or not config.agents.profiles:
+        return
+    errors = []
+    for agent_id in config.agents.profiles:
+        try:
+            agent_cfg = load_agent_config(agent_id)
+            if not agent_cfg.tools or (
+                tool_name not in agent_cfg.tools.builtin_tools
+            ):
+                continue
+            del agent_cfg.tools.builtin_tools[tool_name]
+            save_agent_config(agent_id, agent_cfg)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"tool '{tool_name}', agent '{agent_id}': {exc}")
+    if errors:
+        raise RuntimeError("; ".join(errors))
 
 
 def snapshot_agent_tool_configs(
@@ -578,6 +579,7 @@ class PluginApi:  # pylint: disable=too-many-public-methods
         self.manifest = manifest or {}
         self._registry = None
         self._instance = None
+        self._loader = None
 
     def set_registry(self, registry):
         """Set registry reference (called by loader).
@@ -636,9 +638,10 @@ class PluginApi:  # pylint: disable=too-many-public-methods
             backend_id,
         )
 
-    def bind_instance(self, instance) -> None:
+    def bind_instance(self, instance, *, loader=None) -> None:
         """Attach the current ``PluginInstance`` for ledger recording."""
         self._instance = instance
+        self._loader = loader
 
     def _projection_failed(self, kind: str, exc: Exception) -> None:
         """Fail loudly when a workspace projection cannot be applied."""
@@ -1679,7 +1682,30 @@ class PluginApi:  # pylint: disable=too-many-public-methods
                     _release_tool_registration(tool_name, self.plugin_id)
                 self._projection_failed("tool", exc)
 
+            desc = None
+            recorded = False
+
+            def _teardown():
+                if desc is not None:
+                    _unbridge_from_runtime(
+                        tool_name,
+                        tool_func,
+                        self._registry,
+                        expected=desc,
+                    )
+                if (
+                    tools_module is not None
+                    and getattr(tools_module, tool_name, None) is tool_func
+                ):
+                    delattr(tools_module, tool_name)
+                    if appended_to_all and tool_name in tools_module.__all__:
+                        tools_module.__all__.remove(tool_name)
+                _release_tool_registration(tool_name, self.plugin_id)
+
             try:
+                # Own the cleanup before publishing or awaiting config I/O.
+                self._note_runtime(f"tool:{tool_name}", teardown=_teardown)
+                recorded = self._instance is not None
                 from ..agents import tools as tools_module
                 from ..utils.io_utils import run_sync_io
 
@@ -1692,14 +1718,18 @@ class PluginApi:  # pylint: disable=too-many-public-methods
                     f"to tools module",
                 )
 
-                _bridge_to_runtime(
-                    tool_name,
-                    tool_func,
-                    enabled,
-                    description,
-                    self._registry,
-                    self.plugin_id,
-                )
+                try:
+                    _bridge_to_runtime(
+                        tool_name,
+                        tool_func,
+                        enabled,
+                        description,
+                        self._registry,
+                        self.plugin_id,
+                    )
+                finally:
+                    # A failed bridge may have published to some workspaces.
+                    desc = getattr(tool_func, "_tool_descriptor", None)
                 await run_sync_io(
                     _write_tool_config,
                     tool_name,
@@ -1715,44 +1745,13 @@ class PluginApi:  # pylint: disable=too-many-public-methods
                     ),
                 )
 
-            except Exception as exc:
-                if tools_module is not None:
-                    if hasattr(tools_module, tool_name):
-                        delattr(tools_module, tool_name)
-                    if appended_to_all and tool_name in tools_module.__all__:
-                        tools_module.__all__.remove(tool_name)
-                failed_desc = getattr(tool_func, "_tool_descriptor", None)
-                try:
-                    _unbridge_from_runtime(
-                        tool_name,
-                        tool_func,
-                        self._registry,
-                        expected=failed_desc,
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.debug(
-                        "Runtime unbridge failed for '%s'",
-                        tool_name,
-                        exc_info=True,
-                    )
-                _release_tool_registration(tool_name, self.plugin_id)
-                logger.error(
-                    f"Failed to register tool '{tool_name}' after "
-                    f"governance sync (rolled back): {exc}",
-                    exc_info=True,
-                )
-                self._projection_failed("tool", exc)
+            except BaseException as exc:
+                if not recorded:
+                    _teardown()
+                if isinstance(exc, Exception):
+                    self._projection_failed("tool", exc)
+                raise
 
-            desc = getattr(tool_func, "_tool_descriptor", None)
-            self._note_runtime(
-                f"tool:{tool_name}",
-                teardown=lambda: _unbridge_from_runtime(
-                    tool_name,
-                    tool_func,
-                    self._registry,
-                    expected=desc,
-                ),
-            )
             if self._instance is not None:
                 self._note_install(
                     f"tool_config:{tool_name}",
@@ -2187,7 +2186,7 @@ class PluginApi:  # pylint: disable=too-many-public-methods
         - Copying the skill directory via ``provision_files``.
         - Reconciling the workspace skill manifest.
         - Applying the default enabled/channels strategy.
-        - Cleaning up manifest entries on uninstall (by ``source``).
+        - Cleaning up owned skills and manifest entries on uninstall.
 
         Args:
             skills_dir: Path to the directory containing the plugin's
@@ -2234,15 +2233,34 @@ class PluginApi:  # pylint: disable=too-many-public-methods
         async def _on_workspace_created(workspace_info: dict):
             """Install plugin skills into a newly created workspace."""
             from ..utils.io_utils import run_sync_io
+            from .lifecycle import PluginState
 
-            await run_sync_io(
-                self._install_skills_into_workspace,
-                workspace_info,
-                skills_dir,
-                source_tag,
-                enabled_by_default,
-                resolved_channels,
-            )
+            async def _copy():
+                if self._registry is None or not any(
+                    hook.callback is _on_workspace_created
+                    for hook in self._registry.get_workspace_created_hooks()
+                ):
+                    return
+                if self._loader is not None and (
+                    self._loader.lifecycle.get_instance(self.plugin_id)
+                    is not self._instance
+                    or self._instance.state is not PluginState.ACTIVE
+                ):
+                    return
+                await run_sync_io(
+                    self._install_skills_into_workspace,
+                    workspace_info,
+                    skills_dir,
+                    source_tag,
+                    enabled_by_default,
+                    resolved_channels,
+                )
+
+            if self._loader is None:
+                await _copy()
+            else:
+                async with self._loader.plugin_lifecycle(self.plugin_id):
+                    await _copy()
 
         # Register skill installation on startup
         self.register_startup_hook(

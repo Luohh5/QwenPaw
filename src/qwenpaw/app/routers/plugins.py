@@ -31,13 +31,15 @@ def _log_safe(value: object) -> str:
 
 
 class UnquiescentUnloadError(RuntimeError):
-    """Unload / uninstall stopped because hosted resources are still live."""
+    """Unload / uninstall could not finish runtime or disk cleanup."""
 
     def __init__(self, plugin_id: str, report, *, loaded: bool) -> None:
         self.plugin_id = plugin_id
         self.report = report
         self.loaded = loaded
-        super().__init__(f"Plugin '{plugin_id}' did not go quiescent.")
+        super().__init__(
+            unload_http_detail(plugin_id, report, loaded=loaded)["message"],
+        )
 
 
 def unload_http_detail(
@@ -56,7 +58,13 @@ def unload_http_detail(
         "quiescent": bool(getattr(report, "quiescent", False)),
         "needs_restart": bool(getattr(report, "needs_restart", True)),
         "errors": list(getattr(report, "errors", None) or []),
-        "message": message or f"{kind} '{plugin_id}' did not go quiescent.",
+        "message": message
+        or (
+            f"{kind} '{plugin_id}' cleanup is incomplete."
+            if not getattr(report, "clean", False)
+            and getattr(report, "quiescent", False)
+            else f"{kind} '{plugin_id}' did not go quiescent."
+        ),
     }
 
 
@@ -393,7 +401,7 @@ async def uninstall_plugin_source(
             mode=UnloadMode.UNINSTALL,
         )
         still_loaded = loader.get_loaded_plugin(plugin_id) is not None
-        if not report.quiescent or still_loaded:
+        if not report.clean or not report.quiescent or still_loaded:
             raise UnquiescentUnloadError(
                 plugin_id,
                 report,

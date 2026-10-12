@@ -5,6 +5,7 @@
 import asyncio
 import builtins
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -42,6 +43,98 @@ def registry(tmp_path, monkeypatch):
 
 def workspace():
     return SimpleNamespace(agent_id="same-agent", plugins=WorkspacePlugins())
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tool_config_write_revokes_published_tool(
+    tmp_path,
+    registry,
+    monkeypatch,
+):
+    from qwenpaw.agents import tools
+    from qwenpaw.governance.tool_registry import DEFAULT_REGISTRY
+    from qwenpaw.plugins.api import (
+        _TOOL_PLUGIN_OWNERS,
+        release_tool_ownership_for_plugin,
+    )
+    from qwenpaw.runtime.tool_registry import ToolRegistry
+
+    plugin_id = "cancelled-tool-write"
+    tool_name = "cancelled_plugin_tool"
+    tool_registry = ToolRegistry()
+    registry.set_workspace_manager(
+        SimpleNamespace(
+            agents={
+                "qa": SimpleNamespace(
+                    agent_id="qa",
+                    plugins=SimpleNamespace(tool_registry=tool_registry),
+                ),
+            },
+            _bootstrap_kwargs={},
+        ),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def write_config(*args, **kwargs):
+        entered.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("test did not release config writer")
+
+    monkeypatch.setattr("qwenpaw.plugins.api._write_tool_config", write_config)
+    root = tmp_path / "plugins" / plugin_id
+    root.mkdir(parents=True)
+    manifest = PluginManifest.from_dict(
+        {
+            "id": plugin_id,
+            "name": plugin_id,
+            "version": "1.0.0",
+            "entry": {"backend": "main.py"},
+        },
+    )
+    (root / "main.py").write_text(
+        "def tool():\n    return 'sent'\n"
+        "class Plugin:\n"
+        "    def register(self, api):\n"
+        f"        api.register_tool('{tool_name}', tool)\n"
+        "plugin = Plugin()\n",
+        encoding="utf-8",
+    )
+    loader = PluginLoader([root.parent])
+    loader.registry = registry
+    await loader.load_plugin(manifest, root, activate=False)
+    activation = asyncio.create_task(loader.lifecycle.activate(plugin_id))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert tool_registry.get(tool_name) is not None
+        assert hasattr(tools, tool_name)
+        assert tool_name in tools.__all__
+        activation.cancel()
+        # Let cancellation reach the I/O boundary before releasing its worker.
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await activation
+        assert (
+            loader.lifecycle.get_instance(plugin_id).state
+            is PluginState.FAILED
+        )
+        assert tool_registry.get(tool_name) is None
+        assert not hasattr(tools, tool_name)
+        assert tool_name not in tools.__all__
+        assert tool_name not in _TOOL_PLUGIN_OWNERS
+        assert DEFAULT_REGISTRY.get_owner(tool_name) is None
+    finally:
+        release.set()
+        if not activation.done():
+            activation.cancel()
+            await asyncio.gather(activation, return_exceptions=True)
+        await loader.unload_plugin(plugin_id)
+        release_tool_ownership_for_plugin(plugin_id)
+        if hasattr(tools, tool_name):
+            delattr(tools, tool_name)
+        if tool_name in tools.__all__:
+            tools.__all__.remove(tool_name)
 
 
 @pytest.mark.asyncio
@@ -834,6 +927,74 @@ async def test_workspace_stop_releases_its_plugin_bindings(registry):
     assert old.plugins.slash_command_registry.resolve("/hello") is None
     assert new.plugins.slash_command_registry.resolve("/hello") is not None
     old._service_manager.stop_all.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "final,preserve_reused",
+    [(False, False), (True, True)],
+)
+async def test_workspace_stop_continues_after_failed_plugin_revoke(
+    registry,
+    final,
+    preserve_reused,
+):
+    from qwenpaw.app.workspace.workspace import Workspace
+    from qwenpaw.plugins.lifecycle import QuiescenceError
+
+    old = Workspace.__new__(Workspace)
+    old.agent_id = "retiring"
+    old._started = old._start_attempted = True
+    old._service_manager = SimpleNamespace(stop_all=AsyncMock())
+    harness = SimpleNamespace(stop=AsyncMock())
+    old._harness_runtime = harness
+    registry.projector = SimpleNamespace(
+        revoke_workspace=AsyncMock(
+            side_effect=[QuiescenceError("plugin still alive"), None],
+        ),
+    )
+
+    with pytest.raises(QuiescenceError, match="plugin still alive"):
+        await old.stop(final=final, preserve_reused=preserve_reused)
+
+    old._service_manager.stop_all.assert_awaited_once_with(
+        final=final,
+        preserve_reused=preserve_reused,
+    )
+    harness.stop.assert_awaited_once()
+    assert old._started and old._start_attempted
+    assert old._harness_runtime is None
+
+    await old.stop(final=final, preserve_reused=preserve_reused)
+    assert not old._started and not old._start_attempted
+    harness.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_workspace_stop_retains_failed_harness_for_retry(registry):
+    from qwenpaw.app.workspace.workspace import Workspace
+
+    old = Workspace.__new__(Workspace)
+    old.agent_id = "retiring"
+    old._started = old._start_attempted = True
+    old._service_manager = SimpleNamespace(
+        stop_all=AsyncMock(side_effect=[RuntimeError("service busy"), None]),
+    )
+    harness = SimpleNamespace(
+        stop=AsyncMock(side_effect=[RuntimeError("harness busy"), None]),
+    )
+    old._harness_runtime = harness
+    registry.projector = SimpleNamespace(revoke_workspace=AsyncMock())
+    with pytest.raises(RuntimeError) as raised:
+        await old.stop(final=False)
+    assert "service busy" in str(raised.value)
+    assert "harness busy" in str(raised.value)
+    assert old._harness_runtime is harness
+    assert old._started and old._start_attempted
+    await old.stop(final=False)
+    assert old._harness_runtime is None
+    assert not old._started and not old._start_attempted
+    assert harness.stop.await_count == 2
 
 
 @pytest.mark.asyncio

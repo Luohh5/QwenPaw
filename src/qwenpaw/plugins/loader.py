@@ -280,7 +280,7 @@ def _ensure_plugin_site_on_path() -> None:
     importlib.invalidate_caches()
 
 
-class PluginLoader:
+class PluginLoader:  # pylint: disable=too-many-public-methods
     """Plugin loader for discovering and loading plugins."""
 
     def __init__(self, plugin_dirs: List[Path]):
@@ -754,7 +754,7 @@ class PluginLoader:
         api.set_registry(self.registry)
         instance = self.lifecycle.ensure_instance(plugin_id)
         instance.refuse_unquiescent_reregister()
-        api.bind_instance(instance)
+        api.bind_instance(instance, loader=self)
         self.registry.register_plugin_manifest(plugin_id, manifest_dict)
         instance.record_runtime(
             "plugin_manifest",
@@ -1620,6 +1620,7 @@ class PluginLoader:
                 plugin_id,
                 old_path,
                 incoming,
+                preserve_marker_on_cancel=True,
             )
             target = old_path if swapped or in_place else incoming
             _, installed_manifest = await asyncio.to_thread(
@@ -1790,18 +1791,33 @@ class PluginLoader:
         plugin_id: str,
         old_path: Path,
         incoming: Path,
+        *,
+        preserve_marker_on_cancel: bool = False,
     ) -> Path | None:
         """Stage on the same volume, then short-swap. None if in-place."""
         if not self.lifecycle.delegate.owns_commit(plugin_id):
             return None
         if same_location(incoming, old_path):
             return None
-        from ..utils.io_utils import run_sync_io
+        from ..utils.io_utils import run_async_to_completion, run_sync_io
         from .updates import allocate_update_backup_path, write_updating_marker
 
         await self._recover_or_refuse_prepared_update(plugin_id)
         backup = allocate_update_backup_path(old_path, plugin_id)
         staging = old_path.with_name(old_path.name + f".{plugin_id}.staging")
+        old_manifest = self._load_manifest(
+            resolved_plugin_manifest_path(old_path),
+        )
+
+        def _mark_phase(phase: str) -> None:
+            write_updating_marker(
+                plugin_id,
+                backup_path=backup,
+                target_path=old_path,
+                staging_path=staging,
+                phase=phase,
+                old_version=old_manifest.version,
+            )
 
         def _swap() -> None:
             if staging.exists():
@@ -1813,17 +1829,32 @@ class PluginLoader:
                 raise RuntimeError(
                     f"refusing to clobber existing plugin backup: {backup}",
                 )
+            _mark_phase("swapping")
             shutil.move(str(old_path), str(backup))
             shutil.move(str(staging), str(old_path))
 
-        write_updating_marker(
-            plugin_id,
-            backup_path=backup,
-            target_path=old_path,
-            staging_path=staging,
-        )
+        _mark_phase("staging")
         try:
             await run_sync_io(_swap)
+        except asyncio.CancelledError:
+            # The worker completed, but its backup was not returned. Restore
+            # using the paths owned before awaiting it, then propagate cancel.
+            try:
+                await run_async_to_completion(
+                    self._restore_failed_swap(
+                        plugin_id,
+                        old_path,
+                        backup,
+                        staging,
+                        clear_marker_if_restored=not preserve_marker_on_cancel,
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Cancelled swap recovery failed for plugin '%s'",
+                    plugin_id,
+                )
+            raise
         except PermissionError as exc:
             await self._restore_failed_swap(
                 plugin_id,
@@ -1857,7 +1888,7 @@ class PluginLoader:
     ) -> None:
         """Put the previous directory back after a failed short-swap."""
         from ..utils.io_utils import run_sync_io
-        from .updates import clear_updating_marker
+        from .updates import clear_updating_marker, mark_update_restored
 
         def _restore() -> None:
             if staging.exists():
@@ -1869,15 +1900,24 @@ class PluginLoader:
                         purpose="remove partial swap target",
                     )
                 shutil.move(str(backup), str(old_path))
+            if not clear_marker_if_restored:
+                mark_update_restored(plugin_id)
 
         try:
             await run_sync_io(_restore)
-        except PermissionError:
+        except Exception as exc:  # noqa: BLE001
+            error = f"plugin directory recovery failed: {exc}"
+            self._recovery_blocked[plugin_id] = error
+            self._recovery_errors[plugin_id] = error
+            self._add_recovery_diagnostics(plugin_id)
+            self.lifecycle.ensure_instance(
+                plugin_id,
+            ).state = PluginState.FAILED
             logger.exception(
                 "Could not restore plugin '%s' after a failed swap",
                 plugin_id,
             )
-            return
+            raise
         if clear_marker_if_restored and old_path.exists():
             await run_sync_io(clear_updating_marker, plugin_id)
             if backup.exists():
@@ -1959,13 +1999,19 @@ class PluginLoader:
             failed.errors.append(f"provision recovery failed: {exc}")
             return failed
         if backup is not None and backup.exists():
-
-            def _restore_dir() -> None:
-                if old_path.exists():
-                    safe_remove(old_path, purpose="remove failed reload dest")
-                shutil.move(str(backup), str(old_path))
-
-            await run_sync_io(_restore_dir)
+            try:
+                await self._restore_failed_swap(
+                    plugin_id,
+                    old_path,
+                    backup,
+                    old_path.with_name(
+                        old_path.name + f".{plugin_id}.staging",
+                    ),
+                    clear_marker_if_restored=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                failed.errors.append(f"directory recovery failed: {exc}")
+                return failed
         restore_plugin_import_state(snapshot)
         try:
             record = await self._load_plugin_unlocked(
@@ -2003,6 +2049,83 @@ class PluginLoader:
             ok=True,
             generation=generation,
         )
+
+    def _install_paths(
+        self,
+        plugin_id: str,
+        install_dir: Path | None,
+    ) -> Tuple[Path, Path]:
+        """Resolve and validate the installation target before side effects."""
+        if install_dir is None:
+            if not self.plugin_dirs:
+                raise RuntimeError("No plugin directories configured")
+            install_dir = self.plugin_dirs[0]
+        base = Path(install_dir).resolve()
+        target = (base / plugin_id).resolve()
+        if target == base or not target.is_relative_to(base):
+            raise ValueError(
+                f"Plugin id '{plugin_id}' does not resolve to a safe child "
+                f"of the plugin directory ({base}). Refusing to install.",
+            )
+        return base, target
+
+    async def install_plugin_files(
+        self,
+        source_path: Path,
+        *,
+        force: bool = False,
+    ) -> PluginRecord:
+        """Install offline without registering or starting resources."""
+        source_path = await asyncio.to_thread(Path(source_path).resolve)
+        _, manifest = await asyncio.to_thread(
+            self._read_source_manifest,
+            source_path,
+        )
+        async with self.plugin_lifecycle(manifest.id):
+            if not self.lifecycle.delegate.owns_commit(manifest.id):
+                raise RuntimeError(
+                    f"Plugin '{manifest.id}' commit is not owned "
+                    "by this process",
+                )
+            _, target = await asyncio.to_thread(
+                self._install_paths,
+                manifest.id,
+                None,
+            )
+            if await asyncio.to_thread(target.exists) and not force:
+                raise ValueError(
+                    f"Plugin '{manifest.id}' already exists. "
+                    "Use --force to reinstall.",
+                )
+            await self._recover_or_refuse_prepared_update(manifest.id)
+            entry = _backend_entry_file(source_path, manifest)
+            if entry is not None:
+                from ..utils.io_utils import run_sync_io
+
+                await run_sync_io(
+                    compile_plugin_import_closure,
+                    entry,
+                    [str(entry.parent), str(source_path)],
+                )
+            decision = await self._ensure_dependencies_installed(
+                source_path,
+                manifest.id,
+                allow_install=self.lifecycle.delegate.owns_dependency_env(
+                    manifest.id,
+                ),
+            )
+            if (
+                decision.unsupported
+                or decision.require_restart
+                or (decision.missing and not decision.already_satisfied)
+            ):
+                raise RuntimeError(decision.reason)
+            return await self._load_plugin_from_path_unlocked(
+                source_path,
+                manifest,
+                replace_files=force,
+                enabled=False,
+            )
 
     async def load_plugin_from_path(
         self,
@@ -2179,36 +2302,11 @@ class PluginLoader:
                 "Uninstall it first before reinstalling.",
             )
 
-        # Determine target directory (resolve off the event loop).
-        if install_dir is None:
-            if not self.plugin_dirs:
-                raise RuntimeError("No plugin directories configured")
-            install_base: Path = self.plugin_dirs[0]
-        else:
-            install_base = Path(install_dir)
-
-        def _resolve_install_paths() -> Tuple[Path, Path]:
-            resolved_install = install_base.resolve()
-            resolved_target = (resolved_install / plugin_id).resolve()
-            return resolved_install, resolved_target
-
-        resolved_install_dir, target_dir = await asyncio.to_thread(
-            _resolve_install_paths,
+        _, target_dir = await asyncio.to_thread(
+            self._install_paths,
+            plugin_id,
+            install_dir,
         )
-
-        # Guard against path-traversal in plugin_id (e.g. "../../etc")
-        if (
-            target_dir == resolved_install_dir
-            or not target_dir.is_relative_to(
-                resolved_install_dir,
-            )
-        ):
-            raise ValueError(
-                f"Plugin id '{plugin_id}' does not resolve to a safe child "
-                f"of the plugin directory ({resolved_install_dir}). "
-                "Refusing to install.",
-            )
-
         # Copy files when source is not already the target (off the loop).
         # Identity, not string equality: a case-alias of the same
         # directory must not be deleted then copied onto itself.
@@ -2301,6 +2399,7 @@ class PluginLoader:
         staging_hint = target_dir.with_name(
             target_dir.name + f".{plugin_id}.staging",
         )
+        files_committed = False
         try:
             # Re-read manifest from the installed location so that
             # source_path in the record points to the correct directory
@@ -2331,14 +2430,31 @@ class PluginLoader:
                 )
                 raise RuntimeError(reason)
             if swapped is not None:
-                await self._finish_committed_reload(plugin_id, swapped)
+                files_committed = True
+                cleanup_errors = await self._finish_committed_reload(
+                    plugin_id,
+                    swapped,
+                )
+                if cleanup_errors:
+                    raise RuntimeError("; ".join(cleanup_errors))
             return record
         except BaseException:
+            if files_committed:
+                from .updates import marker_path, update_is_committed
+
+                # A failed commit checkpoint still owns a prepared backup.
+                # Preserve the new files only after durable commit or cleanup.
+                files_committed = await asyncio.to_thread(
+                    lambda: update_is_committed(plugin_id)
+                    or not marker_path(plugin_id).is_file(),
+                )
             instance = self.lifecycle.get_instance(plugin_id)
             current = self._loaded_plugins.get(plugin_id)
             committed = (
-                current is not None and current.status == "active"
-            ) or (instance is not None and instance.activated)
+                files_committed
+                or (current is not None and current.status == "active")
+                or (instance is not None and instance.activated)
+            )
             live = instance is not None and instance.has_runtime_ledger()
             if (
                 swapped is not None
@@ -2566,7 +2682,30 @@ class PluginLoader:
         was_committed = record.status == "active" or bool(
             instance is not None and instance.activated,
         )
-        report.absorb(await instance.dispose(mode))
+        before_install = None
+        if mode is UnloadMode.UNINSTALL:
+            from .provision import recorded_tool_names
+
+            tool_names = recorded_tool_names(plugin_id)
+
+            async def _cleanup_settings() -> None:
+                await self._drop_uninstalled_settings(plugin_id, tool_names)
+
+            before_install = _cleanup_settings
+        disposal = (
+            await instance.dispose(mode, before_install=before_install)
+            if before_install is not None
+            else await instance.dispose(mode)
+        )
+        report.absorb(disposal)
+        if mode is UnloadMode.UNINSTALL and not report.clean:
+            instance.state = PluginState.FAILED
+            record.status = "failed"
+            for error in report.errors:
+                instance.add_diagnostic(error)
+            record.diagnostics = list(instance.diagnostics)
+            memory_registry.cancel_owner_unload(plugin_id)
+            return report
         if report.quiescent and not was_committed:
             try:
                 await self._undo_failed_txn_disk(plugin_id, instance)
@@ -2650,11 +2789,7 @@ class PluginLoader:
         del self._loaded_plugins[plugin_id]
 
         if mode is UnloadMode.UNINSTALL:
-            from .provision import recorded_tool_names
-
-            tool_names = recorded_tool_names(plugin_id)
             await _recheck_created_locations(plugin_id, report)
-            await self._drop_uninstalled_settings(plugin_id, tool_names)
 
         # Optionally delete files from disk (off the event loop).
         should_delete = delete_files or mode is UnloadMode.UNINSTALL
@@ -2940,7 +3075,12 @@ class PluginLoader:
             report.needs_restart = True
             report.errors.extend(replay_errors)
             return report
-        await self._drop_uninstalled_settings(plugin_id, tool_names)
+        try:
+            await self._drop_uninstalled_settings(plugin_id, tool_names)
+        except Exception as exc:  # noqa: BLE001
+            report.clean = False
+            report.errors.append(f"persisted config cleanup: {exc}")
+            return report
         # Skill manifest cleanup needs ownership before the inventory is gone.
         await run_sync_io(PluginApi.cleanup_sourced_skills, plugin_id)
         await run_sync_io(teardown_created_locations, plugin_id)
@@ -2981,12 +3121,18 @@ class PluginLoader:
         names = list(tool_names) if tool_names is not None else []
 
         def _apply() -> None:
+            errors = []
             for name in names:
-                _remove_tool_config(
-                    name,
-                    plugin_id=plugin_id,
-                    owned_names=names,
-                )
+                try:
+                    _remove_tool_config(
+                        name,
+                        plugin_id=plugin_id,
+                        owned_names=names,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(str(exc))
+            if errors:
+                raise RuntimeError("; ".join(errors))
             drop_plugin_settings(plugin_id)
 
         await run_sync_io(_apply)
@@ -3041,7 +3187,7 @@ class PluginLoader:
         api.set_registry(self.registry)
         instance = self.lifecycle.ensure_instance(plugin_id)
         instance.refuse_unquiescent_reregister()
-        api.bind_instance(instance)
+        api.bind_instance(instance, loader=self)
         self.registry.register_plugin_manifest(plugin_id, manifest_dict)
         instance.record_runtime(
             "plugin_manifest",
