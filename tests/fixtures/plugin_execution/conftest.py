@@ -7,11 +7,14 @@ import sys
 import pytest
 
 BLOCKED = (
-    "qwenpaw.app.channels",
+    "qwenpaw.app",
     "qwenpaw.channel_protocol",
     "qwenpaw.plugins.loader",
     "qwenpaw.plugins.api",
     "qwenpaw.plugins.registry",
+    "lark_oapi",
+    "dingtalk_stream",
+    "alibabacloud_dingtalk",
 )
 ATTEMPTS = []
 

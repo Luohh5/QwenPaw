@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 # pylint: disable=undefined-all-variable
-# -*- coding: utf-8 -*-
 """QwenPaw plugin system with import-safe execution primitives."""
 
 from importlib import import_module
@@ -12,6 +11,10 @@ _EXPORTS = {
     "get_tool_config": "api",
     "PluginManifest": "architecture",
     "PluginRecord": "architecture",
+    "PluginLifecycle": "lifecycle",
+    "ConfigUpdateReport": "lifecycle",
+    "ReloadReport": "lifecycle",
+    "UnloadMode": "lifecycle",
 }
 __all__ = list(_EXPORTS)
 

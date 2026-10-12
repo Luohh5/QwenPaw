@@ -41,6 +41,7 @@ import qwenpaw.plugins as plugins
 from qwenpaw.plugins import (
     PluginLoader, PluginRegistry, PluginApi,
     PluginManifest, PluginRecord, get_tool_config,
+    PluginLifecycle, ConfigUpdateReport, ReloadReport, UnloadMode,
 )
 from qwenpaw.plugins.loader import PluginLoader as DirectLoader
 from qwenpaw.plugins.registry import PluginRegistry as DirectRegistry
@@ -50,6 +51,12 @@ from qwenpaw.plugins.api import (
 from qwenpaw.plugins.architecture import (
     PluginManifest as DirectManifest, PluginRecord as DirectRecord,
 )
+from qwenpaw.plugins.lifecycle import (
+    PluginLifecycle as DirectLifecycle,
+    ConfigUpdateReport as DirectConfigUpdateReport,
+    ReloadReport as DirectReloadReport,
+    UnloadMode as DirectUnloadMode,
+)
 for name, public, direct in (
     ('PluginLoader', PluginLoader, DirectLoader),
     ('PluginRegistry', PluginRegistry, DirectRegistry),
@@ -57,7 +64,13 @@ for name, public, direct in (
     ('PluginManifest', PluginManifest, DirectManifest),
     ('PluginRecord', PluginRecord, DirectRecord),
     ('get_tool_config', get_tool_config, direct_config),
+    ('PluginLifecycle', PluginLifecycle, DirectLifecycle),
+    ('ConfigUpdateReport', ConfigUpdateReport, DirectConfigUpdateReport),
+    ('ReloadReport', ReloadReport, DirectReloadReport),
+    ('UnloadMode', UnloadMode, DirectUnloadMode),
 ):
+    assert name in plugins.__all__, name
+    assert name in dir(plugins), name
     assert public is direct, name
     assert getattr(plugins, name) is public, name
     assert getattr(plugins, name) is public, name
