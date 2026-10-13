@@ -106,7 +106,14 @@ async def _shutdown_plugins(app: FastAPI) -> None:
         logger.info("Executing plugin shutdown (mode=shutdown)...")
         from ..plugins.lifecycle import UnloadMode
 
-        await plugin_loader.lifecycle.unload_all(UnloadMode.SHUTDOWN)
+        reports = await plugin_loader.lifecycle.unload_all(UnloadMode.SHUTDOWN)
+        failed = [
+            report.plugin_id for report in reports if not report.quiescent
+        ]
+        if failed:
+            raise RuntimeError(
+                "Plugin shutdown incomplete: " + ", ".join(failed),
+            )
         return
     plugin_registry = getattr(app.state, "plugin_registry", None)
     if plugin_registry is None:
@@ -508,8 +515,24 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
             # Center, hidden from the sidebar.
             plugin_dirs = [get_plugins_dir()]
 
-            plugin_loader = PluginLoader(plugin_dirs)
+            from ..plugins.official_channels import (
+                provision_bundled_channels,
+                resolve_default_channel_runtime,
+            )
 
+            try:
+                channel_runtime = await asyncio.to_thread(
+                    resolve_default_channel_runtime,
+                )
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+                logger.exception("Official channel runtime unavailable")
+                channel_runtime = None
+            plugin_loader = PluginLoader(
+                plugin_dirs,
+                channel_runtime=channel_runtime,
+            )
+
+            plugin_loader.registry.set_workspace_manager(workspace_registry)
             plugin_loader.registry.set_plugin_http_app(app)
 
             config = load_config(get_config_path())
@@ -526,6 +549,16 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
                 types=["channel", "memory"],
                 activate=False,
             )
+            try:
+                seed_errors = await provision_bundled_channels(plugin_loader)
+                for plugin_id, reason in seed_errors.items():
+                    logger.warning(
+                        "Official channel %s needs repair: %s",
+                        plugin_id,
+                        reason,
+                    )
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+                logger.exception("Official channel migration pending")
             logger.debug("Phase 1: channel and memory plugins loaded")
 
             def _mark_core_agents_ready(_results: dict[str, bool]) -> None:

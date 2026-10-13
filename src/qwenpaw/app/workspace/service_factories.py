@@ -223,6 +223,7 @@ async def create_channel_service(
         on_last_dispatch=on_last_dispatch,
         workspace_dir=ws.workspace_dir,
     )
+    cm._defer_channel_start = getattr(ws, "_defer_channel_start", False)
     publish(cm)
 
     cm.set_workspace(ws)

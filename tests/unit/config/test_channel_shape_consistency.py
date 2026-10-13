@@ -29,7 +29,10 @@ def _declared_config_classes() -> set[type]:
 
 def test_builtin_specs_match_channel_config_fields() -> None:
     """Every built-in channel implementation has a config field."""
-    assert set(_BUILTIN_SPECS) == set(ChannelConfig.model_fields)
+    assert set(_BUILTIN_SPECS).isdisjoint({"feishu", "dingtalk"})
+    assert set(_BUILTIN_SPECS) | {"feishu", "dingtalk"} == set(
+        ChannelConfig.model_fields,
+    )
 
 
 def test_channel_config_union_covers_every_builtin_channel() -> None:
@@ -40,7 +43,7 @@ def test_channel_config_union_covers_every_builtin_channel() -> None:
     falls back to coercing it into another member, silently dropping
     the channel's own fields.
     """
-    assert set(get_args(ChannelConfigUnion)) == _declared_config_classes()
+    assert _declared_config_classes() <= set(get_args(ChannelConfigUnion))
 
 
 def test_channel_config_class_resolves_every_builtin_channel() -> None:

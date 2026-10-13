@@ -47,6 +47,13 @@ from .module_isolation import (
     sweep_bare_tree_modules,
     unregister_namespace,
 )
+from .channel_adapter import (
+    CHANNEL_RUNTIME_NOT_INTEGRATED,
+    ChannelRuntimeNotIntegratedError,
+    StaticChannelDefinition,
+    describe_channel,
+    require_channel_runtime_integrated,
+)
 from .safe_fs import safe_remove, same_location
 from .registry import PluginRegistry
 
@@ -152,20 +159,21 @@ def _plugin_site_dir() -> Path:
         f"-{platform.system().lower()}-{platform.machine().lower()}"
     )
     site_dir = _plugin_runtime_dir() / bucket / "site"
-    site_dir.mkdir(parents=True, exist_ok=True)
     return site_dir
 
 
 def _install_lock_path(plugin_id: str) -> Path:
-    """Path to the inter-process lock guarding *plugin_id* installs.
+    """Compatibility helper; exclusion follows the shared write root."""
+    from .install_lock import environment_install_lock_path
+    import sysconfig
 
-    Keyed per plugin so unrelated plugins can install concurrently, but
-    every process installing the *same* plugin serialises through one lock.
-    """
-    safe_id = "".join(
-        c if c.isalnum() or c in "-_." else "_" for c in plugin_id
+    del plugin_id
+    target = (
+        _plugin_site_dir()
+        if _is_frozen()
+        else Path(sysconfig.get_path("purelib"))
     )
-    return _plugin_runtime_dir() / "install-locks" / f"{safe_id}.lock"
+    return environment_install_lock_path(target)
 
 
 def _norm_realpath(path: Any) -> str:
@@ -272,25 +280,25 @@ def _ensure_plugin_site_on_path() -> None:
     os.environ["QWENPAW_PLUGIN_SITE"] = site_dir
     if site_dir in sys.path:
         return
-    import site as _site
-
-    _site.addsitedir(site_dir)
     if site_dir not in sys.path:
         sys.path.insert(0, site_dir)
     importlib.invalidate_caches()
 
 
-class PluginLoader:
+class PluginLoader:  # pylint: disable=too-many-public-methods
     """Plugin loader for discovering and loading plugins."""
 
-    def __init__(self, plugin_dirs: List[Path]):
+    def __init__(self, plugin_dirs: List[Path], *, channel_runtime=None):
         """Initialize plugin loader.
 
         Args:
             plugin_dirs: List of directories to search for plugins
         """
         self.plugin_dirs = [Path(d) for d in plugin_dirs]
+        self._channel_preparations = {}
         self.registry = PluginRegistry()
+        if channel_runtime is not None:
+            self.registry.configure_channel_runtime(channel_runtime)
         self.lifecycle = PluginLifecycle(self)
         self._loaded_plugins: Dict[str, PluginRecord] = {}
         self._recovery_blocked: dict[str, str] = {}
@@ -299,6 +307,37 @@ class PluginLoader:
         # Distinct from the inter-process install-deps file lock.
         self._lifecycle_locks: Dict[str, asyncio.Lock] = {}
         self._lifecycle_locks_mu = threading.Lock()
+
+    def _channel_runtime_for(self, manifest):
+        settings = self.registry.channel_runtime
+        return (
+            settings
+            if (
+                manifest.entry.descriptor is not None
+                and settings
+                and manifest.id in settings.selected_channels
+            )
+            else None
+        )
+
+    def _require_channel_selection(self, manifest):
+        if self._channel_runtime_for(manifest) is None:
+            require_channel_runtime_integrated(manifest)
+
+    def _has_channel_custody(self, plugin_id):
+        return (
+            self.registry.has_channel_owners(plugin_id)
+            or plugin_id in self._channel_preparations
+        )
+
+    def retains_preparation_source(self, root):
+        """Keep upload staging while any retained inspection can use it."""
+        root = Path(root).resolve()
+        return any(
+            (spec := getattr(process, "_spec", None)) is not None
+            and Path(spec.code_root).resolve().is_relative_to(root)
+            for process in self._channel_preparations.values()
+        )
 
     def _require_recovered(self, plugin_id: str) -> None:
         """Do not import or commit a version whose boot recovery failed."""
@@ -490,6 +529,20 @@ class PluginLoader:
         """
         _ensure_plugin_site_on_path()
         requirements_file = source_path / "requirements.txt"
+        from .execution.dependencies import repair_marker
+
+        if any(
+            repair_marker(path).exists()
+            for path in sys.path
+            if path and Path(path).is_dir()
+        ):
+            return GateDecision(
+                False,
+                False,
+                require_restart=True,
+                reason="DEPENDENCY_REPAIR_REQUIRED",
+                reason_code="DEPENDENCY_REPAIR_REQUIRED",
+            )
         if not self.lifecycle.delegate.owns_dependency_env(plugin_id):
             return GateDecision(
                 allow_install=False,
@@ -512,13 +565,7 @@ class PluginLoader:
             len(decision.missing),
             ", ".join(decision.missing),
         )
-        from ..utils.io_utils import run_sync_io
-
-        await run_sync_io(
-            self._install_requirements_locked,
-            requirements_file,
-            plugin_id,
-        )
+        await self._prepare_python_dependencies(requirements_file, plugin_id)
         recheck = DependencyGate().evaluate(
             requirements_file,
             allow_install=False,
@@ -534,35 +581,280 @@ class PluginLoader:
             )
         return recheck
 
+    async def _prepare_channel_candidate(
+        self,
+        description,
+        *,
+        wheels=(),
+        probe=True,
+        allow_install=False,
+    ):
+        """One check/install/probe boundary for activation and C5 staging."""
+        from uuid import uuid4
+        from ..app.channels.process_supervisor import (
+            ChannelProcess,
+            LaunchSpec,
+        )
+        from .dependency_gate import (
+            prepare_shared_dependencies,
+            SharedDependencyError,
+        )
+
+        settings = self.registry.channel_runtime
+        if settings is None:
+            raise ChannelRuntimeNotIntegratedError(
+                CHANNEL_RUNTIME_NOT_INTEGRATED,
+            )
+        process = await self._own_preparation(
+            description.plugin_id,
+            ChannelProcess,
+        )
+        spec = LaunchSpec(
+            python_executable=settings.python_executable,
+            support_root=settings.support_root,
+            code_root=description.code_root,
+            descriptor_path=description.descriptor_path,
+            source_revision=description.source_revision,
+            channel_key=description.descriptor.channel_key,
+            instance_id="probe:" + uuid4().hex,
+            generation=1,
+            qwenpaw_version=settings.qwenpaw_version,
+            config={},
+            dependency_paths=settings.dependency_paths,
+            runtime_identity=settings.runtime_identity,
+            startup_timeout=settings.startup_timeout,
+            shutdown_timeout=settings.shutdown_timeout,
+        )
+        try:
+            try:
+                snapshot = await prepare_shared_dependencies(
+                    process,
+                    spec,
+                    install_target=settings.dependency_install_target,
+                    wheels=wheels,
+                    uses=self.registry.channel_dependency_uses(),
+                )
+            except SharedDependencyError as exc:
+                if (
+                    not allow_install
+                    or wheels
+                    or exc.decision.require_restart
+                    or exc.decision.unsupported
+                ):
+                    raise
+                snapshot = (await process.audit(spec)).snapshot
+                target = settings.dependency_install_target
+                if target is None:
+                    raise RuntimeError(
+                        "DEPENDENCY_INSTALL_TARGET_REQUIRED",
+                    ) from exc
+                await self._acquire_dependency_wheels(
+                    process,
+                    spec,
+                    snapshot,
+                    target,
+                    description.plugin_id,
+                    description.requirements_path,
+                )
+                snapshot = await prepare_shared_dependencies(
+                    process,
+                    spec,
+                    uses=self.registry.channel_dependency_uses(),
+                )
+            return await process.probe(spec) if probe else snapshot
+        finally:
+            cleanup = process.last_cleanup
+            if cleanup is not None and cleanup.exited and not cleanup.residual:
+                self._channel_preparations.pop(description.plugin_id, None)
+
+    async def _own_preparation(self, plugin_id, process_type):
+        """Retain failed probe trees until the same loader confirms exit."""
+        await self._stop_preparation(plugin_id)
+        process = process_type()
+        self._channel_preparations[plugin_id] = process
+        return process
+
+    async def _stop_preparation(self, plugin_id):
+        """Release inspection custody only after confirmed tree exit."""
+        previous = self._channel_preparations.get(plugin_id)
+        if previous is not None:
+            result = await previous.stop()
+            if not result.exited or result.residual:
+                raise RuntimeError("PROBE_CLEANUP_FAILED; needs_restart")
+            self._channel_preparations.pop(plugin_id, None)
+
     def _install_requirements_locked(
         self,
         requirements_file: Path,
         plugin_id: str,
     ) -> None:
-        """Install deps under a per-plugin inter-process lock (blocking).
+        """Compatibility sync entry; safe preparation owns site exclusion."""
+        asyncio.run(
+            self._prepare_python_dependencies(requirements_file, plugin_id),
+        )
 
-        Multiple backend processes (e.g. an orphaned one plus a new launch,
-        issue #5550) must not run ``pip install`` for the same plugin into
-        the same target dir concurrently. The lock serialises them, and the
-        double-check after acquiring it means only the first installer does
-        the work — the rest see the dependencies already satisfied and skip,
-        avoiding the reinstall storm that exhausted memory.
-        """
-        from .install_lock import plugin_install_lock
+    async def _prepare_python_dependencies(
+        self,
+        requirements_file: Path,
+        plugin_id: str,
+    ):
+        """Stage explicit legacy wheel installs through the shared gate."""
+        from dataclasses import replace
+        from .dependency_gate import (
+            SharedDependencyError,
+            evaluate_shared_dependencies,
+        )
+        from .execution import PluginLaunchSpec, PluginProcess
+        from .execution.bootstrap import _hash_code_root
 
-        with plugin_install_lock(_install_lock_path(plugin_id)):
-            # Another process may have installed while we waited; re-probe
-            # with fresh import caches before spending resources on pip.
-            _ensure_plugin_site_on_path()
-            importlib.invalidate_caches()
-            if not self._find_unsatisfied_dependencies(requirements_file):
-                logger.info(
-                    "Plugin '%s' dependencies already satisfied by a "
-                    "concurrent installer; skipping pip install",
-                    plugin_id,
+        python = _desktop_python() if _is_frozen() else sys.executable
+        if (
+            not python
+            or os.environ.get("QWENPAW_RUNTIME_PROVISIONER") == "local"
+        ):
+            raise RuntimeError(
+                "Shared runtime requires explicit administrator repair",
+            )
+        root = requirements_file.parent.resolve()
+        paths = ()
+        process = await self._own_preparation(plugin_id, PluginProcess)
+        spec = PluginLaunchSpec(
+            python_executable=python,
+            support_root=Path(__file__).resolve().parents[2],
+            code_root=root,
+            source_revision=_hash_code_root(root),
+            plugin_id=plugin_id,
+            instance_id="dependency:" + plugin_id,
+            generation=1,
+            entrypoint="_dependency_audit:Driver",
+            config={},
+            requirements_path=requirements_file.resolve(),
+            dependency_paths=paths,
+            startup_timeout=15,
+        )
+        try:
+            snapshot = (await process.audit(spec)).snapshot
+            if _is_frozen():
+                environment = snapshot.marker_environment
+                bucket = (
+                    f"py{environment['python_version']}-"
+                    f"{environment['platform_system'].lower()}-"
+                    f"{environment['platform_machine'].lower()}"
                 )
-                return
-            self._install_requirements(requirements_file, plugin_id)
+                paths = (_plugin_runtime_dir() / bucket / "site",)
+                spec = replace(spec, dependency_paths=paths)
+                snapshot = (await process.audit(spec)).snapshot
+            uses = self.registry.channel_dependency_uses()
+            decision = evaluate_shared_dependencies(
+                requirements_file,
+                snapshot,
+                plugin_id=plugin_id,
+                uses=uses,
+            )
+            if decision.already_satisfied:
+                return decision
+            if decision.require_restart or decision.unsupported:
+                raise SharedDependencyError(decision)
+            targets = list(paths) or [
+                Path(site)
+                for site in snapshot.sites
+                if Path(site).name in {"site-packages", "dist-packages"}
+                and Path(site).is_relative_to(snapshot.prefix)
+            ]
+            if len(targets) != 1:
+                raise RuntimeError("DEPENDENCY_ENVIRONMENT_AMBIGUOUS")
+            await self._acquire_dependency_wheels(
+                process,
+                spec,
+                snapshot,
+                targets[0],
+                plugin_id,
+                requirements_file,
+            )
+            return GateDecision(False, True, reason="already satisfied")
+        finally:
+            cleanup = process.last_cleanup
+            if cleanup is not None and cleanup.exited and not cleanup.residual:
+                self._channel_preparations.pop(plugin_id, None)
+
+    async def _acquire_dependency_wheels(
+        self,
+        process,
+        spec,
+        snapshot,
+        target,
+        plugin_id,
+        requirements_file,
+    ):
+        """Stage only; the shared gate validates every actual package write."""
+        import hashlib
+        from packaging.utils import parse_wheel_filename
+        from .dependency_gate import WheelAddition, prepare_shared_dependencies
+
+        uses = self.registry.channel_dependency_uses()
+        with tempfile.TemporaryDirectory(
+            prefix="qwenpaw-dependency-wheels-",
+        ) as temporary:
+            staging = Path(temporary)
+            constraints = staging / "constraints.txt"
+            constraints.write_text(
+                "".join(
+                    f"{name}=={row['version']}\n"
+                    for name, row in snapshot.distributions.items()
+                ),
+                encoding="utf-8",
+            )
+            command = [
+                spec.python_executable,
+                "-I",
+                "-m",
+                "pip",
+                "download",
+                "--disable-pip-version-check",
+                "--no-input",
+                "--only-binary=:all:",
+                "--dest",
+                str(staging),
+                "--constraint",
+                str(constraints),
+                "-r",
+                str(requirements_file),
+            ]
+            from .execution.process import _settle
+
+            download = asyncio.create_task(
+                asyncio.to_thread(
+                    self._run_subprocess_with_streaming_log,
+                    command,
+                    timeout=300,
+                    plugin_id=plugin_id,
+                ),
+            )
+            try:
+                result = await asyncio.shield(download)
+            except asyncio.CancelledError:
+                await _settle(download)
+                raise
+            if result.returncode:
+                raise RuntimeError(
+                    "DEPENDENCY_PLAN_UNVERIFIED: complete wheels required",
+                )
+            wheels = tuple(
+                WheelAddition(
+                    path,
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                )
+                for path in staging.glob("*.whl")
+                if str(parse_wheel_filename(path.name)[0])
+                not in snapshot.distributions
+            )
+            await prepare_shared_dependencies(
+                process,
+                spec,
+                install_target=target,
+                wheels=wheels,
+                uses=uses,
+            )
 
     def _validate_entry_points(
         self,
@@ -969,6 +1261,8 @@ class PluginLoader:
         allow_existing: bool = True,
     ) -> PluginRecord:
         """Load a plugin; caller must hold :meth:`plugin_lifecycle`."""
+        if activate and self._channel_runtime_for(manifest) is None:
+            self._require_channel_selection(manifest)
         plugin_id = manifest.id
         if not self.lifecycle.delegate.owns_commit(plugin_id):
             raise RuntimeError(
@@ -1011,6 +1305,59 @@ class PluginLoader:
                 status="failed",
             )
             self._loaded_plugins[plugin_id] = record
+            return record
+
+        if manifest.entry.descriptor is not None:
+            try:
+                from .settings import is_plugin_enabled
+
+                settings = self._channel_runtime_for(manifest)
+                definition = StaticChannelDefinition(
+                    describe_channel(source_path, manifest),
+                    settings,
+                    is_plugin_enabled(config),
+                )
+                await self._invoke_plugin_register(
+                    plugin_id,
+                    definition,
+                    config,
+                    _manifest_as_dict(manifest),
+                )
+            except BaseException as exc:
+                record = self._record_failed_backend(
+                    manifest,
+                    source_path,
+                    exc,
+                )
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                return record
+            if settings is None:
+                instance.add_diagnostic(CHANNEL_RUNTIME_NOT_INTEGRATED)
+            record = PluginRecord(
+                manifest=manifest,
+                source_path=source_path,
+                enabled=settings is not None and definition.global_enabled,
+                instance=definition,
+                diagnostics=list(instance.diagnostics),
+                status="registered" if settings is not None else "catalogued",
+            )
+            self._loaded_plugins[plugin_id] = record
+            if not definition.global_enabled:
+                record.status = "inactive"
+                record.diagnostics.append("channel_validation_pending")
+            if activate and settings is not None and definition.global_enabled:
+                try:
+                    await self._prepare_channel_candidate(
+                        definition.description,
+                    )
+                    record.diagnostics.append("channel_validation_passed")
+                    await self.activate_plugin_unlocked(plugin_id)
+                except Exception as exc:
+                    instance.mark_failed(str(exc))
+                    record.status = "failed"
+                    record.enabled = False
+                    record.diagnostics = list(instance.diagnostics)
             return record
 
         decision = await self._ensure_dependencies_installed(
@@ -1227,10 +1574,13 @@ class PluginLoader:
         for manifest, plugin_dir in discovered:
             if types is not None and manifest.plugin_type not in types:
                 continue
-            from .settings import is_plugin_enabled, runtime_config
+            from .settings import is_plugin_enabled
 
             config = configs.get(manifest.id) if configs else None
-            if not is_plugin_enabled(config):
+            if (
+                not is_plugin_enabled(config)
+                and manifest.entry.descriptor is None
+            ):
                 logger.info(
                     "Skipping disabled plugin '%s'",
                     manifest.id,
@@ -1241,7 +1591,7 @@ class PluginLoader:
                 await self.load_plugin(
                     manifest,
                     plugin_dir,
-                    runtime_config(config),
+                    config,
                     activate=activate,
                 )
             except Exception as e:
@@ -1334,122 +1684,8 @@ class PluginLoader:
         requirements_file: Path,
         plugin_id: str,
     ) -> None:
-        """Install Python dependencies for a plugin (blocking).
-
-        Tries ``python -m pip`` first (conda / pip-installed envs).
-        If pip is not available in the current interpreter — which is
-        the case for uv-managed venvs created by the QwenPaw script
-        installer — falls back to ``uv pip install``.
-
-        Intended to be called via ``asyncio.to_thread`` so that the
-        package-manager call does not block the event loop.
-
-        Args:
-            requirements_file: Path to requirements.txt
-            plugin_id: Plugin identifier (for log messages)
-
-        Raises:
-            RuntimeError: If all install attempts fail or time out
-        """
-        if os.environ.get("QWENPAW_RUNTIME_PROVISIONER") == "local":
-            raise RuntimeError(
-                f"Plugin '{plugin_id}' has missing dependencies. "
-                "Local runtimes share administrator-managed Python; "
-                "ask the administrator to install the requirements, "
-                "or use Docker for independently managed dependencies.",
-            )
-        logger.info(
-            f"Installing dependencies for plugin '{plugin_id}'...",
-        )
-        req = str(requirements_file)
-        timeout = 300
-
-        # In a frozen desktop build ``sys.executable`` is the backend binary,
-        # not a Python interpreter; install via the bundled runtime instead.
-        if _is_frozen():
-            self._install_requirements_frozen(req, plugin_id, timeout)
-            return
-
-        # ── Attempt 1: python -m pip ──────────────────────────────────
-        try:
-            result = self._run_subprocess_with_streaming_log(
-                [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "--disable-pip-version-check",
-                    "--no-input",
-                    "-r",
-                    req,
-                ],
-                timeout=timeout,
-                plugin_id=plugin_id,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"Dependency installation timed out for '{plugin_id}' "
-                f"(300 s limit exceeded)",
-            ) from exc
-
-        if result.returncode == 0:
-            logger.info(
-                f"Dependencies installed for plugin '{plugin_id}'"
-                " (via pip)",
-            )
-            return
-
-        # If pip itself is missing, try uv as a fallback.
-        pip_missing = (
-            "No module named pip" in result.stderr
-            or "No module named pip" in result.stdout
-        )
-        if not pip_missing:
-            raise RuntimeError(
-                f"Dependency installation failed for '{plugin_id}': "
-                f"{result.stderr}",
-            )
-
-        # ── Attempt 2: uv pip install ─────────────────────────────────
-        uv = self._find_uv()
-        if uv is None:
-            raise RuntimeError(
-                f"pip is not available in the current Python environment "
-                f"and 'uv' was not found on PATH.  Install dependencies "
-                f"manually: pip install -r {req}",
-            )
-
-        logger.info(
-            f"pip not available; retrying with uv for plugin '{plugin_id}'",
-        )
-        try:
-            uv_result = self._run_subprocess_with_streaming_log(
-                [
-                    uv,
-                    "pip",
-                    "install",
-                    "--python",
-                    sys.executable,
-                    "-r",
-                    req,
-                ],
-                timeout=timeout,
-                plugin_id=plugin_id,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"Dependency installation timed out for '{plugin_id}' "
-                f"(300 s limit exceeded, via uv)",
-            ) from exc
-
-        if uv_result.returncode != 0:
-            raise RuntimeError(
-                f"Dependency installation failed for '{plugin_id}' "
-                f"(via uv): {uv_result.stderr}",
-            )
-        logger.info(
-            f"Dependencies installed for plugin '{plugin_id}' (via uv)",
-        )
+        """Explicit compatibility entry uses validated additive wheels only."""
+        self._install_requirements_locked(requirements_file, plugin_id)
 
     def _install_requirements_frozen(
         self,
@@ -1457,57 +1693,9 @@ class PluginLoader:
         plugin_id: str,
         timeout: int,
     ) -> None:
-        """Install plugin deps in the frozen desktop build.
-
-        Uses the bundled standalone CPython (same ``X.Y``/arch as the frozen
-        runtime) to ``pip install --target`` into a user-writable, ABI-bucketed
-        directory. Never runs ``sys.executable`` — that is the frozen backend
-        binary, and invoking it re-launches the backend and crash-loops the
-        desktop app (issue #5209).
-        """
-        python = _desktop_python()
-        if python is None:
-            raise RuntimeError(
-                f"Cannot install dependencies for plugin '{plugin_id}': the "
-                "bundled Python runtime is unavailable "
-                "(QWENPAW_DESKTOP_PY_RUNTIME not set). Reinstall QwenPaw "
-                "Desktop, or install the plugin's dependencies manually.",
-            )
-        target = str(_plugin_site_dir())
-        try:
-            result = self._run_subprocess_with_streaming_log(
-                [
-                    python,
-                    "-m",
-                    "pip",
-                    "install",
-                    "--disable-pip-version-check",
-                    "--no-input",
-                    "--target",
-                    target,
-                    "-r",
-                    req,
-                ],
-                timeout=timeout,
-                plugin_id=plugin_id,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"Dependency installation timed out for '{plugin_id}' "
-                f"(300 s limit exceeded)",
-            ) from exc
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Dependency installation failed for '{plugin_id}': "
-                f"{result.stdout}",
-            )
-        importlib.invalidate_caches()
-        logger.info(
-            "Dependencies installed for plugin '%s' into %s",
-            plugin_id,
-            target,
-        )
+        """Frozen callers use selected Python and the same safe writer."""
+        del timeout
+        self._install_requirements_locked(Path(req), plugin_id)
 
     def read_source_manifest(
         self,
@@ -1533,6 +1721,7 @@ class PluginLoader:
         allow_install: bool = False,
         owns_dependency_env: bool = True,
         after_unload: Optional[Any] = None,
+        wheels=(),
     ) -> ReloadReport:
         """Reload one plugin. Caller must hold the lifecycle lock."""
         # pylint: disable=too-many-return-statements,too-many-branches
@@ -1562,40 +1751,83 @@ class PluginLoader:
         old_plugin_def = record.instance
         incoming = Path(new_source).resolve() if new_source else old_path
         in_place = same_location(incoming, old_path)
-        incoming_manifest = record.manifest
-        if not in_place:
-            _, incoming_manifest = await asyncio.to_thread(
-                self._read_source_manifest,
-                incoming,
-            )
-        if owns_dependency_env:
-            decision = await self._ensure_dependencies_installed(
-                incoming,
-                plugin_id,
-                allow_install=allow_install,
-            )
-            if decision.require_restart or decision.unsupported:
-                return ReloadReport(
-                    plugin_id=plugin_id,
-                    ok=False,
-                    unchanged=True,
-                    errors=[decision.reason],
-                )
-            if decision.missing and not decision.allow_install:
-                return ReloadReport(
-                    plugin_id=plugin_id,
-                    ok=False,
-                    unchanged=True,
-                    errors=[decision.reason],
-                )
-        entry = _backend_entry_file(incoming, incoming_manifest)
-        failed = await _probe_incoming(
-            plugin_id,
+        _, incoming_manifest = await asyncio.to_thread(
+            self._read_source_manifest,
             incoming,
-            entry,
         )
-        if failed is not None:
-            return failed
+        channel = (
+            record.manifest.entry.descriptor is not None
+            or incoming_manifest.entry.descriptor is not None
+        )
+        if incoming_manifest.id != plugin_id:
+            return ReloadReport(
+                plugin_id=plugin_id,
+                ok=False,
+                unchanged=True,
+                errors=["Plugin identity changed"],
+            )
+        if channel:
+            from ..config.utils import load_config
+            from .settings import is_plugin_enabled
+
+            old_enabled = is_plugin_enabled(
+                (load_config().plugins or {}).get(plugin_id),
+            )
+            try:
+                self._require_channel_selection(incoming_manifest)
+                if in_place:
+                    raise RuntimeError(
+                        "Channel in-place source update is not supported",
+                    )
+                description = describe_channel(incoming, incoming_manifest)
+                if old_enabled:
+                    await self._prepare_channel_candidate(
+                        description,
+                        allow_install=allow_install,
+                        wheels=wheels,
+                    )
+            except Exception as exc:
+                return ReloadReport(
+                    plugin_id=plugin_id,
+                    ok=False,
+                    unchanged=True,
+                    needs_restart=plugin_id in self._channel_preparations,
+                    errors=[str(exc)],
+                )
+            old_config = {**old_config, "enabled": old_enabled}
+            config = {
+                **(config if config is not None else old_config),
+                "enabled": old_enabled,
+            }
+        else:
+            if owns_dependency_env:
+                decision = await self._ensure_dependencies_installed(
+                    incoming,
+                    plugin_id,
+                    allow_install=allow_install,
+                )
+                if decision.require_restart or decision.unsupported:
+                    return ReloadReport(
+                        plugin_id=plugin_id,
+                        ok=False,
+                        unchanged=True,
+                        errors=[decision.reason],
+                    )
+                if decision.missing and not decision.allow_install:
+                    return ReloadReport(
+                        plugin_id=plugin_id,
+                        ok=False,
+                        unchanged=True,
+                        errors=[decision.reason],
+                    )
+            entry = _backend_entry_file(incoming, incoming_manifest)
+            failed = await _probe_incoming(
+                plugin_id,
+                incoming,
+                entry,
+            )
+            if failed is not None:
+                return failed
         snapshot = snapshot_plugin_import_state(plugin_id, old_path)
         swapped: Path | None = None
         activated_new = False
@@ -1674,7 +1906,7 @@ class PluginLoader:
                     saved_plugin_def=old_plugin_def,
                     generation=old_generation,
                 )
-            if committed:
+            if committed and not isinstance(exc, asyncio.CancelledError):
                 await self._finish_committed_reload(plugin_id, swapped)
             if isinstance(exc, asyncio.CancelledError):
                 raise
@@ -1774,6 +2006,8 @@ class PluginLoader:
 
         if live_prepared_backup(plugin_id) is None:
             return
+        if self._has_channel_custody(plugin_id):
+            raise RuntimeError("CHANNEL_INSTANCE_STILL_OWNED; needs_restart")
         try:
             await run_sync_io(recover_one_update, plugin_id)
         except (OSError, shutil.Error) as exc:
@@ -1958,6 +2192,12 @@ class PluginLoader:
             self._note_disk_recovery_failure(exc)
             failed.errors.append(f"provision recovery failed: {exc}")
             return failed
+        if self._has_channel_custody(plugin_id):
+            failed.errors.append("CHANNEL_INSTANCE_STILL_OWNED; needs_restart")
+            return failed
+        from .updates import live_prepared_backup
+
+        backup = backup or live_prepared_backup(plugin_id)
         if backup is not None and backup.exists():
 
             def _restore_dir() -> None:
@@ -1967,6 +2207,11 @@ class PluginLoader:
 
             await run_sync_io(_restore_dir)
         restore_plugin_import_state(snapshot)
+        if incoming_manifest.entry.descriptor is not None:
+            _, incoming_manifest = await run_sync_io(
+                self._read_source_manifest,
+                old_path,
+            )
         try:
             record = await self._load_plugin_unlocked(
                 incoming_manifest,
@@ -1987,9 +2232,9 @@ class PluginLoader:
             return failed
         instance = self.lifecycle.get_instance(plugin_id)
         if (
-            record.status != "active"
+            record.status not in {"active", "inactive"}
             or instance is None
-            or not instance.activated
+            or (record.status == "active" and not instance.activated)
         ):
             failed.errors.append(
                 f"restore load returned status={record.status}",
@@ -2004,6 +2249,32 @@ class PluginLoader:
             generation=generation,
         )
 
+    async def seed_bundled_channel(self, source_path: Path, config=None):
+        """Publish absent official source without dependency or SDK work."""
+        from ..app.channels.catalog import OFFICIAL_CHANNEL_OWNERS
+        from .settings import is_plugin_enabled
+
+        source_path = Path(source_path).resolve()
+        _, manifest = self._read_source_manifest(source_path)
+        description = describe_channel(source_path, manifest)
+        if manifest.id not in OFFICIAL_CHANNEL_OWNERS:
+            raise ValueError("Unknown official channel")
+        compatible, reason = self._check_version_compatibility(manifest)
+        if not compatible:
+            raise ValueError(reason)
+        async with self.plugin_lifecycle(manifest.id):
+            self._require_recovered(manifest.id)
+            if self.find_installed_plugin_dir(manifest.id) is not None:
+                raise ValueError("Official source already exists")
+            # Reuse A first-copy/publication, never replacement.
+            return await self._load_plugin_from_path_unlocked(
+                description.code_root,
+                manifest,
+                config,
+                enabled=is_plugin_enabled(config),
+                _bundled_seed=True,
+            )
+
     async def load_plugin_from_path(
         self,
         source_path: Path,
@@ -2011,6 +2282,7 @@ class PluginLoader:
         install_dir: Optional[Path] = None,
         *,
         force: bool = False,
+        wheels=(),
         before_force_unload: Optional[Any] = None,
         after_force_unload: Optional[Any] = None,
         after_load: Optional[Any] = None,
@@ -2059,9 +2331,13 @@ class PluginLoader:
             source_path,
         )
         del _manifest_path
+        self._require_channel_selection(manifest)
         plugin_id = manifest.id
         async with self.plugin_lifecycle(plugin_id):
             if force and plugin_id in self._loaded_plugins:
+                self._require_channel_selection(
+                    self._loaded_plugins[plugin_id].manifest,
+                )
                 if before_force_unload is not None:
                     maybe_before = before_force_unload(plugin_id)
                     if inspect.isawaitable(maybe_before):
@@ -2077,6 +2353,7 @@ class PluginLoader:
                         )
                     ),
                     after_unload=after_force_unload,
+                    wheels=wheels,
                 )
                 if not report.ok:
                     detail = (
@@ -2095,6 +2372,9 @@ class PluginLoader:
                         (record.source_path / _PAWPORT_MARKER).unlink,
                         missing_ok=True,
                     )
+                from .settings import clear_channel_tombstone
+
+                await asyncio.to_thread(clear_channel_tombstone, plugin_id)
                 return record
             record = None
             from ..config.utils import load_config
@@ -2116,6 +2396,7 @@ class PluginLoader:
                     pawport_owner=pawport_owner,
                     recover_incomplete=recover_incomplete,
                     enabled=enabled,
+                    wheels=wheels,
                 )
                 if record.status in {"active", "registered"}:
                     await self.activate_plugin_unlocked(plugin_id)
@@ -2128,12 +2409,17 @@ class PluginLoader:
                         (record.source_path / _PAWPORT_MARKER).unlink,
                         missing_ok=True,
                     )
+                from .settings import clear_channel_tombstone
+
+                await asyncio.to_thread(clear_channel_tombstone, plugin_id)
                 return record
+            except ChannelRuntimeNotIntegratedError:
+                # Preflight refusal owns no transaction files to roll back.
+                raise
             except BaseException:
-                inst = self.lifecycle.get_instance(plugin_id)
-                already_committed = record is not None and (
-                    record.status == "active"
-                    or (inst is not None and inst.activated)
+                already_committed = self._reload_already_committed(
+                    plugin_id,
+                    False,
                 )
                 if (
                     record is not None
@@ -2164,9 +2450,13 @@ class PluginLoader:
         pawport_owner: Optional[dict[str, Any]] = None,
         recover_incomplete: bool = False,
         enabled: bool = True,
+        wheels=(),
+        _bundled_seed=False,
     ) -> PluginRecord:
         """Install+load from path; caller must hold lifecycle for id."""
         # pylint: disable=too-many-statements,too-many-branches
+        if not _bundled_seed:
+            self._require_channel_selection(manifest)
         plugin_id = manifest.id
         if not self.lifecycle.delegate.owns_commit(plugin_id):
             raise RuntimeError(
@@ -2208,6 +2498,25 @@ class PluginLoader:
                 f"of the plugin directory ({resolved_install_dir}). "
                 "Refusing to install.",
             )
+
+        if await asyncio.to_thread((target_dir / "plugin.json").is_file):
+            _, target_manifest = await asyncio.to_thread(
+                self._read_source_manifest,
+                target_dir,
+            )
+            self._require_channel_selection(target_manifest)
+
+        await self._stop_preparation(plugin_id)
+        if self._has_channel_custody(plugin_id):
+            raise RuntimeError("CHANNEL_INSTANCE_STILL_OWNED; needs_restart")
+        if manifest.entry.descriptor is not None:
+            description = describe_channel(source_path, manifest)
+            if enabled and not _bundled_seed:
+                await self._prepare_channel_candidate(
+                    description,
+                    allow_install=True,
+                    wheels=wheels,
+                )
 
         # Copy files when source is not already the target (off the loop).
         # Identity, not string equality: a case-alias of the same
@@ -2309,7 +2618,15 @@ class PluginLoader:
                 target_dir,
             )
             del _installed_path
-            if enabled:
+            if _bundled_seed:
+                record = await self._load_plugin_unlocked(
+                    installed_manifest,
+                    target_dir,
+                    config,
+                    activate=False,
+                )
+                record.diagnostics.append("channel_validation_pending")
+            elif enabled:
                 record = await self.load_plugin(
                     installed_manifest,
                     target_dir,
@@ -2322,6 +2639,11 @@ class PluginLoader:
                     source_path=target_dir,
                     enabled=False,
                     status="inactive",
+                    diagnostics=(
+                        ["channel_validation_pending"]
+                        if installed_manifest.entry.descriptor
+                        else []
+                    ),
                 )
             if record.status == "failed":
                 reason = (
@@ -2335,10 +2657,7 @@ class PluginLoader:
             return record
         except BaseException:
             instance = self.lifecycle.get_instance(plugin_id)
-            current = self._loaded_plugins.get(plugin_id)
-            committed = (
-                current is not None and current.status == "active"
-            ) or (instance is not None and instance.activated)
+            committed = self._reload_already_committed(plugin_id, False)
             live = instance is not None and instance.has_runtime_ledger()
             if (
                 swapped is not None
@@ -2410,7 +2729,12 @@ class PluginLoader:
             delete_files=delete_files,
         )
 
-    async def repair_dependencies(self, plugin_id: str) -> PluginRecord:
+    async def repair_dependencies(
+        self,
+        plugin_id: str,
+        *,
+        wheels=(),
+    ) -> PluginRecord:
         """Explicit repair: gate + install + load a FAILED or disk plugin."""
         async with self.plugin_lifecycle(plugin_id):
             record = self._loaded_plugins.get(plugin_id)
@@ -2426,13 +2750,22 @@ class PluginLoader:
                     source_path,
                 )
                 del _path
-            decision = await self._ensure_dependencies_installed(
-                source_path,
-                plugin_id,
-                allow_install=True,
-            )
-            if decision.require_restart:
-                raise RuntimeError(decision.reason)
+            self._require_channel_selection(manifest)
+            channel = manifest.entry.descriptor is not None
+            if channel:
+                await self._prepare_channel_candidate(
+                    describe_channel(source_path, manifest),
+                    allow_install=True,
+                    wheels=wheels,
+                )
+            else:
+                decision = await self._ensure_dependencies_installed(
+                    source_path,
+                    plugin_id,
+                    allow_install=True,
+                )
+                if decision.require_restart:
+                    raise RuntimeError(decision.reason)
             from ..config.utils import load_config
             from .settings import is_plugin_enabled, runtime_config
 
@@ -2465,7 +2798,14 @@ class PluginLoader:
                     enabled=False,
                     status="inactive",
                     diagnostics=[
-                        "dependencies installed; plugin remains disabled",
+                        (
+                            "channel_validation_passed"
+                            if channel
+                            else (
+                                "dependencies installed; "
+                                "plugin remains disabled"
+                            )
+                        ),
                     ],
                 )
             if saved_config is None:
@@ -2521,6 +2861,28 @@ class PluginLoader:
             memory_registry.cancel_owner_unload(plugin_id)
             raise
 
+    async def _shutdown_channel_owners(self, plugin_id):
+        """Drain retained projections without Loader bookkeeping."""
+        report = UnloadReport(plugin_id=plugin_id, mode=UnloadMode.SHUTDOWN)
+        keys = dict.fromkeys(
+            row.channel_key
+            for row in self.registry.channel_owner_registrations(plugin_id)
+        )
+        for key in keys:
+            try:
+                await self.registry.projector.revoke("channel", key, plugin_id)
+            except Exception as exc:
+                report.clean = False
+                report.quiescent = False
+                report.needs_restart = True
+                report.errors.append(str(exc))
+        if self.registry.has_channel_owners(plugin_id):
+            report.clean = False
+            report.quiescent = False
+            report.needs_restart = True
+            report.errors.append("CHANNEL_INSTANCE_STILL_OWNED")
+        return report
+
     async def _unload_plugin_reserved(
         self,
         plugin_id: str,
@@ -2534,8 +2896,21 @@ class PluginLoader:
         # pylint: disable=too-many-branches,too-many-statements
         if mode is None:
             mode = UnloadMode.UNINSTALL if delete_files else UnloadMode.UNLOAD
+        try:
+            await self._stop_preparation(plugin_id)
+        except Exception as exc:
+            return UnloadReport(
+                plugin_id=plugin_id,
+                mode=mode,
+                clean=False,
+                quiescent=False,
+                needs_restart=True,
+                errors=[str(exc)],
+            )
         record = self._loaded_plugins.get(plugin_id)
         if record is None:
+            if mode is UnloadMode.SHUTDOWN:
+                return await self._shutdown_channel_owners(plugin_id)
             if mode is UnloadMode.UNINSTALL:
                 return await self._uninstall_without_instance(plugin_id)
             raise KeyError(
@@ -2555,6 +2930,10 @@ class PluginLoader:
         await self._run_shutdown_hooks(plugin_id, report)
         if mode is UnloadMode.SHUTDOWN:
             report.absorb(await instance.dispose(mode))
+            if report.quiescent and self.registry.has_channel_owners(
+                plugin_id,
+            ):
+                report.absorb(await self._shutdown_channel_owners(plugin_id))
             logger.info("Shutdown hooks finished for plugin '%s'", plugin_id)
             return report
         if not skip_legacy:
@@ -2595,6 +2974,10 @@ class PluginLoader:
                     record.diagnostics = list(instance.diagnostics)
                     raise
                 return report
+        if self._has_channel_custody(plugin_id):
+            report.quiescent = False
+            report.needs_restart = True
+            report.errors.append("CHANNEL_INSTANCE_STILL_OWNED")
         if not report.quiescent and mode is not UnloadMode.SHUTDOWN:
             record.status = "failed"
             record.diagnostics = list(
@@ -2897,6 +3280,12 @@ class PluginLoader:
             plugin_id=plugin_id,
             mode=UnloadMode.UNINSTALL,
         )
+        if self._has_channel_custody(plugin_id):
+            report.quiescent = False
+            report.clean = False
+            report.needs_restart = True
+            report.errors.append("CHANNEL_INSTANCE_STILL_OWNED")
+            return report
         source_path = self._find_installed_plugin_dir(plugin_id)
         has_inventory = inventory_path(plugin_id).is_file()
         if source_path is None and not has_inventory:
@@ -3020,6 +3409,12 @@ class PluginLoader:
         record = self._loaded_plugins.get(plugin_id)
         if record is None or record.instance is None:
             raise RuntimeError(f"Plugin '{plugin_id}' is not loaded")
+        if record.manifest.entry.descriptor is not None:
+            record.instance = StaticChannelDefinition(
+                describe_channel(record.source_path, record.manifest),
+                self._channel_runtime_for(record.manifest),
+                record.enabled,
+            )
         await self._reregister_body(
             plugin_id,
             record.instance,
@@ -3076,7 +3471,50 @@ class PluginLoader:
         preserve_instance_on_failure: bool = False,
     ) -> None:
         """Project, start, then commit; config updates own failure recovery."""
+        record = self._loaded_plugins.get(plugin_id)
+        if (
+            record is not None
+            and self._channel_runtime_for(record.manifest) is None
+        ):
+            require_channel_runtime_integrated(record.manifest)
         self._require_recovered(plugin_id)
+        if (
+            record is not None
+            and record.enabled
+            and record.manifest.entry.descriptor is not None
+        ):
+            from .workspace_projector import channel_passes_gates
+
+            row = self.registry.get_channel_registration(plugin_id)
+            targets = [
+                workspace
+                for workspace in self.registry.projector.workspaces()
+                if channel_passes_gates(workspace, plugin_id)
+                and getattr(workspace, "channel_manager", None) is not None
+            ]
+            for workspace in targets:
+                owner = await workspace.channel_manager.get_channel(plugin_id)
+                if (
+                    owner is not None
+                    and getattr(owner, "_registration", None) is not row
+                ):
+                    raise RuntimeError("CHANNEL_ALREADY_OWNED")
+            if targets:
+                await self._prepare_channel_candidate(
+                    describe_channel(record.source_path, record.manifest),
+                )
+                record.diagnostics = [
+                    item
+                    for item in record.diagnostics
+                    if item != "channel_validation_pending"
+                ]
+                if "channel_validation_passed" not in record.diagnostics:
+                    record.diagnostics.append("channel_validation_passed")
+            elif not {
+                "channel_validation_passed",
+                "channel_validation_pending",
+            }.intersection(record.diagnostics):
+                record.diagnostics.append("channel_validation_pending")
         instance = self.lifecycle.get_instance(plugin_id)
         if instance is not None and instance.activated:
             record = self._loaded_plugins.get(plugin_id)

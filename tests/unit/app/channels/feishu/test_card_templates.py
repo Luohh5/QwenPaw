@@ -11,7 +11,9 @@ import json
 
 import pytest
 
-from qwenpaw.app.channels.feishu import card_templates as ct
+from tests.fixtures.channel_plugins.c6_artifacts import artifact_module
+
+ct = artifact_module("feishu", "card_templates")
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 # pylint:disable=too-many-statements
 """Plugin management CLI commands."""
 
+import asyncio
 import json
 import logging
 import os
@@ -29,6 +30,19 @@ logger = logging.getLogger(__name__)
 
 
 # ── Live-API helpers ──────────────────────────────────────────────────────
+
+
+def _echo_install_result(body, fallback):
+    name = body.get("name", fallback)
+    if "status" in body:
+        click.echo(
+            f"Plugin '{name}' installation: {body['status']}; "
+            f"enabled={body.get('enabled', 'unknown')}.",
+        )
+        for diagnostic in body.get("diagnostics") or []:
+            click.echo(f"  {diagnostic}")
+    else:
+        click.echo(f"✅ Plugin '{name}' installed and loaded (hot reload).")
 
 
 def _get_api_base() -> Optional[str]:
@@ -73,10 +87,7 @@ def _api_install_plugin(source: str, force: bool = False) -> bool:
             )
             response.raise_for_status()
             body = response.json()
-        name = body.get("name", source)
-        click.echo(
-            f"✅ Plugin '{name}' installed and loaded (hot reload).",
-        )
+        _echo_install_result(body, source)
         return True
     except httpx.HTTPStatusError as exc:
         try:
@@ -139,10 +150,7 @@ def _api_upload_plugin(zip_path: Path, force: bool = False) -> bool:
             )
             response.raise_for_status()
             result = response.json()
-        name = result.get("name", zip_path.name)
-        click.echo(
-            f"✅ Plugin '{name}' installed and loaded (hot reload).",
-        )
+        _echo_install_result(result, zip_path.name)
         return True
     except httpx.HTTPStatusError as exc:
         try:
@@ -338,6 +346,72 @@ def _is_running() -> bool:
     return is_qwenpaw_running()
 
 
+def _is_channel_transaction(plugin_id, manifest):
+    from ..app.channels.catalog import OFFICIAL_CHANNEL_OWNERS
+
+    return plugin_id in OFFICIAL_CHANNEL_OWNERS or bool(
+        (manifest or {}).get("entry", {}).get("descriptor"),
+    )
+
+
+def _offline_channel_transaction(
+    plugin_id,
+    *,
+    source_path=None,
+    force=False,
+    temp_dir=None,
+):
+    """Use the existing source transaction while the host is stopped."""
+    from ..plugins.channel_bootstrap import resolve_default_channel_runtime
+    from ..plugins.lifecycle import UnloadMode
+    from ..plugins.loader import PluginLoader
+
+    async def run():
+        loader = PluginLoader(
+            [config_utils.get_plugins_dir()],
+            channel_runtime=(
+                resolve_default_channel_runtime() if source_path else None
+            ),
+        )
+        try:
+            await loader.load_all_plugins(types=[], activate=False)
+            if source_path is not None:
+                config = config_utils.load_config().plugins.get(plugin_id)
+                return await loader.load_plugin_from_path(
+                    source_path,
+                    config=config,
+                    force=force,
+                )
+            report = await loader.unload_plugin(plugin_id, delete_files=True)
+            if (
+                not report.clean
+                or not report.quiescent
+                or report.needs_restart
+            ):
+                raise RuntimeError(
+                    "; ".join(report.errors) or "Uninstall needs_restart",
+                )
+            return None
+        finally:
+            reports = await loader.lifecycle.unload_all(UnloadMode.SHUTDOWN)
+            retained = temp_dir and loader.retains_preparation_source(temp_dir)
+            if temp_dir and not retained:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            if retained or any(
+                not row.clean or not row.quiescent or row.needs_restart
+                for row in reports
+            ):
+                raise RuntimeError(
+                    "Channel cleanup failed; needs_restart. "
+                    "Retained source must remain until its child has stopped.",
+                )
+
+    try:
+        return asyncio.run(run())
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def _safe_extract_zip(zip_ref: zipfile.ZipFile, extract_path: Path):
     """Safely extract zip file, preventing Zip Slip attacks.
 
@@ -522,6 +596,35 @@ def plugin():
     """Plugin management commands."""
 
 
+@plugin.group()
+def preset():
+    """Choose dormant bundled channel sources for this working directory."""
+
+
+@preset.command("apply")
+@click.argument("name", type=click.Choice(["light", "channels-full"]))
+@click.option(
+    "--offline",
+    is_flag=True,
+    help="Publish local sources at next boot; never download.",
+)
+def apply_channel_preset(name, offline):
+    """Persist intent; the running host owns source publication."""
+    from ..plugins.official_channels import initialize_channel_policy
+
+    del offline
+    initialize_channel_policy()
+
+    def apply(config):
+        config.channel_plugin_state.preset = name
+
+    config_utils.mutate_config(apply)
+    click.echo(
+        f"Channel preset {name} saved. Offline source publication "
+        "and activation pending next boot.",
+    )
+
+
 @plugin.command()
 @click.argument("source")
 @click.option(
@@ -615,6 +718,18 @@ def install(source: str, force: bool):
         return
 
     click.echo(f"Installing plugin: {plugin_name} ({plugin_id})")
+
+    if _is_channel_transaction(plugin_id, manifest):
+        _offline_channel_transaction(
+            plugin_id,
+            source_path=source_path,
+            force=force,
+            temp_dir=temp_dir,
+        )
+        click.echo(
+            f"Plugin '{plugin_name}' installed; activation pending next boot.",
+        )
+        return
 
     plugin_dir = get_plugins_dir()
     plugin_dir.mkdir(parents=True, exist_ok=True)
@@ -850,6 +965,11 @@ def uninstall(plugin_id: str):
         f"Uninstall plugin '{plugin_id}'?",
     ):
         click.echo("Cancelled.")
+        return
+
+    if _is_channel_transaction(plugin_id, manifest):
+        _offline_channel_transaction(plugin_id)
+        click.echo(f"✅ Plugin '{plugin_id}' uninstalled successfully")
         return
 
     if manifest:

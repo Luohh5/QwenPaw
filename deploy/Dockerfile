@@ -35,6 +35,7 @@ ARG QWENPAW_DISABLED_CHANNELS="imessage"
 ENV QWENPAW_DISABLED_CHANNELS=${QWENPAW_DISABLED_CHANNELS}
 ARG QWENPAW_ENABLED_CHANNELS=""
 ENV QWENPAW_ENABLED_CHANNELS=${QWENPAW_ENABLED_CHANNELS}
+ARG QWENPAW_CHANNEL_PRESET="channels-full"
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -99,7 +100,10 @@ RUN python3 /tmp/stage_python_runtime.py \
   && rm /tmp/stage_python_runtime.py
 ENV PATH="/app/venv/bin:$PATH"
 
-COPY pyproject.toml setup.py README.md ./
+COPY pyproject.toml setup.py MANIFEST.in README.md ./
+COPY scripts/pack/generate_plugin_metadata.py ./scripts/pack/generate_plugin_metadata.py
+COPY plugins/channel/feishu ./plugins/channel/feishu
+COPY plugins/channel/dingtalk ./plugins/channel/dingtalk
 COPY src ./src
 COPY packages/qwenpawmail-mcp/src/qwenpawmail_mcp ./packages/qwenpawmail-mcp/src/qwenpawmail_mcp
 COPY website/public/docs/ ./src/qwenpaw/docs/
@@ -116,8 +120,17 @@ COPY --from=uv-src /uv /bin/uv
 # half-removed pkg_resources (module present, declare_namespace gone), which
 # raises an AttributeError the fallback does not catch — crashing the Feishu
 # channel. The pin keeps every environment in the known-good state.
-RUN uv pip install --python /app/venv/bin/python \
-    --no-cache-dir . "setuptools<82" && rm -rf ./build
+RUN case "$QWENPAW_CHANNEL_PRESET" in light|channels-full) ;; *) exit 1 ;; esac \
+    && uv pip install --python /app/venv/bin/python --no-cache-dir "setuptools<82" wheel \
+    && python -c 'import setuptools.build_meta as b; b.build_wheel("/tmp/qwenpaw-wheel")' \
+    && EXTRA="" \
+    && if [ "$QWENPAW_CHANNEL_PRESET" = channels-full ]; then EXTRA="[channels]"; fi \
+    && set -- /tmp/qwenpaw-wheel/*.whl \
+    && uv pip install --python /app/venv/bin/python --no-cache-dir "$1$EXTRA" \
+    && mkdir -p /opt/qwenpaw \
+    && QWENPAW_CHANNEL_PRESET="$QWENPAW_CHANNEL_PRESET" python -c \
+       'import json, os; from pathlib import Path; Path("/opt/qwenpaw/channel-preset.json").write_text(json.dumps({"schema_version": 1, "preset": os.environ["QWENPAW_CHANNEL_PRESET"]}))' \
+    && rm -rf ./build /tmp/qwenpaw-wheel
 
 
 # QwenPaw app port (default 8088). Override at runtime with -e QWENPAW_PORT=3000.

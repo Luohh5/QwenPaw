@@ -79,74 +79,53 @@ def _release_os_lock(fd: int) -> None:
         logger.debug("Failed to release plugin install lock", exc_info=True)
 
 
+class InstallLockError(RuntimeError):
+    """No shared dependency writes are permitted without exclusion."""
+
+    reason_code = "INSTALL_LOCK_UNAVAILABLE"
+
+
+def environment_install_lock_path(target: Path) -> Path:
+    """Key exclusion by the canonical write destination, across workspaces."""
+    root = Path(os.path.normcase(os.path.realpath(target)))
+    return root.parent / f".{root.name}.dependencies.lock"
+
+
 @contextlib.contextmanager
 def plugin_install_lock(
     lock_path: Path,
     *,
     timeout: float = 300.0,
 ) -> Iterator[bool]:
-    """Hold an inter-process lock for the duration of the ``with`` block.
-
-    Args:
-        lock_path: Path to the lock file. Parent dirs are created.
-        timeout: Seconds to wait for the lock before giving up. The block
-            still runs when the wait times out (the install proceeds
-            unlocked rather than being skipped), so a stuck peer can never
-            permanently block a plugin from installing its dependencies.
-
-    Yields:
-        ``True`` if the lock was acquired, ``False`` if the wait timed out
-        and the body runs without the lock.
-    """
+    """Yield True only while holding exclusion; acquisition fails closed."""
     lock_path = Path(lock_path)
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        logger.debug(
-            "Could not create lock dir for %s; proceeding without lock",
-            lock_path,
-            exc_info=True,
-        )
-        yield False
-        return
-
-    try:
-        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
-    except OSError:
-        logger.debug(
-            "Could not open lock file %s; proceeding without lock",
-            lock_path,
-            exc_info=True,
-        )
-        yield False
-        return
-
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise InstallLockError("INSTALL_LOCK_UNAVAILABLE") from exc
     acquired = False
     deadline = time.monotonic() + max(timeout, 0.0)
     try:
-        while True:
-            try:
+        try:
+            if os.name == "nt" and os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            while True:
+                os.lseek(fd, 0, os.SEEK_SET)
                 acquired = _acquire_os_lock(fd)
-            except OSError:
-                logger.debug(
-                    "Unexpected error locking %s; proceeding without lock",
-                    lock_path,
-                    exc_info=True,
+                if acquired:
+                    break
+                if time.monotonic() >= deadline:
+                    raise InstallLockError("INSTALL_LOCK_UNAVAILABLE")
+                time.sleep(
+                    min(
+                        _RETRY_INTERVAL_SECONDS,
+                        max(0, deadline - time.monotonic()),
+                    ),
                 )
-                acquired = False
-                break
-            if acquired or time.monotonic() >= deadline:
-                break
-            time.sleep(_RETRY_INTERVAL_SECONDS)
-
-        if not acquired:
-            logger.warning(
-                "Timed out after %.0fs waiting for plugin install lock %s; "
-                "proceeding without it",
-                timeout,
-                lock_path,
-            )
-        yield acquired
+        except OSError as exc:
+            raise InstallLockError("INSTALL_LOCK_UNAVAILABLE") from exc
+        yield True
     finally:
         if acquired:
             _release_os_lock(fd)

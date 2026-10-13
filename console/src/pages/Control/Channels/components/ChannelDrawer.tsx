@@ -17,7 +17,10 @@ import { useEffect, useState } from "react";
 import type { FormInstance } from "antd";
 import { getChannelLabel, isLoopbackHost, type ChannelKey } from "./constants";
 import { QrcodeAuthBlock } from "./QrcodeAuthBlock";
-import type { ChannelSchema } from "../../../../api/modules/channel";
+import {
+  channelApi,
+  type ChannelSchema,
+} from "../../../../api/modules/channel";
 import styles from "../index.module.less";
 import { useAgentStore } from "../../../../stores/agentStore";
 import { openExternalLink } from "../../../../utils/openExternalLink";
@@ -150,6 +153,7 @@ interface ChannelDrawerProps {
   initialValues: Record<string, unknown> | undefined;
   isBuiltin: boolean;
   channelSchema?: ChannelSchema;
+  onRuntimeChange?: () => void | Promise<void>;
   onClose: () => void;
   onSubmit: (values: Record<string, unknown>) => void | Promise<void>;
 }
@@ -164,8 +168,10 @@ export function ChannelDrawer({
   channelSchema,
   onClose,
   onSubmit,
+  onRuntimeChange,
 }: ChannelDrawerProps) {
   const { t, i18n } = useTranslation();
+  const [repairing, setRepairing] = useState(false);
   const [expandedSections, setExpandedSections] = useState<string[]>([]);
   useEffect(() => {
     if (open)
@@ -241,7 +247,7 @@ export function ChannelDrawer({
 
   // ── Builtin channel-specific fields ─────────────────────────────────────
 
-  const renderBuiltinExtraFields = (key: ChannelKey) => {
+  const renderKnownChannelFields = (key: ChannelKey) => {
     switch (key) {
       case "matrix":
         return (
@@ -1601,6 +1607,54 @@ export function ChannelDrawer({
 
   // ── Custom channel fields (key-value editor) ─────────────────────────────
 
+  const renderStructuredField = (
+    name: string,
+    label: string,
+    kind?: "array" | "object",
+    required = false,
+    defaultValue?: unknown,
+  ) => (
+    <Form.Item
+      key={name}
+      name={name}
+      label={label}
+      required={required}
+      initialValue={defaultValue}
+      getValueProps={(value) => ({
+        value:
+          typeof value === "string" ? value : JSON.stringify(value, null, 2),
+      })}
+      normalize={(value: string) => {
+        if (!value.trim()) return undefined;
+        try {
+          return JSON.parse(value);
+        } catch {
+          return value;
+        }
+      }}
+      rules={[
+        {
+          validator: (_, value) => {
+            if (value === undefined || value === null) {
+              return required
+                ? Promise.reject(new Error(`Please enter ${label}`))
+                : Promise.resolve();
+            }
+            return typeof value === "object" &&
+              (kind === undefined ||
+                (kind === "array"
+                  ? Array.isArray(value)
+                  : !Array.isArray(value)))
+              ? Promise.resolve()
+              : Promise.reject(new Error("Enter a valid JSON object or array"));
+          },
+        },
+      ]}
+    >
+      <Input.TextArea autoSize={{ minRows: 2, maxRows: 10 }} />
+    </Form.Item>
+  );
+
   const renderCustomExtraFields = (
     values: Record<string, unknown> | undefined,
   ) => {
@@ -1613,95 +1667,105 @@ export function ChannelDrawer({
               {channelSchema.description}
             </div>
           )}
-          {channelSchema.config_fields.map((field) => {
-            const fieldLabel = resolveLocalized(field.label, i18n.language);
-            const fieldHelp =
-              resolveLocalized(field.help, i18n.language) || undefined;
-            const fieldPlaceholder = resolveLocalized(
-              field.placeholder,
-              i18n.language,
-            );
-            const rules = field.required
-              ? [{ required: true, message: `Please enter ${fieldLabel}` }]
-              : undefined;
+          {channelSchema.config_fields
+            .filter((field) => !BASE_FIELDS.includes(field.name))
+            .map((field) => {
+              const fieldLabel = resolveLocalized(field.label, i18n.language);
+              const fieldHelp =
+                resolveLocalized(field.help, i18n.language) || undefined;
+              const fieldPlaceholder = resolveLocalized(
+                field.placeholder,
+                i18n.language,
+              );
+              const rules = field.required
+                ? [{ required: true, message: `Please enter ${fieldLabel}` }]
+                : undefined;
 
-            switch (field.type) {
-              case "password":
-                return (
-                  <Form.Item
-                    key={field.name}
-                    name={field.name}
-                    label={fieldLabel}
-                    rules={rules}
-                    tooltip={fieldHelp}
-                    initialValue={field.default}
-                  >
-                    <Input.Password placeholder={fieldPlaceholder} />
-                  </Form.Item>
-                );
-              case "number":
-                return (
-                  <Form.Item
-                    key={field.name}
-                    name={field.name}
-                    label={fieldLabel}
-                    rules={rules}
-                    tooltip={fieldHelp}
-                    initialValue={field.default}
-                  >
-                    <InputNumber
-                      style={{ width: "100%" }}
-                      placeholder={fieldPlaceholder}
-                    />
-                  </Form.Item>
-                );
-              case "switch":
-                return (
-                  <Form.Item
-                    key={field.name}
-                    name={field.name}
-                    label={fieldLabel}
-                    valuePropName="checked"
-                    tooltip={fieldHelp}
-                    initialValue={field.default}
-                  >
-                    <Switch />
-                  </Form.Item>
-                );
-              case "select":
-                return (
-                  <Form.Item
-                    key={field.name}
-                    name={field.name}
-                    label={fieldLabel}
-                    rules={rules}
-                    tooltip={fieldHelp}
-                    initialValue={field.default}
-                  >
-                    <Select
-                      placeholder={fieldPlaceholder}
-                      options={(field.options || []).map((opt) => ({
-                        label: opt,
-                        value: opt,
-                      }))}
-                    />
-                  </Form.Item>
-                );
-              default:
-                return (
-                  <Form.Item
-                    key={field.name}
-                    name={field.name}
-                    label={fieldLabel}
-                    rules={rules}
-                    tooltip={fieldHelp}
-                    initialValue={field.default}
-                  >
-                    <Input placeholder={fieldPlaceholder} />
-                  </Form.Item>
-                );
-            }
-          })}
+              switch (field.type) {
+                case "json":
+                  return renderStructuredField(
+                    field.name,
+                    fieldLabel,
+                    field.json_type,
+                    field.required,
+                    field.default,
+                  );
+                case "password":
+                  return (
+                    <Form.Item
+                      key={field.name}
+                      name={field.name}
+                      label={fieldLabel}
+                      rules={rules}
+                      tooltip={fieldHelp}
+                      initialValue={field.default}
+                    >
+                      <Input.Password placeholder={fieldPlaceholder} />
+                    </Form.Item>
+                  );
+                case "number":
+                  return (
+                    <Form.Item
+                      key={field.name}
+                      name={field.name}
+                      label={fieldLabel}
+                      rules={rules}
+                      tooltip={fieldHelp}
+                      initialValue={field.default}
+                    >
+                      <InputNumber
+                        style={{ width: "100%" }}
+                        placeholder={fieldPlaceholder}
+                      />
+                    </Form.Item>
+                  );
+                case "switch":
+                  return (
+                    <Form.Item
+                      key={field.name}
+                      name={field.name}
+                      label={fieldLabel}
+                      valuePropName="checked"
+                      tooltip={fieldHelp}
+                      initialValue={field.default}
+                    >
+                      <Switch />
+                    </Form.Item>
+                  );
+                case "select":
+                  return (
+                    <Form.Item
+                      key={field.name}
+                      name={field.name}
+                      label={fieldLabel}
+                      rules={rules}
+                      tooltip={fieldHelp}
+                      initialValue={field.default}
+                    >
+                      <Select
+                        placeholder={fieldPlaceholder}
+                        options={(field.options || []).map((opt) => ({
+                          label: opt,
+                          value: opt,
+                        }))}
+                      />
+                    </Form.Item>
+                  );
+                default:
+                  return (
+                    <Form.Item
+                      key={field.name}
+                      name={field.name}
+                      label={fieldLabel}
+                      rules={rules}
+                      tooltip={fieldHelp}
+                      initialValue={field.default}
+                    >
+                      <Input placeholder={fieldPlaceholder} />
+                    </Form.Item>
+                  );
+              }
+            })}
         </>
       );
     }
@@ -1718,8 +1782,15 @@ export function ChannelDrawer({
         <div style={{ marginBottom: 8, fontWeight: 500 }}>Custom Fields</div>
         {extraKeys.map((fieldKey) => {
           const value = values[fieldKey];
+          if (value === null || typeof value === "object")
+            return renderStructuredField(fieldKey, fieldKey);
           return (
-            <Form.Item key={fieldKey} name={fieldKey} label={fieldKey}>
+            <Form.Item
+              key={fieldKey}
+              name={fieldKey}
+              label={fieldKey}
+              valuePropName={typeof value === "boolean" ? "checked" : "value"}
+            >
               {typeof value === "boolean" ? (
                 <Switch />
               ) : typeof value === "number" ? (
@@ -1842,6 +1913,42 @@ export function ChannelDrawer({
       footer={null}
       key={activeKey} // Force remount when switching channels
     >
+      {channelSchema?.availability && (
+        <Alert
+          type="info"
+          showIcon
+          message={t(
+            `channels.runtime.${channelSchema.availability}`,
+            channelSchema.availability.replace(/_/g, " "),
+          )}
+          description={channelSchema.diagnostic}
+          action={
+            channelSchema.repair && (
+              <Button
+                loading={repairing}
+                onClick={async () => {
+                  setRepairing(true);
+                  try {
+                    await channelApi.repairChannel(channelSchema.repair!);
+                    await onRuntimeChange?.();
+                  } catch (error) {
+                    message.error(
+                      error instanceof Error ? error.message : String(error),
+                    );
+                  } finally {
+                    setRepairing(false);
+                  }
+                }}
+              >
+                {t(
+                  `channels.runtime.${channelSchema.repair.action}`,
+                  channelSchema.repair.action,
+                )}
+              </Button>
+            )
+          }
+        />
+      )}
       {activeKey && (
         <Form
           form={form}
@@ -1869,8 +1976,8 @@ export function ChannelDrawer({
             <Switch disabled={activeKey === "console"} />
           </Form.Item>
 
-          {isBuiltin
-            ? renderBuiltinExtraFields(activeKey)
+          {isBuiltin || activeKey === "feishu" || activeKey === "dingtalk"
+            ? renderKnownChannelFields(activeKey)
             : renderCustomExtraFields(initialValues)}
 
           <Collapse

@@ -114,6 +114,17 @@ def message(
     }
 
 
+def set_admission(channel, callback):
+    """Adapt the direct-proxy fixture to acknowledged local admission."""
+    from qwenpaw.app.channels.unified_queue_manager import EnqueueResult
+
+    async def admit(payload):
+        callback(payload)
+        return EnqueueResult(True)
+
+    channel.set_enqueue_async(admit)
+
+
 @pytest.fixture
 def proxy_api():
     name = "qwenpaw.app.channels.isolated_proxy"
@@ -151,7 +162,7 @@ async def runtime(proxy_api, tmp_path):
         plugin = code / "feishu"
         shutil.copytree(
             ROOT / "plugins/channel/feishu",
-            plugin,
+            code,
             ignore=shutil.ignore_patterns("__pycache__"),
         )
         fixture = Path(__file__).with_name("feishu_process_boundary.py")
@@ -159,9 +170,9 @@ async def runtime(proxy_api, tmp_path):
             f"WORK = {str(work)!r}\n" + fixture.read_text(encoding="utf-8"),
             encoding="utf-8",
         )
-        descriptor = json.loads((plugin / "channel.json").read_text())
+        descriptor = json.loads((code / "channel.json").read_text())
         descriptor["entrypoint"]["module"] = "feishu.boundary"
-        (plugin / "channel.json").write_text(json.dumps(descriptor))
+        (code / "channel.json").write_text(json.dumps(descriptor))
         config = {
             "enabled": True,
             "app_id": "cli_test",
@@ -174,14 +185,16 @@ async def runtime(proxy_api, tmp_path):
             python_executable=sys.executable,
             support_root=ROOT / "src",
             code_root=code,
-            descriptor_path=plugin / "channel.json",
+            descriptor_path=code / "channel.json",
             source_revision=digest(code),
             channel_key="feishu",
             instance_id=f"workspace-{index}",
             generation=1,
             qwenpaw_version="2.2.2b4",
             config=config,
-            startup_timeout=4,
+            # Real lark-oapi startup took 3.8s on the diagnostic host.
+            # Leave headroom for cold imports; explicit hang tests stay sharp.
+            startup_timeout=8,
             shutdown_timeout=0.8,
         )
         requests, queued, pids = [], [], []
@@ -204,7 +217,7 @@ async def runtime(proxy_api, tmp_path):
             workspace_dir=work,
         )
         owned.append(channel)
-        channel.set_enqueue(queued.append)
+        set_admission(channel, queued.append)
         rt = NS(
             channel=channel,
             process=process,
@@ -354,7 +367,7 @@ async def test_rejected_admission_retries_and_concurrent_duplicate_is_once(
             raise RuntimeError("host queue temporarily unavailable")
         rt.queued.append(payload)
 
-    rt.channel.set_enqueue(accept)
+    set_admission(rt.channel, accept)
     event = message("same-id")
     rt.emit(event)
     await eventually(lambda: len(attempts) == 1)
@@ -720,21 +733,21 @@ async def test_real_descriptor_loads_and_rejects_invalid_config_before_network(
     code = tmp_path / "actual-entry"
     shutil.copytree(
         ROOT / "plugins/channel/feishu",
-        code / "feishu",
+        code,
         ignore=shutil.ignore_patterns("__pycache__"),
     )
     spec = LaunchSpec(
         python_executable=sys.executable,
         support_root=ROOT / "src",
         code_root=code,
-        descriptor_path=code / "feishu/channel.json",
+        descriptor_path=code / "channel.json",
         source_revision=digest(code),
         channel_key="feishu",
         instance_id="real-descriptor",
         generation=1,
         qwenpaw_version="2.2.2b4",
         config={"app_id": "", "app_secret": ""},
-        startup_timeout=4,
+        startup_timeout=8,
         shutdown_timeout=0.5,
     )
     process = ChannelProcess()
@@ -1434,7 +1447,7 @@ async def test_single_sdk_callback_recovers_transient_host_admission(runtime):
             raise RuntimeError("queue temporarily unavailable")
         rt.queued.append(payload)
 
-    rt.channel.set_enqueue(accept)
+    set_admission(rt.channel, accept)
     rt.emit(message("single-transient"))
     await eventually(lambda: len(rt.queued) == 1)
     assert len(rt.rows("callback")) == 1
@@ -1456,7 +1469,7 @@ async def test_exhausted_host_admission_retries_are_bounded_and_release_route(
         attempts.append(payload)
         raise RuntimeError("queue remains unavailable")
 
-    rt.channel.set_enqueue(reject)
+    set_admission(rt.channel, reject)
     rt.emit(message("always-rejected"))
     await eventually(lambda: len(attempts) >= 2)
     await eventually(
@@ -1475,7 +1488,7 @@ async def test_exhausted_host_admission_retries_are_bounded_and_release_route(
     assert rt.queued == rt.rows("create") == []
 
     # A definitely unused route must allow a later native redelivery to work.
-    rt.channel.set_enqueue(rt.queued.append)
+    set_admission(rt.channel, rt.queued.append)
     payload = await inbound(rt, message("always-rejected"))
     assert len(rt.queued) == 1
     await rt.channel.consume_one(payload)
@@ -1511,7 +1524,7 @@ async def test_stop_cancels_pending_host_admission_retries(runtime):
         attempts.append(payload)
         raise RuntimeError("queue remains unavailable")
 
-    rt.channel.set_enqueue(reject)
+    set_admission(rt.channel, reject)
     rt.emit(message("stop-retrying"))
     await eventually(lambda: len(attempts) >= 2)
     await asyncio.wait_for(rt.channel.stop(), 3)

@@ -5,7 +5,11 @@
   "type": "channel",
   "description": "DingTalk messaging channel; standalone integration preview.",
   "author": "QwenPaw Team",
-  "entry": { "backend": "plugin.py" },
-  "qwenpaw_version": { "min": "2.2.2b4" },
+  "entry": {
+    "descriptor": "channel.json"
+  },
+  "qwenpaw_version": {
+    "min": "2.2.2b4"
+  },
   "publish": false
 }

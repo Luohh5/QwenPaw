@@ -38,6 +38,7 @@ class LaunchSpec:
     enabled: bool = True
     startup_timeout: float = 5.0
     shutdown_timeout: float = 2.0
+    runtime_identity: Mapping[str, Any] | None = None
     restart_limit: int = 0
     restart_backoff: float = 0.1
 
@@ -58,6 +59,24 @@ class ChannelProcess(PluginProcess):
     connecting_state = "connecting"
     component_states = {"connecting", "connected", "disconnected", "failed"}
     failed_reason = "PLATFORM_START_FAILED"
+
+    async def _evidence(self, params, request):
+        result = await super()._evidence(params, request)
+        from ...plugins.channel_bootstrap import validate_runtime_identity
+        from ...plugins.execution.errors import ProtocolValidationError
+
+        try:
+            validate_runtime_identity(
+                self.dependency_snapshot,
+                self._spec.runtime_identity,
+                self._spec.python_executable,
+            )
+        except ValueError as exc:
+            reason = "CHANNEL_RUNTIME_IDENTITY_MISMATCH"
+            if self._ready is not None and not self._ready.done():
+                self._ready.set_exception(self.error_type(reason))
+            raise ProtocolValidationError(reason, reason_code=reason) from exc
+        return result
 
     def _identity(self, spec):
         return IdentityParams.from_mapping(
@@ -97,6 +116,13 @@ class ChannelProcess(PluginProcess):
         packet["dependency_paths"] = [
             str(Path(path).resolve()) for path in spec.dependency_paths
         ]
+        descriptor = SharedChannelDescriptor.load(spec.descriptor_path)
+        packet["requirements_path"] = str(
+            (
+                Path(spec.descriptor_path).parent
+                / descriptor.requirements_file
+            ).resolve(),
+        )
         packet["config"] = dict(spec.config)
         return self._encode_packet(packet)
 
@@ -121,5 +147,8 @@ class ChannelProcess(PluginProcess):
             qwenpaw_version=spec.qwenpaw_version,
             requirements_path=Path(spec.descriptor_path).parent
             / descriptor.requirements_file,
+        )
+        self.observed_hello = (
+            hello.to_mapping() if hasattr(hello, "to_mapping") else dict(hello)
         )
         return {"accepted": True}

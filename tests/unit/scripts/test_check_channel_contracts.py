@@ -1034,7 +1034,7 @@ def test_skip_in_unrelated_test_method_is_allowed(tmp_path: Path) -> None:
 def test_repository_has_complete_contract_coverage() -> None:
     report = checker.analyze_repository(REPO_ROOT)
 
-    assert len(report.specs) == 18
-    assert len(report.tested_classes) == 18
+    assert len(report.specs) == 16
+    assert len(report.tested_classes) == 16
     assert report.missing_specs == ()
     assert report.errors == ()

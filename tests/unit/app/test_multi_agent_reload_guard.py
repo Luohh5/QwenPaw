@@ -30,6 +30,7 @@ def _fake_workspace() -> MagicMock:
     ws.set_manager = MagicMock()
     ws.set_task_tracker = MagicMock()
     ws.set_reusable_components = AsyncMock()
+    ws.channel_manager = None
     ws._service_manager.services.get.return_value = None
     ws._service_manager.get_reusable_services.return_value = {}
     ws.task_tracker.snapshot_active_tasks = AsyncMock(return_value=[])

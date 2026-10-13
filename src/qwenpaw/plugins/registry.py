@@ -2,11 +2,14 @@
 # pylint:disable=too-many-nested-blocks
 """Central plugin registry."""
 
-from typing import Any, Callable, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type
 from dataclasses import dataclass, field
 import logging
 
 from fastapi import APIRouter
+
+if TYPE_CHECKING:
+    from .channel_adapter import ChannelDescription
 
 logger = logging.getLogger(__name__)
 
@@ -99,12 +102,15 @@ class ChannelRegistration:
 
     plugin_id: str
     channel_key: str
-    channel_class: Type
+    channel_class: Optional[Type] = None
     label: str = ""
     description: str = ""
     config_fields: List[Dict[str, Any]] = field(default_factory=list)
     icon: str = ""
     doc_url: Any = ""
+    description_record: Optional["ChannelDescription"] = None
+    runtime_settings: Any = None
+    global_enabled: bool = True
 
 
 @dataclass
@@ -161,6 +167,9 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
         self._workspace_created_hooks: List[HookRegistration] = []
         self._control_commands: List[ControlCommandRegistration] = []
         self._channels: Dict[str, ChannelRegistration] = {}
+        self.channel_runtime = None
+        self._channel_generations: dict[str, int] = {}
+        self._channel_owners: dict[str, Any] = {}
         self._runtime_helpers = None
         self._plugin_manifests: Dict[str, Dict[str, Any]] = {}
         self._middleware_registrations: List[MiddlewareRegistration] = []
@@ -817,7 +826,7 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
         config_fields: Optional[List[Dict[str, Any]]] = None,
         icon: str = "",
         doc_url: Any = "",
-    ) -> None:
+    ) -> ChannelRegistration:
         """Register a custom channel from a plugin.
 
         Args:
@@ -876,7 +885,12 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
                 )
 
         # Prevent overriding built-in channels
-        if normalized_key in BUILTIN_CHANNEL_KEYS:
+        from ..app.channels.catalog import OFFICIAL_CHANNEL_OWNERS
+
+        if (
+            normalized_key in BUILTIN_CHANNEL_KEYS
+            or normalized_key in OFFICIAL_CHANNEL_OWNERS
+        ):
             raise ValueError(
                 f"Channel '{normalized_key}' conflicts with a built-in "
                 f"channel and cannot be registered by a plugin",
@@ -914,13 +928,19 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
             f"'{plugin_id}'",
         )
 
+        return self._channels[normalized_key]
+
     def get_registered_channels(self) -> Dict[str, ChannelRegistration]:
         """Get all plugin-registered channels.
 
         Returns:
             Dictionary of channel_key -> ChannelRegistration.
         """
-        return self._channels.copy()
+        return {
+            key: row
+            for key, row in self._channels.items()
+            if row.channel_class is not None
+        }
 
     def get_channel_registration(
         self,
@@ -934,12 +954,178 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
         Returns:
             ChannelRegistration or None.
         """
+        row = self._channels.get(channel_key)
+        return (
+            row
+            if row is not None
+            and (
+                row.channel_class is not None
+                or row.runtime_settings is not None
+            )
+            else None
+        )
+
+    def get_channel_catalog(self) -> Dict[str, ChannelRegistration]:
+        """Return static candidates and active class registrations."""
+        return self._channels.copy()
+
+    def get_channel_catalog_entry(
+        self,
+        channel_key: str,
+    ) -> Optional[ChannelRegistration]:
+        """Look up an owned row without claiming it is runtime-ready."""
         return self._channels.get(channel_key)
 
-    def unregister_channel(self, channel_key: str) -> bool:
+    def configure_channel_runtime(self, settings) -> None:
+        """Reserve selected keys independently of installed artifacts."""
+        if (
+            self.channel_runtime is not None
+            and self.channel_runtime != settings
+        ):
+            raise RuntimeError("CHANNEL_RUNTIME_ALREADY_CONFIGURED")
+        self.channel_runtime = settings
+
+    def channel_dependency_uses(self) -> tuple[dict[str, Any], ...]:
+        """Derive declarations and real observations from existing owners."""
+        uses = []
+        for row in self._channels.values():
+            if (
+                row.global_enabled
+                and row.description_record is not None
+                and row.runtime_settings is not None
+            ):
+                settings = row.runtime_settings
+                uses.append(
+                    {
+                        "plugin_id": row.plugin_id,
+                        "requirements": row.description_record.requirements,
+                        "python_executable": settings.python_executable,
+                        "dependency_paths": tuple(
+                            str(path) for path in settings.dependency_paths
+                        ),
+                        "instance_id": None,
+                        "generation": None,
+                        "active": False,
+                    },
+                )
+        for instance_id, owner in self._channel_owners.items():
+            spec = owner._launch_spec  # pylint: disable=protected-access
+            snapshot = owner.channel_process.dependency_snapshot
+            row = self._channels.get(spec.channel_key)
+            uses.append(
+                {
+                    "plugin_id": (
+                        row.plugin_id if row is not None else spec.channel_key
+                    ),
+                    "requirements": (
+                        row.description_record.requirements
+                        if row is not None
+                        and row.description_record is not None
+                        else ()
+                    ),
+                    "python_executable": spec.python_executable,
+                    "dependency_paths": tuple(
+                        str(path) for path in spec.dependency_paths
+                    ),
+                    "instance_id": instance_id,
+                    "generation": spec.generation,
+                    "active": True,
+                    "snapshot": (
+                        snapshot.to_mapping() if snapshot is not None else None
+                    ),
+                },
+            )
+        return tuple(uses)
+
+    def channel_owner_registrations(self, plugin_id: str | None = None):
+        """Snapshot actual custody, independent of Loader and catalog rows."""
+        return tuple(
+            row
+            for owner in self._channel_owners.values()
+            if (row := getattr(owner, "_registration", None)) is not None
+            and (plugin_id is None or row.plugin_id == plugin_id)
+        )
+
+    def has_channel_owners(self, plugin_id: str) -> bool:
+        """Read actual retained custody independently of Loader bookkeeping."""
+        return bool(self.channel_owner_registrations(plugin_id))
+
+    def next_channel_generation(self, instance_id: str) -> int:
+        if instance_id in self._channel_owners:
+            raise RuntimeError("CHANNEL_ALREADY_OWNED")
+        generation = self._channel_generations.get(instance_id, 0) + 1
+        self._channel_generations[instance_id] = generation
+        return generation
+
+    def release_channel_owner(self, instance_id: str, owner) -> None:
+        if self._channel_owners.get(instance_id) is owner:
+            del self._channel_owners[instance_id]
+
+    def register_channel_descriptor(
+        self,
+        plugin_id: str,
+        description: "ChannelDescription",
+        *,
+        runtime_settings=None,
+        global_enabled: bool = True,
+    ) -> ChannelRegistration:
+        """Register host-owned static metadata without loading a driver."""
+        from ..app.channels.registry import BUILTIN_CHANNEL_KEYS
+
+        descriptor = description.descriptor
+        key = descriptor.channel_key
+        if plugin_id != description.plugin_id or plugin_id != key:
+            raise ValueError("Channel descriptor owner mismatch")
+        from ..app.channels.catalog import (
+            OFFICIAL_CHANNEL_OWNERS,
+            config_fields,
+        )
+
+        if key in BUILTIN_CHANNEL_KEYS or (
+            key in OFFICIAL_CHANNEL_OWNERS
+            and OFFICIAL_CHANNEL_OWNERS[key] != plugin_id
+        ):
+            raise ValueError(
+                f"Channel '{key}' conflicts with a built-in channel",
+            )
+        if key in self._channels:
+            raise ValueError(f"Channel '{key}' is already registered")
+        fields = config_fields(
+            descriptor.config_schema,
+            descriptor.config_fields,
+        )
+        row = ChannelRegistration(
+            plugin_id=plugin_id,
+            channel_key=key,
+            label=descriptor.label["en"],
+            description=description.description,
+            config_fields=fields,
+            description_record=description,
+            runtime_settings=runtime_settings,
+            global_enabled=global_enabled,
+        )
+        self._channels[key] = row
+        return row
+
+    def unregister_channel(
+        self,
+        channel_key: str,
+        *,
+        expected: Optional[ChannelRegistration] = None,
+    ) -> bool:
         """Drop one channel registration by key."""
-        if channel_key not in self._channels:
+        current = self._channels.get(channel_key)
+        if current is None or (
+            expected is not None and current is not expected
+        ):
             return False
+        if current.runtime_settings is not None and any(
+            getattr(owner, "_registration", None) is current
+            for owner in self._channel_owners.values()
+        ):
+            from .lifecycle import QuiescenceError
+
+            raise QuiescenceError("CHANNEL_INSTANCE_STILL_OWNED")
         del self._channels[channel_key]
         logger.info("Unregistered channel '%s'", channel_key)
         return True

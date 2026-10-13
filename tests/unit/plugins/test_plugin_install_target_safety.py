@@ -77,10 +77,22 @@ async def test_pawport_plugin_failure_cleans_its_prepared_target(
         encoding="utf-8",
     )
     loader = PluginLoader([install_root])
+
+    async def failed_preparation(_requirements_file, _plugin_id):
+        raise RuntimeError("install failed")
+
+    def no_network_subprocess(*_args, **_kwargs):
+        raise AssertionError("Controlled install failure attempted download")
+
     monkeypatch.setattr(
         loader,
-        "_install_requirements_locked",
-        lambda *_args: (_ for _ in ()).throw(RuntimeError("install failed")),
+        "_prepare_python_dependencies",
+        failed_preparation,
+    )
+    monkeypatch.setattr(
+        loader,
+        "_run_subprocess_with_streaming_log",
+        no_network_subprocess,
     )
 
     with pytest.raises(RuntimeError, match="install failed"):

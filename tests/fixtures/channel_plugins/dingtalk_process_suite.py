@@ -127,6 +127,17 @@ def message(mid, *, group=False, mentioned=True, content=None, **fields):
     }
 
 
+def set_admission(channel, callback):
+    """Adapt the direct-proxy fixture to acknowledged local admission."""
+    from qwenpaw.app.channels.unified_queue_manager import EnqueueResult
+
+    async def admit(payload):
+        callback(payload)
+        return EnqueueResult(True)
+
+    channel.set_enqueue_async(admit)
+
+
 @pytest.fixture
 def proxy_api():
     name = "qwenpaw.app.channels.isolated_proxy"
@@ -166,7 +177,7 @@ async def runtime(proxy_api, tmp_path):
         plugin = code / "dingtalk"
         shutil.copytree(
             ROOT / "plugins/channel/dingtalk",
-            plugin,
+            code,
             ignore=shutil.ignore_patterns("__pycache__"),
         )
         fixture = Path(__file__).with_name("dingtalk_process_boundary.py")
@@ -174,9 +185,9 @@ async def runtime(proxy_api, tmp_path):
             f"WORK = {str(work)!r}\n" + fixture.read_text(encoding="utf-8"),
             encoding="utf-8",
         )
-        descriptor = json.loads((plugin / "channel.json").read_text())
+        descriptor = json.loads((code / "channel.json").read_text())
         descriptor["entrypoint"]["module"] = "dingtalk.boundary"
-        (plugin / "channel.json").write_text(json.dumps(descriptor))
+        (code / "channel.json").write_text(json.dumps(descriptor))
         config = {
             "enabled": True,
             "client_id": "client-one",
@@ -190,7 +201,7 @@ async def runtime(proxy_api, tmp_path):
             python_executable=sys.executable,
             support_root=ROOT / "src",
             code_root=code,
-            descriptor_path=plugin / "channel.json",
+            descriptor_path=code / "channel.json",
             source_revision=digest(code),
             channel_key="dingtalk",
             instance_id=f"workspace-{index}",
@@ -220,7 +231,7 @@ async def runtime(proxy_api, tmp_path):
             workspace_dir=work,
         )
         owned.append(channel)
-        channel.set_enqueue(queued.append)
+        set_admission(channel, queued.append)
         rt = NS(
             channel=channel,
             process=process,
@@ -1334,7 +1345,7 @@ async def test_host_admission_ack_waits_for_acceptance_and_transient_retry(
             raise RuntimeError("queue temporarily unavailable")
         rt.queued.append(payload)
 
-    rt.channel.set_enqueue(accept)
+    set_admission(rt.channel, accept)
     payload = await inbound(rt, message("single-transient"))
     await eventually(lambda: len(rt.rows("ack")) == 1)
     assert len(attempts) == 2
@@ -1355,7 +1366,7 @@ async def test_exhausted_admission_is_bounded_and_allows_redelivery(
         attempts.append(payload)
         raise RuntimeError("queue unavailable")
 
-    rt.channel.set_enqueue(reject)
+    set_admission(rt.channel, reject)
     rt.emit(message("rejected"))
     await eventually(lambda: len(attempts) >= 2)
     await eventually(
@@ -1372,7 +1383,7 @@ async def test_exhausted_admission_is_bounded_and_allows_redelivery(
     ] == "HOST_ADMISSION_EXHAUSTED"
     await asyncio.sleep(0.2)
     assert len(attempts) == count
-    rt.channel.set_enqueue(rt.queued.append)
+    set_admission(rt.channel, rt.queued.append)
     payload = await inbound(rt, message("rejected"))
     await rt.channel.consume_one(payload)
     assert len(deliveries(rt)) == 1
@@ -1387,7 +1398,7 @@ async def test_stop_cancels_pending_admission_and_real_child_exits(runtime):
         attempts.append(payload)
         raise RuntimeError("queue unavailable")
 
-    rt.channel.set_enqueue(reject)
+    set_admission(rt.channel, reject)
     rt.emit(message("stop-retrying"))
     await eventually(lambda: len(attempts) >= 2)
     await asyncio.wait_for(rt.channel.stop(), 3)

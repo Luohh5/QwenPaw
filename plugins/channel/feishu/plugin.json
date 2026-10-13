@@ -5,7 +5,11 @@
   "type": "channel",
   "description": "Feishu / Lark channel with messaging and instance-owned connection lifecycle; standalone integration preview.",
   "author": "QwenPaw Team",
-  "entry": { "backend": "plugin.py" },
-  "qwenpaw_version": { "min": "2.2.2b4" },
+  "entry": {
+    "descriptor": "channel.json"
+  },
+  "qwenpaw_version": {
+    "min": "2.2.2b4"
+  },
   "publish": false
 }

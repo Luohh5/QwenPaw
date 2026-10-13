@@ -247,6 +247,10 @@ class Runtime:
             "python_abi": f"{tag.interpreter}-{tag.abi}",
             "platform_tag": tag.platform,
             "marker_environment": environment,
-            "dependencies": _dependencies(requirements, environment),
+            "dependencies": _dependencies(
+                requirements,
+                environment,
+                packet.get("dependency_versions"),
+            ),
         }
         return entrypoint, source, hello

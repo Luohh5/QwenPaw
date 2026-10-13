@@ -92,6 +92,7 @@ class ChannelRuntime:
             qwenpaw_version=packet["qwenpaw_version"],
             requirements_path=requirements,
             capabilities=descriptor.capabilities,
+            versions=packet.get("dependency_versions"),
         )
         return descriptor.entrypoint, source, hello.to_mapping()
 

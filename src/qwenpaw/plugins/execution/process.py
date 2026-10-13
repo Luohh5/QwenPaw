@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from .dependencies import DependencySnapshot
 from .errors import RpcClosedError, RpcTimeoutError
 from .framing import FramedTransport
 from .models import PluginIdentity
@@ -51,6 +52,15 @@ class StopResult:
     returncode: int | None
     forced: bool
     residual: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class InspectionResult:
+    """One-shot evidence is usable only after confirmed child-tree exit."""
+
+    snapshot: DependencySnapshot
+    hello: Mapping[str, Any] | None
+    cleanup: StopResult
 
 
 class ProcessError(RuntimeError):
@@ -104,6 +114,11 @@ class PluginProcess:
         "ENTRYPOINT_OUTSIDE_CODE_ROOT",
         "ENTRYPOINT_IMPORT_FAILED",
         "DEPENDENCY_UNSATISFIED",
+        "DEPENDENCY_METADATA_INVALID",
+        "DEPENDENCY_ENVIRONMENT_AMBIGUOUS",
+        "DEPENDENCY_REPAIR_REQUIRED",
+        "DEPENDENCY_ORIGIN_INVALID",
+        "PROBE_NETWORK_OR_PROCESS_DENIED",
         "SCHEMA_MISMATCH",
         "PROTOCOL_MISMATCH",
     }
@@ -138,6 +153,89 @@ class PluginProcess:
         self._counter = 0
         self._log_bytes = 0
         self._forced = False
+        self._mode = "run"
+        self.dependency_snapshot: DependencySnapshot | None = None
+        self.observed_hello: Mapping[str, Any] | None = None
+        self.last_cleanup: StopResult | None = None
+
+    async def audit(self, spec: PluginLaunchSpec) -> InspectionResult:
+        """Read real child metadata without importing candidate code."""
+        return await self._inspect(spec, "audit")
+
+    async def probe(self, spec: PluginLaunchSpec) -> InspectionResult:
+        """Check Driver import/interface without creating a consumer."""
+        return await self._inspect(spec, "probe")
+
+    async def _inspect(self, spec: Any, mode: str) -> InspectionResult:
+        if self._process is not None or any(
+            task is not None and not task.done()
+            for task in (
+                self._start_task,
+                self._stop_task,
+                self._monitor_task,
+                self._spawn_task,
+                self._cleanup_task,
+            )
+        ):
+            raise self.error_type("PROCESS_OWNED")
+        spec = replace(spec, config={}, enabled=True, restart_limit=0)
+        self._validate_spec(spec)
+        self._spec, self._generation, self._mode = spec, spec.generation, mode
+        self._restart_enabled = False
+        self.dependency_snapshot = self.observed_hello = None
+        self.last_cleanup = None
+        self._start_task = asyncio.create_task(self._launch(spec))
+        try:
+            try:
+                await asyncio.shield(self._start_task)
+            except asyncio.CancelledError:
+                self._start_task.cancel()
+                try:
+                    await _settle(self._start_task)
+                except (asyncio.CancelledError, Exception):
+                    pass
+                raise
+        finally:
+            cleanup = await _settle(
+                asyncio.create_task(
+                    self._cleanup(spec.shutdown_timeout, graceful=False),
+                ),
+            )
+            self.last_cleanup = cleanup
+            if not cleanup.exited or cleanup.residual:
+                self._state = "residual"
+                error = self.error_type("PROBE_CLEANUP_FAILED")
+                error.process = self
+                error.cleanup = cleanup
+                raise error
+            self._state, self._mode = "stopped", "run"
+        if self.dependency_snapshot is None:
+            raise self.error_type("DEPENDENCY_METADATA_INVALID")
+        return InspectionResult(
+            self.dependency_snapshot,
+            self.observed_hello,
+            cleanup,
+        )
+
+    async def _evidence(self, params: Any, _request: Any) -> dict[str, bool]:
+        assert self._spec is not None
+        if not isinstance(params, Mapping) or set(params) != {
+            "identity",
+            "snapshot",
+        }:
+            raise self.error_type("DEPENDENCY_METADATA_INVALID")
+        if params["identity"] != self._identity(self._spec).to_mapping():
+            raise self.error_type("IDENTITY_MISMATCH")
+        snapshot = DependencySnapshot.from_mapping(params["snapshot"])
+        excluded = (Path(self._spec.code_root).resolve(),)
+        if any(
+            Path(site).is_relative_to(root)
+            for site in snapshot.sites
+            for root in excluded
+        ):
+            raise self.error_type("DEPENDENCY_ORIGIN_INVALID")
+        self.dependency_snapshot = snapshot
+        return {"accepted": True}
 
     def _register(
         self,
@@ -153,7 +251,7 @@ class PluginProcess:
         if (
             not name
             or name.startswith(self.control_prefix)
-            or name == self.hello_method
+            or name in {self.hello_method, "execution.dependencies"}
             or name in target
             or not callable(handler)
         ):
@@ -199,6 +297,8 @@ class PluginProcess:
             self._state = "disabled"
             return self.health_snapshot()
         self._validate_spec(spec)
+        self._mode = "run"
+        self.dependency_snapshot = self.observed_hello = None
         self._spec = spec
         self._generation = spec.generation
         self._restart_count = 0
@@ -315,6 +415,9 @@ class PluginProcess:
         return self._encode_packet(packet)
 
     def _encode_packet(self, packet: Mapping[str, Any]) -> bytes:
+        packet = {**packet, "mode": self._mode}
+        if self._mode != "run":
+            packet["config"] = {}
         try:
             data = (
                 json.dumps(packet, allow_nan=False, separators=(",", ":"))
@@ -413,9 +516,10 @@ class PluginProcess:
             FramedTransport(process.stdout, process.stdin),
         )
         self._peer.register_method(self.hello_method, self._hello)
+        self._peer.register_method("execution.dependencies", self._evidence)
         for name in (
             self.control_prefix + suffix
-            for suffix in ("ready", "state", "error")
+            for suffix in ("ready", "inspected", "state", "error")
         ):
             self._peer.register_notification(name, self._control)
         for name, handler in self._methods.items():
@@ -467,6 +571,7 @@ class PluginProcess:
     async def _hello(self, hello: Any, _request: Any) -> dict[str, bool]:
         assert self._spec is not None
         validate_hello(hello, self._spec)
+        self.observed_hello = dict(hello)
         return {"accepted": True}
 
     async def _control(self, params: Any, notification: Any) -> None:
@@ -480,9 +585,16 @@ class PluginProcess:
                 return
         except (ValueError, AttributeError):
             return
-        if notification.method == self.control_prefix + "ready":
+        ready = "ready" if self._mode == "run" else "inspected"
+        if notification.method == self.control_prefix + ready:
             if self._ready is not None and not self._ready.done():
-                self._platform = self.connecting_state
+                if self.dependency_snapshot is None:
+                    self._ready.set_exception(
+                        self.error_type("DEPENDENCY_METADATA_INVALID"),
+                    )
+                    return
+                if self._mode == "run":
+                    self._platform = self.connecting_state
                 self._ready.set_result(None)
         elif notification.method == self.control_prefix + "state":
             state = params.get(self.state_key)
@@ -631,7 +743,9 @@ class PluginProcess:
             self._cleanup_task = asyncio.create_task(
                 self._cleanup_owned(budget, graceful=graceful),
             )
-        return await asyncio.shield(self._cleanup_task)
+        result = await asyncio.shield(self._cleanup_task)
+        self.last_cleanup = result
+        return result
 
     async def _close_peer(self, budget: float, *, graceful: bool) -> None:
         """Request component shutdown and bound private transport closure."""

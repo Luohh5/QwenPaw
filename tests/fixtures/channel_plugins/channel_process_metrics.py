@@ -95,7 +95,7 @@ async def probe(channel, mode, experiment):
         plugin = code / channel
         shutil.copytree(
             ROOT / "plugins/channel" / channel,
-            plugin,
+            code,
             ignore=shutil.ignore_patterns("__pycache__"),
         )
         started = time.perf_counter()
@@ -262,79 +262,10 @@ input()
             )
             await gen.aclose()
         else:
-            sys.path.insert(0, str(code))
-            boundary = (HERE / f"{channel}_process_boundary.py").read_text()
-            # Baseline must import the same-process candidate, not the Driver.
-            boundary = boundary[: boundary.rfind("from .driver import")]
-            # The B4 child fixture asserts host absence; baseline is the host.
-            boundary = boundary.replace(
-                'assert "qwenpaw.app.channels.base" not in sys.modules',
-                "pass",
+            raise ValueError(
+                "Connected same-process baseline was retired in "
+                "C6; use archived B5 measurements",
             )
-            (plugin / "boundary.py").write_text(
-                f"WORK={str(work)!r}\n" + boundary,
-            )
-            candidate = importlib.import_module(f"{channel}.channel")
-            config = {"enabled": True, "media_dir": str(work / "media")}
-            if channel == "feishu":
-                cls, schema = candidate.FeishuChannel, FeishuConfig
-                config.update(app_id="cli_test", app_secret="test-only")
-            else:
-                cls, schema = candidate.DingTalkChannel, DingTalkConfig
-                config.update(
-                    client_id="client-one",
-                    client_secret="test-only",
-                )
-
-            async def agent(_request):
-                if False:
-                    yield None
-
-            constructor_start = time.perf_counter()
-            instance = cls.from_config(
-                agent,
-                schema(**config),
-                workspace_dir=work,
-            )
-            record["construction_seconds"] = (
-                time.perf_counter() - constructor_start
-            )
-            record["preparation_seconds"] = time.perf_counter() - started
-            preparation = time.perf_counter()
-            importlib.import_module(f"{channel}.boundary")
-            await instance.start()
-            async with asyncio.timeout(8):
-                while (
-                    not (work / "ledger.jsonl").exists()
-                    or '"connected"' not in (work / "ledger.jsonl").read_text()
-                ):
-                    await asyncio.sleep(0.01)
-            record.update(
-                readiness_seconds=time.perf_counter() - preparation,
-                preparation_scope=(
-                    "package/Channel imports and "
-                    "Channel construction before readiness"
-                ),
-                parent_rss_bytes=rss(),
-                child_rss_bytes=0,
-                parent_sdk_modules=sdk_count(channel),
-                origins=origins(channel, code),
-            )
-            platform_owner = (
-                instance._platform if channel == "feishu" else instance
-            )
-            thread = getattr(
-                platform_owner,
-                "_ws_thread" if channel == "feishu" else "_stream_thread",
-            )
-            stop = time.perf_counter()
-            await instance.stop()
-            record["stop_seconds"] = time.perf_counter() - stop
-            record["same_process_stop"] = {
-                "state": instance._state,
-                "last_error": instance._last_error,
-                "owned_thread_alive": thread.is_alive() if thread else False,
-            }
         record["summed_current_rss_bytes"] = (
             record["parent_rss_bytes"] + record["child_rss_bytes"]
         )
@@ -353,7 +284,11 @@ def main():
     samples = []
     for experiment in ("cold-import-only", "fixture-connected"):
         for channel in SDK:
-            for mode in ("same-process", "subprocess"):
+            for mode in (
+                ("same-process", "subprocess")
+                if experiment == "cold-import-only"
+                else ("subprocess",)
+            ):
                 for repeat in range(args.repeats):
                     result = subprocess.run(
                         [
@@ -401,8 +336,10 @@ def main():
             "makes these instrumented candidates, not pure production RSS. "
             "Fresh -I probes, common host imports warmed before timings; "
             "current psutil RSS bytes. Real SDKs; B3/B4 file-mailbox "
-            "platform/network substitutes. Same-process installed "
-            "channel.py vs subprocess installed Driver. Readiness includes "
+            "platform/network substitutes. Historical B5 "
+            "same-process Channel baseline is archived; current "
+            "connected measurement uses the installed Driver. "
+            "Readiness includes "
             "SDK/network boundary imports and connect: baseline timer "
             "starts before boundary import after Channel construction; "
             "subprocess timer starts at proxy.start before child "

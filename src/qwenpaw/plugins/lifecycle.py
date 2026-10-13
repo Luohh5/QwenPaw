@@ -642,6 +642,8 @@ class PluginLifecycle:
 
     # pylint: disable=too-many-return-statements,too-many-statements
     # pylint: disable=too-many-branches
+    # Lifecycle and Loader share the same locked transaction boundaries.
+    # pylint: disable=protected-access
     async def _update_config_unlocked(
         self,
         plugin_id: str,
@@ -660,6 +662,22 @@ class PluginLifecycle:
             )
         inst = self._instances.get(plugin_id)
         record = self._loader.get_loaded_plugin(plugin_id)
+        if record is not None and record.manifest.entry.descriptor is not None:
+            from .channel_adapter import describe_channel
+
+            try:
+                self._loader._require_channel_selection(record.manifest)
+                if record.enabled:
+                    await self._loader._prepare_channel_candidate(
+                        describe_channel(record.source_path, record.manifest),
+                    )
+            except Exception as exc:
+                return ConfigUpdateReport(
+                    plugin_id=plugin_id,
+                    ok=False,
+                    unchanged=True,
+                    errors=[str(exc)],
+                )
         if inst is None or record is None or record.instance is None:
             return ConfigUpdateReport(
                 plugin_id=plugin_id,
@@ -802,6 +820,8 @@ class PluginLifecycle:
             )
         return ConfigUpdateReport(plugin_id=plugin_id, ok=True)
 
+    # Lifecycle and Loader share the locked load boundary.
+    # pylint: disable=protected-access
     async def set_enabled(
         self,
         plugin_id: str,
@@ -813,7 +833,37 @@ class PluginLifecycle:
         from ..utils.io_utils import run_sync_io
 
         async with self._loader.plugin_lifecycle(plugin_id):
-            loaded = plugin_id in self._loader.get_all_loaded_plugins()
+            record = self._loader.get_loaded_plugin(plugin_id)
+            if enabled:
+                from .channel_adapter import require_channel_runtime_integrated
+
+                manifest = record.manifest if record is not None else None
+                if manifest is None:
+                    path = self._loader.find_installed_plugin_dir(plugin_id)
+                    if path is not None:
+                        # Lifecycle and Loader share this internal boundary.
+                        # pylint: disable=protected-access
+                        _, manifest = await run_sync_io(
+                            self._loader._read_source_manifest,
+                            path,
+                        )
+                        # pylint: enable=protected-access
+                # pylint: disable=protected-access
+                if (
+                    manifest is not None
+                    and self._loader._channel_runtime_for(manifest) is None
+                ):
+                    require_channel_runtime_integrated(manifest)
+                if (
+                    manifest is not None
+                    and manifest.entry.descriptor is not None
+                ):
+                    return await self._enable_channel_unlocked(
+                        plugin_id,
+                        record,
+                        manifest,
+                    )
+            loaded = record is not None
             if not enabled and loaded:
                 report = await self._unload_unlocked(
                     plugin_id,
@@ -841,10 +891,59 @@ class PluginLifecycle:
             )
             return self._loader.get_loaded_plugin(plugin_id)
 
+    async def _enable_channel_unlocked(self, plugin_id, record, manifest):
+        """Enable selected descriptors without a directory transaction."""
+        from .settings import persist_plugin_settings, runtime_config
+        from ..config.utils import load_config
+        from .channel_adapter import describe_channel
+        from ..utils.io_utils import run_sync_io
+
+        if record is not None and record.enabled and record.status == "active":
+            return record
+        source = (
+            record.source_path
+            if record is not None
+            else self._loader.find_installed_plugin_dir(plugin_id)
+        )
+        inst = self._instances.get(plugin_id)
+        config = (
+            dict(inst.config or {})
+            if inst is not None
+            else runtime_config((load_config().plugins or {}).get(plugin_id))
+        )
+        await self._loader._prepare_channel_candidate(
+            describe_channel(source, manifest),
+        )
+        if record is not None:
+            report = await self._unload_unlocked(
+                plugin_id,
+                UnloadMode.UNLOAD,
+                delete_files=False,
+            )
+            if not report.quiescent:
+                return report
+        config["enabled"] = True
+        record = await self._loader._load_plugin_unlocked(
+            manifest,
+            source,
+            config,
+            activate=True,
+        )
+        if record.status == "active" and record.enabled:
+            await run_sync_io(persist_plugin_settings, plugin_id, enabled=True)
+        return record
+
     async def unload_all(self, mode: UnloadMode) -> list[UnloadReport]:
         """Unload every known instance (used at process shutdown)."""
         reports: list[UnloadReport] = []
-        for plugin_id in list(self._instances):
+        owners = self._loader.registry.channel_owner_registrations()
+        for plugin_id in dict.fromkeys(
+            (
+                *self._instances,
+                *self._loader._channel_preparations,
+                *(row.plugin_id for row in owners),
+            ),
+        ):
             try:
                 reports.append(
                     await self.unload(plugin_id, mode, delete_files=False),
@@ -862,6 +961,8 @@ class PluginLifecycle:
                         plugin_id=plugin_id,
                         mode=mode,
                         clean=False,
+                        quiescent=False,
+                        needs_restart=True,
                         errors=[str(exc)],
                     ),
                 )
@@ -884,3 +985,5 @@ async def await_with_budget(
         raise TimeoutError(
             f"Plugin '{plugin_id}' {what} exceeded {seconds:.0f}s",
         ) from exc
+
+    # pylint: enable=protected-access

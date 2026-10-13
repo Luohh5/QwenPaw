@@ -87,6 +87,7 @@ def fake_agent_workspace():
     """Workspace stub whose ``config`` has channels + agent_id attribute."""
     workspace = MagicMock(name="Workspace")
     workspace.agent_id = "default"
+    workspace.channel_manager = None
     workspace.config = MagicMock(name="AgentConfig")
     workspace.config.channels = ChannelConfig(
         console=ConsoleConfig(enabled=True),
@@ -105,11 +106,11 @@ def patch_get_agent(fake_agent_workspace):
 
 
 # ---------------------------------------------------------------------------
-# /config/channels/types — pure list, no deps
+# /config/channels/types — editable workspace catalog
 # ---------------------------------------------------------------------------
 
 
-def test_list_channel_types_returns_list(client):
+def test_list_channel_types_returns_list(client, patch_get_agent):
     response = client.get("/api/config/channels/types")
 
     assert response.status_code == 200
@@ -982,3 +983,58 @@ def test_put_sandbox_admin_enabling_saves(client):
     assert body["enabled"] is True
     assert body["effective"] is True
     assert calls == [fake_cfg]
+
+
+def test_c6_validated_record_later_worker_failure_retains_HTTP_repair(
+    client,
+    app,
+    fake_agent_workspace,
+    patch_get_agent,
+    tmp_path,
+    monkeypatch,
+):
+    from qwenpaw.config.config import Config
+
+    installed = tmp_path / "plugins/feishu"
+    installed.mkdir(parents=True)
+    (installed / "plugin.json").write_text('{"id":"feishu"}')
+    monkeypatch.setattr(
+        "qwenpaw.config.utils.get_plugins_dir",
+        lambda: installed.parent,
+    )
+    monkeypatch.setattr("qwenpaw.config.utils.load_config", Config)
+    record = SimpleNamespace(
+        status="active",
+        enabled=True,
+        diagnostics=["channel_validation_passed"],
+    )
+    app.state.plugin_loader = SimpleNamespace(
+        get_loaded_plugin=lambda key: record if key == "feishu" else None,
+    )
+    health = {
+        "state": "failed",
+        "platform_state": "failed",
+        "last_error": "CHANNEL_DEPENDENCY_ORIGIN_INVALID",
+    }
+    channel = SimpleNamespace(
+        channel_process=SimpleNamespace(health_snapshot=lambda: health),
+    )
+    fake_agent_workspace.channel_manager = SimpleNamespace(
+        get_channel=AsyncMock(
+            side_effect=lambda key: channel if key == "feishu" else None,
+        ),
+    )
+    fake_agent_workspace.config.channels = ChannelConfig.model_validate(
+        {"saved_unknown": {"enabled": False, "options": []}},
+    )
+    monkeypatch.setenv("QWENPAW_ENABLED_CHANNELS", "console")
+    response = client.get("/api/config/channels/schemas")
+    assert response.status_code == 200, response.text
+    catalog = response.json()
+    assert "saved_unknown" in catalog and "dingtalk" in catalog
+    row = catalog["feishu"]
+    assert row["availability"] == "failed"
+    assert row["runtime_state"] == "failed"
+    assert row["diagnostic"] == "CHANNEL_DEPENDENCY_ORIGIN_INVALID"
+    assert row["repair"]["action"] == "repair"
+    assert row["repair"]["plugin_id"] == "feishu"

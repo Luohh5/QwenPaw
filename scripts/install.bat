@@ -467,6 +467,16 @@ if not exist "%VENV_QWENPAW%" (
     echo [qwenpaw] ERROR: Installation failed: qwenpaw CLI not found in venv
     exit /b 1
 )
+REM Exact extras select persisted intent; SDK presence never selects a preset.
+set "CHANNEL_PRESET_SELECTED="
+for %%E in (%ARG_EXTRAS:,= %) do (
+    if /i "%%E"=="channels" set "CHANNEL_PRESET_SELECTED=1"
+    if /i "%%E"=="full" set "CHANNEL_PRESET_SELECTED=1"
+)
+if defined CHANNEL_PRESET_SELECTED (
+    "%VENV_QWENPAW%" plugins preset apply channels-full --offline
+    if errorlevel 1 exit /b 1
+)
 echo [qwenpaw] QwenPaw installed successfully
 
 REM Check console availability (for PyPI installs, probe the installed package)

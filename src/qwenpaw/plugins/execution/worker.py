@@ -44,15 +44,19 @@ def _configure(
     ):
         if (root / namespace).exists() or (root / namespace).is_symlink():
             raise RuntimeError("BOOTSTRAP_UNAVAILABLE")
+    packet["_audit_sites"] = [
+        *packet["dependency_paths"],
+        *(item for item in sys.path if item),
+    ]
     sys.dont_write_bytecode = True
-    sys.path[:] = [str(root), str(support)] + [
+    sys.path[:] = [str(support)] + [
         item
         for item in sys.path
         if item and Path(item).resolve() not in {root, support}
     ]
     package = types.ModuleType("qwenpaw")
     package.__package__ = "qwenpaw"
-    package.__path__ = [str(root / "qwenpaw"), str(support / "qwenpaw")]
+    package.__path__ = [str(support / "qwenpaw")]
     sys.modules["qwenpaw"] = package
     plugins = types.ModuleType("qwenpaw.plugins")
     plugins.__package__ = "qwenpaw.plugins"
@@ -61,7 +65,7 @@ def _configure(
     for value in reversed(packet["dependency_paths"]):
         path = boot._absolute_existing_directory(value, "dependency_path")
         # Explicit directories do not execute .pth files.
-        sys.path.insert(2, str(path))
+        sys.path.insert(1, str(path))
     boot._clean_environment(())
 
 
@@ -82,7 +86,7 @@ async def run(
     )
     peer = runtime.peer(transport)
     identity = runtime.identity(packet)
-    context = runtime.context(peer, identity)
+    context = None
     component = None
     start_task = None
     stopped = asyncio.Event()
@@ -109,18 +113,26 @@ async def run(
         except Exception:
             await runtime.state(context, runtime.failed_state)
 
-    peer.register_method(runtime.control_prefix + "stop", stop)
+    mode = packet.get("mode", "run")
+    if mode == "run":
+        peer.register_method(runtime.control_prefix + "stop", stop)
     await peer.start()
     try:
-        entrypoint, source, hello = runtime.verify(boot, packet, identity)
-        accepted = await peer.call(
-            runtime.hello_method,
-            hello,
-            timeout=packet["startup_timeout"],
+        component_class = await _prepare_component(
+            boot,
+            packet,
+            runtime,
+            identity,
+            peer,
         )
-        if accepted != {"accepted": True}:
-            raise boot.BootstrapError("HELLO_REJECTED", "hello rejected")
-        component_class = boot._load_driver_class(entrypoint, source)
+        if mode != "run":
+            await peer.notify(
+                runtime.control_prefix + "inspected",
+                identity.to_mapping(),
+            )
+            await peer.wait_closed()
+            return
+        context = runtime.context(peer, identity)
         component = component_class()
         if any(
             not callable(getattr(component, name, None))
@@ -155,6 +167,62 @@ async def run(
         await peer.aclose()
 
 
+async def _prepare_component(boot, packet, runtime, identity, peer):
+    """Publish child evidence and optionally import a nonconnecting Driver."""
+    mode = packet.get("mode", "run")
+    from .dependencies import (
+        observe_dependencies,
+        validate_driver,
+        check_import_origins,
+        require_dependencies,
+    )
+
+    snapshot = observe_dependencies(packet)
+    accepted = await peer.call(
+        "execution.dependencies",
+        {
+            "identity": identity.to_mapping(),
+            "snapshot": snapshot.to_mapping(),
+        },
+        timeout=packet["startup_timeout"],
+    )
+    if accepted != {"accepted": True}:
+        raise boot.BootstrapError("HELLO_REJECTED", "evidence rejected")
+    if mode == "audit":
+        if (
+            boot._hash_code_root(Path(packet["code_root"]))
+            != packet["source_revision"]
+        ):
+            raise boot.BootstrapError(
+                "SOURCE_REVISION_MISMATCH",
+                "source mismatch",
+            )
+        return None
+    relevant = require_dependencies(snapshot, packet)
+    packet["dependency_versions"] = snapshot.versions
+    entrypoint, source, hello = runtime.verify(boot, packet, identity)
+    accepted = await peer.call(
+        runtime.hello_method,
+        hello,
+        timeout=packet["startup_timeout"],
+    )
+    if accepted != {"accepted": True}:
+        raise boot.BootstrapError("HELLO_REJECTED", "hello rejected")
+    # Candidate paths enter only after trusted metadata/protocol imports.
+    root = Path(packet["code_root"])
+    sys.path.insert(0, str(root))
+    sys.modules["qwenpaw"].__path__.insert(0, str(root / "qwenpaw"))
+    component_class = boot._load_driver_class(entrypoint, source)
+    check_import_origins(
+        snapshot,
+        Path(packet["code_root"]).resolve(),
+        relevant,
+    )
+    if mode == "probe":
+        validate_driver(component_class)
+    return component_class
+
+
 async def _report_error(
     peer: Any,
     identity: Any,
@@ -175,6 +243,33 @@ async def _report_error(
         pass
 
 
+def _guard_inspection(boot):
+    """Python audit guard installed before any candidate path is admitted."""
+
+    def guard(event, _args):
+        if event in {
+            "socket.connect",
+            "socket.sendto",
+            "socket.sendmsg",
+            "socket.bind",
+            "socket.getaddrinfo",
+            "socket.gethostbyname",
+            "socket.gethostbyaddr",
+            "subprocess.Popen",
+            "os.system",
+            "os.posix_spawn",
+            "os.fork",
+            "os.forkpty",
+            "os.exec",
+        }:
+            raise boot.BootstrapError(
+                "PROBE_NETWORK_OR_PROCESS_DENIED",
+                "inspection operation denied",
+            )
+
+    sys.addaudithook(guard)
+
+
 def main(
     runtime_factory: Any = None,
     *,
@@ -191,6 +286,8 @@ def main(
         if len(raw) > 1024 * 1024 or not raw.endswith(b"\n"):
             return 70
         packet = json.loads(raw)
+        if packet.get("mode", "run") != "run":
+            _guard_inspection(boot)
         _configure(boot, packet, protected_namespaces)
         from qwenpaw.plugins.execution.runtime import Runtime
 

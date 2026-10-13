@@ -582,6 +582,7 @@ class Workspace:
                 post_init=create_channel_service,
                 start_method="start_all",
                 stop_method="stop_all",
+                require_clean_stop=True,
                 priority=30,
                 concurrent_init=False,
             ),
@@ -695,6 +696,9 @@ class Workspace:
             return
 
         self._start_attempted = True
+        from ...plugins.registry import PluginRegistry
+
+        PluginRegistry().projector.track_workspace(self)
 
         logger.info(
             f"Starting workspace: {sanitize_log_value(self.agent_id)}",
@@ -844,7 +848,14 @@ class Workspace:
         # Reload candidates and draining old instances may share an agent id.
         from ...plugins.registry import PluginRegistry
 
+        if self.channel_manager is not None:
+            from ...plugins.lifecycle import QuiescenceError
+
+            if not await self.channel_manager.quiesce():
+                raise QuiescenceError("CHANNEL_DRAIN_TIMEOUT")
         await PluginRegistry().projector.revoke_workspace(self)
+        if self.channel_manager is not None:
+            await self.channel_manager.stop_all()
 
         # Stop all services via ServiceManager (handles reuse automatically)
         await self._service_manager.stop_all(
@@ -858,6 +869,7 @@ class Workspace:
 
         self._started = False
         self._start_attempted = False
+        PluginRegistry().projector.forget_workspace(self)
         logger.info(
             f"Workspace stopped: {sanitize_log_value(self.agent_id)}",
         )

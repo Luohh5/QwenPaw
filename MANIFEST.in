@@ -1,0 +1,4 @@
+include scripts/pack/generate_plugin_metadata.py
+recursive-include plugins/channel/feishu *.py *.json *.txt *.md
+recursive-include plugins/channel/dingtalk *.py *.json *.txt *.md
+global-exclude __pycache__ *.py[cod] .DS_Store

@@ -59,22 +59,40 @@ class TestPluginRuntimeDirs:
     def test_runtime_dir_under_working_dir(self, working_dir):
         assert pl._plugin_runtime_dir() == working_dir / "plugin_runtime"
 
-    def test_site_dir_bucketed_and_created(self, working_dir):
+    def test_site_dir_bucketed_without_creating_environment(self, working_dir):
         site = pl._plugin_site_dir()
-        assert site.is_dir()
+        assert not site.exists()
+        assert not (working_dir / "plugin_runtime").exists()
         assert site.name == "site"
         assert f"py{sys.version_info.major}.{sys.version_info.minor}" in (
             str(site)
         )
 
-    def test_install_lock_path_sanitised(self, working_dir):
-        lock = pl._install_lock_path("my plugin/id")
-        assert lock.name == "my_plugin_id.lock"
-        assert lock.parent == working_dir / "plugin_runtime" / "install-locks"
+    def test_normal_install_lock_is_shared_by_environment(
+        self,
+        working_dir,
+        monkeypatch,
+    ):
+        target = working_dir / "shared" / "site-packages"
+        monkeypatch.setattr(pl, "_is_frozen", lambda: False)
+        monkeypatch.setattr("sysconfig.get_path", lambda _name: str(target))
+        expected = working_dir / "shared" / ".site-packages.dependencies.lock"
+        assert pl._install_lock_path("my plugin/id") == expected
+        assert pl._install_lock_path("demo-1.0") == expected
+        assert not target.parent.exists()
 
-    def test_install_lock_path_simple(self, working_dir):
-        lock = pl._install_lock_path("demo-1.0")
-        assert lock.name == "demo-1.0.lock"
+    def test_frozen_install_lock_is_shared_by_environment(
+        self,
+        working_dir,
+        monkeypatch,
+    ):
+        target = working_dir / "frozen-shared" / "site"
+        monkeypatch.setattr(pl, "_is_frozen", lambda: True)
+        monkeypatch.setattr(pl, "_plugin_site_dir", lambda: target)
+        expected = working_dir / "frozen-shared" / ".site.dependencies.lock"
+        assert pl._install_lock_path("my plugin/id") == expected
+        assert pl._install_lock_path("demo-1.0") == expected
+        assert not target.parent.exists()
 
 
 class TestNormRealpath:

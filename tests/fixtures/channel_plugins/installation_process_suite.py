@@ -67,17 +67,21 @@ async def test_installed_layout_receive_send_restart_stop(
 
     instrument(monkeypatch)
     rt = await runtime()
-    installed = rt.spec.code_root / CHANNEL
+    installed = rt.spec.code_root
+    package = installed / CHANNEL
     assert not installed.is_relative_to(contracts.ROOT / "plugins")
     for name in (
         "plugin.json",
         "channel.json",
         "requirements.txt",
-        "driver.py",
         "README.md",
-        "__init__.py",
     ):
         assert (installed / name).is_file()
+    for name in ("driver.py", "__init__.py"):
+        assert (package / name).is_file()
+    assert rt.spec.descriptor_path == installed / "channel.json"
+    formal_manifest = json.loads((installed / "plugin.json").read_text())
+    assert formal_manifest["entry"] == {"descriptor": "channel.json"}
     source_descriptor = json.loads(
         (
             contracts.ROOT / "plugins/channel" / CHANNEL / "channel.json"
@@ -96,9 +100,7 @@ async def test_installed_layout_receive_send_restart_stop(
     assert (
         f"{CHANNEL}.platform" in origins or f"{CHANNEL}.transport" in origins
     )
-    assert all(
-        Path(path).is_relative_to(installed) for path in origins.values()
-    )
+    assert all(Path(path).is_relative_to(package) for path in origins.values())
     assert rt.process.health_snapshot()["pid"] != os.getpid()
     rt.emit(contracts.message("installed-first"))
     await contracts.eventually(lambda: len(rt.queued) == 1)

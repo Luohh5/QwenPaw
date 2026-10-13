@@ -57,6 +57,9 @@ class MultiAgentManager:
         )
         self._cleanup_tasks: Set[asyncio.Task] = set()
         self._config_generations: Dict[str, int] = {}
+        self._operation_locks: dict[str, asyncio.Lock] = {}
+        self._operations: set[asyncio.Task] = set()
+        self._closing = False
         logger.debug("MultiAgentManager initialized")
 
     def note_agent_config_changed(self, agent_id: str) -> int:
@@ -109,6 +112,8 @@ class MultiAgentManager:
                 exc_info=True,
             )
 
+    # Workspace preparation and recovery own the manager service internals.
+    # pylint: disable=protected-access
     async def _prepare_reload_candidate(
         self,
         candidate: Workspace,
@@ -134,8 +139,9 @@ class MultiAgentManager:
                     f"{list(reusable.keys())}",
                 )
 
-        await candidate.start()
+        candidate._defer_channel_start = True
         candidate.set_manager(self)
+        await candidate.start()
         await self._setup_workspace_plugins(candidate, str(workspace_dir))
         logger.info(f"New workspace instance started: {agent_id}")
         return reusable
@@ -165,7 +171,45 @@ class MultiAgentManager:
         """Return an already loaded workspace without starting it."""
         return self.agents.get(agent_id)
 
+    def _has_failed_owner(self, agent_id):
+        return (
+            agent_id in self.agents
+            and self._agent_startup_statuses.get(agent_id)
+            is AgentStartupStatus.FAILED
+        )
+
+    def _check_startup_status(self, agent_id):
+        if self._has_failed_owner(agent_id):
+            raise ConfigurationException(
+                config_key="agent",
+                message=(
+                    f"Agent {agent_id!r} startup cleanup is incomplete; "
+                    "stop it before retrying"
+                ),
+            )
+
     async def get_agent(self, agent_id: str) -> Workspace:
+        self._check_startup_status(agent_id)
+        if self._closing:
+            raise RuntimeError("Workspace manager is stopping")
+        if agent_id in self.agents:
+            return self.agents[agent_id]
+        await self._wait_for_scheduled_startup(agent_id)
+        return await self._run_agent_operation(agent_id, self._get_agent)
+
+    async def _run_agent_operation(self, agent_id, operation):
+        lock = self._operation_locks.setdefault(agent_id, asyncio.Lock())
+        task = asyncio.current_task()
+        self._operations.add(task)
+        try:
+            async with lock:
+                if self._closing:
+                    raise RuntimeError("Workspace manager is stopping")
+                return await operation(agent_id)
+        finally:
+            self._operations.discard(task)
+
+    async def _get_agent(self, agent_id: str) -> Workspace:
         """Get agent workspace by ID (lazy loading with dedup).
 
         If workspace doesn't exist in memory, it will be created and started.
@@ -184,7 +228,7 @@ class MultiAgentManager:
         Raises:
             ConfigurationException: If agent ID not found in configuration
         """
-        await self._wait_for_scheduled_startup(agent_id)
+        self._check_startup_status(agent_id)
 
         # Fast path: already loaded (no lock)
         if agent_id in self.agents:
@@ -244,14 +288,15 @@ class MultiAgentManager:
 
         # We are the starter — create outside the lock for parallelism
         t0 = time.perf_counter()
+        instance = None
         try:
             logger.debug(f"Creating new workspace: {agent_id}")
             instance = self._create_workspace(
                 agent_id=agent_id,
                 workspace_dir=agent_ref.workspace_dir,
             )
-            await instance.start()
             instance.set_manager(self)
+            await instance.start()
 
             async with self._lock:
                 self.agents[agent_id] = instance
@@ -273,28 +318,57 @@ class MultiAgentManager:
             )
 
             return instance
-        except Exception as e:
+        except BaseException as e:
+            if (
+                instance is not None
+                and self.agents.get(agent_id) is not instance
+            ):
+                await run_async_to_completion(
+                    self._cleanup_unpublished_workspace(agent_id, instance),
+                )
             logger.error(
                 f"Failed to start workspace {sanitize_log_value(agent_id)}: "
                 f"{sanitize_log_value(e)}",
             )
             raise
         finally:
-            # Always clean up pending state and signal waiters
-            # This handles cancellation (CancelledError) and all other cases
-            async with self._lock:
-                self._pending_starts.pop(agent_id, None)
-                if agent_id in self.agents:
-                    self._agent_startup_statuses[
-                        agent_id
-                    ] = AgentStartupStatus.RUNNING
-                elif self._agent_startup_statuses.get(agent_id) == (
-                    AgentStartupStatus.STARTING
+            await run_async_to_completion(
+                self._finish_agent_startup(agent_id, event),
+            )
+
+    async def _finish_agent_startup(self, agent_id, event):
+        async with self._lock:
+            self._pending_starts.pop(agent_id, None)
+            if agent_id in self.agents:
+                if (
+                    self._agent_startup_statuses.get(agent_id)
+                    is not AgentStartupStatus.FAILED
                 ):
                     self._agent_startup_statuses[
                         agent_id
-                    ] = AgentStartupStatus.FAILED
-            event.set()
+                    ] = AgentStartupStatus.RUNNING
+            elif self._agent_startup_statuses.get(agent_id) == (
+                AgentStartupStatus.STARTING
+            ):
+                self._agent_startup_statuses[
+                    agent_id
+                ] = AgentStartupStatus.FAILED
+        event.set()
+
+    async def _cleanup_unpublished_workspace(self, agent_id, instance):
+        try:
+            await instance.stop()
+        except BaseException:
+            async with self._lock:
+                self.agents[agent_id] = instance
+                self._agent_startup_statuses[
+                    agent_id
+                ] = AgentStartupStatus.FAILED
+            logger.warning(
+                "Workspace startup cleanup retained owner for %s",
+                agent_id,
+                exc_info=True,
+            )
 
     @staticmethod
     async def _run_workspace_hooks(
@@ -482,6 +556,9 @@ class MultiAgentManager:
                 )
 
     async def stop_agent(self, agent_id: str) -> bool:
+        return await self._run_agent_operation(agent_id, self._stop_agent)
+
+    async def _stop_agent(self, agent_id: str) -> bool:
         """Stop a specific agent instance.
 
         Args:
@@ -549,6 +626,11 @@ class MultiAgentManager:
             )
 
     async def reload_agent(self, agent_id: str) -> bool:
+        return await self._run_agent_operation(agent_id, self._reload_agent)
+
+    # One transaction keeps the candidate/old ownership rollback explicit.
+    # pylint: disable=too-many-branches,too-many-statements,protected-access
+    async def _reload_agent(self, agent_id: str) -> bool:
         """Reload a specific agent instance with zero-downtime.
 
         This method performs a seamless reload by:
@@ -593,7 +675,7 @@ class MultiAgentManager:
 
         # Step 1.5: Stop old config watcher (no-op if it triggered
         # this reload, since it already disabled itself).
-        await self._stop_old_config_watcher(old_instance, agent_id)
+        # Stop the old watcher only once channel handoff has succeeded.
 
         # Step 2: Load configuration (outside lock)
         config = load_config()
@@ -617,12 +699,50 @@ class MultiAgentManager:
         # Until the atomic swap commits, this manager exclusively owns the
         # candidate and must stop it on every exit path.
         candidate_committed = False
+        old_channels_stopped = False
+        old_manager = getattr(old_instance, "channel_manager", None)
+        old_keys = (
+            [ch.channel for ch in old_manager.channels] if old_manager else []
+        )
         try:
             reusable = await self._prepare_reload_candidate(
                 new_instance,
                 agent_id,
                 agent_ref.workspace_dir,
             )
+
+            from ..plugins.registry import PluginRegistry
+            from ..plugins.lifecycle import QuiescenceError
+
+            if (
+                self.agents.get(agent_id) is not old_instance
+                or self._config_generations.get(agent_id, 0) != generation
+            ):
+                await self._discard_reload_candidate(
+                    new_instance,
+                    agent_id,
+                    "stale",
+                )
+                return False
+            if old_manager is not None:
+                if not await old_manager.quiesce():
+                    raise QuiescenceError("CHANNEL_DRAIN_TIMEOUT")
+                # Rollback must also recover a partially stopped set.
+                old_channels_stopped = True
+                await old_manager.stop_all()
+            new_instance._defer_channel_start = False
+            new_manager = getattr(new_instance, "channel_manager", None)
+            if new_manager is not None:
+                new_manager._defer_channel_start = False
+                await new_manager.start_all()
+            await PluginRegistry().projector.project_workspace_channels(
+                new_instance,
+            )
+            if self._config_generations.get(agent_id, 0) != generation:
+                raise RuntimeError(
+                    "Workspace config changed during channel handoff",
+                )
+            await self._stop_old_config_watcher(old_instance, agent_id)
 
             # Step 4: Atomic swap (minimal lock time). Do not await candidate
             # cleanup while holding this lock.
@@ -652,6 +772,10 @@ class MultiAgentManager:
                 error,
             )
 
+            if old_channels_stopped and old_manager is not None:
+                await run_async_to_completion(
+                    self._restore_channels(old_instance, old_keys),
+                )
             if isinstance(error, asyncio.CancelledError):
                 raise
             if isinstance(error, Exception):
@@ -666,6 +790,10 @@ class MultiAgentManager:
                 agent_id,
                 discard_reason,
             )
+            if old_channels_stopped:
+                await run_async_to_completion(
+                    self._restore_channels(old_instance, old_keys),
+                )
             return False
 
         logger.info(f"Workspace instance replaced: {agent_id}")
@@ -699,6 +827,26 @@ class MultiAgentManager:
 
         return True
 
+    # pylint: enable=too-many-branches,too-many-statements
+
+    # pylint: disable=protected-access
+    async def _restore_channels(self, workspace, keys):
+        from ..plugins.registry import PluginRegistry
+
+        manager = workspace.channel_manager
+        await manager.start_all()
+        for key in keys:
+            if manager._find_channel(key) is None:
+                try:
+                    await manager.start_one(key, manager._workspace_config)
+                except Exception:
+                    logger.exception(
+                        "Unable to restore channel '%s'; retaining owner",
+                        key,
+                    )
+        manager.resume_ingress()
+        await PluginRegistry().projector.project_workspace_channels(workspace)
+
     async def cancel_all_cleanup_tasks(self) -> None:
         """Cancel and await all pending delayed cleanup tasks.
 
@@ -725,34 +873,41 @@ class MultiAgentManager:
         logger.info("All cleanup tasks cancelled/completed")
 
     async def stop_all(self):
-        """Stop all agent instances concurrently.
+        """Retain failed live and preparing workspaces for cleanup retries."""
+        from ..plugins.registry import PluginRegistry
+        from ..plugins.lifecycle import QuiescenceError
 
-        Called during application shutdown to clean up resources.
-        Cancels any pending delayed cleanup tasks and stops all
-        agents in parallel via asyncio.gather.
-        """
-        logger.info(
-            f"Stopping all agents ({len(self.agents)} running)...",
-        )
-
+        self._closing = True
+        operations = [
+            task
+            for task in self._operations
+            if task is not asyncio.current_task()
+        ]
+        for task in operations:
+            task.cancel()
+        if operations:
+            _, pending = await asyncio.wait(operations, timeout=5.0)
+            if pending:
+                raise QuiescenceError("Workspace preparation is still pending")
         await self.cancel_all_startup_tasks()
         await self.cancel_all_cleanup_tasks()
-
-        async def _stop_one(agent_id: str, instance: Workspace):
+        workspaces = {id(ws): ws for ws in self.agents.values()}
+        for ws in PluginRegistry().projector.workspaces():
+            if getattr(ws, "_manager", None) is self:
+                workspaces[id(ws)] = ws
+        failures = []
+        for workspace in workspaces.values():
             try:
-                await instance.stop()
-                logger.debug(f"Agent stopped: {agent_id}")
-            except Exception as e:
-                logger.error(
-                    f"Error stopping agent {agent_id}: {e}",
-                )
-
-        await asyncio.gather(
-            *(_stop_one(aid, inst) for aid, inst in self.agents.items()),
-        )
-
-        self.agents.clear()
-        logger.info("All agents stopped")
+                await workspace.stop()
+            except Exception as exc:
+                failures.append(str(exc))
+                continue
+            if self.agents.get(workspace.agent_id) is workspace:
+                self.agents.pop(workspace.agent_id, None)
+        if failures:
+            raise QuiescenceError(
+                "Workspace cleanup failed: " + "; ".join(failures),
+            )
 
     def list_loaded_agents(self) -> list[str]:
         """List currently loaded agent IDs.
@@ -840,10 +995,12 @@ class MultiAgentManager:
         if existing_task is not None and not existing_task.done():
             return existing_task
 
-        if agent_id in self.agents:
-            self._agent_startup_statuses[agent_id] = AgentStartupStatus.RUNNING
-        else:
-            self._agent_startup_statuses[agent_id] = AgentStartupStatus.PENDING
+        if not self._has_failed_owner(agent_id):
+            self._agent_startup_statuses[agent_id] = (
+                AgentStartupStatus.RUNNING
+                if agent_id in self.agents
+                else AgentStartupStatus.PENDING
+            )
 
         task = asyncio.create_task(
             self._start_agent_with_limit(agent_id),
@@ -861,7 +1018,7 @@ class MultiAgentManager:
     async def _start_agent_with_limit(self, agent_id: str) -> bool:
         """Start one custom agent inside the process-wide startup bound."""
         if agent_id in self.agents:
-            return True
+            return not self._has_failed_owner(agent_id)
         async with self._custom_startup_semaphore:
             return await self.preload_agent(agent_id)
 
@@ -903,6 +1060,8 @@ class MultiAgentManager:
 
         async with self._lock:
             for agent_id, ref in config.agents.profiles.items():
+                if self._has_failed_owner(agent_id):
+                    continue
                 enabled = getattr(ref, "enabled", True)
                 if not enabled:
                     status = AgentStartupStatus.DISABLED
@@ -918,8 +1077,7 @@ class MultiAgentManager:
             logger.warning("No enabled agents configured in config")
             return {}
 
-        total_agents = len(config.agents.profiles)
-        disabled_count = total_agents - len(agent_ids)
+        disabled_count = len(config.agents.profiles) - len(agent_ids)
         logger.debug(
             f"Starting {len(agent_ids)} enabled agent(s) "
             f"({disabled_count} disabled)",
@@ -968,6 +1126,7 @@ class MultiAgentManager:
         if core_result_map.get("default") is False:
             custom_result_map = {
                 agent_id: agent_id in self.agents
+                and not self._has_failed_owner(agent_id)
                 for agent_id in custom_agent_ids
             }
             logger.error(

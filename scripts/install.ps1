@@ -326,6 +326,11 @@ if ($FromSource) {
 
 # Verify the CLI entry point exists
 if (-not (Test-Path $VenvQwenpaw)) { Stop-WithError "Installation failed: qwenpaw CLI not found in venv" }
+$SelectedExtras = @($Extras -split ',' | ForEach-Object { $_.Trim().ToLowerInvariant() })
+if ($SelectedExtras -contains 'channels' -or $SelectedExtras -contains 'full') {
+    & $VenvQwenpaw plugins preset apply channels-full --offline
+    if ($LASTEXITCODE -ne 0) { Stop-WithError "Channel preset setup failed" }
+}
 
 Write-Info "QwenPaw installed successfully"
 

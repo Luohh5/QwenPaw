@@ -20,6 +20,8 @@ def main() -> int:
     # This development-only command is the sole schema-generation importer.
     from qwenpaw.config.config import DingTalkConfig, FeishuConfig
     from qwenpaw.channel_protocol.shared import SharedChannelDescriptor
+    from qwenpaw.plugins.architecture import PluginManifest
+    from qwenpaw.plugins.channel_adapter import describe_channel
 
     stale = []
     for key, model, label, driver, capabilities in (
@@ -59,7 +61,16 @@ def main() -> int:
                 "capabilities": capabilities,
             },
         )
-        path = root / "plugins" / "channel" / key / "channel.json"
+        plugin_root = root / "plugins" / "channel" / key
+        manifest = PluginManifest.from_dict(
+            json.loads((plugin_root / "plugin.json").read_text()),
+        )
+        if manifest.entry.descriptor != "channel.json":
+            raise ValueError("Candidate must declare channel.json")
+        for relative in (f"{key}/__init__.py", f"{key}/driver.py"):
+            if not (plugin_root / relative).is_file():
+                raise FileNotFoundError(plugin_root / relative)
+        path = plugin_root / "channel.json"
         content = (
             json.dumps(descriptor.to_mapping(), ensure_ascii=False, indent=2)
             + "\n"
@@ -72,6 +83,7 @@ def main() -> int:
                 stale.append(str(path.relative_to(root)))
         else:
             path.write_text(content, encoding="utf-8")
+        describe_channel(plugin_root, manifest)
     if stale:
         print("Stale shared descriptors: " + ", ".join(stale), file=sys.stderr)
         return 1

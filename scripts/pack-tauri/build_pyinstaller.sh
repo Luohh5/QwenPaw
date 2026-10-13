@@ -178,6 +178,23 @@ echo "== Installing bundled Python helper dependencies =="
     --check-runtime
 echo ""
 
+echo "== Building readable channel runtime =="
+CHANNEL_WHEELS="${DIST}/channel-wheels"
+rm -rf "$CHANNEL_WHEELS" "${BINARIES_DIR}/channel-runtime"
+mkdir -p "$CHANNEL_WHEELS"
+"$PYTHON_BIN" -c 'import setuptools.build_meta as backend, sys; backend.build_wheel(sys.argv[1])' "$CHANNEL_WHEELS"
+HOST_WHEELS=("$CHANNEL_WHEELS"/qwenpaw-*.whl)
+[ "${#HOST_WHEELS[@]}" -eq 1 ] || { echo "Expected one host wheel"; exit 1; }
+# Resolve with the actual target interpreter. Local acceptance invokes the
+# offline stager directly with available artifacts, never this download step.
+"$NATIVE_HOST_PYTHON" -m pip download --only-binary=:all: \
+    --dest "$CHANNEL_WHEELS" "${HOST_WHEELS[0]}[channels]"
+"$PYTHON_BIN" "${REPO_ROOT}/scripts/pack-tauri/stage_channel_runtime.py" \
+    --python "$NATIVE_HOST_PYTHON" --wheel "${HOST_WHEELS[0]}" \
+    --resource-dir "${REPO_ROOT}/console/src-tauri" \
+    --wheelhouse "$CHANNEL_WHEELS" \
+    --python-runtime-release "$(cat "${PYTHON_RUNTIME_DIR}/.python-runtime-version")"
+
 echo "== Staging bundled Node runtime =="
 "$PYTHON_BIN" "${REPO_ROOT}/scripts/pack-tauri/stage_node_runtime.py" \
     --dest "${BINARIES_DIR}/node-runtime"

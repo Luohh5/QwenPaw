@@ -13,7 +13,7 @@ from fastapi import (
     Query,
     Request,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from ...agents.acp.core import ACPAgentConfig, ACPConfig
 from ...agents.acp.node_runtime import (
@@ -26,7 +26,6 @@ from ...config import (
     ChannelConfigUnion,
     ToolGuardConfig,
     ToolGuardRuleConfig,
-    get_available_channels,
     load_config,
 )
 from ...config.utils import mutate_config
@@ -48,6 +47,10 @@ from ..channels.qrcode_auth_handler import (
     generate_qrcode_image,
 )
 from ..channels.registry import BUILTIN_CHANNEL_KEYS
+from ..channels.catalog import (
+    get_configurable_channel_catalog,
+    clean_channel_config,
+)
 from ..utils import schedule_agent_reload
 from .schemas_config import (
     ChannelConflictAgent,
@@ -139,7 +142,9 @@ async def list_channels(request: Request) -> dict:
 
     agent = await get_agent_for_request(request)
     agent_config = agent.config
-    available = get_available_channels()
+    available = get_configurable_channel_catalog(
+        agent.config.channels.model_dump() if agent.config.channels else (),
+    )
 
     # Get channel configs from agent's config (with fallback to empty)
     channels_config = agent_config.channels
@@ -153,7 +158,7 @@ async def list_channels(request: Request) -> dict:
 
     # Return all available channels (use default config if not saved)
     result = {}
-    for key in available:
+    for key, metadata in available.items():
         if key in all_configs:
             channel_data = (
                 dict(all_configs[key])
@@ -162,7 +167,12 @@ async def list_channels(request: Request) -> dict:
             )
         else:
             # Channel registered but no config saved yet, use empty default
-            channel_data = {"enabled": False, "bot_prefix": ""}
+            channel_data = dict(
+                metadata.get(
+                    "defaults",
+                    {"enabled": False, "bot_prefix": ""},
+                ),
+            )
         if isinstance(channel_data, dict):
             channel_data["isBuiltin"] = key in BUILTIN_CHANNEL_KEYS
         result[key] = channel_data
@@ -175,34 +185,57 @@ async def list_channels(request: Request) -> dict:
     summary="List channel types",
     description="Return all available channel type identifiers",
 )
-async def list_channel_types() -> List[str]:
-    """Return available channel type identifiers (env-filtered)."""
-    return list(get_available_channels())
+async def list_channel_types(request: Request) -> List[str]:
+    """Configurable types are independent of runtime gates."""
+    return list(await list_channel_schemas(request))
 
 
-@router.get(
-    "/channels/schemas",
-    summary="Get plugin channel config schemas",
-    description=(
-        "Return config_fields metadata for plugin-registered channels "
-        "so the frontend can render dynamic forms."
-    ),
-)
-async def list_channel_schemas() -> dict:
-    """Return plugin channel schemas for frontend form rendering."""
-    from ...plugins.registry import PluginRegistry
+@router.get("/channels/schemas", summary="Get editable channel schemas")
+async def list_channel_schemas(request: Request) -> dict:
+    from ..agent_context import get_agent_for_request
 
-    registry = PluginRegistry()
-    result: dict = {}
-    for key, reg in registry.get_registered_channels().items():
-        result[key] = {
-            "label": reg.label,
-            "description": reg.description,
-            "plugin_id": reg.plugin_id,
-            "config_fields": reg.config_fields,
-            "icon": reg.icon,
-            "doc_url": reg.doc_url,
-        }
+    agent = await get_agent_for_request(request)
+    saved = agent.config.channels.model_dump() if agent.config.channels else {}
+    result = get_configurable_channel_catalog(saved)
+    loader = getattr(request.app.state, "plugin_loader", None)
+    if loader is not None:
+        for key, row in result.items():
+            record = loader.get_loaded_plugin(row.get("plugin_id", key))
+            if record is not None and record.status == "failed":
+                row.update(
+                    availability="failed",
+                    diagnostic="; ".join(record.diagnostics),
+                )
+            elif (
+                record is not None
+                and record.enabled
+                and "channel_validation_passed" in record.diagnostics
+            ):
+                row["availability"] = "validated"
+    manager = getattr(agent, "channel_manager", None)
+    if manager is not None:
+        for key, row in result.items():
+            if row.get("process_mode") != "runner_process":
+                continue
+            channel = await manager.get_channel(key)
+            process = getattr(channel, "channel_process", None)
+            if process is None:
+                continue
+            health = process.health_snapshot()
+            row["runtime_state"] = health["platform_state"]
+            if (
+                health["state"] == "ready"
+                and health["platform_state"] == "connected"
+            ):
+                row["availability"] = "running"
+            elif health["last_error"]:
+                row.update(
+                    availability="failed",
+                    diagnostic=health["last_error"],
+                )
+    for row in result.values():
+        if row.get("availability") in {"running", "validated"}:
+            row.pop("repair", None)
     return result
 
 
@@ -224,6 +257,13 @@ async def put_channels(
     from ..agent_context import get_agent_for_request
 
     agent = await get_agent_for_request(request)
+    current = (
+        agent.config.channels.model_dump() if agent.config.channels else {}
+    )
+    incoming = channels_config.model_dump()
+    for key in channels_config.model_fields_set:
+        current[key] = clean_channel_config(incoming[key])
+    channels_config = ChannelConfig.model_validate(current)
     agent.config.channels = channels_config
     save_agent_config(agent.agent_id, agent.config)
 
@@ -247,7 +287,10 @@ async def _resolve_channel_manager(
     """Shared dependency: validate channel name and return channel_manager."""
     from ..agent_context import get_agent_for_request
 
-    available = get_available_channels()
+    agent = await get_agent_for_request(request)
+    available = get_configurable_channel_catalog(
+        agent.config.channels.model_dump() if agent.config.channels else (),
+    )
     if channel_name not in available:
         raise HTTPException(
             status_code=404,
@@ -377,7 +420,7 @@ async def get_channel_qrcode_status(
 
 @router.get(
     "/channels/{channel_name}",
-    response_model=ChannelConfigUnion,
+    response_model=ChannelConfigUnion | dict,
     summary="Get channel config",
     description="Retrieve configuration for a specific channel by name",
 )
@@ -392,7 +435,10 @@ async def get_channel(
     """Get a specific channel config by name."""
     from ..agent_context import get_agent_for_request
 
-    available = get_available_channels()
+    agent = await get_agent_for_request(request)
+    available = get_configurable_channel_catalog(
+        agent.config.channels.model_dump() if agent.config.channels else (),
+    )
     if channel_name not in available:
         raise HTTPException(
             status_code=404,
@@ -440,7 +486,10 @@ async def check_channel_conflict(
     """Check a proposed config against channels in running agents."""
     from ..agent_context import get_agent_for_request
 
-    available = get_available_channels()
+    agent = await get_agent_for_request(request)
+    available = get_configurable_channel_catalog(
+        agent.config.channels.model_dump() if agent.config.channels else (),
+    )
     if channel_name not in available:
         raise HTTPException(
             status_code=404,
@@ -505,7 +554,7 @@ async def check_channel_conflict(
 
 @router.put(
     "/channels/{channel_name}",
-    response_model=ChannelConfigUnion,
+    response_model=ChannelConfigUnion | dict,
     summary="Update channel config",
     description="Update configuration for a specific channel by name",
 )
@@ -525,7 +574,10 @@ async def put_channel(
     from ...config.config import save_agent_config
     from ..agent_context import get_agent_for_request
 
-    available = get_available_channels()
+    agent = await get_agent_for_request(request)
+    available = get_configurable_channel_catalog(
+        agent.config.channels.model_dump() if agent.config.channels else (),
+    )
     if channel_name not in available:
         raise HTTPException(
             status_code=404,
@@ -538,9 +590,16 @@ async def put_channel(
     if agent.config.channels is None:
         agent.config.channels = ChannelConfig()
 
+    single_channel_config = clean_channel_config(single_channel_config)
     config_class = _channel_config_class(channel_name)
     if config_class is not None:
-        channel_config = config_class(**single_channel_config)
+        try:
+            channel_config = config_class(**single_channel_config)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=exc.errors(include_context=False),
+            ) from exc
     else:
         # For custom channels, just use the dict
         channel_config = single_channel_config

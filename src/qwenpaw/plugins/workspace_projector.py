@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# pylint: disable=protected-access
+# Projector coordinates manager ownership and immutable generation bindings.
 """Project process-level plugin intents onto live workspaces."""
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ class WorkspaceIntent:
     pending: dict[str, asyncio.Task[None]] = field(default_factory=dict)
     retiring: dict[str, Callable[[], Any]] = field(default_factory=dict)
     revoking: bool = False
+    active: bool = True
 
 
 @dataclass
@@ -66,6 +69,62 @@ class WorkspaceProjector:
     ) -> None:
         self._intents: list[WorkspaceIntent] = []
         self._live = live_workspaces or default_live_workspaces
+        self._preparing: dict[int, Any] = {}
+
+    def track_workspace(self, workspace):
+        """Publish preparing resources before any startup can suspend."""
+        self._preparing[id(workspace)] = workspace
+
+    def forget_workspace(self, workspace):
+        self._preparing.pop(id(workspace), None)
+
+    def workspaces(self):
+        return list(
+            {
+                id(ws): ws for ws in [*self._live(), *self._preparing.values()]
+            }.values(),
+        )
+
+    async def project_workspace_channels(self, workspace):
+        for intent in list(self._intents):
+            if intent.kind != "channel":
+                continue
+            key = _workspace_key(workspace)
+            token = intent.bindings.get(key)
+            manager = getattr(workspace, "channel_manager", None)
+            if (
+                token is not None
+                and manager is not None
+                and manager._find_channel(intent.name) is not token.channel
+            ):
+                intent.bindings.pop(key, None)
+                intent.workspaces.pop(key, None)
+            await self._project_one(intent, workspace)
+
+    def channel_start_allowed(self, workspace, name):
+        key = _workspace_key(workspace)
+        return not any(
+            intent.kind == "channel"
+            and intent.name == name
+            and (intent.revoking or key in intent.retiring)
+            for intent in self._intents
+        )
+
+    def replace_channel_binding(self, workspace, name, old, handle):
+        """Retarget only the current intent's exact outgoing generation."""
+        if workspace is None:
+            return
+        key = _workspace_key(workspace)
+        for intent in self._intents:
+            token = intent.bindings.get(key)
+            if (
+                intent.kind == "channel"
+                and intent.name == name
+                and token is not None
+                and token.channel is old
+                and intent.workspaces[key]() is workspace
+            ):
+                intent.bindings[key] = handle
 
     def intend(
         self,
@@ -105,7 +164,7 @@ class WorkspaceProjector:
         if intent is None:
             return
         errors: list[str] = []
-        for workspace in self._live():
+        for workspace in self.workspaces():
             key = _workspace_key(workspace)
             try:
                 await self._project_one(intent, workspace)
@@ -138,8 +197,15 @@ class WorkspaceProjector:
     ) -> None:
         key = _workspace_key(workspace)
         retiring = intent.retiring.get(key)
-        if intent.revoking or (
-            retiring is not None and retiring() is workspace
+        if intent not in self._intents or not intent.active:
+            return
+        if (
+            (
+                intent.kind == "channel"
+                and getattr(workspace, "_defer_channel_start", False)
+            )
+            or intent.revoking
+            or (retiring is not None and retiring() is workspace)
         ):
             return
         if self._has_binding(intent, workspace):
@@ -180,15 +246,22 @@ class WorkspaceProjector:
                     f"Projection {intent.kind} {intent.name!r} still starting",
                 )
 
-    async def revoke(self, kind: str, name: str, plugin_id: str) -> None:
+    async def revoke(
+        self,
+        kind: str,
+        name: str,
+        plugin_id: str,
+        *,
+        expected: WorkspaceIntent | None = None,
+    ) -> None:
         intent = self._find(kind, name, plugin_id)
-        if intent is None:
+        if intent is None or (expected is not None and intent is not expected):
             return
         intent.revoking = True
         await self._drain(intent)
         errors: list[str] = []
         failed_stop: StopReceipt | None = None
-        workspaces = {_workspace_key(ws): ws for ws in self._live()}
+        workspaces = {_workspace_key(ws): ws for ws in self.workspaces()}
         for key, resolve in intent.workspaces.items():
             workspace = resolve()
             if workspace is not None:
@@ -205,7 +278,7 @@ class WorkspaceProjector:
                 continue
             token = intent.bindings[key]
             try:
-                result = await _run_revoke(intent.revoke, workspace, token)
+                result = await self._revoke_binding(intent, workspace, token)
             except Exception as exc:  # noqa: BLE001
                 intent.workspaces[key] = _hold_workspace(workspace)
                 errors.append(f"{key}:{exc}")
@@ -233,6 +306,16 @@ class WorkspaceProjector:
                 f"Revoke {kind} {name!r} failed: {'; '.join(errors)}",
             )
 
+    async def _revoke_binding(self, intent, workspace, token):
+        key = _workspace_key(workspace)
+        while True:
+            result = await _run_revoke(intent.revoke, workspace, token)
+            current = intent.bindings.get(key)
+            if current is None or current is token:
+                return result
+            # A legitimate replacement committed while revoke awaited its lock.
+            token = current
+
     async def revoke_workspace(self, workspace: Any) -> None:
         """Release one retiring workspace without dropping future intents."""
         key = _workspace_key(workspace)
@@ -254,8 +337,8 @@ class WorkspaceProjector:
             if not self._has_binding(intent, workspace):
                 continue
             try:
-                result = await _run_revoke(
-                    intent.revoke,
+                result = await self._revoke_binding(
+                    intent,
                     workspace,
                     intent.bindings[key],
                 )

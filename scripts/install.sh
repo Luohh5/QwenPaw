@@ -279,6 +279,12 @@ fi
 
 # Verify the CLI entry point exists
 [ -x "$QWENPAW_VENV/bin/qwenpaw" ] || die "Installation failed: qwenpaw CLI not found in venv"
+NORMALIZED_EXTRAS="$(printf '%s' "$EXTRAS" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+case ",${NORMALIZED_EXTRAS// /}," in
+    *,channels,*|*,full,*)
+        "$QWENPAW_VENV/bin/qwenpaw" plugins preset apply channels-full --offline
+        ;;
+esac
 info "QwenPaw installed successfully"
 
 # Check console availability (for PyPI installs, check the installed package)

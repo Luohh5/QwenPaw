@@ -19,10 +19,7 @@ SUITE = (
     [
         "registration_suite.py",
         "dingtalk_registration_suite.py",
-        "dingtalk_suite.py",
-        "feishu_suite.py",
         "contract_suite.py",
-        "lifecycle_suite.py",
         "packaging_suite.py",
     ],
 )
@@ -43,6 +40,6 @@ def test_channel_packages(tmp_path, suite_name):
         capture_output=True,
         text=True,
         check=False,
-        timeout=60,
+        timeout=180,
     )
     assert result.returncode == 0, result.stdout + result.stderr

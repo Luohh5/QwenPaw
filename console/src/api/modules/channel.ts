@@ -12,7 +12,8 @@ export type LocalizedText = string | Record<string, string>;
 export interface ChannelConfigField {
   name: string;
   label: LocalizedText;
-  type: "text" | "password" | "number" | "switch" | "select";
+  type: "text" | "password" | "number" | "switch" | "select" | "json";
+  json_type?: "object" | "array";
   required?: boolean;
   placeholder?: LocalizedText;
   help?: LocalizedText;
@@ -27,6 +28,17 @@ export interface ChannelSchema {
   config_fields: ChannelConfigField[];
   icon?: string;
   doc_url?: LocalizedText;
+  owner?: string;
+  form_kind?: string;
+  process_mode?: string;
+  availability?: string;
+  global_enabled?: boolean;
+  diagnostic?: string;
+  repair?: {
+    action: "install" | "enable" | "repair";
+    plugin_id: string;
+    source?: string;
+  };
 }
 
 export interface ChannelConflictAgent {
@@ -40,6 +52,25 @@ export interface ChannelConflictResponse {
 }
 
 export const channelApi = {
+  repairChannel: (repair: NonNullable<ChannelSchema["repair"]>) => {
+    const id = encodeURIComponent(repair.plugin_id);
+    if (repair.action === "install")
+      return request("/plugins/install", {
+        method: "POST",
+        body: JSON.stringify({ source: repair.source }),
+      });
+    return request(
+      `/plugins/${id}/${
+        repair.action === "enable" ? "enabled" : "repair-dependencies"
+      }`,
+      {
+        method: "POST",
+        ...(repair.action === "enable"
+          ? { body: JSON.stringify({ enabled: true }) }
+          : {}),
+      },
+    );
+  },
   listChannelTypes: () => request<string[]>("/config/channels/types"),
 
   listChannels: () => request<ChannelConfig>("/config/channels"),

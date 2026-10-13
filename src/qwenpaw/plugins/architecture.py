@@ -53,6 +53,28 @@ class PluginEntryPoints(BaseModel):
 
     frontend: Optional[str] = None
     backend: Optional[str] = None
+    descriptor: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_descriptor(self):
+        if self.descriptor is None:
+            return self
+        path = str(self.descriptor)
+        if (
+            path != path.strip()
+            or "\\" in path
+            or ":" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+            or not path.endswith(".json")
+        ):
+            raise ValueError(
+                "descriptor must be a canonical relative JSON path",
+            )
+        if self.backend is not None:
+            raise ValueError(
+                "descriptor and backend entries are mutually exclusive",
+            )
+        return self
 
 
 def _coerce_manifest_str(value: Any) -> str:
@@ -197,6 +219,12 @@ class PluginManifest(BaseModel):
         if legacy_entry_point and not entry_data.get("backend"):
             entry_data["backend"] = legacy_entry_point
         data["entry"] = entry_data
+
+        if (
+            entry_data.get("descriptor") is not None
+            and data.get("type") != "channel"
+        ):
+            raise ValueError("descriptor entry requires explicit channel type")
 
         # Resolve ``type``: explicit value wins; otherwise infer.  We
         # need the parsed entry/meta to infer, so do a light parse here.

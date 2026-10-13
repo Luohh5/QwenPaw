@@ -3239,10 +3239,22 @@ class ThemeConfig(BaseModel):
         return value
 
 
+class ChannelPluginState(BaseModel):
+    """Host distribution intent, never runtime ownership or credentials."""
+
+    version: int = 0
+    preset: Literal["light", "channels-full"] = "light"
+    legacy_pending: list[str] = Field(default_factory=list)
+    uninstalled: list[str] = Field(default_factory=list)
+
+
 class Config(BaseModel):
     """Root config (config.json)."""
 
     channels: ChannelConfig = ChannelConfig()
+    channel_plugin_state: ChannelPluginState = Field(
+        default_factory=ChannelPluginState,
+    )
     mcp: MCPConfig = MCPConfig()
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     last_api: LastApiConfig = LastApiConfig()

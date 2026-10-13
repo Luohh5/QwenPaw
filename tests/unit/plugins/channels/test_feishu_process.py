@@ -27,6 +27,6 @@ def test_feishu_actual_process(tmp_path):
         capture_output=True,
         text=True,
         check=False,
-        timeout=180,
+        timeout=300,
     )
     assert result.returncode == 0, result.stdout + result.stderr

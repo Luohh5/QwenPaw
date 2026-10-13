@@ -10,6 +10,7 @@ lifecycle tests rather than removed router bookkeeping helpers.
 # pylint: disable=use-implicit-booleaness-not-comparison
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import tempfile
@@ -137,6 +138,7 @@ def _loader_stub(
         return load_result
 
     loader.load_plugin_from_path = AsyncMock(side_effect=_load)
+    loader.retains_preparation_source.return_value = False
     return loader
 
 
@@ -562,6 +564,66 @@ class TestInstallPluginSource:
         # the temporary download directory is removed afterwards
         assert not made[0].exists()
 
+    @pytest.mark.parametrize(
+        "failure",
+        [RuntimeError("load failed"), asyncio.CancelledError()],
+        ids=["load-failure", "cancelled"],
+    )
+    async def test_url_keeps_temp_source_while_loader_retains_preparation(
+        self,
+        tmp_path,
+        monkeypatch,
+        failure,
+    ):
+        """URL cleanup must not erase the only code root of a live probe."""
+        from qwenpaw.plugins.loader import PluginLoader
+
+        loader = PluginLoader([tmp_path])
+        temp_dir = tmp_path / "url-download"
+        source_seen = None
+
+        def _mkdtemp(*_args, **_kwargs):
+            temp_dir.mkdir()
+            return str(temp_dir)
+
+        async def _download(_url, destination):
+            destination.write_bytes(
+                _zip_bytes({"inner/plugin.json": '{"id": "retained"}'}),
+            )
+
+        async def _failed_load(**kwargs):
+            nonlocal source_seen
+            source_seen = kwargs["source_path"]
+            loader._channel_preparations["retained"] = SimpleNamespace(
+                _spec=SimpleNamespace(code_root=source_seen),
+            )
+            assert loader.retains_preparation_source(temp_dir)
+            raise failure
+
+        monkeypatch.setattr(loader, "load_plugin_from_path", _failed_load)
+        with (
+            patch(
+                "qwenpaw.config.utils.get_plugins_dir",
+                return_value=tmp_path,
+            ),
+            patch(
+                "qwenpaw.app.routers.plugins._async_download",
+                new=_download,
+            ),
+            patch(
+                "qwenpaw.app.routers.plugins.tempfile.mkdtemp",
+                side_effect=_mkdtemp,
+            ),
+        ):
+            with pytest.raises(type(failure)):
+                await install_plugin_source(
+                    "https://example.test/retained.zip",
+                    app=_app(loader),
+                )
+        assert source_seen == temp_dir / "inner"
+        assert temp_dir.is_dir()
+        assert (source_seen / "plugin.json").is_file()
+
     async def test_temp_dir_is_removed_even_when_load_fails(
         self,
         tmp_path,
@@ -700,7 +762,10 @@ class TestInstallPluginRoute:
             "description": "desc",
             "author": "auth",
             "loaded": True,
-            "message": "Plugin 'plug display name' installed successfully.",
+            "status": "active",
+            "enabled": True,
+            "diagnostics": [],
+            "message": "Plugin 'plug display name' installation: active.",
         }
 
     @pytest.mark.parametrize(

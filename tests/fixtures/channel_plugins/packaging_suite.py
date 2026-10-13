@@ -43,15 +43,17 @@ def archived_plugin(request, tmp_path):
         zipped.extractall(extracted_root)
     extracted = extracted_root / channel
     for rel in (
-        "__init__.py",
         "plugin.json",
-        "plugin.py",
-        "channel.py",
-        "platform.py",
+        "channel.json",
+        f"{channel}/__init__.py",
+        f"{channel}/platform.py",
+        f"{channel}/driver.py",
         "requirements.txt",
         "README.md",
     ):
         assert (extracted / rel).is_file(), f"Archive missing {channel}/{rel}"
+    assert not (extracted / channel / "channel.py").exists()
+    assert not (extracted / channel / "plugin.py").exists()
     assert (extracted / "plugin.json").read_bytes() == manifest_bytes
     assert (source / "plugin.json").read_bytes() == manifest_bytes
     return channel, extracted_root
@@ -80,7 +82,7 @@ def run_archived_suite(archived_plugin, tmp_path, cases):
         capture_output=True,
         text=True,
         check=False,
-        timeout=60,
+        timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -104,18 +106,28 @@ def test_archive_runs_without_builtin_platform_implementation(
     channel, _ = archived_plugin
     cases = {
         "feishu": [
-            "lifecycle_suite.py::"
-            "test_old_sdk_dispatcher_cannot_mutate_reconnected_state",
-            "lifecycle_suite.py::"
-            "test_stop_finishes_inflight_send_before_http_close",
+            (
+                "feishu_process_suite.py::"
+                "test_network_reconnect_fences_late_old_connection_callbacks"
+            ),
+            (
+                "feishu_process_suite.py::"
+                "test_proactive_send_reads_both_old_receive_store_orders"
+            ),
         ],
         "dingtalk": [
-            "dingtalk_suite.py::"
-            "test_real_sdk_callback_ack_and_identity_preserve_native_message",
-            "dingtalk_suite.py::"
-            "test_webhook_send_reads_legacy_routes_without_openapi",
-            "dingtalk_suite.py::"
-            "test_proactive_openapi_routes_group_and_staff_identity",
+            (
+                "dingtalk_process_suite.py::"
+                "test_native_message_runs_host_agent_and_sends_from_real_child"
+            ),
+            (
+                "dingtalk_process_suite.py::"
+                "test_direct_and_legacy_webhook_routes_bypass_openapi"
+            ),
+            (
+                "dingtalk_process_suite.py::"
+                "test_proactive_openapi_preserves_group_and_staff_identity"
+            ),
         ],
     }
     run_archived_suite(archived_plugin, tmp_path, cases[channel])

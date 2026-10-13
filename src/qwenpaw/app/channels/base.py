@@ -4,6 +4,7 @@
 """
 Base Channel: bound to AgentRequest/AgentResponse, unified by process.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -569,6 +570,7 @@ class BaseChannel(ABC):
             payload,
             self._stream_with_tracker,
             owner=self._workspace,
+            channel_id=self.channel,
             on_finished=self._workspace.chat_manager.mark_chat_finished,
         )
 

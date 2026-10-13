@@ -62,13 +62,19 @@ export function useChannels() {
     [],
   );
 
-  const orderedKeys = useMemo(
-    () => [
-      ...builtinOrder.filter((k) => channelTypes.includes(k)),
-      ...channelTypes.filter((k) => !builtinOrder.includes(k)),
-    ],
-    [builtinOrder, channelTypes],
-  );
+  const orderedKeys = useMemo(() => {
+    const keys = Array.from(
+      new Set([
+        ...channelTypes,
+        ...Object.keys(channels),
+        ...Object.keys(channelSchemas),
+      ]),
+    );
+    return [
+      ...builtinOrder.filter((k) => keys.includes(k)),
+      ...keys.filter((k) => !builtinOrder.includes(k)),
+    ];
+  }, [builtinOrder, channelTypes, channels, channelSchemas]);
 
   // Read isBuiltin from API response
   const isBuiltin = useCallback(

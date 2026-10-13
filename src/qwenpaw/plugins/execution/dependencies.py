@@ -1,0 +1,419 @@
+# -*- coding: utf-8 -*-
+"""Actual-child dependency evidence, without importing candidate SDKs."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from importlib import metadata
+import inspect
+import os
+from pathlib import Path
+import sys
+from typing import Any, Mapping
+
+from packaging.markers import default_environment
+from packaging.tags import sys_tags
+from packaging.utils import canonicalize_name
+from packaging.version import Version
+
+from .errors import ProtocolValidationError
+
+
+def dependency_error(reason: str = "DEPENDENCY_METADATA_INVALID"):
+    """Return a safe error without package code or environment secrets."""
+    return ProtocolValidationError(reason, reason_code=reason)
+
+
+def valid_metadata_headers(message, required, optional=()) -> bool:
+    """Singleton metadata must never be interpreted by first-header wins."""
+    return all(
+        len(message.get_all(name, [])) == 1 for name in required
+    ) and all(len(message.get_all(name, [])) <= 1 for name in optional)
+
+
+def repair_marker(site: str | Path) -> Path:
+    """Persistent evidence that an interrupted shared write needs repair."""
+    root = Path(site).resolve()
+    return root.parent / f".{root.name}.dependencies-repair-required"
+
+
+@dataclass(frozen=True)
+class DependencySnapshot:
+    """Bounded target metadata; candidate roots never supply distributions."""
+
+    executable: str
+    prefix: str
+    sites: tuple[str, ...]
+    marker_environment: Mapping[str, str]
+    supported_tags: tuple[str, ...]
+    distributions: Mapping[str, Mapping[str, Any]]
+
+    def to_mapping(self) -> dict[str, Any]:
+        """Encode independent JSON data for the private transport."""
+        return {
+            "executable": self.executable,
+            "prefix": self.prefix,
+            "sites": list(self.sites),
+            "marker_environment": dict(self.marker_environment),
+            "supported_tags": list(self.supported_tags),
+            "distributions": {
+                key: {
+                    **row,
+                    "requires_dist": list(row["requires_dist"]),
+                    "top_level": list(row["top_level"]),
+                }
+                for key, row in self.distributions.items()
+            },
+        }
+
+    @classmethod
+    # Closed metadata validation intentionally checks every untrusted field.
+    # pylint: disable=too-many-branches
+    def from_mapping(cls, value: object) -> DependencySnapshot:
+        """Validate evidence fields, origins and installed versions."""
+        fields = {
+            "executable",
+            "prefix",
+            "sites",
+            "marker_environment",
+            "supported_tags",
+            "distributions",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise dependency_error()
+        data = dict(value)
+        for key in ("executable", "prefix"):
+            if (
+                not isinstance(data[key], str)
+                or not Path(data[key]).is_absolute()
+            ):
+                raise dependency_error()
+        for key in ("sites", "supported_tags"):
+            if not isinstance(data[key], list) or any(
+                not isinstance(item, str) or not item for item in data[key]
+            ):
+                raise dependency_error()
+        if any(not Path(site).is_absolute() for site in data["sites"]):
+            raise dependency_error()
+        environment = data["marker_environment"]
+        if (
+            not isinstance(environment, Mapping)
+            or set(environment) != set(default_environment())
+            or any(not isinstance(item, str) for item in environment.values())
+        ):
+            raise dependency_error()
+        distributions = data["distributions"]
+        if (
+            not isinstance(distributions, Mapping)
+            or len(distributions) > 10000
+        ):
+            raise dependency_error()
+        copied = {}
+        for name, row in distributions.items():
+            if (
+                not isinstance(name, str)
+                or canonicalize_name(name) != name
+                or not isinstance(row, Mapping)
+                or set(row)
+                != {
+                    "version",
+                    "metadata_path",
+                    "requires_dist",
+                    "top_level",
+                }
+            ):
+                raise dependency_error()
+            try:
+                Version(row["version"])
+                origin = Path(row["metadata_path"])
+            except (TypeError, ValueError):
+                raise dependency_error() from None
+            if (
+                not origin.is_absolute()
+                or str(origin.parent) not in data["sites"]
+            ):
+                raise dependency_error()
+            for key in ("requires_dist", "top_level"):
+                if not isinstance(row[key], (list, tuple)) or any(
+                    not isinstance(item, str) for item in row[key]
+                ):
+                    raise dependency_error()
+            copied[name] = {
+                **row,
+                "requires_dist": tuple(row["requires_dist"]),
+                "top_level": tuple(row["top_level"]),
+            }
+        return cls(
+            data["executable"],
+            data["prefix"],
+            tuple(data["sites"]),
+            dict(environment),
+            tuple(data["supported_tags"]),
+            copied,
+        )
+
+    @property
+    def versions(self) -> dict[str, str]:
+        """Observed versions for the existing shared hello validators."""
+        return {
+            name: row["version"] for name, row in self.distributions.items()
+        }
+
+
+# Inventory and relevant-closure rejection form one child-only audit.
+# pylint: disable=too-many-branches,too-many-statements,protected-access
+def observe_dependencies(packet: Mapping[str, Any]) -> DependencySnapshot:
+    """Inspect this interpreter's paths before candidate imports execute."""
+    excluded = {Path(packet["code_root"]).resolve()}
+    sites = tuple(
+        dict.fromkeys(
+            str(Path(item).resolve())
+            for item in packet["_audit_sites"]
+            if item
+            and Path(item).is_dir()
+            and not any(
+                Path(item).resolve().is_relative_to(root) for root in excluded
+            )
+        ),
+    )
+    if any(repair_marker(site).exists() for site in sites):
+        raise dependency_error("DEPENDENCY_REPAIR_REQUIRED")
+    rows, invalid, observed = {}, {}, {}
+    for distribution in metadata.distributions(path=list(sites)):
+        # importlib.metadata exposes the on-disk metadata origin here.
+        origin = Path(
+            distribution._path,
+        ).resolve()  # pylint: disable=protected-access
+        installed_metadata = distribution.metadata
+        name = installed_metadata.get("Name")
+        version = installed_metadata.get("Version")
+        key = str(canonicalize_name(name or origin.name.split("-", 1)[0]))
+        if not valid_metadata_headers(
+            installed_metadata,
+            ("Name", "Version"),
+            ("Requires-Python",),
+        ):
+            for claimed in installed_metadata.get_all("Name", []) or (key,):
+                invalid[
+                    str(canonicalize_name(claimed))
+                ] = "DEPENDENCY_METADATA_INVALID"
+            continue
+        try:
+            if not name or not version or str(origin.parent) not in sites:
+                raise ValueError("invalid metadata")
+            Version(version)
+        except ValueError:
+            invalid[key] = "DEPENDENCY_METADATA_INVALID"
+            continue
+        if key in rows:
+            if rows[key]["metadata_path"] == str(origin):
+                continue
+            invalid[key] = "DEPENDENCY_ENVIRONMENT_AMBIGUOUS"
+            continue
+        tops = set((distribution.read_text("top_level.txt") or "").split())
+        if not tops:
+            tops.add(key.replace("-", "_"))
+        rows[key] = {
+            "version": version,
+            "metadata_path": str(origin),
+            "requires_dist": tuple(
+                installed_metadata.get_all("Requires-Dist", []),
+            ),
+            "top_level": tuple(sorted(tops)),
+        }
+        observed[key] = distribution
+    from packaging.requirements import Requirement
+    from .runtime import _requirements
+
+    pending = list(_requirements(packet.get("requirements_path")))
+    visited = set()
+    environment = default_environment()
+    while pending:
+        value = pending.pop()
+        if value in visited:
+            continue
+        visited.add(value)
+        requirement = Requirement(value)
+        if requirement.marker and not requirement.marker.evaluate(
+            environment=environment,
+        ):
+            continue
+        name = str(canonicalize_name(requirement.name))
+        if name in invalid:
+            raise dependency_error(invalid[name])
+        if name in rows:
+            tops = set(rows[name]["top_level"])
+            for path in observed[name].files or ():
+                part = str(path).replace("\\", "/").split("/", 1)[0]
+                if part not in {"", ".", ".."} and not part.endswith(
+                    (".dist-info", ".egg-info"),
+                ):
+                    tops.add(part.split(".", 1)[0])
+            rows[name]["top_level"] = tuple(sorted(tops))
+            pending.extend(rows[name]["requires_dist"])
+    for name in invalid:
+        rows.pop(name, None)
+    return DependencySnapshot.from_mapping(
+        {
+            "executable": os.path.abspath(sys.executable),
+            "prefix": sys.prefix,
+            "sites": list(sites),
+            "marker_environment": default_environment(),
+            "supported_tags": [str(tag) for tag in sys_tags()],
+            "distributions": rows,
+        },
+    )
+
+
+def validate_driver(component: Any) -> None:
+    """Check ordinary Driver calls without constructing or invoking it."""
+    if not inspect.isclass(component):
+        raise dependency_error("ENTRYPOINT_INVALID")
+    try:
+        inspect.signature(component).bind()
+    except (TypeError, ValueError):
+        raise dependency_error("ENTRYPOINT_INVALID") from None
+    for name, arguments in (
+        ("bind", (None, None)),
+        ("start", (None, {})),
+        ("stop", (None,)),
+    ):
+        method = getattr(component, name, None)
+        if not callable(method):
+            raise dependency_error("ENTRYPOINT_INVALID")
+        try:
+            inspect.signature(method).bind(*arguments)
+        except (TypeError, ValueError):
+            raise dependency_error("ENTRYPOINT_INVALID") from None
+        if name in {"start", "stop"} and not inspect.iscoroutinefunction(
+            method,
+        ):
+            raise dependency_error("ENTRYPOINT_INVALID")
+
+
+def _owned_import_paths(row, tops):
+    """Read RECORD ownership from an already selected metadata origin."""
+    distribution = metadata.Distribution.at(row["metadata_path"])
+    if distribution.version != row["version"]:
+        raise dependency_error("DEPENDENCY_ORIGIN_INVALID")
+    files = distribution.files
+    root = Path(row["metadata_path"]).parent
+    owned = set()
+    provided = set(row["top_level"]).intersection(tops)
+    for item in files or ():
+        relative = Path(str(item))
+        if relative.is_absolute() or ".." in relative.parts:
+            continue
+        top = relative.parts[0].split(".", 1)[0]
+        if top in tops:
+            provided.add(top)
+            # Metadata root is canonical and RECORD is relative/traversal-free.
+            # Index lexical ownership without stat/realpath for every installed
+            # file; actual imported locations are resolved and fenced below.
+            owned.add(root / relative)
+    directories = {
+        parent
+        for path in owned
+        for parent in path.parents
+        if parent.is_relative_to(root)
+    }
+    return root, provided, owned, directories, files is not None
+
+
+def check_import_origins(snapshot, code_root, relevant) -> None:
+    """Fence imported SDK modules and namespace portions to metadata owners."""
+    rows = [snapshot.distributions[name] for name in relevant]
+    tops = {top for row in rows for top in row["top_level"]}
+    modules = {
+        name: module
+        for name, module in tuple(sys.modules.items())
+        if name.split(".", 1)[0] in tops and module is not None
+    }
+    resolved = {}
+    for module in modules.values():
+        locations = list(getattr(module, "__path__", ()))
+        origin = getattr(module, "__file__", None)
+        if origin:
+            locations.append(origin)
+        for location in locations:
+            if location not in resolved:
+                resolved[location] = Path(location).resolve()
+            if resolved[location].is_relative_to(code_root):
+                raise dependency_error("DEPENDENCY_ORIGIN_INVALID")
+    # Restrict RECORD reads to observed providers for relevant namespaces.
+    # Relevant transitive providers have their top-level names read at audit.
+    providers = [
+        row
+        for row in snapshot.distributions.values()
+        if set(row["top_level"]).intersection(tops)
+    ]
+    owners = [_owned_import_paths(row, tops) for row in providers]
+    for name, module in modules.items():
+        module_name = getattr(module, "__name__", name)
+        # requests.packages aliases the actual urllib3 module objects. Resolve
+        # such aliases only through an already imported, identical module.
+        identity_name = (
+            module_name if sys.modules.get(module_name) is module else name
+        )
+        top = identity_name.split(".", 1)[0]
+        locations = list(getattr(module, "__path__", ()))
+        origin = getattr(module, "__file__", None)
+        if origin:
+            locations.append(origin)
+        for location in locations:
+            path = resolved[location]
+            directory = location in getattr(module, "__path__", ())
+            accepted = False
+            for root, provided, owned, directories, has_record in owners:
+                if top not in provided or not path.is_relative_to(root):
+                    continue
+                if has_record:
+                    accepted = path in (directories if directory else owned)
+                else:
+                    # Older distributions may omit RECORD; their selected site
+                    # still fences plain modules and package search portions.
+                    accepted = path == root / (
+                        top + ".py"
+                    ) or path.is_relative_to(root / top)
+                if accepted:
+                    break
+            if not accepted:
+                raise dependency_error("DEPENDENCY_ORIGIN_INVALID")
+
+
+def require_dependencies(
+    snapshot: DependencySnapshot,
+    packet: Mapping[str, Any],
+) -> set[str]:
+    """Require the closure and return its canonical distribution names."""
+    from packaging.requirements import Requirement
+    from .runtime import _requirements
+
+    pending = list(_requirements(packet.get("requirements_path")))
+    visited, relevant = set(), set()
+    while pending:
+        value = pending.pop()
+        if value in visited:
+            continue
+        visited.add(value)
+        requirement = Requirement(value)
+        if requirement.marker and not requirement.marker.evaluate(
+            environment=dict(snapshot.marker_environment),
+        ):
+            continue
+        row = snapshot.distributions.get(
+            str(canonicalize_name(requirement.name)),
+        )
+        if (
+            requirement.url
+            or requirement.extras
+            or row is None
+            or not requirement.specifier.contains(
+                Version(row["version"]),
+                prereleases=True,
+            )
+        ):
+            raise dependency_error("DEPENDENCY_UNSATISFIED")
+        relevant.add(str(canonicalize_name(requirement.name)))
+        pending.extend(row["requires_dist"])
+    return relevant

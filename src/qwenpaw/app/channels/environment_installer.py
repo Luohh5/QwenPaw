@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import csv
+from contextlib import contextmanager
 from dataclasses import dataclass
 from http.client import HTTPMessage
 from html.parser import HTMLParser
@@ -45,7 +46,7 @@ from ...channel_protocol.identifiers import (
 from ...channel_protocol.release_target_registry import (
     RELEASE_TARGET_PLATFORM_TAGS,
 )
-from ...plugins.install_lock import plugin_install_lock
+from ...plugins.install_lock import InstallLockError, plugin_install_lock
 from .env_manager import (
     EnvironmentManifestError,
     EnvironmentSpecManifest,
@@ -56,7 +57,6 @@ from .env_manager import (
     validate_installed_environment,
 )
 
-
 DEFAULT_ALIYUN_INDEX_URL = "https://mirrors.aliyun.com/pypi/simple/"
 DEFAULT_PYPI_INDEX_URL = "https://pypi.org/simple/"
 DEFAULT_PYTHON_INDEX_URL = DEFAULT_ALIYUN_INDEX_URL
@@ -64,6 +64,20 @@ _LOGGER = logging.getLogger(__name__)
 _CLEANUP_RETRIES = 3
 _CLEANUP_RETRY_DELAY_SECONDS = 0.05
 _PACKAGING_ROOT = str(Path(packaging.__file__).resolve().parent.parent)
+
+
+@contextmanager
+def _environment_install_lock(path: Path, *, timeout: float):
+    """Translate fail-closed shared lock errors to the installer API."""
+    try:
+        with plugin_install_lock(path, timeout=timeout) as acquired:
+            yield acquired
+    except InstallLockError as exc:
+        raise EnvironmentInstallError(
+            "install_lock_timeout",
+            "Environment install exclusion unavailable",
+        ) from exc
+
 
 _TARGET_PROBE_SCRIPT = """
 import json
@@ -327,7 +341,7 @@ class EnvironmentInstaller:
         lock_path = self.environments_root / (
             f".{spec_directory.name}.install.lock"
         )
-        with plugin_install_lock(
+        with _environment_install_lock(
             lock_path,
             timeout=self.lock_timeout,
         ) as acquired:

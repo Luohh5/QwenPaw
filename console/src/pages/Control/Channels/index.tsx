@@ -37,6 +37,7 @@ function ChannelsPage() {
     isBuiltin,
     loading,
     setChannels,
+    fetchChannels,
   } = useChannels();
   const [filter, setFilter] = useState<FilterType>("all");
   const [saving, setSaving] = useState(false);
@@ -330,6 +331,7 @@ function ChannelsPage() {
         channelSchema={activeKey ? channelSchemas[activeKey] : undefined}
         onClose={handleDrawerClose}
         onSubmit={handleSubmit}
+        onRuntimeChange={fetchChannels}
       />
       <AccessControlDrawer
         open={aclDrawerOpen}

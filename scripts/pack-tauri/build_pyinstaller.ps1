@@ -239,6 +239,29 @@ Assert-LastExit "Failed to install Chrome Native Messaging host dependencies"
 Assert-LastExit "Bundled Python runtime cannot run the Native Messaging host"
 Write-Host ""
 
+Write-Host "== Building readable channel runtime ==" -ForegroundColor Yellow
+$CHANNEL_WHEELS = Join-Path $DIST "channel-wheels"
+$CHANNEL_RUNTIME = Join-Path $BINARIES_DIR "channel-runtime"
+foreach ($generated in @($CHANNEL_WHEELS, $CHANNEL_RUNTIME)) {
+    if (Test-Path $generated) { Remove-Item -Recurse -Force $generated }
+}
+New-Item -ItemType Directory -Force -Path $CHANNEL_WHEELS | Out-Null
+& $PYTHON_BIN -c 'import setuptools.build_meta as backend, sys; backend.build_wheel(sys.argv[1])' $CHANNEL_WHEELS
+Assert-LastExit "Host wheel build failed"
+$HOST_WHEELS = @(Get-ChildItem $CHANNEL_WHEELS -Filter "qwenpaw-*.whl")
+if ($HOST_WHEELS.Count -ne 1) { throw "Expected one host wheel" }
+$HOST_WHEEL = $HOST_WHEELS[0].FullName
+# Normal release resolution only; the stager itself is strictly offline.
+& $NATIVE_HOST_PYTHON -m pip download --only-binary=:all: `
+    --dest $CHANNEL_WHEELS "${HOST_WHEEL}[channels]"
+Assert-LastExit "Channel wheel resolution failed"
+$RUNTIME_RELEASE = (Get-Content (Join-Path $PYTHON_RUNTIME_DIR ".python-runtime-version") -Raw).Trim()
+& $PYTHON_BIN (Join-Path $PSScriptRoot "stage_channel_runtime.py") `
+    --python $NATIVE_HOST_PYTHON --wheel $HOST_WHEEL `
+    --resource-dir (Join-Path $REPO_ROOT "console\src-tauri") `
+    --wheelhouse $CHANNEL_WHEELS --python-runtime-release $RUNTIME_RELEASE
+Assert-LastExit "Readable channel runtime staging failed"
+
 Write-Host "== Staging bundled Node runtime ==" -ForegroundColor Yellow
 & $PYTHON_BIN (Join-Path $REPO_ROOT "scripts\pack-tauri\stage_node_runtime.py") `
     --dest (Join-Path $BINARIES_DIR "node-runtime")

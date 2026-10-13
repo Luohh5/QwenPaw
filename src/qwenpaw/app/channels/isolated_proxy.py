@@ -120,6 +120,11 @@ class IsolatedChannelProxy(BaseChannel):
         )
         self.channel_process = channel_process or ChannelProcess()
         self._accepted = OrderedDict()
+        self._enqueue_async = None
+        self._ingress_open = True
+        self.last_stop_result = None
+        self._owner_registry = None
+        self._admission_wakeup = None
         self._state = {}
         self._state_lock = asyncio.Lock()
         self._ingress_lock = asyncio.Lock()
@@ -194,7 +199,11 @@ class IsolatedChannelProxy(BaseChannel):
         async with self._lifecycle_lock:
             if self._started or not self.enabled:
                 return
+            self.last_stop_result = None
+            self._ingress_open = True
             generation = self.channel_process.health_snapshot()["generation"]
+            if generation and self._owner_registry is not None:
+                raise RuntimeError("CHANNEL_GENERATION_RETIRED")
             if generation:
                 self._launch_spec = replace(
                     self._launch_spec,
@@ -215,16 +224,35 @@ class IsolatedChannelProxy(BaseChannel):
                     return
                 if snapshot["state"] != "ready" or snapshot[
                     "platform_state"
-                ] in {"failed", "disconnected"}:
+                ] in {
+                    "failed",
+                    "disconnected",
+                }:
                     raise RuntimeError("CHANNEL_NOT_CONNECTED")
                 await asyncio.sleep(0.01)
 
     async def stop(self):
+        self.last_stop_result = None
+        self._ingress_open = False
+        if self._admission_wakeup is not None:
+            self._admission_wakeup()
         async with self._lifecycle_lock:
             result = await self.channel_process.stop()
+            self.last_stop_result = result
             if not result.exited:
                 raise RuntimeError("CHANNEL_STOP_INCOMPLETE")
             self._started = False
+            if self._owner_registry is not None:
+                self._owner_registry.release_channel_owner(
+                    self._launch_spec.instance_id,
+                    self,
+                )
+            return result
+
+    def set_enqueue_async(self, callback):
+        self._enqueue_async = callback
+        if callback is None:
+            self._ingress_open = False
 
     async def health_check(self):
         snapshot = self.channel_process.health_snapshot()
@@ -267,6 +295,12 @@ class IsolatedChannelProxy(BaseChannel):
         logger.warning("Channel diagnostic: %s", reason)
 
     async def _event_batch(self, params, request):
+        from ...utils.io_utils import run_async_to_completion
+
+        # RPC cancellation cannot split queue commit from the dedup record.
+        return await run_async_to_completion(self._admit_batch(params))
+
+    async def _admit_batch(self, params):
         batch = (
             params
             if isinstance(params, EventBatchParams)
@@ -321,7 +355,16 @@ class IsolatedChannelProxy(BaseChannel):
                         ),
                     )
                     continue
-                if self._enqueue is None:
+                if not self._ingress_open:
+                    rejected.append(
+                        RejectedEvent(
+                            event.event_id,
+                            "CHANNEL_STOPPING",
+                            True,
+                        ),
+                    )
+                    continue
+                if self._enqueue_async is None:
                     rejected.append(
                         RejectedEvent(
                             event.event_id,
@@ -331,13 +374,22 @@ class IsolatedChannelProxy(BaseChannel):
                     )
                     continue
                 try:
-                    self._enqueue(payload)
+                    result = await self._enqueue_async(payload)
                 except Exception:
                     rejected.append(
                         RejectedEvent(
                             event.event_id,
                             "QUEUE_UNAVAILABLE",
                             True,
+                        ),
+                    )
+                    continue
+                if not result.accepted:
+                    rejected.append(
+                        RejectedEvent(
+                            event.event_id,
+                            result.reason_code,
+                            result.retryable,
                         ),
                     )
                     continue

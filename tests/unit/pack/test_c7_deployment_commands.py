@@ -1,0 +1,127 @@
+# -*- coding: utf-8 -*-
+"""Source-level deployment command contracts; no native builds or installs."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import subprocess
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+def _source(path: str) -> str:
+    return (ROOT / path).read_text(encoding="utf-8")
+
+
+def test_c7_docker_preset_selects_exact_install_and_mount_handoff() -> None:
+    docker = _source("deploy/Dockerfile")
+    entrypoint = _source("deploy/entrypoint.sh")
+    assert 'ARG QWENPAW_CHANNEL_PRESET="channels-full"' in docker
+    assert "light|channels-full) ;; *) exit 1" in docker
+    assert (
+        'if [ "$QWENPAW_CHANNEL_PRESET" = channels-full ]; '
+        'then EXTRA="[channels]"' in docker
+    )
+    assert '"$1$EXTRA"' in docker
+    assert "channel-preset.json" in docker
+    assert 'data["preset"] in {"light", "channels-full"}' in entrypoint
+    assert "export QWENPAW_CHANNEL_PRESET" in entrypoint
+    assert entrypoint.index(
+        "export QWENPAW_CHANNEL_PRESET",
+    ) < entrypoint.index(
+        "qwenpaw init --defaults --accept-security",
+    )
+
+
+def test_c7_installers_apply_exact_extras_offline() -> None:
+    for path in (
+        "scripts/install.sh",
+        "scripts/install.ps1",
+        "scripts/install.bat",
+    ):
+        content = _source(path)
+        assert "channels" in content and "full" in content
+        assert "plugins preset apply channels-full --offline" in content
+
+
+@pytest.mark.parametrize(
+    ("extras", "selected"),
+    [
+        ("CHANNELS", True),
+        ("Full", True),
+        ("dev, ChAnNeLs", True),
+        ("whisper,full,dev", True),
+        ("dev,whisper", False),
+        ("notchannels,fully", False),
+    ],
+)
+def test_c7_bash_installer_selects_exact_extras_case_insensitively(
+    tmp_path: Path,
+    extras: str,
+    selected: bool,
+) -> None:
+    """Execute only the installer's policy block with a recording CLI."""
+    content = _source("scripts/install.sh")
+    start = content.index("# Verify the CLI entry point exists")
+    end = content.index('info "QwenPaw installed successfully"', start)
+    marker = tmp_path / "preset-argv"
+    cli = tmp_path / "bin/qwenpaw"
+    cli.parent.mkdir()
+    cli.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$*" > "$C7_MARKER"\n',
+        encoding="utf-8",
+    )
+    cli.chmod(0o755)
+    result = subprocess.run(
+        ["bash", "-c", content[start:end]],
+        env={
+            **os.environ,
+            "EXTRAS": extras,
+            "QWENPAW_VENV": str(tmp_path),
+            "C7_MARKER": str(marker),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.exists() is selected
+    if selected:
+        assert marker.read_text(encoding="utf-8") == (
+            "plugins preset apply channels-full --offline\n"
+        )
+
+
+def test_c7_desktop_resource_and_launcher_command_paths() -> None:
+    config = json.loads(_source("console/src-tauri/tauri.conf.json"))
+    assert "binaries/channel-runtime" in config["bundle"]["resources"]
+    launcher = _source("console/src-tauri/src/channel_runtime.rs")
+    assert 'root.join("runtime.json")' in launcher
+    assert 'root.join("site")' in launcher
+    for key in (
+        "QWENPAW_CHANNEL_RUNTIME_MANIFEST",
+        "QWENPAW_CHANNEL_SUPPORT_ROOT",
+        "QWENPAW_CHANNEL_DEPENDENCY_PATHS",
+    ):
+        assert key in launcher
+
+
+def test_c7_release_builds_resolve_and_stage_target_child() -> None:
+    for path in (
+        "scripts/pack-tauri/build_pyinstaller.sh",
+        "scripts/pack-tauri/build_pyinstaller.ps1",
+    ):
+        content = _source(path)
+        assert "setuptools.build_meta" in content
+        assert "[channels]" in content
+        assert "pip download --only-binary=:all:" in content
+        assert "stage_channel_runtime.py" in content
+        assert "--python" in content
+        assert "--wheel" in content
+        assert "--resource-dir" in content
+        assert "--wheelhouse" in content

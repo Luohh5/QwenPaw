@@ -3,6 +3,13 @@
 # Default port 8088; override at runtime with -e QWENPAW_PORT=3000.
 set -e
 
+# Build policy reaches the actual mounted working directory through C6 boot.
+# Persisted user choices and uninstall tombstones take precedence there.
+if [ -f /opt/qwenpaw/channel-preset.json ]; then
+  QWENPAW_CHANNEL_PRESET="$(python -c 'import json; from pathlib import Path; data = json.loads(Path("/opt/qwenpaw/channel-preset.json").read_text()); assert data["schema_version"] == 1 and data["preset"] in {"light", "channels-full"}; print(data["preset"])')"
+  export QWENPAW_CHANNEL_PRESET
+fi
+
 is_auth_enabled() {
   if [ "${QWENPAW_AUTH_ENABLED+x}" ]; then
     flag="${QWENPAW_AUTH_ENABLED}"
