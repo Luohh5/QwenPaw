@@ -4,6 +4,7 @@
 """Protect actual AgentScope middleware hooks without replaying downstream."""
 
 import asyncio
+import gc
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -361,6 +362,159 @@ async def test_request_cancellation_propagates(diagnostic):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("hook", AWAIT_HOOKS)
+@pytest.mark.parametrize("finish", ["await", "discard", "cancel"])
+async def test_prepared_call_starts_only_when_awaited(
+    hook,
+    finish,
+    diagnostic,
+    recwarn,
+):
+    prepared = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+    result = None if hook == "on_compress_context" else "result"
+
+    async def downstream(**_):
+        calls.append(True)
+        return result
+
+    async def waiting(self, agent, input_kwargs, next_handler):
+        pending = next_handler()
+        prepared.set()
+        await release.wait()
+        return await pending if finish == "await" else result
+
+    guarded = _wrap_plugin_middleware(middleware(hook, waiting), "lazy")
+    request = asyncio.create_task(getattr(guarded, hook)(None, {}, downstream))
+    try:
+        await asyncio.wait_for(prepared.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert not calls, "preparing a call must not execute downstream"
+        if finish == "cancel":
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+        else:
+            release.set()
+            assert await request == result
+        assert calls == ([True] if finish == "await" else [])
+        gc.collect()
+        assert not [
+            w for w in recwarn if issubclass(w.category, RuntimeWarning)
+        ]
+        diagnostic.assert_not_called()
+    finally:
+        release.set()
+        request.cancel()
+        await asyncio.gather(request, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook", AWAIT_HOOKS)
+@pytest.mark.parametrize("scheduled", [False, True])
+async def test_cancelled_hook_stops_started_call_without_recovery(
+    hook,
+    scheduled,
+    diagnostic,
+):
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+    calls = []
+    hosted = []
+
+    async def downstream(**_):
+        calls.append(True)
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    async def forward(self, agent, input_kwargs, next_handler):
+        if scheduled:
+            hosted.append(asyncio.create_task(next_handler()))
+            await asyncio.Event().wait()
+        return await next_handler()
+
+    guarded = _wrap_plugin_middleware(middleware(hook, forward), "cancel")
+    request = asyncio.create_task(getattr(guarded, hook)(None, {}, downstream))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(request, timeout=1)
+        assert stopped.is_set()
+        assert calls == [True]
+        diagnostic.assert_not_called()
+    finally:
+        request.cancel()
+        for task in hosted:
+            task.cancel()
+        await asyncio.gather(request, *hosted, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancel_cleanup_is_bounded_and_keeps_unfinished_handle(
+    monkeypatch,
+    diagnostic,
+):
+    monkeypatch.setattr(
+        "qwenpaw.runtime.plugin_middleware._CANCEL_TIMEOUT",
+        0.01,
+    )
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+    stopped = asyncio.Event()
+    calls = []
+
+    async def downstream(**_):
+        calls.append(True)
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+        finally:
+            stopped.set()
+
+    async def forward(self, agent, input_kwargs, next_handler):
+        return await next_handler()
+
+    guarded = _wrap_plugin_middleware(
+        middleware("on_model_call", forward),
+        "slow-cancel",
+    )
+    request = asyncio.create_task(guarded.on_model_call(None, {}, downstream))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        request.cancel()
+        done, _ = await asyncio.wait({request}, timeout=0.2)
+        assert (
+            request in done
+        ), "cleanup must not wait forever for cancellation"
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert cancelled.is_set() and not stopped.is_set()
+        assert calls == [True]
+        assert len(guarded._pending_cleanup) == 1
+        handles = list(guarded._pending_cleanup)
+        assert not handles[0].done()
+        diagnostic.assert_called_once()
+        assert "cleanup" in diagnostic.call_args.args[1].lower()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*handles), timeout=1)
+        await asyncio.sleep(0)
+        assert stopped.is_set()
+        assert not guarded._pending_cleanup
+    finally:
+        release.set()
+        await asyncio.gather(request, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_agent_scope_reply_chain_survives_plugin_hook_fault(diagnostic):
     from agentscope.agent import Agent
     from agentscope.message import Msg
@@ -394,7 +548,10 @@ async def test_agent_scope_reply_chain_survives_plugin_hook_fault(diagnostic):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("delivery", ["before", "after", "copy"])
+@pytest.mark.parametrize(
+    "delivery",
+    ["before", "after", "copy", "model-closed"],
+)
 async def test_reply_end_fault_does_not_trigger_another_reasoning_round(
     delivery,
     diagnostic,
@@ -422,13 +579,23 @@ async def test_reply_end_fault_does_not_trigger_another_reasoning_round(
                 raise RuntimeError("plugin failed at reply end")
             yield item
 
+    async def model_broken(self, agent, input_kwargs, next_handler):
+        pending = next_handler(**input_kwargs)
+        try:
+            raise RuntimeError("plugin failed before model execution")
+        finally:
+            pending.close()
+
+    hook = "on_model_call" if delivery == "model-closed" else "on_reply"
+    method = model_broken if delivery == "model-closed" else broken
+
     agent = Agent(
         name="agent",
         system_prompt="",
         model=model,
         middlewares=[
             _wrap_plugin_middleware(
-                middleware("on_reply", broken),
+                middleware(hook, method),
                 "broken",
             ),
         ],
@@ -537,7 +704,44 @@ async def test_downstream_model_stream_error_is_not_plugin_fault(diagnostic):
 
 
 @pytest.mark.asyncio
-async def test_failed_hook_uses_original_arguments(diagnostic):
+async def test_model_stream_cleanup_error_propagates(diagnostic):
+    error = OSError("stream close failed")
+
+    class FailingClose:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def aclose(self):
+            raise error
+
+    async def downstream(**_):
+        return FailingClose()
+
+    async def forward(self, agent, input_kwargs, next_handler):
+        return await next_handler()
+
+    guarded = _wrap_plugin_middleware(
+        middleware("on_model_call", forward),
+        "close-failed",
+    )
+    stream = await guarded.on_model_call(None, {}, downstream)
+    with pytest.raises(OSError) as caught:
+        await anext(stream)
+    assert caught.value is error
+    diagnostic.assert_called_once()
+    assert diagnostic.call_args.args == (
+        "close-failed",
+        "middleware on_model_call: stream close failed",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook", AWAIT_HOOKS)
+@pytest.mark.parametrize("closed", [False, True])
+async def test_failed_hook_uses_original_arguments(hook, closed, diagnostic):
     received = []
 
     async def downstream(**kwargs):
@@ -546,17 +750,71 @@ async def test_failed_hook_uses_original_arguments(diagnostic):
 
     async def broken(self, agent, input_kwargs, next_handler):
         input_kwargs["messages"] = "plugin modified"
+        pending = next_handler(**input_kwargs)
+        try:
+            raise RuntimeError("plugin failed")
+        finally:
+            if closed:
+                pending.close()
+
+    guarded = _wrap_plugin_middleware(
+        middleware(hook, broken),
+        "broken",
+    )
+    assert await getattr(guarded, hook)(
+        None,
+        {"messages": "original"},
+        downstream,
+    ) == (None if hook == "on_compress_context" else "safe result")
+    assert received == [{"messages": "original"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completed", [False, True])
+async def test_fault_reuses_started_call_before_closed_unused_call(
+    completed,
+    diagnostic,
+):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    received = []
+    hosted = []
+
+    async def downstream(**kwargs):
+        received.append(kwargs)
+        started.set()
+        await release.wait()
+        return "started result"
+
+    async def broken(self, agent, input_kwargs, next_handler):
+        first = next_handler(messages="started")
+        hosted.append(asyncio.create_task(first))
+        await started.wait()
+        if completed:
+            release.set()
+            assert await hosted[0] == "started result"
+        first.close()
+        unused = next_handler(messages="unused")
+        unused.close()
         raise RuntimeError("plugin failed")
 
     guarded = _wrap_plugin_middleware(
         middleware("on_model_call", broken),
         "broken",
     )
-    assert (
-        await guarded.on_model_call(None, {"messages": "original"}, downstream)
-        == "safe result"
+    request = asyncio.create_task(
+        guarded.on_model_call(None, {"messages": "original"}, downstream),
     )
-    assert received == [{"messages": "original"}]
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        release.set()
+        assert await request == "started result"
+        assert received == [{"messages": "started"}]
+        diagnostic.assert_called_once()
+    finally:
+        release.set()
+        await asyncio.gather(request, *hosted, return_exceptions=True)
 
 
 @pytest.mark.asyncio

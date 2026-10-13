@@ -671,6 +671,67 @@ async def test_failed_register_undoes_this_txn_create(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["register", "startup"])
+@pytest.mark.parametrize("user_owned", [False, True])
+async def test_failed_provision_relative_target_respects_ownership(
+    tmp_path: Path,
+    fresh_registry,
+    monkeypatch,
+    phase: str,
+    user_owned: bool,
+):
+    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
+    monkeypatch.chdir(tmp_path)
+    plugin_id = "relative-provision"
+    factory = tmp_path / "factory"
+    factory.mkdir()
+    (factory / "note.md").write_text("factory\n", encoding="utf-8")
+    dest = tmp_path / "data" / "config"
+    if user_owned:
+        dest.mkdir(parents=True)
+        (dest / "note.md").write_text("user\n", encoding="utf-8")
+        assert provision_files(plugin_id, factory, dest, "1.0.0") == "keep"
+    else:
+        # Keep an old inventory key but recreate its missing destination.
+        # Newly added keys already have a separate rollback cleanup path.
+        assert provision_files(plugin_id, factory, dest, "1.0.0") == "create"
+        shutil.rmtree(dest)
+    root = _write_plugin(tmp_path / "plugins" / plugin_id, plugin_id)
+    branch = "keep" if user_owned else "create"
+    provision = (
+        f"        assert api.provision_files({str(factory)!r}, "
+        f"'data/config', '1.0.0') == {branch!r}\n"
+        "        raise RuntimeError('provision hook failed')\n"
+    )
+    register = provision
+    if phase == "startup":
+        register = (
+            "        def startup():\n"
+            + "".join("    " + line for line in provision.splitlines(True))
+            + "        api.register_startup_hook('fail', startup)\n"
+        )
+    (root / "main.py").write_text(
+        "class Plugin:\n"
+        "    def register(self, api):\n" + register + "plugin = Plugin()\n",
+        encoding="utf-8",
+    )
+    loader = PluginLoader(plugin_dirs=[root.parent])
+    loader.registry = fresh_registry
+    manifest = PluginManifest.from_dict(
+        json.loads((root / "plugin.json").read_text(encoding="utf-8")),
+    )
+    record = await loader.load_plugin(manifest, root)
+    assert record.status == "failed"
+    locations = load_inventory(plugin_id).get("locations", {})
+    if user_owned:
+        assert (dest / "note.md").read_text(encoding="utf-8") == "user\n"
+        assert locations[str(dest)]["owned"] is False
+    else:
+        assert not dest.exists()
+        assert str(dest) not in locations
+
+
+@pytest.mark.asyncio
 async def test_failed_channel_stop_keeps_handle():
     class _Bad:
         channel = "bad-ch"

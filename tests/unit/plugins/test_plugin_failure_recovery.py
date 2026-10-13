@@ -1160,6 +1160,177 @@ async def test_stop_task_accepts_normal_cancellation():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("close_method", ["aclose", "close", "sync_close"])
+async def test_connection_timeout_preserves_owned_files_and_retry_handle(
+    tmp_path,
+    registry,
+    monkeypatch,
+    close_method,
+):
+    # pylint: disable=too-many-statements
+    from qwenpaw.plugins import custody
+
+    monkeypatch.setattr(custody, "CONNECTION_STOP_SECONDS", 0.01)
+    loader = PluginLoader([])
+    inst = loader.lifecycle.ensure_instance("stubborn-connection")
+    api = PluginApi("stubborn-connection", {}, {"id": inst.plugin_id})
+    api.set_registry(registry)
+    api.bind_instance(inst)
+    source = tmp_path / "factory.txt"
+    source.write_text("owned", encoding="utf-8")
+    dest = tmp_path / "installed.txt"
+    assert api.provision_files(source, dest, "1.0.0") == "create"
+    finish = asyncio.Event()
+    cancelled = asyncio.Event()
+    started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    thread_finish = threading.Event()
+    close_calls = []
+
+    async def close():
+        close_calls.append(True)
+        while not finish.is_set():
+            try:
+                await finish.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+
+    def sync_close():
+        close_calls.append(True)
+        loop.call_soon_threadsafe(started.set)
+        thread_finish.wait()
+
+    client = SimpleNamespace(
+        **{
+            "close"
+            if close_method == "sync_close"
+            else close_method: (
+                sync_close if close_method == "sync_close" else close
+            ),
+        },
+    )
+    assert api.hold_connection(client, "stubborn") is client
+    inst.state = PluginState.ACTIVE
+    inst.activated = True
+    root = tmp_path / "plugin"
+    root.mkdir()
+    loader._loaded_plugins[inst.plugin_id] = PluginRecord(
+        manifest=PluginManifest.from_dict(
+            {"id": inst.plugin_id, "name": "Connection", "version": "1.0.0"},
+        ),
+        source_path=root,
+        enabled=True,
+        status="active",
+        instance=object(),
+    )
+    monkeypatch.setattr(loader, "_drop_uninstalled_settings", AsyncMock())
+    operations = []
+    closer = inst._runtime[-1].teardown
+    try:
+        if close_method == "sync_close":
+            monkeypatch.setattr(custody, "CONNECTION_STOP_SECONDS", 1)
+            operation = asyncio.create_task(
+                loader.lifecycle.unload(inst.plugin_id, UnloadMode.UNINSTALL),
+            )
+            operations.append(operation)
+            await asyncio.wait_for(started.wait(), timeout=0.3)
+            operation.cancel()
+            done, _ = await asyncio.wait({operation}, timeout=0.3)
+            assert operation in done, "cancellation waited for sync close"
+            with pytest.raises(asyncio.CancelledError):
+                operation.result()
+            assert closer.task is not None and not closer.task.done()
+            monkeypatch.setattr(custody, "CONNECTION_STOP_SECONDS", 0.01)
+        for _ in range(2):
+            operation = asyncio.create_task(
+                loader.lifecycle.unload(inst.plugin_id, UnloadMode.UNINSTALL),
+            )
+            operations.append(operation)
+            done, _ = await asyncio.wait({operation}, timeout=0.3)
+            assert operation in done, "connection cleanup exceeded its budget"
+            report = operation.result()
+            assert not report.clean
+            assert not report.quiescent
+            assert report.needs_restart
+            assert any("stubborn" in error for error in report.errors)
+            assert dest.read_text(encoding="utf-8") == "owned"
+            assert root.is_dir()
+            assert load_inventory(inst.plugin_id)["locations"]
+            assert inst.state is PluginState.FAILED
+            assert inst.has_runtime_ledger()
+            assert len(close_calls) == 1
+            assert closer.task is not None and not closer.task.done()
+            if close_method == "sync_close":
+                assert not closer.task.cancelling()
+        if close_method != "sync_close":
+            await asyncio.wait_for(cancelled.wait(), timeout=0.3)
+    finally:
+        finish.set()
+        thread_finish.set()
+        tasks = [*operations]
+        if closer.task is not None:
+            tasks.append(closer.task)
+        await asyncio.gather(*tasks, return_exceptions=True)
+    report = await loader.lifecycle.unload(
+        inst.plugin_id,
+        UnloadMode.UNINSTALL,
+    )
+    assert report.clean
+    assert report.quiescent
+    assert not report.needs_restart
+    assert len(close_calls) == 1
+    assert inst.state is PluginState.DISPOSED
+    assert not dest.exists()
+    assert not root.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_method", ["aclose", "close", "sync_close"])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_connection_cleanup_reports_actual_result(
+    registry,
+    close_method,
+    fails,
+):
+    inst = PluginLoader([]).lifecycle.ensure_instance("connection-result")
+    api = PluginApi(inst.plugin_id, {}, {"id": inst.plugin_id})
+    api.set_registry(registry)
+    api.bind_instance(inst)
+
+    async def close():
+        await asyncio.sleep(0)
+        if fails:
+            raise OSError("connection close failed")
+
+    def sync_close():
+        if fails:
+            raise OSError("connection close failed")
+
+    api.hold_connection(
+        SimpleNamespace(
+            **{
+                "close"
+                if close_method == "sync_close"
+                else close_method: (
+                    sync_close if close_method == "sync_close" else close
+                ),
+            },
+        ),
+    )
+    report = await inst.dispose(UnloadMode.UNLOAD)
+    assert report.clean is not fails
+    assert report.quiescent is not fails
+    assert inst.state is (
+        PluginState.FAILED if fails else PluginState.DISPOSED
+    )
+    if fails:
+        assert inst.has_runtime_ledger()
+        assert any(
+            "connection close failed" in error for error in report.errors
+        )
+
+
+@pytest.mark.asyncio
 async def test_stop_request_cancellation_does_not_wait_for_stubborn_task():
     from qwenpaw.plugins.custody import stop_task
 

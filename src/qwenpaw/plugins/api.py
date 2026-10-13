@@ -908,14 +908,19 @@ class PluginApi:  # pylint: disable=too-many-public-methods
         self._guard_register()
         if not self._owns_commit():
             return "skipped"
+        dest = Path(dest)
+        if not str(dest).strip() or dest == Path("."):
+            raise ValueError("refusing to provision an empty dest")
+        if not dest.is_absolute():
+            dest = dest.resolve()
         branch = _provision_files(
             self.plugin_id,
             Path(src),
-            Path(dest),
+            dest,
             version,
         )
         if self._instance is not None and branch == "create":
-            self._instance.note_created_dest(str(Path(dest)))
+            self._instance.note_created_dest(str(dest))
         self._note_install(
             f"provision_files:{dest}",
             kind="provision_files",
@@ -1111,12 +1116,9 @@ class PluginApi:  # pylint: disable=too-many-public-methods
         if self._instance is None:
             raise RuntimeError("Plugin instance is not bound")
 
-        async def _teardown():
-            await custody.close_connection(client, desc)
-
         self._instance.record_runtime(
             f"connection:{desc}",
-            _teardown,
+            custody.ConnectionCloser(client, desc),
             kind="custody",
         )
         return client

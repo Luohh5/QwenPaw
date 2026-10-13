@@ -1127,6 +1127,100 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         logger.info(f"✓ Loaded plugin '{plugin_id}' successfully")
         return record
 
+    async def _recover_startup_transactions(self) -> None:
+        """Recover leftovers under each id's lock, never a live transaction."""
+        from ..utils.io_utils import run_sync_io
+        from .provision import (
+            provision_ids_to_recover,
+            recover_migrating_inventory,
+        )
+        from .updates import (
+            interrupted_update_ids,
+            recover_interrupted_updates,
+        )
+
+        try:
+            ids = await run_sync_io(
+                lambda: set(interrupted_update_ids())
+                | set(provision_ids_to_recover()),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Startup recovery scan failed; continuing plugin discovery",
+            )
+            return
+        ids.update(self._recovery_blocked)
+        for plugin_id in sorted(ids):
+            async with self.plugin_lifecycle(plugin_id):
+                if not self.lifecycle.delegate.owns_commit(plugin_id):
+                    continue
+                record = self._loaded_plugins.get(plugin_id)
+                if record is not None and record.status in (
+                    "registered",
+                    "active",
+                ):
+                    continue
+                instance = self.lifecycle.get_instance(plugin_id)
+                if instance is not None and instance.has_runtime_ledger():
+                    error = "Recovery has runtime resources; unload first"
+                    self._recovery_blocked[plugin_id] = error
+                    self._recovery_errors[plugin_id] = error
+                    self._add_recovery_diagnostics(plugin_id)
+                    continue
+
+                blocked: dict[str, str] = {}
+                errors: dict[str, str] = {}
+                try:
+                    updates = await run_sync_io(
+                        recover_interrupted_updates,
+                        plugin_id=plugin_id,
+                    )
+                    provisions = await run_sync_io(
+                        recover_migrating_inventory,
+                        plugin_id,
+                    )
+                    blocked.update(updates.blocked)
+                    blocked.update(provisions.blocked)
+                    errors.update(updates.failures)
+                    errors.update(provisions.failures)
+                except Exception as exc:  # noqa: BLE001
+                    error = str(exc) or type(exc).__name__
+                    blocked[plugin_id] = error
+                    errors[plugin_id] = error
+                    logger.exception(
+                        "Startup recovery failed for '%s'",
+                        plugin_id,
+                    )
+                if plugin_id in blocked:
+                    self._recovery_blocked[plugin_id] = blocked[plugin_id]
+                    manifest, path = next(
+                        (
+                            (manifest, path)
+                            for manifest, path in self.discover_plugins()
+                            if manifest.id == plugin_id
+                        ),
+                        (
+                            PluginManifest(id=plugin_id, version="unknown"),
+                            (
+                                self.plugin_dirs[0] / plugin_id
+                                if self.plugin_dirs
+                                else Path(plugin_id)
+                            ),
+                        ),
+                    )
+                    self._record_failed_backend(
+                        manifest,
+                        path,
+                        RuntimeError(blocked[plugin_id]),
+                    )
+                elif self._recovery_blocked.pop(plugin_id, None) is not None:
+                    self._loaded_plugins.pop(plugin_id, None)
+                    self.lifecycle.drop_instance(plugin_id)
+                self._recovery_errors.pop(plugin_id, None)
+                self._recovery_errors.update(errors)
+                if plugin_id in errors:
+                    self._add_recovery_diagnostics(plugin_id)
+
     async def load_all_plugins(
         self,
         configs: Optional[Dict[str, Dict]] = None,
@@ -1151,78 +1245,8 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         Returns:
             Dictionary of plugin_id -> PluginRecord
         """
-        from ..utils.io_utils import run_sync_io
-        from .provision import recover_migrating_inventory
-        from .updates import recover_interrupted_updates
-
-        previous_blocked = self._recovery_blocked.copy()
-        blocked: dict[str, str] = {}
-        errors: dict[str, str] = {}
-        scan_complete = True
-        try:
-            recovered_updates = await run_sync_io(
-                recover_interrupted_updates,
-                self.lifecycle.delegate.owns_commit,
-            )
-            blocked.update(recovered_updates.blocked)
-            errors.update(recovered_updates.failures)
-        except Exception:  # noqa: BLE001
-            scan_complete = False
-            logger.exception(
-                "Interrupted update recovery failed; "
-                "continuing plugin discovery",
-            )
-        try:
-            recovered_provisions = await run_sync_io(
-                recover_migrating_inventory,
-                None,
-                owns_commit=self.lifecycle.delegate.owns_commit,
-            )
-            blocked.update(recovered_provisions.blocked)
-            errors.update(recovered_provisions.failures)
-        except Exception:  # noqa: BLE001
-            scan_complete = False
-            logger.exception(
-                "Provision migration recovery failed; "
-                "continuing plugin discovery",
-            )
-
-        if not scan_complete:
-            blocked = {**previous_blocked, **blocked}
-            errors = {**self._recovery_errors, **errors}
-        for plugin_id in previous_blocked.keys() - blocked.keys():
-            instance = self.lifecycle.get_instance(plugin_id)
-            if instance is not None and instance.has_runtime_ledger():
-                blocked[
-                    plugin_id
-                ] = "Recovery has runtime resources; unload first"
-                errors[plugin_id] = blocked[plugin_id]
-                continue
-            self._loaded_plugins.pop(plugin_id, None)
-            self.lifecycle.drop_instance(plugin_id)
-        self._recovery_blocked = blocked
-        self._recovery_errors = errors
+        await self._recover_startup_transactions()
         discovered = self.discover_plugins()
-        sources = {
-            manifest.id: (manifest, path) for manifest, path in discovered
-        }
-        for plugin_id, error in self._recovery_blocked.items():
-            manifest, path = sources.get(
-                plugin_id,
-                (
-                    PluginManifest(id=plugin_id, version="unknown"),
-                    (
-                        self.plugin_dirs[0] / plugin_id
-                        if self.plugin_dirs
-                        else Path(plugin_id)
-                    ),
-                ),
-            )
-            self._record_failed_backend(manifest, path, RuntimeError(error))
-            self._add_recovery_diagnostics(plugin_id)
-        for plugin_id in self._recovery_errors:
-            if plugin_id in self._loaded_plugins:
-                self._add_recovery_diagnostics(plugin_id)
 
         for manifest, plugin_dir in discovered:
             if types is not None and manifest.plugin_type not in types:
@@ -1599,6 +1623,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         snapshot = snapshot_plugin_import_state(plugin_id, old_path)
         swapped: Path | None = None
         activated_new = False
+        old_unloaded = False
         cleanup_errors: list[str] = []
         try:
             unload_report = await self._unload_plugin_unlocked(
@@ -1611,10 +1636,17 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     plugin_id=plugin_id,
                     ok=False,
                     needs_restart=True,
-                    errors=list(unload_report.errors)
-                    or ["hosted resources did not go quiescent"],
+                    errors=(
+                        list(unload_report.errors)
+                        or ["hosted resources did not go quiescent"]
+                    )
+                    + [
+                        "New version was not enabled; "
+                        "stopping the previous service was incomplete",
+                    ],
                     generation=old_generation,
                 )
+            old_unloaded = True
             await _invoke_after_unload(after_unload, plugin_id)
             swapped = await self._swap_plugin_dir(
                 plugin_id,
@@ -1643,6 +1675,13 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                         else f"Plugin '{plugin_id}' failed to load"
                     ),
                 )
+            if not self._reload_already_committed(
+                plugin_id,
+                False,
+                previous_instance=inst,
+                generation=old_generation + 1,
+            ):
+                raise RuntimeError("New plugin instance did not activate")
             activated_new = True
             cleanup_errors = await self._finish_committed_reload(
                 plugin_id,
@@ -1661,8 +1700,37 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             committed = self._reload_already_committed(
                 plugin_id,
                 activated_new,
+                previous_instance=inst,
+                generation=old_generation + 1,
             )
             restore: ReloadReport | None = None
+            if not committed and not old_unloaded:
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                unchanged = (
+                    self._loaded_plugins.get(plugin_id) is record
+                    and self.lifecycle.get_instance(plugin_id) is inst
+                    and record.status == "active"
+                    and inst is not None
+                    and inst.state is PluginState.ACTIVE
+                    and inst.activated
+                )
+                return ReloadReport(
+                    plugin_id=plugin_id,
+                    ok=False,
+                    unchanged=unchanged,
+                    needs_restart=not unchanged,
+                    errors=[
+                        str(exc),
+                        "New version was not enabled; "
+                        + (
+                            "previous service is still active"
+                            if unchanged
+                            else "stopping the previous service was incomplete"
+                        ),
+                    ],
+                    generation=old_generation,
+                )
             if not committed and (not occupied or old_path.exists()):
                 restore = await self._rollback_reload(
                     plugin_id,
@@ -1691,6 +1759,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             needs_restart = occupied
             if restore is not None:
                 errors.extend(restore.errors)
+                errors.append(
+                    "New version was not enabled; previous service "
+                    + ("was restored" if restore.ok else "was not restored"),
+                )
                 needs_restart = needs_restart or (
                     restore.needs_restart or not restore.ok
                 )
@@ -1713,19 +1785,24 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         self,
         plugin_id: str,
         activated_new: bool,
+        *,
+        previous_instance: Any,
+        generation: int,
     ) -> bool:
         """Whether the new version is already the committed service."""
         if activated_new:
             return True
         instance = self.lifecycle.get_instance(plugin_id)
-        if instance is not None and instance.activated:
-            return True
         current = self._loaded_plugins.get(plugin_id)
-        if current is not None and current.status == "active":
-            return True
-        from .updates import STATUS_COMMITTED, update_marker_status
-
-        return update_marker_status(plugin_id) == STATUS_COMMITTED
+        return bool(
+            instance is not None
+            and instance is not previous_instance
+            and instance.generation == generation
+            and instance.state is PluginState.ACTIVE
+            and instance.activated
+            and current is not None
+            and current.status == "active",
+        )
 
     async def _finish_committed_reload(
         self,
@@ -2203,7 +2280,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 )
                 if not report.ok:
                     detail = (
-                        report.errors[0]
+                        "; ".join(report.errors)
                         if report.errors
                         else f"Reload of '{plugin_id}' failed"
                     )

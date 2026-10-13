@@ -177,7 +177,22 @@ def recover_one_update(plugin_id: str) -> str | None:
     return _restore_one_marker(path)
 
 
-def recover_interrupted_updates(owns_commit=None) -> RecoveryResult:
+def interrupted_update_ids() -> list[str]:
+    """Return marker ids without restoring current-process transactions."""
+    from ..constant import WORKING_DIR
+
+    root = Path(WORKING_DIR) / "plugin_updates"
+    return [
+        _peek_marker_plugin_id(path) or path.stem
+        for path in sorted(root.glob("*.json"))
+    ]
+
+
+def recover_interrupted_updates(
+    owns_commit=None,
+    *,
+    plugin_id: str | None = None,
+) -> RecoveryResult:
     """Restore plugin dirs still marked updating. Returns restored ids.
 
     Each marker is isolated: an occupied target must not stop the rest.
@@ -188,7 +203,14 @@ def recover_interrupted_updates(owns_commit=None) -> RecoveryResult:
     restored = RecoveryResult()
     if not root.is_dir():
         return restored
-    for path in sorted(root.glob("*.json")):
+    paths = (
+        [marker_path(plugin_id)]
+        if plugin_id is not None
+        else sorted(root.glob("*.json"))
+    )
+    for path in paths:
+        if not path.is_file():
+            continue
         plugin_id = _peek_marker_plugin_id(path) or path.stem
         if (
             plugin_id

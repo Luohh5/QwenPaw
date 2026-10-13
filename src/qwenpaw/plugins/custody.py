@@ -103,39 +103,102 @@ async def stop_subprocess(proc: Any, desc: str) -> None:
     await run_sync_io(_stop_subprocess_blocking, proc, desc)
 
 
-async def close_connection(client: Any, desc: str) -> None:
-    """Close *client*. Await ``aclose``; run sync ``close`` in a thread."""
-    aclose = getattr(client, "aclose", None)
-    if callable(aclose):
-        result = aclose()
+class ConnectionCloser:
+    """Retain a close operation across teardown retries."""
+
+    def __init__(self, client: Any, desc: str) -> None:
+        self.client = client
+        self.desc = desc
+        self.task: asyncio.Future[Any] | None = None
+        self._cancel_task = True
+
+    @staticmethod
+    def _observe(task: asyncio.Future[Any]) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    @staticmethod
+    async def _close_sync(closer: Callable[[], Any]) -> Any:
+        result = await run_sync_io(closer)
+        return await result if inspect.isawaitable(result) else result
+
+    async def _start(self) -> None:
+        self._cancel_task = True
+        closer = getattr(self.client, "aclose", None)
+        if callable(closer):
+            result = closer()
+        else:
+            closer = getattr(self.client, "close", None)
+            if closer is None:
+                return
+            if inspect.iscoroutinefunction(closer):
+                result = closer()
+            else:
+                # A thread cannot be cancelled. Keep its wrapper alive until
+                # close really finishes, including any returned awaitable.
+                self._cancel_task = False
+                result = self._close_sync(closer)
         if inspect.isawaitable(result):
-            try:
-                await asyncio.wait_for(
-                    result,
-                    timeout=CONNECTION_STOP_SECONDS,
-                )
-            except asyncio.TimeoutError as exc:
-                raise TimeoutError(
-                    f"connection {desc!r} did not close "
-                    f"in {CONNECTION_STOP_SECONDS:.0f}s",
-                ) from exc
-        return
-    closer = getattr(client, "close", None)
-    if closer is None:
-        return
-    if inspect.iscoroutinefunction(closer):
+            self.task = asyncio.ensure_future(result)
+            self.task.add_done_callback(self._observe)
+        elif result is False:
+            raise RuntimeError(
+                f"connection {self.desc!r} did not fully close",
+            )
+
+    async def __call__(self) -> None:
+        if self.task is None:
+            await self._start()
+        if self.task is None:
+            return
+
+        task = self.task
         try:
-            await asyncio.wait_for(
-                closer(),
+            _, pending = await asyncio.wait(
+                {task},
                 timeout=CONNECTION_STOP_SECONDS,
             )
-        except asyncio.TimeoutError as exc:
+        except asyncio.CancelledError:
+            if (
+                self._cancel_task
+                and not task.done()
+                and (
+                    not isinstance(task, asyncio.Task) or not task.cancelling()
+                )
+            ):
+                task.cancel()
+            raise
+        if pending:
+            # Cancel once; retries must not interrupt ongoing cancellation
+            # cleanup or start another close operation for this connection.
+            if self._cancel_task and (
+                not isinstance(task, asyncio.Task) or not task.cancelling()
+            ):
+                task.cancel()
             raise TimeoutError(
-                f"connection {desc!r} did not close "
-                f"in {CONNECTION_STOP_SECONDS:.0f}s",
-            ) from exc
-        return
-    await run_sync_io(closer)
+                f"connection {self.desc!r} did not fully close "
+                f"in {CONNECTION_STOP_SECONDS:g}s",
+            )
+        if task.cancelled():
+            self.task = None
+            raise RuntimeError(
+                f"connection {self.desc!r} close was cancelled",
+            )
+        try:
+            result = task.result()
+        except Exception:
+            self.task = None
+            raise
+        if result is False:
+            self.task = None
+            raise RuntimeError(
+                f"connection {self.desc!r} did not fully close",
+            )
+
+
+async def close_connection(client: Any, desc: str) -> None:
+    """Close *client* once; hosted connections retain their closer instead."""
+    await ConnectionCloser(client, desc)()
 
 
 def start_watch(

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import inspect
 import hashlib
 import importlib
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Awaitable, Iterator
@@ -333,6 +335,57 @@ def location_owned(loc: dict[str, Any] | None) -> bool:
     return loc.get("branch") in {"create", "migrate"}
 
 
+@dataclass
+class _CreateTxn:
+    dest: Path
+    identity: tuple[int, int, int] | None = None
+    published: bool = False
+
+    def rollback(self) -> None:
+        if not self.published:
+            return
+        try:
+            current = self.dest.lstat()
+        except FileNotFoundError:
+            return
+        if (current.st_dev, current.st_ino, current.st_mode) != self.identity:
+            raise OSError(f"provision target identity changed: {self.dest}")
+        _remove_path(self.dest)
+
+
+def _rename_noreplace(src: Path, dest: Path) -> None:
+    """Publish without overwriting another writer's file or directory."""
+    if os.name == "nt":
+        os.rename(src, dest)  # Windows rename refuses an existing target.
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    arguments: tuple[Any, ...]
+    argument_types: list[Any]
+    if sys.platform == "darwin":
+        rename = getattr(libc, "renamex_np", None)
+        arguments = (os.fsencode(src), os.fsencode(dest), 4)  # RENAME_EXCL
+        argument_types = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    elif sys.platform.startswith("linux"):
+        rename = getattr(libc, "renameat2", None)
+        arguments = (-100, os.fsencode(src), -100, os.fsencode(dest), 1)
+        argument_types = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+    else:
+        rename = None
+    if rename is None:
+        raise OSError("atomic no-replace provision publication unavailable")
+    rename.argtypes = argument_types
+    rename.restype = ctypes.c_int
+    if rename(*arguments) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(dest))
+
+
 def provision_files(
     plugin_id: str,
     src: Path,
@@ -360,7 +413,7 @@ def provision_files(
     prev_version = previous.get("version")
     prev_files: dict[str, Any] = previous.get("files") or {}
     owned = location_owned(previous)
-    dest_existed = dest.exists()
+    dest_existed = os.path.lexists(dest)
 
     if dest_existed and prev_version == version:
         return "keep"
@@ -379,6 +432,7 @@ def provision_files(
         return "keep"
 
     branch = "create" if not dest_existed else "migrate"
+    create_txn = _CreateTxn(dest)
     if branch == "create":
         owned = True
     backup = None
@@ -396,7 +450,7 @@ def provision_files(
         )
     try:
         if branch == "create":
-            new_files = _create_via_staging(src, dest, prev_files)
+            new_files = _create_via_staging(src, dest, prev_files, create_txn)
         else:
             new_files = _apply_factory_copy(src, dest, prev_files, branch)
         marker = None
@@ -419,9 +473,13 @@ def provision_files(
             "migrating": marker,
         }
         save_inventory(plugin_id, data)
-    except Exception:
-        if branch == "create" and not dest_existed and dest.exists():
-            _remove_path(dest)
+    except BaseException as exc:
+        try:
+            create_txn.rollback()
+        except Exception as cleanup_error:
+            raise OSError(
+                f"{exc}; provision cleanup incomplete: {cleanup_error}",
+            ) from exc
         raise
     return branch
 
@@ -486,9 +544,10 @@ def _create_via_staging(
     src: Path,
     dest: Path,
     prev_files: dict[str, Any],
+    txn: _CreateTxn,
 ) -> dict[str, Any]:
     """Copy factory files on the same volume, then rename onto dest."""
-    if dest.exists():
+    if os.path.lexists(dest):
         raise RuntimeError(f"provision create dest already exists: {dest}")
     parent = dest.parent
     parent.mkdir(parents=True, exist_ok=True)
@@ -503,16 +562,15 @@ def _create_via_staging(
     staging = staging_root / (dest.name or "dest")
     try:
         new_files = _apply_factory_copy(src, staging, prev_files, "create")
-        if dest.exists():
+        if os.path.lexists(dest):
             raise RuntimeError(
                 f"provision dest appeared during create: {dest}",
             )
-        os.rename(str(staging), str(dest))
+        identity = staging.lstat()
+        txn.identity = (identity.st_dev, identity.st_ino, identity.st_mode)
+        _rename_noreplace(staging, dest)
+        txn.published = True
         return new_files
-    except Exception:
-        if dest.exists():
-            _remove_path(dest)
-        raise
     finally:
         if staging_root.exists():
             safe_remove(
@@ -672,7 +730,8 @@ def _recover_one_migrating_location(
     return True
 
 
-def _provision_ids_to_recover(plugin_id: str | None) -> list[str]:
+def provision_ids_to_recover(plugin_id: str | None = None) -> list[str]:
+    """Return inventory ids for startup recovery without changing them."""
     if plugin_id is not None:
         return [plugin_id]
     from ..constant import WORKING_DIR
@@ -746,7 +805,7 @@ def recover_migrating_inventory(
     from .updates import update_is_committed
 
     recovered = RecoveryResult()
-    for item_id in _provision_ids_to_recover(plugin_id):
+    for item_id in provision_ids_to_recover(plugin_id):
         if owns_commit is not None and not owns_commit(item_id):
             continue
         try:
