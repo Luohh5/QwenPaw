@@ -206,10 +206,10 @@ async def uninstall_pawapp(app_id: str, request: Request) -> Dict[str, Any]:
         from ...plugins.lifecycle import UnloadMode
         from .plugins import memory_in_use_detail, unload_http_detail
 
-        report = await loader.unload_plugin(
+        report = await loader.lifecycle.unload(
             app_id,
+            UnloadMode.UNINSTALL,
             delete_files=True,
-            mode=UnloadMode.UNINSTALL,
         )
     except KeyError as exc:
         raise HTTPException(

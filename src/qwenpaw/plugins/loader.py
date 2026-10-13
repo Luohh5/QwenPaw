@@ -302,6 +302,13 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
 
     def _require_recovered(self, plugin_id: str) -> None:
         """Do not import or commit a version whose boot recovery failed."""
+        if plugin_id == "cloudpaw":
+            from .legacy_cloudpaw import has_pending_uninstall
+
+            if has_pending_uninstall(self):
+                raise RuntimeError(
+                    "CloudPaw uninstall is incomplete; retry uninstall",
+                )
         if plugin_id in self._recovery_blocked:
             raise RuntimeError(
                 f"Plugin '{plugin_id}' recovery failed; needs_restart: "
@@ -1567,6 +1574,20 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 unchanged=True,
                 errors=["commit is not owned by this process"],
             )
+        if plugin_id == "cloudpaw":
+            from .legacy_cloudpaw import has_pending_uninstall
+
+            from ..utils.io_utils import run_sync_io
+
+            if await run_sync_io(has_pending_uninstall, self):
+                return ReloadReport(
+                    plugin_id=plugin_id,
+                    ok=False,
+                    unchanged=True,
+                    errors=[
+                        "CloudPaw uninstall is incomplete; retry uninstall",
+                    ],
+                )
         record = self._loaded_plugins.get(plugin_id)
         if record is None:
             return ReloadReport(
@@ -2742,6 +2763,42 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         if mode is not UnloadMode.SHUTDOWN:
             self.registry.assert_memory_backends_not_in_use(plugin_id)
 
+        cloudpaw_cleanup = None
+        if plugin_id == "cloudpaw":
+            from ..utils.io_utils import run_sync_io
+            from .legacy_cloudpaw import (
+                has_pending_stops,
+                has_pending_uninstall,
+                prepare_uninstall,
+            )
+
+            pending = await run_sync_io(has_pending_uninstall, self)
+            if mode is UnloadMode.UNLOAD and pending:
+                return UnloadReport(
+                    plugin_id=plugin_id,
+                    mode=mode,
+                    clean=False,
+                    quiescent=not has_pending_stops(self),
+                    errors=[
+                        "CloudPaw uninstall is incomplete; retry uninstall",
+                    ],
+                )
+            if mode is UnloadMode.UNINSTALL or pending:
+                try:
+                    cloudpaw_cleanup = await prepare_uninstall(
+                        self,
+                        record.source_path,
+                    )
+                except Exception as exc:
+                    return UnloadReport(
+                        plugin_id=plugin_id,
+                        mode=mode,
+                        clean=False,
+                        quiescent=False,
+                        needs_restart=True,
+                        errors=[f"CloudPaw agent shutdown: {exc}"],
+                    )
+
         # Author hooks must run while they are still in the registry.
         # Ledger teardowns only drop the rows; they do not invoke them.
         report = UnloadReport(plugin_id=plugin_id, mode=mode)
@@ -2766,6 +2823,12 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             tool_names = recorded_tool_names(plugin_id)
 
             async def _cleanup_settings() -> None:
+                if cloudpaw_cleanup is not None:
+                    from .legacy_cloudpaw import cleanup, retire_agent_cleanup
+                    from ..utils.io_utils import run_sync_io
+
+                    await run_sync_io(cleanup, cloudpaw_cleanup)
+                    await run_sync_io(retire_agent_cleanup, instance)
                 await self._drop_uninstalled_settings(plugin_id, tool_names)
 
             before_install = _cleanup_settings
@@ -2886,6 +2949,16 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
 
         if mode is not UnloadMode.SHUTDOWN:
             self.lifecycle.drop_instance(plugin_id)
+
+        if (
+            mode is UnloadMode.UNINSTALL
+            and cloudpaw_cleanup is not None
+            and report.clean
+        ):
+            from .legacy_cloudpaw import finish_uninstall
+            from ..utils.io_utils import run_sync_io
+
+            await run_sync_io(finish_uninstall, self, cloudpaw_cleanup)
 
         logger.info(f"Unloaded plugin '{plugin_id}'")
         return report
@@ -3111,8 +3184,27 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         )
         source_path = self._find_installed_plugin_dir(plugin_id)
         has_inventory = inventory_path(plugin_id).is_file()
-        if source_path is None and not has_inventory:
+        from .legacy_cloudpaw import has_pending_cleanup
+
+        if (
+            source_path is None
+            and not has_inventory
+            and not (plugin_id == "cloudpaw" and has_pending_cleanup())
+        ):
             raise KeyError(f"Plugin '{plugin_id}' is not installed")
+
+        cloudpaw_cleanup = None
+        if plugin_id == "cloudpaw":
+            from .legacy_cloudpaw import prepare_uninstall
+
+            try:
+                cloudpaw_cleanup = await prepare_uninstall(self, source_path)
+            except Exception as exc:
+                report.clean = False
+                report.quiescent = False
+                report.needs_restart = True
+                report.errors.append(f"CloudPaw agent shutdown: {exc}")
+                return report
 
         created = snapshot_created_dests(plugin_id)
         declared: list[str] = []
@@ -3145,6 +3237,11 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             replay_persisted_provisions,
             plugin_id,
             source_path,
+            **(
+                {"skip_kinds": ("cloudpaw_agents",)}
+                if cloudpaw_cleanup is not None
+                else {}
+            ),
         )
         if replay_errors:
             report.clean = False
@@ -3153,6 +3250,11 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             report.errors.extend(replay_errors)
             return report
         try:
+            if cloudpaw_cleanup is not None:
+                from .legacy_cloudpaw import cleanup, retire_agent_cleanup
+
+                await run_sync_io(cleanup, cloudpaw_cleanup)
+                await run_sync_io(retire_agent_cleanup)
             await self._drop_uninstalled_settings(plugin_id, tool_names)
         except Exception as exc:  # noqa: BLE001
             report.clean = False
@@ -3179,6 +3281,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 purpose="uninstall plugin directory",
             )
         self.lifecycle.drop_instance(plugin_id)
+        if cloudpaw_cleanup is not None and report.clean:
+            from .legacy_cloudpaw import finish_uninstall
+
+            await run_sync_io(finish_uninstall, self, cloudpaw_cleanup)
         logger.info(
             "Uninstalled plugin '%s' without a live instance",
             plugin_id,
@@ -3595,6 +3701,27 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             )
 
     async def _invoke_startup_hook(self, hook: Any) -> None:
+        from .legacy_cloudpaw import (
+            is_legacy_source,
+            remember,
+            restore_unload,
+            snapshot,
+        )
+        from ..utils.io_utils import run_sync_io
+
+        record = self._loaded_plugins.get(hook.plugin_id)
+        source = record.source_path if record is not None else None
+        legacy = hook.plugin_id == "cloudpaw" and is_legacy_source(source)
+        before = await run_sync_io(snapshot) if legacy else None
+        try:
+            await self._invoke_startup_hook_body(hook)
+        finally:
+            if hook.plugin_id == "cloudpaw":
+                patched = restore_unload(self)
+                if (legacy or patched) and source is not None:
+                    await run_sync_io(remember, source, before)
+
+    async def _invoke_startup_hook_body(self, hook: Any) -> None:
         result = hook.callback()
         await await_with_budget(
             result,

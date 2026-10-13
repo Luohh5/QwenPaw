@@ -224,3 +224,35 @@ async def test_shutdown_retries_retired_workspace_preserving_reused_services(
         call.kwargs == {"final": False} for call in old.stop.await_args_list
     )
     new.stop.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replace_instance", [False, True])
+async def test_stop_reuses_instance_task_without_removing_replacement(
+    replace_instance,
+):
+    """Concurrent stops share work and preserve a replacement agent."""
+    mgr = MultiAgentManager()
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def stop():
+        started.set()
+        await release.wait()
+
+    old = SimpleNamespace(stop=AsyncMock(side_effect=stop))
+    new = SimpleNamespace(stop=AsyncMock())
+    mgr.agents["agent"] = old
+    first = asyncio.create_task(mgr.stop_agent("agent"))
+    await asyncio.wait_for(started.wait(), 1)
+    second = asyncio.create_task(mgr.stop_agent("agent"))
+    await asyncio.sleep(0)
+    if replace_instance:
+        mgr.agents["agent"] = new
+    release.set()
+    await asyncio.wait_for(asyncio.gather(first, second), 1)
+    old.stop.assert_awaited_once()
+    new.stop.assert_not_awaited()
+    if replace_instance:
+        assert mgr.agents["agent"] is new
+    else:
+        assert "agent" not in mgr.agents

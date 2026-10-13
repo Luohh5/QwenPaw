@@ -123,8 +123,8 @@ def _loader_stub(
         log,
         f"lifecycle({plugin_id})",
     )
-    loader.unload_plugin = AsyncMock(
-        side_effect=lambda *a, **k: log.append("unload_plugin"),
+    loader.lifecycle.unload = AsyncMock(
+        side_effect=lambda *a, **k: log.append("lifecycle.unload"),
     )
 
     def _load(**kwargs):
@@ -471,7 +471,7 @@ class TestLoadPluginWithOptionalForceReinstall:
         assert (kwargs["before_force_unload"] is not None) is force
         assert kwargs["pawport_owner"] == {"owner": "pawport"}
         assert kwargs["recover_incomplete"] is True
-        loader.unload_plugin.assert_not_awaited()
+        loader.lifecycle.unload.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -624,34 +624,36 @@ class TestUninstallPluginSource:
         report = UnloadReport(plugin_id="plug", mode=UnloadMode.UNINSTALL)
 
         async def unload(*args, **kwargs):
-            log.append("unload_plugin")
+            log.append("lifecycle.unload")
             return report
 
-        loader.unload_plugin.side_effect = unload
+        loader.lifecycle.unload.side_effect = unload
         app = _app(loader)
         await uninstall_plugin_source(
             "plug",
             app=app,
             reload_agents=reload_agents,
         )
-        loader.unload_plugin.assert_awaited_once_with(
+        loader.lifecycle.unload.assert_awaited_once_with(
             "plug",
+            UnloadMode.UNINSTALL,
             delete_files=True,
-            mode=UnloadMode.UNINSTALL,
         )
         assert log == [
             "lifecycle(plug):enter",
-            "unload_plugin",
+            "lifecycle.unload",
             "lifecycle(plug):exit",
         ]
         assert not app.state.multi_agent_manager.mock_calls
 
     async def test_unknown_plugin_error_comes_from_lifecycle(self):
         loader = _loader_stub([])
-        loader.unload_plugin.side_effect = KeyError("Plugin 'ghost' not found")
+        loader.lifecycle.unload.side_effect = KeyError(
+            "Plugin 'ghost' not found",
+        )
         with pytest.raises(KeyError, match="ghost"):
             await uninstall_plugin_source("ghost", app=_app(loader))
-        loader.unload_plugin.assert_awaited_once()
+        loader.lifecycle.unload.assert_awaited_once()
 
     @pytest.mark.parametrize(
         "quiescent,loaded",
@@ -671,7 +673,7 @@ class TestUninstallPluginSource:
             quiescent=quiescent,
             needs_restart=True,
         )
-        loader.unload_plugin = AsyncMock(return_value=report)
+        loader.lifecycle.unload = AsyncMock(return_value=report)
         with pytest.raises(plugins_module.UnquiescentUnloadError) as caught:
             await uninstall_plugin_source("plug", app=_app(loader))
         assert caught.value.report is report
@@ -882,7 +884,7 @@ class TestUninstallPluginRoute:
         from qwenpaw.plugins.lifecycle import UnloadMode, UnloadReport
 
         loader = _loader_stub([])
-        loader.unload_plugin = AsyncMock(
+        loader.lifecycle.unload = AsyncMock(
             return_value=UnloadReport(
                 plugin_id="plug",
                 mode=UnloadMode.UNINSTALL,
@@ -912,7 +914,7 @@ class TestUninstallPluginRoute:
         from qwenpaw.plugins.lifecycle import UnloadMode, UnloadReport
 
         loader = _loader_stub([], record=_record() if loaded else None)
-        loader.unload_plugin = AsyncMock(
+        loader.lifecycle.unload = AsyncMock(
             return_value=UnloadReport(
                 plugin_id="plug",
                 mode=UnloadMode.UNINSTALL,
@@ -940,7 +942,7 @@ class TestUninstallPluginRoute:
 
     def test_memory_backend_in_use_returns_409_and_keeps_plugin_loaded(self):
         loader = _loader_stub([], record=_record())
-        loader.unload_plugin.side_effect = RuntimeError(
+        loader.lifecycle.unload.side_effect = RuntimeError(
             "memory backend is in use",
         )
         response = _client(loader).delete("/api/plugins/plug")

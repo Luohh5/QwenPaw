@@ -419,6 +419,9 @@ class Workspace:
 
         Drop-in replacement for the old ``Runner.stream_query()``.
         """
+        available = getattr(self._manager, "assert_agent_available", None)
+        if available is not None:
+            available(self.agent_id)
         config = load_agent_config(self.agent_id)
         backend = config.backend
         if backend != "qwenpaw":

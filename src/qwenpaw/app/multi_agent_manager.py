@@ -58,6 +58,9 @@ class MultiAgentManager:
         )
         self._cleanup_tasks: Set[asyncio.Task] = set()
         self._retired_instances: Dict[int, Workspace] = {}
+        self._uninstalling_agents: Set[str] = set()
+        self._agent_stop_tasks: Dict[int, asyncio.Task] = {}
+        self._reloading_agents: Dict[str, int] = {}
         self._config_generations: Dict[str, int] = {}
         logger.debug("MultiAgentManager initialized")
 
@@ -202,6 +205,7 @@ class MultiAgentManager:
 
         async with self._lock:
             # Re-check under lock
+            self.assert_agent_available(agent_id)
             if agent_id in self.agents:
                 logger.debug(
                     f"Returning cached agent: {sanitize_log_value(agent_id)}",
@@ -509,6 +513,20 @@ class MultiAgentManager:
             f"Old instance cleanup scheduled in background.",
         )
 
+    def assert_agent_available(self, agent_id: str) -> None:
+        if agent_id in self._uninstalling_agents:
+            raise RuntimeError(f"Agent '{agent_id}' is being uninstalled")
+        instance = self.agents.get(agent_id)
+        if instance is not None and id(instance) in self._agent_stop_tasks:
+            raise RuntimeError(f"Agent '{agent_id}' is stopping")
+
+    def reserve_agent_uninstall(self, agent_ids) -> None:
+        """Block new requests while plugin-owned agents are removed."""
+        self._uninstalling_agents.update(agent_ids)
+
+    def release_agent_uninstall(self, agent_ids) -> None:
+        self._uninstalling_agents.difference_update(agent_ids)
+
     async def stop_agent(self, agent_id: str) -> bool:
         """Stop a specific agent instance.
 
@@ -524,13 +542,37 @@ class MultiAgentManager:
                 return False
 
             instance = self.agents[agent_id]
-            await instance.stop()
-            del self.agents[agent_id]
-            self._agent_startup_statuses[
-                agent_id
-            ] = AgentStartupStatus.DISABLED
-            logger.info(f"Agent stopped and removed: {agent_id}")
-            return True
+            key = id(instance)
+            task = self._agent_stop_tasks.get(key)
+            if task is None or task.done():
+                task = asyncio.create_task(
+                    self._stop_agent_instance(agent_id, instance),
+                )
+                self._agent_stop_tasks[key] = task
+                # A cancelled caller must not lose the worker's exception.
+                task.add_done_callback(
+                    lambda done: None
+                    if done.cancelled()
+                    else done.exception(),
+                )
+        return await asyncio.shield(task)
+
+    async def _stop_agent_instance(
+        self,
+        agent_id: str,
+        instance: Workspace,
+    ) -> bool:
+        if await instance.stop() is False:
+            raise RuntimeError(f"Agent '{agent_id}' did not stop")
+        async with self._lock:
+            if self.agents.get(agent_id) is instance:
+                self.agents.pop(agent_id)
+                self._agent_startup_statuses[
+                    agent_id
+                ] = AgentStartupStatus.DISABLED
+            self._agent_stop_tasks.pop(id(instance), None)
+        logger.info(f"Agent stopped and removed: {agent_id}")
+        return True
 
     @staticmethod
     def _mark_rejected_reusable_services_for_cleanup(
@@ -577,6 +619,19 @@ class MultiAgentManager:
             )
 
     async def reload_agent(self, agent_id: str) -> bool:
+        """Track replacements so plugin uninstall cannot miss a candidate."""
+        self.assert_agent_available(agent_id)
+        self._reloading_agents[agent_id] = (
+            self._reloading_agents.get(agent_id, 0) + 1
+        )
+        try:
+            return await self._reload_agent_body(agent_id)
+        finally:
+            self._reloading_agents[agent_id] -= 1
+            if not self._reloading_agents[agent_id]:
+                self._reloading_agents.pop(agent_id)
+
+    async def _reload_agent_body(self, agent_id: str) -> bool:
         """Reload a specific agent instance with zero-downtime.
 
         This method performs a seamless reload by:
@@ -656,7 +711,12 @@ class MultiAgentManager:
             # cleanup while holding this lock.
             discard_reason = None
             async with self._lock:
-                if agent_id not in self.agents:
+                if (
+                    agent_id in self._uninstalling_agents
+                    or id(self.agents.get(agent_id)) in self._agent_stop_tasks
+                ):
+                    discard_reason = "stopping"
+                elif agent_id not in self.agents:
                     discard_reason = "removed"
                 elif self._config_generations.get(agent_id, 0) != generation:
                     discard_reason = "stale"
@@ -768,10 +828,8 @@ class MultiAgentManager:
 
         async def _stop_one(agent_id: str, instance: Workspace):
             try:
-                await instance.stop()
-                logger.debug(f"Agent stopped: {agent_id}")
                 if self.agents.get(agent_id) is instance:
-                    self.agents.pop(agent_id)
+                    await self.stop_agent(agent_id)
             except Exception as e:
                 logger.error(
                     f"Error stopping agent {agent_id}: {e}",
@@ -788,11 +846,13 @@ class MultiAgentManager:
             ),
         )
 
-        if self.agents or self._retired_instances:
+        if self.agents or self._retired_instances or self._agent_stop_tasks:
             logger.error(
-                "Workspace cleanup incomplete: %d current, %d retired",
+                "Workspace cleanup incomplete: %d current, %d retired, "
+                "%d closing",
                 len(self.agents),
                 len(self._retired_instances),
+                len(self._agent_stop_tasks),
             )
         else:
             logger.info("All agents stopped")
@@ -864,6 +924,7 @@ class MultiAgentManager:
 
     async def _wait_for_scheduled_startup(self, agent_id: str) -> None:
         """Join an existing queued startup instead of bypassing its limit."""
+        self.assert_agent_available(agent_id)
         startup_task = self._agent_startup_tasks.get(agent_id)
         if (
             startup_task is None
@@ -876,6 +937,8 @@ class MultiAgentManager:
                 config_key="agent",
                 message=f"Agent '{agent_id}' failed to initialize",
             )
+
+        self.assert_agent_available(agent_id)
 
     def schedule_agent_startup(self, agent_id: str) -> asyncio.Task[bool]:
         """Queue one custom agent through the shared startup limit."""

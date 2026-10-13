@@ -211,6 +211,8 @@ async def _invoke_teardown(callback) -> None:
 def replay_persisted_provisions(
     plugin_id: str,
     source_path: Path | None,
+    *,
+    skip_kinds: tuple[str, ...] = (),
 ) -> list[str]:
     """Replay persisted cleanup, retaining unresolved rows for retry."""
     data = load_inventory(plugin_id)
@@ -220,6 +222,8 @@ def replay_persisted_provisions(
             continue
         ref = str(row.get("teardown_ref") or "").strip()
         kind = str(row.get("kind") or "")
+        if kind in skip_kinds:
+            continue
         if kind == "cloudpaw_agents" and not ref:
             ref = "agents_setup:uninstall_agents"
         desc = str(row.get("desc") or kind or "unknown provision")

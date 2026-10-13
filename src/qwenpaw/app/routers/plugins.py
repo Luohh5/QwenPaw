@@ -395,10 +395,10 @@ async def uninstall_plugin_source(
     async with loader.plugin_lifecycle(plugin_id):
         from ...plugins.lifecycle import UnloadMode
 
-        report = await loader.unload_plugin(
+        report = await loader.lifecycle.unload(
             plugin_id,
+            UnloadMode.UNINSTALL,
             delete_files=True,
-            mode=UnloadMode.UNINSTALL,
         )
         still_loaded = loader.get_loaded_plugin(plugin_id) is not None
         if not report.clean or not report.quiescent or still_loaded:
@@ -627,10 +627,10 @@ async def unload_plugin_keep_config(plugin_id: str, request: Request):
 
     try:
         async with loader.plugin_lifecycle(plugin_id):
-            report = await loader.unload_plugin(
+            report = await loader.lifecycle.unload(
                 plugin_id,
+                UnloadMode.UNLOAD,
                 delete_files=False,
-                mode=UnloadMode.UNLOAD,
             )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
