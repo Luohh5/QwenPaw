@@ -1,5 +1,6 @@
 import { getApiUrl } from "../config";
 import { buildAuthHeaders } from "../authHeaders";
+import { responseErrorMessage } from "../error";
 
 /** Matches the backend ``PluginType`` enum values. */
 export type PluginType =
@@ -104,9 +105,11 @@ export async function fetchPluginCatalog(): Promise<OfficialPluginCatalog> {
   });
 
   if (!response.ok) {
-    const body = await response.json().catch(() => ({}));
     throw new Error(
-      body.detail ?? `Failed to load plugin catalog (${response.status})`,
+      await responseErrorMessage(
+        response,
+        `Failed to load plugin catalog (${response.status})`,
+      ),
     );
   }
 
@@ -127,8 +130,12 @@ export async function installPlugin(
   });
 
   if (!response.ok) {
-    const body = await response.json().catch(() => ({}));
-    throw new Error(body.detail ?? `Install failed (${response.status})`);
+    throw new Error(
+      await responseErrorMessage(
+        response,
+        `Install failed (${response.status})`,
+      ),
+    );
   }
 
   return response.json();
@@ -148,8 +155,12 @@ export async function uploadPlugin(file: File): Promise<InstallPluginResult> {
   });
 
   if (!response.ok) {
-    const body = await response.json().catch(() => ({}));
-    throw new Error(body.detail ?? `Upload failed (${response.status})`);
+    throw new Error(
+      await responseErrorMessage(
+        response,
+        `Upload failed (${response.status})`,
+      ),
+    );
   }
 
   return response.json();
@@ -165,8 +176,12 @@ export async function uninstallPlugin(pluginId: string): Promise<void> {
   });
 
   if (!response.ok) {
-    const body = await response.json().catch(() => ({}));
-    throw new Error(body.detail ?? `Uninstall failed (${response.status})`);
+    throw new Error(
+      await responseErrorMessage(
+        response,
+        `Uninstall failed (${response.status})`,
+      ),
+    );
   }
 }
 
@@ -181,8 +196,12 @@ export async function fetchPluginStatus(
   });
 
   if (!response.ok) {
-    const body = await response.json().catch(() => ({}));
-    throw new Error(body.detail ?? `Status fetch failed (${response.status})`);
+    throw new Error(
+      await responseErrorMessage(
+        response,
+        `Status fetch failed (${response.status})`,
+      ),
+    );
   }
 
   return response.json();
