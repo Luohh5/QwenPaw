@@ -11,6 +11,9 @@ import json
 from pathlib import Path
 import uuid
 
+from qwenpaw.channel_protocol.errors import RPC_LIFECYCLE_ERROR, RpcError
+from qwenpaw.channel_protocol.response_policy import ResponsePolicy
+from qwenpaw.channel_protocol.targets import decode_reply_target
 from qwenpaw.channel_protocol.models import InboundEvent
 from qwenpaw.channel_protocol.response_lifecycle import ResponseResourceRef
 from qwenpaw.channel_protocol.shared_response_driver import (
@@ -144,6 +147,14 @@ class FeishuDriver(SharedResponseDriver):
             raise ValueError("NOT_CONNECTED")
         return self._platform
 
+    def response_policy(self, response_handle: str) -> ResponsePolicy:
+        attrs = self._route_attrs(response_handle)
+        return ResponsePolicy(
+            streaming=bool(self._config.get("streaming_enabled"))
+            and not bool(json.loads(attrs["session_ctx"]).get("thread_id")),
+            completion_reaction=True,
+        )
+
     def _session(self, sender, meta):
         chat = str(meta.get("feishu_chat_id") or "")
         if meta.get("feishu_chat_type") == "group" and chat:
@@ -155,11 +166,19 @@ class FeishuDriver(SharedResponseDriver):
         return short_session_id_from_full_id(sender or chat)
 
     def _target(self, handle, meta):
+        neutral = decode_reply_target(str(handle))
         if meta.get("feishu_receive_id"):
             return [
                 meta.get("feishu_receive_id_type") or "open_id",
                 meta["feishu_receive_id"],
             ]
+        if neutral is not None:
+            session = neutral["session_id"]
+            if session:
+                return self._receive_ids.get(session)
+            return (
+                ["open_id", neutral["user_id"]] if neutral["user_id"] else None
+            )
         value = str(handle).strip()
         if value.startswith("feishu:sw:"):
             key = value[len("feishu:sw:") :]
@@ -277,7 +296,14 @@ class FeishuDriver(SharedResponseDriver):
             meta["session_id"] = params["session_id"]
         target = self._target(params["to_handle"], meta)
         if not target:
-            raise ValueError("OUTBOUND_TARGET_UNKNOWN")
+            raise RpcError(
+                RPC_LIFECYCLE_ERROR,
+                "outbound target unavailable",
+                data={
+                    "reason_code": "OUTBOUND_TARGET_UNKNOWN",
+                    "retryable": False,
+                },
+            )
         handle = "feishu:reply:" + uuid.uuid4().hex
         await self._open_route(handle, target, meta)
         return {"response_handle": handle}
@@ -371,6 +397,12 @@ class FeishuDriver(SharedResponseDriver):
         )
 
     async def _emit(self, event_id, kind, sender, actor, parts, meta):
+        meta = dict(meta)
+        meta["debounce_key"] = meta["session_id"] + (
+            ":" + meta["user_id"]
+            if meta.get("is_group") and meta["user_id"] != "group"
+            else ""
+        )
         handle = (
             "feishu:reply:"
             + hashlib.sha256(

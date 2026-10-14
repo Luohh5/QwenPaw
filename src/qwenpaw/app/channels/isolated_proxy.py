@@ -17,7 +17,10 @@ from pathlib import Path
 import tempfile
 import uuid
 
-from qwenpaw.channel_protocol.errors import RpcError
+from qwenpaw.channel_protocol.errors import RpcError, ProtocolValidationError
+from qwenpaw.channel_protocol.normalization import normalize_inbound_event
+from qwenpaw.channel_protocol.targets import encode_reply_target
+from qwenpaw.channel_protocol.response_policy import ResponsePolicy
 from qwenpaw.channel_protocol.models import (
     DeliveryState,
     EventBatchAck,
@@ -52,6 +55,28 @@ class ChannelDeliveryError(RuntimeError):
 class IsolatedChannelProxy(BaseChannel):
     """Keep queue, policy and Agent execution in the parent process."""
 
+    def __new__(cls, process, *, launch_spec, **kwargs):
+        target_class = cls
+        if cls is IsolatedChannelProxy:
+            descriptor = SharedChannelDescriptor.load(
+                launch_spec.descriptor_path,
+            )
+            if "channel.generic.v1" not in descriptor.capabilities:
+                from .legacy_isolated_proxy import legacy_proxy_class
+
+                target_class = legacy_proxy_class(descriptor.channel_key)
+        return object.__new__(target_class)
+
+    def _configure_response(self, config):
+        """Optional frozen compatibility hook."""
+
+    def _normalize_event(self, event):
+        payload = normalize_inbound_event(event)
+        payload["content_parts"] = Message(
+            content=payload["content_parts"],
+        ).content
+        return payload
+
     def __init__(
         self,
         process,
@@ -72,12 +97,7 @@ class IsolatedChannelProxy(BaseChannel):
             launch_spec.enabled and config.get("enabled", True),
         )
         self.bot_prefix = str(config.get("bot_prefix") or "")
-        if self.channel == "dingtalk":
-            config["streaming_enabled"] = bool(
-                config.get("streaming_enabled")
-                and str(config.get("message_type") or "markdown").lower()
-                == "card",
-            )
+        self._configure_response(config)
         super().__init__(
             process,
             on_reply_sent=on_reply_sent,
@@ -187,6 +207,12 @@ class IsolatedChannelProxy(BaseChannel):
             snapshot["generation"] or self._launch_spec.generation,
         )
 
+    def bind_dependency_usage(self, usage, lease):
+        """Publish standard audit evidence to an already-bound exact lease."""
+        self.channel_process.dependency_observer = (
+            lambda snapshot: usage.observe(lease, snapshot)
+        )
+
     def _check_identity(self, params):
         identity = self._identity()
         if any(
@@ -209,7 +235,47 @@ class IsolatedChannelProxy(BaseChannel):
                     self._launch_spec,
                     generation=generation + 1,
                 )
-            await self.channel_process.start(self._launch_spec)
+            try:
+                if self._owner_registry is not None:
+                    from ...plugins.dependency_gate import (
+                        admit_shared_dependencies,
+                    )
+
+                    row = self._registration
+                    settings = row.runtime_settings
+
+                    async def audit():
+                        return (
+                            await self.channel_process.audit(self._launch_spec)
+                        ).snapshot
+
+                    await admit_shared_dependencies(
+                        audit,
+                        plugin_id=row.plugin_id,
+                        requirements_file=(
+                            row.description_record.requirements_path
+                        ),
+                        usage_registry=self._owner_registry.dependency_usage,
+                        admission_token=row.dependency_token,
+                        targets=(
+                            *settings.dependency_paths,
+                            *(
+                                (settings.dependency_install_target,)
+                                if settings.dependency_install_target
+                                else ()
+                            ),
+                        ),
+                    )
+                await self.channel_process.start(self._launch_spec)
+            finally:
+                if (
+                    self._owner_registry is not None
+                    and self.channel_process.dependency_snapshot is not None
+                ):
+                    self._owner_registry.dependency_usage.observe(
+                        self._runtime_lease,
+                        self.channel_process.dependency_snapshot,
+                    )
             self._started = True
             await self._wait_connected()
 
@@ -242,11 +308,6 @@ class IsolatedChannelProxy(BaseChannel):
             if not result.exited:
                 raise RuntimeError("CHANNEL_STOP_INCOMPLETE")
             self._started = False
-            if self._owner_registry is not None:
-                self._owner_registry.release_channel_owner(
-                    self._launch_spec.instance_id,
-                    self,
-                )
             return result
 
     def set_enqueue_async(self, callback):
@@ -323,26 +384,18 @@ class IsolatedChannelProxy(BaseChannel):
                 if event.event_id in self._accepted:
                     duplicates.append(event.event_id)
                     continue
-                meta = dict(event.metadata)
-                meta["response_handle"] = event.response_handle
-                payload = {
-                    "channel_id": self.channel,
-                    "sender_id": event.sender_id,
-                    "acl_sender_id": event.acl_sender_id,
-                    "user_id": meta.get("user_id") or event.acl_sender_id,
-                    "session_id": meta.get("session_id")
-                    or event.conversation["id"],
-                    "content_parts": Message(
-                        content=list(event.content_parts),
-                    ).content,
-                    "meta": meta,
-                }
-                if self.channel == "dingtalk":
-                    payload["message_id"] = str(
-                        meta.get("message_id") or event.event_id,
+                try:
+                    payload = self._normalize_event(event)
+                except ProtocolValidationError:
+                    rejected.append(
+                        RejectedEvent(
+                            event.event_id,
+                            "SCHEMA_MISMATCH",
+                            False,
+                        ),
                     )
-                    if meta.get("session_webhook"):
-                        payload["session_webhook"] = meta["session_webhook"]
+                    continue
+                meta = payload["meta"]
                 if not self._check_group_mention(
                     bool(meta.get("is_group")),
                     meta,
@@ -545,7 +598,6 @@ class IsolatedChannelProxy(BaseChannel):
         user_id = (
             native_payload.get("user_id")
             or meta.get("user_id")
-            or meta.get("feishu_sender_id")
             or native_payload.get("sender_id", "")
         )
         query = self._extract_query_from_payload(native_payload)
@@ -583,56 +635,21 @@ class IsolatedChannelProxy(BaseChannel):
         return request
 
     def resolve_session_id(self, sender_id, channel_meta=None):
-        meta = channel_meta or {}
-        if meta.get("session_id"):
-            return meta["session_id"]
-        if self.channel == "dingtalk":
-            cid = str(meta.get("conversation_id") or "")
-            if cid:
-                return (
-                    hashlib.sha256(cid.encode()).hexdigest()[:16]
-                    if meta.get("is_group")
-                    and self._launch_spec.config.get("share_session_in_group")
-                    else cid[-8:]
-                )
-            return f"dingtalk:{sender_id}"
-        if self.channel == "feishu":
-            chat = str(meta.get("feishu_chat_id") or "")
-            if meta.get("feishu_chat_type") == "group" and chat:
-                app_suffix = str(self._launch_spec.config.get("app_id") or "")[
-                    -4:
-                ]
-                return f"{app_suffix}_{chat[-8:]}"
-            return (
-                str(sender_id or chat)[-8:]
-                if sender_id or chat
-                else f"{self.channel}:{sender_id}"
-            )
-        return super().resolve_session_id(sender_id, meta)
+        value = (channel_meta or {}).get("session_id")
+        if value:
+            return value
+        return super().resolve_session_id(sender_id, channel_meta)
 
     def get_debounce_key(self, payload):
-        key = super().get_debounce_key(payload)
-        if self.channel == "dingtalk" and isinstance(payload, dict):
-            meta = payload.get("meta") or {}
-            if not (
-                meta.get("is_group")
-                and self._launch_spec.config.get("share_session_in_group")
-            ) and payload.get("sender_id"):
-                return key + ":" + payload["sender_id"]
-        return key
+        if not isinstance(payload, dict):
+            return super().get_debounce_key(payload)
+        value = (payload.get("meta") or {}).get("debounce_key")
+        if not isinstance(value, str) or not value.strip():
+            raise ProtocolValidationError("Standard debounce_key required")
+        return value
 
     def to_handle_from_target(self, *, user_id, session_id):
-        if self.channel == "dingtalk":
-            return (
-                f"dingtalk:sw:{user_id}_{session_id}"
-                if user_id
-                else f"dingtalk:sw:{session_id}"
-            )
-        return (
-            f"{self.channel}:sw:{session_id}"
-            if session_id
-            else f"{self.channel}:open_id:{user_id}"
-        )
+        return encode_reply_target(user_id=user_id, session_id=session_id)
 
     def get_to_handle_from_request(self, request):
         meta = getattr(request, "channel_meta", None) or {}
@@ -853,19 +870,57 @@ class IsolatedChannelProxy(BaseChannel):
         if not meta.get("_reply_unknown"):
             await super()._on_consume_error(request, to_handle, err_text)
 
+    async def _response_policy(self, to_handle, meta):
+        route = await self._route(to_handle, meta)
+        cached = meta.get("_response_policy")
+        if cached is not None and cached[0] == route:
+            return cached[1]
+        policy = ResponsePolicy.from_mapping(
+            await self.channel_process.call(
+                "channel.response.describe",
+                {**self._identity().to_mapping(), "response_handle": route},
+            ),
+        )
+        capabilities = self.descriptor.capabilities
+        policy = ResponsePolicy(
+            streaming=policy.streaming
+            and "streaming" in capabilities
+            and self.streaming_enabled,
+            prepare=policy.prepare and "response.prepare" in capabilities,
+            completion_reaction=policy.completion_reaction
+            and "reaction" in capabilities,
+        )
+        meta["_response_policy"] = (route, policy)
+        return policy
+
     async def _before_consume_process(self, request):
-        if self.channel != "dingtalk":
-            return
         scope = self._response_context.get()
         meta = getattr(request, "channel_meta", None) or {}
+        request.channel_meta = meta
         if scope is not None:
             scope["meta"] = meta
-        if not meta.get("message_id") or not meta.get("conversation_id"):
+        if meta.get("_reply_unknown"):
+            raise ChannelDeliveryError(
+                OutboundResult(
+                    "unsettled",
+                    DeliveryState.UNKNOWN,
+                    "PLATFORM_RESULT_UNKNOWN",
+                ),
+            )
+        if not (
+            await self._response_policy(
+                self.get_to_handle_from_request(request),
+                meta,
+            )
+        ).prepare:
             return
         route = await self._route(
             self.get_to_handle_from_request(request),
             meta,
         )
+        failed = meta.get("_response_prepare_failure")
+        if failed is not None and failed["response_handle"] == route:
+            return
         try:
             result = OutboundResult.from_mapping(
                 await self.channel_process.call(
@@ -884,7 +939,11 @@ class IsolatedChannelProxy(BaseChannel):
                 if error.side_effect_possible:
                     meta["_reply_unknown"] = True
                     raise error
-                # Ordinary precreation refusal is retryable by Agent hooks.
+                meta["_response_prepare_failure"] = {
+                    "response_handle": route,
+                    "result": result.to_mapping(),
+                }
+                self._record_diagnostic(error.reason_code)
                 return
         except (ChannelCallUnknown, asyncio.CancelledError):
             meta["_reply_unknown"] = True
@@ -905,7 +964,7 @@ class IsolatedChannelProxy(BaseChannel):
         stream_type,
         accumulated_text="",
     ):
-        if not self.streaming_enabled or send_meta.get("feishu_thread_id"):
+        if not (await self._response_policy(to_handle, send_meta)).streaming:
             return
         try:
             delivery = await self._send_operation(
@@ -1047,8 +1106,11 @@ class IsolatedChannelProxy(BaseChannel):
                     "PLATFORM_RESULT_UNKNOWN",
                 ),
             )
-        if self.channel == "dingtalk" or not send_meta.get(
-            "_last_delivery_id",
+        if (
+            not send_meta.get("_last_delivery_id")
+            or not (
+                await self._response_policy(to_handle, send_meta)
+            ).completion_reaction
         ):
             return
         try:
@@ -1111,10 +1173,24 @@ class IsolatedChannelProxy(BaseChannel):
         if task.cancelled() or task.exception() is not None:
             self._record_diagnostic("RESPONSE_FINISH_FAILED")
 
+    async def _consume_request(self, request, payload):
+        # Base calls this only after debounce and the host access gate.
+        meta = getattr(request, "channel_meta", None) or {}
+        request.channel_meta = meta
+        async with self._response_scope(meta):
+            await super()._consume_request(request, payload)
+
     async def _run_process_loop(self, request, to_handle, send_meta):
+        # Preparation can add policy, delivery state or a newly opened route.
+        send_meta.update(getattr(request, "channel_meta", None) or {})
         request.channel_meta = send_meta
-        async with self._response_scope(send_meta):
+        scope = self._response_context.get()
+        if scope is not None:
+            scope["meta"] = send_meta
             await super()._run_process_loop(request, to_handle, send_meta)
+        else:
+            async with self._response_scope(send_meta):
+                await super()._run_process_loop(request, to_handle, send_meta)
 
     async def _stream_with_tracker(self, payload):
         meta = (

@@ -1698,3 +1698,62 @@ async def test_lost_admission_ack_preserves_accepted_reply_route(
     await rt.channel.consume_one(payload)
     assert len(rt.rows("create")) == 1
     assert post_text(rt.rows("create")[0]) == "host answer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
+# Keep the stable pytest selector; only this definition is long.
+# pylint: disable-next=line-too-long
+async def test_standard_debounce_separates_members_and_threads_without_changing_historic_session(  # noqa: E501
+    runtime,
+    shared,
+):
+    rt = await runtime(share_session_in_group=shared)
+    native = []
+    for event in [
+        message("member-one", sender="ou_member00000001", group=True),
+        message("member-two", sender="ou_member00000002", group=True),
+        message(
+            "thread-one",
+            sender="ou_member00000001",
+            group=True,
+            thread="omt-thread00000001",
+        ),
+        message(
+            "thread-two",
+            sender="ou_member00000001",
+            group=True,
+            thread="omt-thread00000002",
+        ),
+    ]:
+        native.append(await inbound(rt, event))
+    assert [item["session_id"] for item in native] == ["test_oc_room"] * 4
+    requests = [
+        rt.channel.build_agent_request_from_native(item) for item in native
+    ]
+    assert [request.session_id for request in requests] == ["test_oc_room"] * 4
+    assert [item["acl_sender_id"] for item in native] == [
+        "ou_member00000001",
+        "ou_member00000002",
+        "ou_member00000001",
+        "ou_member00000001",
+    ]
+    expected_members = (
+        ["test_oc_room", "test_oc_room"]
+        if shared
+        else [
+            "test_oc_room:ou_member00000001",
+            "test_oc_room:ou_member00000002",
+        ]
+    )
+    assert [
+        rt.channel.get_debounce_key(item) for item in native
+    ] == expected_members + [
+        "test_oc_room:thread:00000001",
+        "test_oc_room:thread:00000002",
+    ]
+    assert [request.user_id for request in requests] == (
+        ["group", "group"]
+        if shared
+        else ["ou_member00000001", "ou_member00000002"]
+    ) + ["thread:00000001", "thread:00000002"]

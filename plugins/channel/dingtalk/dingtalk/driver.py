@@ -11,6 +11,8 @@ import json
 import time
 import uuid
 
+from qwenpaw.channel_protocol.response_policy import ResponsePolicy
+from qwenpaw.channel_protocol.targets import decode_reply_target
 from qwenpaw.channel_protocol.errors import RPC_LIFECYCLE_ERROR, RpcError
 from qwenpaw.channel_protocol.models import (
     InboundEvent,
@@ -379,6 +381,17 @@ class DingTalkDriver(SharedResponseDriver):
             raise ValueError("NOT_CONNECTED")
         return self._platform
 
+    def response_policy(self, response_handle: str) -> ResponsePolicy:
+        meta = json.loads(self._route_attrs(response_handle)["session_ctx"])
+        return ResponsePolicy(
+            streaming=bool(self._config.get("streaming_enabled"))
+            and str(self._config.get("message_type") or "markdown").lower()
+            == "card",
+            prepare=bool(
+                meta.get("message_id") and meta.get("conversation_id"),
+            ),
+        )
+
     def _session(self, sender, meta):
         cid = str(meta.get("conversation_id") or "")
         if cid:
@@ -391,6 +404,13 @@ class DingTalkDriver(SharedResponseDriver):
 
     async def _target(self, handle, meta):
         platform = self._require_connected()
+        neutral = decode_reply_target(str(handle))
+        if neutral is not None:
+            handle = (
+                "dingtalk:sw:"
+                + (neutral["user_id"] + "_" if neutral["user_id"] else "")
+                + neutral["session_id"]
+            )
         route = platform._route_from_handle(handle)
         entry = (
             await platform._load_session_webhook_entry(
@@ -476,6 +496,12 @@ class DingTalkDriver(SharedResponseDriver):
                     and self._config.get("share_session_in_group")
                     else sender
                 ),
+            )
+            meta["debounce_key"] = meta["session_id"] + (
+                ""
+                if meta.get("is_group")
+                and self._config.get("share_session_in_group")
+                else ":" + sender
             )
             key = (
                 "dingtalk:sw:"

@@ -10,15 +10,10 @@ import inspect
 import logging
 import weakref
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Collection
 
-from ..app.channels.manager import (
-    StopReceipt,
-    channel_cfg_for_key,
-    channel_enabled,
-)
-from ..config import get_available_channels
 from .lifecycle import QuiescenceError
+from .ownership import RuntimeStopReceipt
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +35,11 @@ class WorkspaceIntent:
     plugin_id: str
     apply: ApplyFn
     revoke: RevokeFn
+    can_apply: Callable[[Any], bool] = lambda workspace: True
+    binding_is_current: Callable[
+        [Any, Any],
+        bool,
+    ] = lambda workspace, token: True
     bindings: dict[str, Any] = field(default_factory=dict)
     workspaces: dict[str, Callable[[], Any]] = field(default_factory=dict)
     pending: dict[str, asyncio.Task[None]] = field(default_factory=dict)
@@ -59,8 +59,8 @@ class OwnerScan:
 class WorkspaceProjector:
     """Store intents; apply/revoke against the *current* live workspace set.
 
-    Resolve current workspaces at revoke time. Weak references also keep
-    bindings reachable while replaced workspaces drain in-flight requests.
+    Resolve current workspaces at revoke time. Retain the exact bound object
+    while replaced workspaces drain in-flight requests.
     """
 
     def __init__(
@@ -85,46 +85,56 @@ class WorkspaceProjector:
             }.values(),
         )
 
-    async def project_workspace_channels(self, workspace):
+    async def project_workspace(
+        self,
+        workspace,
+        *,
+        kinds: Collection[str] | None = None,
+    ):
         for intent in list(self._intents):
-            if intent.kind != "channel":
+            if kinds is not None and intent.kind not in kinds:
                 continue
-            key = _workspace_key(workspace)
-            token = intent.bindings.get(key)
-            manager = getattr(workspace, "channel_manager", None)
-            if (
-                token is not None
-                and manager is not None
-                and manager._find_channel(intent.name) is not token.channel
-            ):
-                intent.bindings.pop(key, None)
-                intent.workspaces.pop(key, None)
             await self._project_one(intent, workspace)
 
-    def channel_start_allowed(self, workspace, name):
+    def start_allowed(self, kind, name, plugin_id, workspace):
         key = _workspace_key(workspace)
         return not any(
-            intent.kind == "channel"
+            intent.kind == kind
             and intent.name == name
-            and (intent.revoking or key in intent.retiring)
+            and intent.plugin_id == plugin_id
+            and (
+                intent.revoking
+                or (
+                    key in intent.retiring
+                    and intent.retiring[key]() is workspace
+                )
+            )
             for intent in self._intents
         )
 
-    def replace_channel_binding(self, workspace, name, old, handle):
+    def replace_binding(
+        self,
+        kind,
+        name,
+        plugin_id,
+        workspace,
+        *,
+        expected,
+        token,
+    ):
         """Retarget only the current intent's exact outgoing generation."""
-        if workspace is None:
-            return
+        intent = self._find(kind, name, plugin_id)
+        if (
+            intent is None
+            or expected is None
+            or not self._has_binding(intent, workspace)
+        ):
+            return False
         key = _workspace_key(workspace)
-        for intent in self._intents:
-            token = intent.bindings.get(key)
-            if (
-                intent.kind == "channel"
-                and intent.name == name
-                and token is not None
-                and token.channel is old
-                and intent.workspaces[key]() is workspace
-            ):
-                intent.bindings[key] = handle
+        if intent.bindings[key] is not expected:
+            return False
+        intent.bindings[key] = token
+        return True
 
     def intend(
         self,
@@ -133,6 +143,9 @@ class WorkspaceProjector:
         plugin_id: str,
         apply: ApplyFn,
         revoke: RevokeFn,
+        *,
+        can_apply: Callable[[Any], bool] | None = None,
+        binding_is_current: Callable[[Any, Any], bool] | None = None,
     ) -> WorkspaceIntent:
         intent = WorkspaceIntent(
             kind=kind,
@@ -141,6 +154,10 @@ class WorkspaceProjector:
             apply=apply,
             revoke=revoke,
         )
+        if can_apply is not None:
+            intent.can_apply = can_apply
+        if binding_is_current is not None:
+            intent.binding_is_current = binding_is_current
         self._intents.append(intent)
         return intent
 
@@ -200,16 +217,16 @@ class WorkspaceProjector:
         if intent not in self._intents or not intent.active:
             return
         if (
-            (
-                intent.kind == "channel"
-                and getattr(workspace, "_defer_channel_start", False)
-            )
-            or intent.revoking
+            intent.revoking
             or (retiring is not None and retiring() is workspace)
+            or not intent.can_apply(workspace)
         ):
             return
         if self._has_binding(intent, workspace):
-            return
+            if intent.binding_is_current(workspace, intent.bindings[key]):
+                return
+            intent.bindings.pop(key, None)
+            intent.workspaces.pop(key, None)
         task = intent.pending.get(key)
         if task is None:
 
@@ -260,7 +277,7 @@ class WorkspaceProjector:
         intent.revoking = True
         await self._drain(intent)
         errors: list[str] = []
-        failed_stop: StopReceipt | None = None
+        failed_stop: RuntimeStopReceipt | None = None
         workspaces = {_workspace_key(ws): ws for ws in self.workspaces()}
         for key, resolve in intent.workspaces.items():
             workspace = resolve()
@@ -279,22 +296,20 @@ class WorkspaceProjector:
             token = intent.bindings[key]
             try:
                 result = await self._revoke_binding(intent, workspace, token)
-            except Exception as exc:  # noqa: BLE001
+            except BaseException as exc:
                 intent.workspaces[key] = _hold_workspace(workspace)
+                if not isinstance(exc, Exception):
+                    raise
                 errors.append(f"{key}:{exc}")
                 continue
-            if isinstance(result, StopReceipt) and not result.stopped:
-                if result.detail == "not running":
-                    intent.bindings.pop(key, None)
-                    intent.workspaces.pop(key, None)
-                    continue
+            if isinstance(result, RuntimeStopReceipt) and not result.stopped:
                 failed_stop = result
                 intent.workspaces[key] = _hold_workspace(workspace)
                 errors.append(f"{key}:{result.detail or 'stop failed'}")
                 continue
             intent.bindings.pop(key, None)
             intent.workspaces.pop(key, None)
-        if not intent.bindings:
+        if not intent.bindings and intent in self._intents:
             self._intents.remove(intent)
         if failed_stop is not None:
             raise QuiescenceError(
@@ -320,13 +335,15 @@ class WorkspaceProjector:
         """Release one retiring workspace without dropping future intents."""
         key = _workspace_key(workspace)
         errors: list[str] = []
-        for intent in reversed(self._intents):
+        intents = list(reversed(self._intents))
+        for intent in intents:
             intent.retiring = {
                 item: resolve
                 for item, resolve in intent.retiring.items()
                 if resolve() is not None
             }
             intent.retiring[key] = _workspace_ref(workspace)
+        for intent in intents:
             try:
                 await self._drain(intent, key)
             except QuiescenceError as exc:
@@ -343,9 +360,8 @@ class WorkspaceProjector:
                     intent.bindings[key],
                 )
                 if (
-                    isinstance(result, StopReceipt)
+                    isinstance(result, RuntimeStopReceipt)
                     and not result.stopped
-                    and result.detail != "not running"
                 ):
                     raise QuiescenceError(result.detail, receipt=result)
             except BaseException as exc:
@@ -380,10 +396,7 @@ class WorkspaceProjector:
     def _remember(intent: WorkspaceIntent, workspace: Any, token: Any) -> None:
         key = _workspace_key(workspace)
         intent.bindings[key] = token
-        if intent.revoking or key in intent.retiring:
-            intent.workspaces[key] = _hold_workspace(workspace)
-            return
-        intent.workspaces[key] = _workspace_ref(workspace)
+        intent.workspaces[key] = _hold_workspace(workspace)
 
     async def _apply(self, intent: WorkspaceIntent, workspace: Any) -> Any:
         try:
@@ -405,6 +418,29 @@ class WorkspaceProjector:
             intent for intent in self._intents if intent.plugin_id != plugin_id
         ]
 
+    async def revoke_plugin(self, plugin_id: str) -> None:
+        """Drain every retained intent, even without a plugin record."""
+        errors = []
+        intents = [
+            intent
+            for intent in reversed(self._intents)
+            if intent.plugin_id == plugin_id
+        ]
+        for intent in intents:
+            intent.revoking = True
+        for intent in intents:
+            try:
+                await self.revoke(
+                    intent.kind,
+                    intent.name,
+                    plugin_id,
+                    expected=intent,
+                )
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            raise QuiescenceError("; ".join(errors))
+
 
 def default_live_workspaces() -> list[Any]:
     """Read the current workspace manager; never cached object pointers."""
@@ -417,36 +453,6 @@ def default_live_workspaces() -> list[Any]:
         return list(getattr(manager, "agents", {}).values())
     except Exception:  # noqa: BLE001
         return []
-
-
-def live_channel_managers() -> list[Any]:
-    """ChannelManager instances on the current live workspace set."""
-    managers: list[Any] = []
-    seen: set[int] = set()
-    for workspace in default_live_workspaces():
-        manager = getattr(workspace, "channel_manager", None)
-        if manager is None:
-            continue
-        ident = id(manager)
-        if ident in seen:
-            continue
-        seen.add(ident)
-        managers.append(manager)
-    return managers
-
-
-def channel_passes_gates(workspace: Any, key: str) -> bool:
-    """Three-gate: available, has a config section, and enabled."""
-    available = get_available_channels()
-    if key not in available:
-        return False
-    config = getattr(workspace, "_config", None)
-    if config is None:
-        return False
-    ch_cfg = channel_cfg_for_key(config, key)
-    if ch_cfg is None:
-        return False
-    return channel_enabled(ch_cfg)
 
 
 def scan_owner_rows(plugin_id: str, workspaces: list[Any]) -> OwnerScan:

@@ -1522,6 +1522,14 @@ class BaseChannel(ABC):
             # Always attach so channel _before_consume_process can use it
             # (e.g. Feishu save receive_id for cron send).
             setattr(request, "channel_meta", meta_from_payload)
+        await self._consume_request(request, payload)
+
+    async def _consume_request(
+        self,
+        request: "AgentRequest",
+        payload: Any,
+    ) -> None:
+        """Run an admitted direct request, including response preparation."""
         to_handle = self.get_to_handle_from_request(request)
         await self._before_consume_process(request)
         # Prefer meta built from payload so session_webhook is present when

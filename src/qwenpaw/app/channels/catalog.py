@@ -15,6 +15,14 @@ RESPONSE_FIELDS = frozenset(
         "runtime_state",
         "repair",
         "diagnostic",
+        "config_schema",
+        "config_fields",
+        "defaults",
+        "label",
+        "description",
+        "plugin_id",
+        "icon",
+        "doc_url",
     },
 )
 
@@ -65,10 +73,13 @@ def config_fields(schema, names=None):
     return result
 
 
-def clean_channel_config(value):
-    """Response metadata never becomes credentials or plugin settings."""
+def clean_channel_config(value, schema=None):
+    """Drop catalogue metadata unless the plugin declares it as a setting."""
+    declared = schema.get("properties", {}) if schema is not None else {}
     return {
-        key: item for key, item in value.items() if key not in RESPONSE_FIELDS
+        key: item
+        for key, item in value.items()
+        if key not in RESPONSE_FIELDS or key in declared
     }
 
 
@@ -78,6 +89,7 @@ def get_configurable_channel_catalog(saved_keys=()):
     from ...config.utils import get_plugins_dir, load_config
     from ...plugins.registry import PluginRegistry
     from ...plugins.settings import is_plugin_enabled
+    from ...plugins.channel_config import channel_config_defaults
 
     registry = PluginRegistry()
     settings = load_config().plugins
@@ -119,16 +131,22 @@ def get_configurable_channel_catalog(saved_keys=()):
             icon=row.icon,
             doc_url=row.doc_url,
         )
-        if key in OFFICIAL_CHANNEL_OWNERS:
-            base.update(global_enabled=row.global_enabled)
-            base["availability"] = (
-                "disabled"
-                if not row.global_enabled
-                else (
-                    "missing_runtime"
-                    if row.runtime_settings is None
-                    else "validation_pending"
-                )
+        if row.description_record is not None:
+            descriptor = row.description_record.descriptor
+            base.update(
+                owner=row.plugin_id,
+                process_mode=descriptor.process_mode,
+                defaults=channel_config_defaults(descriptor.config_schema),
+                global_enabled=row.global_enabled,
+                availability=(
+                    "disabled"
+                    if not row.global_enabled
+                    else (
+                        "missing_runtime"
+                        if row.runtime_settings is None
+                        else "validation_pending"
+                    )
+                ),
             )
     for key in saved_keys:
         result.setdefault(
@@ -139,6 +157,9 @@ def get_configurable_channel_catalog(saved_keys=()):
                 "plugin_id": key,
                 "owner": key,
                 "form_kind": "key_value",
+                "process_mode": "runner_process",
+                "availability": "missing_code",
+                "global_enabled": is_plugin_enabled(settings.get(key)),
                 "config_fields": [],
             },
         )

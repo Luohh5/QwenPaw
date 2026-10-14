@@ -28,7 +28,6 @@ from .identifiers import (
 from .release_target_registry import RELEASE_TARGET_PLATFORM_TAGS
 from .requirements import canonicalize_requirements
 
-
 _HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _WHEEL_NAME = re.compile(r"^[^/\\]+\.whl$")
 _URL_PERCENT_ESCAPE_PATTERN = re.compile(r"%[0-9A-Fa-f]{2}")
@@ -925,7 +924,11 @@ def _expected_lock_keys(
     }
 
 
-def code_root_digest(code_root: Path) -> str:
+def code_root_digest(
+    code_root: Path,
+    *,
+    ignored_paths: Collection[str] = (),
+) -> str:
     """Hash a Channel code root using the bootstrap source algorithm."""
     root = Path(code_root).resolve()
     if not root.is_dir():
@@ -937,6 +940,8 @@ def code_root_digest(code_root: Path) -> str:
             continue
         if path.is_symlink():
             raise _error("code_root cannot contain symlinks", "code_root")
+        if path.relative_to(root).as_posix() in ignored_paths:
+            continue
         if path.is_file():
             files.append(path)
     for path in sorted(

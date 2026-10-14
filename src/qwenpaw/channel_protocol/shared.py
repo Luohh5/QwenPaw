@@ -422,6 +422,26 @@ class SharedHelloParams(IdentityParams):
         }
 
 
+def validate_channel_contract(channel_key: str, capabilities) -> None:
+    """Reject unimplemented contracts before candidate activation."""
+    contracts = {
+        item for item in capabilities if item.startswith("channel.generic.")
+    }
+    if contracts and contracts != {"channel.generic.v1"}:
+        raise ProtocolValidationError(
+            "Unsupported channel contract",
+            reason_code="CHANNEL_CONTRACT_UNSUPPORTED",
+        )
+    if not contracts:
+        from .legacy_contract import accepts_legacy_contract
+
+        if not accepts_legacy_contract(channel_key):
+            raise ProtocolValidationError(
+                "Channel contract required",
+                reason_code="CHANNEL_CONTRACT_UNSUPPORTED",
+            )
+
+
 def validate_shared_hello(
     hello: SharedHelloParams | Mapping[str, Any],
     *,
@@ -433,6 +453,7 @@ def validate_shared_hello(
     python_abi: str | None = None,
     platform_tag: str | None = None,
     requirements_path: str | Path | None = None,
+    capabilities: tuple[str, ...] | None = None,
 ) -> SharedHelloParams:
     """Check child observations against the parent's authoritative launch."""
     parsed = SharedHelloParams.from_mapping(
@@ -459,4 +480,11 @@ def validate_shared_hello(
             "Shared dependency declaration mismatch",
             reason_code="DEPENDENCY_UNSATISFIED",
         )
+    if capabilities is not None:
+        validate_channel_contract(channel_key, capabilities)
+        if set(parsed.capabilities) != set(capabilities):
+            raise ProtocolValidationError(
+                "Shared capabilities mismatch",
+                reason_code="CAPABILITY_MISMATCH",
+            )
     return parsed

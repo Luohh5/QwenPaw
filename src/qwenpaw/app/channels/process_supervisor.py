@@ -17,6 +17,7 @@ from ...channel_protocol.rpc import RpcPeer
 from ...channel_protocol.shared import (
     SharedChannelDescriptor,
     validate_shared_hello,
+    validate_channel_contract,
 )
 
 
@@ -93,6 +94,11 @@ class ChannelProcess(PluginProcess):
             raise ChannelProcessError("LAUNCH_PATH_INVALID")
         if not path.resolve().is_relative_to(Path(spec.code_root).resolve()):
             raise ChannelProcessError("DESCRIPTOR_OUTSIDE_CODE_ROOT")
+        descriptor = SharedChannelDescriptor.load(spec.descriptor_path)
+        validate_channel_contract(
+            descriptor.channel_key,
+            descriptor.capabilities,
+        )
         self._identity(spec)
 
     def _packet(self, spec):
@@ -145,6 +151,7 @@ class ChannelProcess(PluginProcess):
             generation=self._generation,
             source_revision=spec.source_revision,
             qwenpaw_version=spec.qwenpaw_version,
+            capabilities=descriptor.capabilities,
             requirements_path=Path(spec.descriptor_path).parent
             / descriptor.requirements_file,
         )

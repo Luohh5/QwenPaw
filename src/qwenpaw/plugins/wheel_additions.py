@@ -239,4 +239,5 @@ def validate_additions(
         snapshot.marker_environment,
         snapshot.supported_tags,
         distributions,
+        snapshot.dependency_sites,
     )

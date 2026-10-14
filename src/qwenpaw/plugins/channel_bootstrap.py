@@ -196,7 +196,7 @@ def resolve_default_channel_runtime():
         python_executable=str(executable),
         support_root=support,
         qwenpaw_version=__version__,
-        selected_channels=frozenset({"feishu", "dingtalk"}),
+        selected_channels=None,
         dependency_paths=tuple(dict.fromkeys((*sites, target.resolve()))),
         dependency_install_target=target.resolve(),
         runtime_identity=identity if getattr(sys, "frozen", False) else None,

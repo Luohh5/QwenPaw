@@ -111,6 +111,8 @@ class ChannelRegistration:
     description_record: Optional["ChannelDescription"] = None
     runtime_settings: Any = None
     global_enabled: bool = True
+    dependency_token: Any = None
+    owns_dependency_token: bool = False
 
 
 @dataclass
@@ -166,10 +168,14 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
         self._uninstall_hooks: List[HookRegistration] = []
         self._workspace_created_hooks: List[HookRegistration] = []
         self._control_commands: List[ControlCommandRegistration] = []
+        from .ownership import RuntimeOwners
+
+        self.runtime_owners = RuntimeOwners()
+        from .dependency_usage import DependencyUsageRegistry
+
+        self.dependency_usage = DependencyUsageRegistry(self.runtime_owners)
         self._channels: Dict[str, ChannelRegistration] = {}
         self.channel_runtime = None
-        self._channel_generations: dict[str, int] = {}
-        self._channel_owners: dict[str, Any] = {}
         self._runtime_helpers = None
         self._plugin_manifests: Dict[str, Dict[str, Any]] = {}
         self._middleware_registrations: List[MiddlewareRegistration] = []
@@ -985,81 +991,12 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
             raise RuntimeError("CHANNEL_RUNTIME_ALREADY_CONFIGURED")
         self.channel_runtime = settings
 
-    def channel_dependency_uses(self) -> tuple[dict[str, Any], ...]:
-        """Derive declarations and real observations from existing owners."""
-        uses = []
-        for row in self._channels.values():
-            if (
-                row.global_enabled
-                and row.description_record is not None
-                and row.runtime_settings is not None
-            ):
-                settings = row.runtime_settings
-                uses.append(
-                    {
-                        "plugin_id": row.plugin_id,
-                        "requirements": row.description_record.requirements,
-                        "python_executable": settings.python_executable,
-                        "dependency_paths": tuple(
-                            str(path) for path in settings.dependency_paths
-                        ),
-                        "instance_id": None,
-                        "generation": None,
-                        "active": False,
-                    },
-                )
-        for instance_id, owner in self._channel_owners.items():
-            spec = owner._launch_spec  # pylint: disable=protected-access
-            snapshot = owner.channel_process.dependency_snapshot
-            row = self._channels.get(spec.channel_key)
-            uses.append(
-                {
-                    "plugin_id": (
-                        row.plugin_id if row is not None else spec.channel_key
-                    ),
-                    "requirements": (
-                        row.description_record.requirements
-                        if row is not None
-                        and row.description_record is not None
-                        else ()
-                    ),
-                    "python_executable": spec.python_executable,
-                    "dependency_paths": tuple(
-                        str(path) for path in spec.dependency_paths
-                    ),
-                    "instance_id": instance_id,
-                    "generation": spec.generation,
-                    "active": True,
-                    "snapshot": (
-                        snapshot.to_mapping() if snapshot is not None else None
-                    ),
-                },
-            )
-        return tuple(uses)
-
-    def channel_owner_registrations(self, plugin_id: str | None = None):
-        """Snapshot actual custody, independent of Loader and catalog rows."""
-        return tuple(
-            row
-            for owner in self._channel_owners.values()
-            if (row := getattr(owner, "_registration", None)) is not None
-            and (plugin_id is None or row.plugin_id == plugin_id)
-        )
-
     def has_channel_owners(self, plugin_id: str) -> bool:
-        """Read actual retained custody independently of Loader bookkeeping."""
-        return bool(self.channel_owner_registrations(plugin_id))
-
-    def next_channel_generation(self, instance_id: str) -> int:
-        if instance_id in self._channel_owners:
-            raise RuntimeError("CHANNEL_ALREADY_OWNED")
-        generation = self._channel_generations.get(instance_id, 0) + 1
-        self._channel_generations[instance_id] = generation
-        return generation
-
-    def release_channel_owner(self, instance_id: str, owner) -> None:
-        if self._channel_owners.get(instance_id) is owner:
-            del self._channel_owners[instance_id]
+        """Compatibility query over the sole runtime custody authority."""
+        return any(
+            lease.key.kind == "channel"
+            for lease in self.runtime_owners.leases(plugin_id)
+        )
 
     def register_channel_descriptor(
         self,
@@ -1068,6 +1005,7 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
         *,
         runtime_settings=None,
         global_enabled: bool = True,
+        dependency_token=None,
     ) -> ChannelRegistration:
         """Register host-owned static metadata without loading a driver."""
         from ..app.channels.registry import BUILTIN_CHANNEL_KEYS
@@ -1103,7 +1041,25 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
             description_record=description,
             runtime_settings=runtime_settings,
             global_enabled=global_enabled,
+            dependency_token=dependency_token,
         )
+        if (
+            global_enabled
+            and runtime_settings is not None
+            and dependency_token is None
+        ):
+            from .dependency_usage import DependencyDeclaration
+
+            row.dependency_token = self.dependency_usage.declare(
+                DependencyDeclaration(
+                    plugin_id,
+                    description.source_revision,
+                    description.requirements,
+                    None,
+                ),
+                pending=False,
+            )
+            row.owns_dependency_token = True
         self._channels[key] = row
         return row
 
@@ -1120,13 +1076,15 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
         ):
             return False
         if current.runtime_settings is not None and any(
-            getattr(owner, "_registration", None) is current
-            for owner in self._channel_owners.values()
+            lease.key.kind == "channel" and lease.key.name == channel_key
+            for lease in self.runtime_owners.leases(current.plugin_id)
         ):
             from .lifecycle import QuiescenceError
 
             raise QuiescenceError("CHANNEL_INSTANCE_STILL_OWNED")
         del self._channels[channel_key]
+        if current.owns_dependency_token:
+            self.dependency_usage.withdraw(current.dependency_token)
         logger.info("Unregistered channel '%s'", channel_key)
         return True
 

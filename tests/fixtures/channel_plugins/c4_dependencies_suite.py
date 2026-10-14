@@ -8,6 +8,7 @@ from dataclasses import replace
 import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
 import sys
 import zipfile
@@ -83,6 +84,18 @@ def gate_api():
         "prepare_shared_dependencies",
     ), "C4 preparation missing"
     return gate
+
+
+def preparation_inputs(spec):
+    """Channel fixtures provide explicit generic Gate inputs."""
+    from qwenpaw.plugins.dependency_usage import DependencyUsageRegistry
+    from qwenpaw.plugins.ownership import RuntimeOwners
+
+    return {
+        "plugin_id": spec.channel_key,
+        "requirements_file": spec.code_root / "requirements.txt",
+        "usage_registry": DependencyUsageRegistry(RuntimeOwners()),
+    }
 
 
 def driver(spec, marker, mode="normal", port=9):
@@ -357,6 +370,7 @@ async def test_known_local_wheel_addition_then_satisfied_zero_wheel_read(
     snapshot = await gate.prepare_shared_dependencies(
         processes(),
         spec,
+        **preparation_inputs(spec),
         install_target=site,
         wheels=(addition,),
     )
@@ -368,6 +382,7 @@ async def test_known_local_wheel_addition_then_satisfied_zero_wheel_read(
     reused = await gate.prepare_shared_dependencies(
         processes(),
         spec,
+        **preparation_inputs(spec),
         install_target=site,
         wheels=(addition,),
     )
@@ -427,6 +442,7 @@ async def test_unsafe_addition_refused_without_site_mutation(
         await gate_api().prepare_shared_dependencies(
             processes(),
             spec,
+            **preparation_inputs(spec),
             install_target=site,
             wheels=(addition,),
         )
@@ -458,6 +474,7 @@ async def test_held_environment_lock_means_zero_package_writes(
             await gate_api().prepare_shared_dependencies(
                 processes(),
                 spec,
+                **preparation_inputs(spec),
                 install_target=site,
                 wheels=(addition,),
                 lock_timeout=0,
@@ -477,25 +494,53 @@ async def test_two_real_hosts_contend_and_reuse_known_addition(
     alias = tmp_path / "alias"
     alias.symlink_to(site, target_is_directory=True)
     addition = wheel(tmp_path)
-    script = """import asyncio,json,sys
+    script = r"""
+import asyncio, json, sys
 from pathlib import Path
+
+source = Path(sys.argv[5]).resolve()
+sys.path.insert(0, str(source))
+import qwenpaw
+
+assert Path(qwenpaw.__file__).resolve().is_relative_to(source)
 from qwenpaw.plugins.dependency_gate import (
-    WheelAddition,prepare_shared_dependencies,
+    WheelAddition,
+    prepare_shared_dependencies,
 )
-from qwenpaw.app.channels.process_supervisor import ChannelProcess,LaunchSpec
+from qwenpaw.app.channels.process_supervisor import ChannelProcess, LaunchSpec
+from qwenpaw.plugins.dependency_usage import DependencyUsageRegistry
+from qwenpaw.plugins.ownership import RuntimeOwners
+
+
 async def main():
-    value=json.loads(Path(sys.argv[1]).read_text())
-    for key in ('support_root','code_root','descriptor_path'):
-        value[key]=Path(value[key])
-    value['dependency_paths']=tuple(Path(p) for p in value['dependency_paths'])
-    process=ChannelProcess()
-    result=await prepare_shared_dependencies(process,LaunchSpec(**value),
+    value = json.loads(Path(sys.argv[1]).read_text())
+    for key in ("support_root", "code_root", "descriptor_path"):
+        value[key] = Path(value[key])
+    value["dependency_paths"] = tuple(
+        Path(p) for p in value["dependency_paths"]
+    )
+    process = ChannelProcess()
+    result = await prepare_shared_dependencies(
+        process,
+        LaunchSpec(**value),
+        plugin_id=value["channel_key"],
+        requirements_file=value["code_root"] / "requirements.txt",
+        usage_registry=DependencyUsageRegistry(RuntimeOwners()),
         install_target=Path(sys.argv[2]),
-        wheels=(WheelAddition(Path(sys.argv[3]),sys.argv[4]),),lock_timeout=8)
-    print(result.distributions['c4-fixture-sdk']['version'],flush=True)
+        wheels=(WheelAddition(Path(sys.argv[3]), sys.argv[4]),),
+        lock_timeout=8,
+    )
+    print(result.distributions["c4-fixture-sdk"]["version"], flush=True)
+
+
 asyncio.run(main())
 """
     hosts = []
+    source_root = (
+        Path(os.environ["QWENPAW_C7_RELEASE_ROOT"])
+        if "QWENPAW_C7_RELEASE_ROOT" in os.environ
+        else Path(__file__).resolve().parents[3]
+    ) / "src"
     for index, target in enumerate((site, alias)):
         spec, _ = launch(
             requirements="c4-fixture-sdk==2.5\n",
@@ -517,6 +562,7 @@ asyncio.run(main())
                 str(target),
                 str(addition.path),
                 addition.sha256,
+                str(source_root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             ),
@@ -574,6 +620,7 @@ async def test_interrupted_publication_retains_repair_blocker(
         gate.prepare_shared_dependencies(
             processes(),
             spec,
+            **preparation_inputs(spec),
             install_target=site,
             wheels=(addition,),
         ),
@@ -597,7 +644,11 @@ async def test_interrupted_publication_retains_repair_blocker(
         )
         assert dependencies.repair_marker(site).exists()
         with pytest.raises(RuntimeError):
-            await gate.prepare_shared_dependencies(processes(), spec)
+            await gate.prepare_shared_dependencies(
+                processes(),
+                spec,
+                **preparation_inputs(spec),
+            )
     finally:
         release.set()
         await asyncio.gather(operation, return_exceptions=True)
@@ -658,6 +709,7 @@ async def test_absent_install_site_is_never_created(
         await gate_api().prepare_shared_dependencies(
             processes(),
             spec,
+            **preparation_inputs(spec),
             install_target=site,
             wheels=(addition,),
         )
@@ -683,7 +735,11 @@ async def test_dirty_satisfied_environment_still_blocks_activation(
         dependency_paths=(site,),
     )
     with pytest.raises(RuntimeError):
-        await gate_api().prepare_shared_dependencies(processes(), spec)
+        await gate_api().prepare_shared_dependencies(
+            processes(),
+            spec,
+            **preparation_inputs(spec),
+        )
 
 
 @pytest.mark.asyncio
@@ -801,6 +857,7 @@ async def test_valid_sdk_sized_wheel_exceeds_lark_real_record_profile(
     snapshot = await gate_api().prepare_shared_dependencies(
         processes(),
         spec,
+        **preparation_inputs(spec),
         install_target=site,
         wheels=(addition,),
     )
@@ -981,6 +1038,7 @@ async def test_conflicting_singleton_metadata_is_rejected(
             await gate_api().prepare_shared_dependencies(
                 process,
                 spec,
+                **preparation_inputs(spec),
                 install_target=site,
                 wheels=(addition,),
             )

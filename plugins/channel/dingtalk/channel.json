@@ -223,7 +223,9 @@
   ],
   "capabilities": [
     "approval_card",
+    "channel.generic.v1",
     "media",
+    "response.prepare",
     "streaming"
   ]
 }

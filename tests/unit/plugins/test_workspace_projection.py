@@ -293,7 +293,7 @@ async def test_channel_project_respects_three_gates(fresh_registry):
     )
     with (
         patch(
-            "qwenpaw.plugins.workspace_projector.get_available_channels",
+            "qwenpaw.plugins.api.get_available_channels",
             return_value=("fake-heart",),
         ),
         patch(
@@ -364,7 +364,7 @@ async def test_failed_channel_stop_is_not_quiescent(fresh_registry):
     )
     with (
         patch(
-            "qwenpaw.plugins.workspace_projector.get_available_channels",
+            "qwenpaw.plugins.api.get_available_channels",
             return_value=("stuck-ch",),
         ),
         patch(
@@ -435,7 +435,7 @@ async def test_unload_drains_boot_channel_start(
         live_workspaces=lambda: [workspace],
     )
     monkeypatch.setattr(
-        "qwenpaw.plugins.workspace_projector.get_available_channels",
+        "qwenpaw.plugins.api.get_available_channels",
         lambda: ("boot-race",),
     )
     monkeypatch.setattr(
@@ -590,7 +590,7 @@ async def channel_plugin(tmp_path, monkeypatch, fresh_registry):
         raising=False,
     )
     for module in (
-        "qwenpaw.plugins.workspace_projector",
+        "qwenpaw.plugins.api",
         "qwenpaw.app.channels.manager",
     ):
         monkeypatch.setattr(

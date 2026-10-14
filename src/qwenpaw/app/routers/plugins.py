@@ -8,7 +8,6 @@ import json
 import logging
 import mimetypes
 import re
-import shutil
 import tempfile
 import urllib.request
 import zipfile
@@ -373,10 +372,8 @@ async def install_plugin_source(
             recover_incomplete=recover_incomplete,
         )
     finally:
-        if temp_dir is not None and not loader.retains_preparation_source(
-            temp_dir,
-        ):
-            await asyncio.to_thread(shutil.rmtree, temp_dir, True)
+        if temp_dir is not None:
+            await loader.cleanup_preparation_source(temp_dir)
 
 
 async def uninstall_plugin_source(
@@ -528,10 +525,7 @@ async def upload_plugin(
             detail=f"Plugin installation failed: {exc}",
         ) from exc
     finally:
-        if await asyncio.to_thread(
-            temp_dir.exists,
-        ) and not loader.retains_preparation_source(temp_dir):
-            await asyncio.to_thread(shutil.rmtree, temp_dir, True)
+        await loader.cleanup_preparation_source(temp_dir)
 
     return {
         "id": record.manifest.id,

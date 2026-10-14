@@ -735,8 +735,9 @@ class MultiAgentManager:
             if new_manager is not None:
                 new_manager._defer_channel_start = False
                 await new_manager.start_all()
-            await PluginRegistry().projector.project_workspace_channels(
+            await PluginRegistry().projector.project_workspace(
                 new_instance,
+                kinds={"channel"},
             )
             if self._config_generations.get(agent_id, 0) != generation:
                 raise RuntimeError(
@@ -845,7 +846,10 @@ class MultiAgentManager:
                         key,
                     )
         manager.resume_ingress()
-        await PluginRegistry().projector.project_workspace_channels(workspace)
+        await PluginRegistry().projector.project_workspace(
+            workspace,
+            kinds={"channel"},
+        )
 
     async def cancel_all_cleanup_tasks(self) -> None:
         """Cancel and await all pending delayed cleanup tasks.

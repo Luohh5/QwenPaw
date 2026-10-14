@@ -96,7 +96,8 @@ def test_c7_frozen_resolver_uses_child_resource_and_writable_target(
     assert default_channel_preset() == "channels-full"
     assert Path(settings.python_executable) == resource.executable
     assert settings.support_root == resource.site
-    assert settings.selected_channels == {"dingtalk", "feishu"}
+    assert settings.selected_channels is None
+    assert settings.allows("sample_chat")
     assert settings.dependency_paths[0] == resource.site
     assert settings.dependency_paths[-1] == settings.dependency_install_target
     assert settings.dependency_install_target.is_relative_to(resource.working)

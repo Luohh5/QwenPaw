@@ -392,6 +392,8 @@ class DiscordConfig(BaseChannelConfig):
 
 
 class DingTalkConfig(BaseChannelConfig):
+    model_config = ConfigDict(extra="allow")
+
     client_id: str = ""
     client_secret: str = ""
     message_type: str = "markdown"
@@ -418,6 +420,8 @@ class FeishuConfig(BaseChannelConfig):
     share_session_in_group: if True, all group members share one session;
     if False (default), each member gets an independent session.
     """
+
+    model_config = ConfigDict(extra="allow")
 
     app_id: str = ""
     app_secret: str = ""

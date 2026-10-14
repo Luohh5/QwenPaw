@@ -651,7 +651,7 @@ async def test_channel_failed_projection_can_retry_cleanup(
         lambda *a, **k: ch,
     )
     monkeypatch.setattr(
-        "qwenpaw.plugins.workspace_projector.channel_passes_gates",
+        "qwenpaw.plugins.api.channel_passes_gates",
         lambda *_: True,
     )
     loader = PluginLoader([])

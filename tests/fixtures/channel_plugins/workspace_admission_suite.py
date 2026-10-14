@@ -56,6 +56,21 @@ def batch(channel, event_id="event-one", *, generation=None):
                 sender_name="Alice",
                 content_parts=({"type": "text", "text": "hello"},),
                 event_kind="message",
+                metadata={
+                    "session_id": "session-one",
+                    "user_id": "ou_alice",
+                    "debounce_key": "session-one",
+                    # Complete Driver fixture context;
+                    # host treats these as opaque.
+                    "feishu_receive_id": "ou_alice",
+                    "feishu_receive_id_type": "open_id",
+                    "session_webhook": (
+                        "https://oapi.dingtalk.com/robot/"
+                        "sendBySession?session=old-session"
+                    ),
+                    "conversation_id": "session-one",
+                    "conversation_type": "single",
+                },
             ),
         ),
     )
@@ -416,6 +431,7 @@ async def test_failed_stop_retains_owner_and_only_current_exit_evidence(
     from qwenpaw.app.channels.manager import ChannelManager
     from qwenpaw.plugins.execution.process import StopResult
     from qwenpaw.plugins.registry import PluginRegistry
+    from qwenpaw.plugins.ownership import RuntimeKey
 
     channel = proxy()
     manager = ChannelManager([channel])
@@ -423,7 +439,15 @@ async def test_failed_stop_retains_owner_and_only_current_exit_evidence(
     PluginRegistry._instance = None
     registry = PluginRegistry()
     channel._owner_registry = registry
-    registry._channel_owners[channel._launch_spec.instance_id] = channel
+    spec = channel._launch_spec
+    lease = registry.runtime_owners.reserve(
+        "feishu",
+        RuntimeKey("channel", "feishu", "queue-workspace"),
+        spec.code_root,
+        instance_id=spec.instance_id,
+    )
+    channel._runtime_lease = lease
+    manager._attach_runtime(channel)
     channel.last_stop_result = StopResult(True, 0, False)
 
     async def stop():
@@ -435,10 +459,7 @@ async def test_failed_stop_retains_owner_and_only_current_exit_evidence(
     try:
         receipt = await manager.stop_one("feishu")
         assert not receipt.stopped and manager.channels == [channel]
-        assert (
-            registry._channel_owners[channel._launch_spec.instance_id]
-            is channel
-        )
+        assert registry.runtime_owners.resource(lease) is channel
         assert (
             receipt.instance_id == "queue-workspace"
             and receipt.generation == 1

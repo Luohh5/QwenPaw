@@ -65,7 +65,8 @@ async def test_c7_extracted_wheel_resolver_and_offline_full_seed() -> None:
         Path(settings.python_executable).resolve()
         == Path(os.sys.executable).resolve()
     )
-    assert settings.selected_channels == {"feishu", "dingtalk"}
+    assert settings.selected_channels is None
+    assert settings.allows("sample_chat")
     assert settings.dependency_install_target.is_relative_to(
         config_utils.WORKING_DIR,
     )

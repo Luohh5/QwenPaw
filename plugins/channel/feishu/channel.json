@@ -149,7 +149,8 @@
       "domain": {
         "default": "feishu",
         "title": "Domain",
-        "type": "string"
+        "type": "string",
+        "pattern": "^(feishu$|lark$|https?://)"
       },
       "streaming_enabled": {
         "default": false,
@@ -200,6 +201,7 @@
   ],
   "capabilities": [
     "approval_card",
+    "channel.generic.v1",
     "media",
     "reaction",
     "streaming"

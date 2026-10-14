@@ -356,5 +356,6 @@ def test_c6_fresh_runtime_provisions_audit_visible_site_under_lock(offline):
     runtime = offline.runtime
     assert runtime.dependency_install_target.is_dir()
     assert runtime.dependency_install_target in runtime.dependency_paths
-    assert runtime.selected_channels == frozenset({"feishu", "dingtalk"})
+    assert runtime.selected_channels is None
+    assert runtime.allows("sample_chat")
     assert not list(runtime.dependency_install_target.iterdir())

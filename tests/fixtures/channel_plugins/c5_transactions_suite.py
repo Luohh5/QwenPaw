@@ -13,6 +13,8 @@ from types import SimpleNamespace as NS
 import psutil
 import pytest
 
+from ownership_helpers import channel_leases, channel_owner
+
 pytest.register_assert_rewrite("c5_support")
 from c5_support import KEY, eventually, rows, wheelhouse  # noqa: E402
 
@@ -31,7 +33,10 @@ async def test_first_install_runs_only_installed_source(transaction):
     assert channel._launch_spec.code_root == transaction.installed
     assert source.exists() and transaction.installed.exists()
     assert len(rows(transaction.network, "connected")) == 1
-    assert not transaction.loader._channel_preparations
+    assert not any(
+        lease.key.kind == "preparation"
+        for lease in transaction.registry.runtime_owners.leases()
+    )
 
 
 @pytest.mark.asyncio
@@ -91,16 +96,51 @@ async def test_active_update_swaps_all_workspaces_after_old_exit(transaction):
 
 
 @pytest.mark.asyncio
-async def test_bad_candidate_is_probed_before_any_old_teardown(transaction):
+async def test_bad_candidate_is_probed_before_any_old_teardown(
+    transaction,
+    tmp_path,
+    monkeypatch,
+):
     ws = await transaction.workspace("candidate-failure")
     await transaction.seed()
     channel, old = await transaction.identity(ws)
+    retained_row = transaction.registry.get_channel_registration(KEY)
+    usage = transaction.registry.dependency_usage
+    native_refine = usage.refine
+    borrowed_old_token = []
+
+    def refine(token, snapshot, **kwargs):
+        if token is retained_row.dependency_token:
+            borrowed_old_token.append(snapshot)
+        return native_refine(token, snapshot, **kwargs)
+
+    monkeypatch.setattr(usage, "refine", refine)
     candidate = transaction.artifact("2.0.0", broken=True)
+    (candidate / "requirements.txt").write_text("c5-transaction-sdk==1.0\n")
+    local = wheelhouse(tmp_path / "candidate-wheelhouse")
+
+    def local_download(command, **_kwargs):
+        assert "download" in command and "install" not in command
+        staging = Path(command[command.index("--dest") + 1])
+        for path in local.glob("*.whl"):
+            shutil.copyfile(path, staging / path.name)
+        return NS(returncode=0)
+
+    monkeypatch.setattr(
+        transaction.loader,
+        "_run_subprocess_with_streaming_log",
+        local_download,
+    )
     report = await transaction.loader.lifecycle.reload(
         KEY,
         new_source=candidate,
+        allow_install=True,
     )
     assert not report.ok
+    assert (
+        not borrowed_old_token
+    ), "different-source candidate borrowed retained registration token"
+    assert transaction.registry.get_channel_registration(KEY) is retained_row
     assert rows(
         transaction.network,
         "imported",
@@ -117,6 +157,11 @@ async def test_bad_candidate_is_probed_before_any_old_teardown(transaction):
         ]
         == "1.0.0"
     )
+    site = transaction.registry.channel_runtime.dependency_install_target
+    assert (
+        site / "c5_transaction_sdk.py"
+    ).read_bytes() == b"VALUE = 'offline-c5-sdk'\n"
+    assert (site / "c5_transaction_sdk-1.0.dist-info/METADATA").is_file()
 
 
 @pytest.mark.asyncio
@@ -184,7 +229,7 @@ async def test_partial_new_activation_obeys_quiescence_before_restore(
             marker = json.loads(marker_path(KEY).read_text())
             assert marker["status"] in {"prepared", "updating"}
             assert Path(marker["backup_path"]).exists()
-            assert transaction.registry._channel_owners
+            assert channel_leases(transaction.registry)
             connected = rows(transaction.network, "connected", "2.0.0")
             assert connected and any(
                 psutil.pid_exists(row["pid"]) for row in connected
@@ -463,9 +508,10 @@ async def test_no_record_uninstall_respects_owner_and_workspace_assets(
         assert KEY in load_config().plugins
         assert psutil.pid_exists(before["pid"])
         assert (
-            transaction.registry._channel_owners[
-                channel._launch_spec.instance_id
-            ]
+            channel_owner(
+                transaction.registry,
+                channel._launch_spec.instance_id,
+            )
             is channel
         )
     finally:
@@ -671,9 +717,10 @@ async def test_existing_http_entrypoints_acquire_validated_local_wheels(
             assert "repaired" not in payload["message"].lower()
             assert transaction.loader.get_loaded_plugin(KEY) is retained
             assert (
-                transaction.registry._channel_owners[
-                    channel._launch_spec.instance_id
-                ]
+                channel_owner(
+                    transaction.registry,
+                    channel._launch_spec.instance_id,
+                )
                 is channel
             )
             assert psutil.pid_exists(before["pid"])

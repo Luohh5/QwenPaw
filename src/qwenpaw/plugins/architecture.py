@@ -4,9 +4,12 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+if TYPE_CHECKING:
+    from .execution_backend import BackendBinding
 
 
 class PluginType(str, Enum):
@@ -220,11 +223,13 @@ class PluginManifest(BaseModel):
             entry_data["backend"] = legacy_entry_point
         data["entry"] = entry_data
 
-        if (
-            entry_data.get("descriptor") is not None
-            and data.get("type") != "channel"
-        ):
-            raise ValueError("descriptor entry requires explicit channel type")
+        if entry_data.get("descriptor") is not None:
+            try:
+                PluginType(data.get("type"))
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    "descriptor entry requires an explicit valid plugin type",
+                ) from exc
 
         # Resolve ``type``: explicit value wins; otherwise infer.  We
         # need the parsed entry/meta to infer, so do a light parse here.
@@ -260,7 +265,12 @@ class PluginManifest(BaseModel):
 
 @dataclass
 class PluginRecord:
-    """Plugin record for loaded plugins."""
+    """Loaded source and execution state.
+
+    ``enabled`` is effective execution eligibility. ``global_enabled`` keeps
+    the user's enable intent when a backend temporarily blocks execution;
+    None preserves the effective flag for legacy manually constructed rows.
+    """
 
     manifest: PluginManifest
     source_path: Path
@@ -268,3 +278,8 @@ class PluginRecord:
     instance: Optional[Any] = None
     diagnostics: List[str] = field(default_factory=list)
     status: str = "active"
+    backend_binding: Optional["BackendBinding"] = field(
+        default=None,
+        repr=False,
+    )
+    global_enabled: Optional[bool] = None

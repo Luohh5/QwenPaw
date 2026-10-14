@@ -20,6 +20,7 @@ from qwenpaw.channel_protocol.models import (
     DeliveryState,
     ResponseFinishResult,
 )
+from qwenpaw.channel_protocol.response_policy import ResponsePolicy
 from qwenpaw.channel_protocol.reliability import RetryPolicy, events_for_retry
 from qwenpaw.channel_protocol.response_lifecycle import (
     ResponseCleanupState,
@@ -92,8 +93,31 @@ class SharedResponseDriver:
             ("channel.reaction", self._reaction),
             ("channel.response.open", self._open),
             ("channel.response.finish", self._finish),
+            ("channel.response.describe", self._describe),
         ):
             context.peer.register_method(name, handler)
+
+    def response_policy(self, response_handle: str) -> ResponsePolicy:
+        """Read route policy; subclasses may narrow optional operations."""
+        return ResponsePolicy()
+
+    async def _describe(self, params, request):
+        self._identity(params)
+        if (
+            not isinstance(params, dict)
+            or set(params)
+            != {*self._context.identity.to_mapping(), "response_handle"}
+            or not isinstance(params["response_handle"], str)
+        ):
+            raise ValueError("SCHEMA_MISMATCH")
+        self._require_connected()
+        handle = params["response_handle"]
+        async with self._lock(handle):
+            self._route_attrs(handle)
+            policy = self.response_policy(handle)
+            if not isinstance(policy, ResponsePolicy):
+                raise ValueError("SCHEMA_MISMATCH")
+            return policy.to_mapping()
 
     def _identity(self, value):
         identity = self._context.identity

@@ -248,3 +248,128 @@ def test_c7_sdist_rebuilds_the_same_official_resources(
     first = _assert_official_bundle(wheel, c7_artifacts[0])
     second = _assert_official_bundle(rebuilt, extracted)
     assert second == first
+
+
+def test_c7_generic_contracts_execute_from_wheel_sdist_and_staged_support(
+    c7_artifacts,
+    tmp_path,
+) -> None:
+    """
+    Missing release/support payloads must fail outside the checkout source.
+    """
+    import importlib.util
+
+    _, wheel, sdist = c7_artifacts
+    sdist_root = tmp_path / "source-release"
+    sdist_root.mkdir()
+    with tarfile.open(sdist, "r:gz") as archive:
+        archive.extractall(sdist_root, filter="data")
+    source = next(sdist_root.iterdir()) / "src"
+    spec = importlib.util.spec_from_file_location(
+        "extension_channel_support_stager",
+        ROOT / "scripts/pack-tauri/stage_channel_runtime.py",
+    )
+    assert spec is not None and spec.loader is not None
+    stager = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(stager)
+    support = tmp_path / "resources/binaries/channel-runtime/site"
+    support.mkdir(parents=True)
+    # Exercise the actual wheel extraction boundary, not a fake stager.
+    # pylint: disable-next=protected-access
+    stager._extract_wheel(wheel, support)
+
+    script = r"""
+import importlib.abc, json, pathlib, sys
+
+root = pathlib.Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(root))
+
+
+class NoPlatformImports(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.startswith(
+            (
+                "lark_oapi",
+                "dingtalk_stream",
+                "qwenpaw.app.channels.feishu",
+                "qwenpaw.app.channels.dingtalk",
+            )
+        ):
+            raise AssertionError(
+                "Platform import from pure released contracts: " + fullname
+            )
+
+
+sys.meta_path.insert(0, NoPlatformImports())
+from qwenpaw.channel_protocol import normalization, targets, response_policy
+from qwenpaw.channel_protocol.models import InboundEvent
+
+for module in (normalization, targets, response_policy):
+    assert (
+        pathlib.Path(module.__file__).resolve().is_relative_to(root)
+    ), module.__file__
+target = targets.encode_reply_target(
+    user_id="member-17", session_id="historic-room"
+)
+assert targets.decode_reply_target(target) == {
+    "user_id": "member-17",
+    "session_id": "historic-room",
+}
+assert (
+    response_policy.ResponsePolicy.from_mapping(
+        {"streaming": True, "prepare": False, "completion_reaction": False}
+    ).streaming
+    is True
+)
+event = InboundEvent.from_mapping(
+    {
+        "channel_key": "sample_chat",
+        "instance_id": "workspace-one",
+        "generation": 1,
+        "event_id": "one",
+        "event_kind": "message",
+        "conversation": {"id": "room-A", "type": "group"},
+        "sender_id": "Alice",
+        "sender_name": "Alice",
+        "acl_sender_id": "actor-17",
+        "content_parts": [{"type": "text", "text": "hello"}],
+        "metadata": {
+            "session_id": "historic-room",
+            "user_id": "group",
+            "debounce_key": "historic-room:actor-17",
+        },
+    }
+)
+payload = normalization.normalize_inbound_event(event)
+assert (
+    payload["session_id"] == "historic-room"
+    and payload["acl_sender_id"] == "actor-17"
+)
+print(
+    json.dumps(
+        {
+            "user_id": payload["user_id"],
+            "is_group": payload["meta"]["is_group"],
+        }
+    )
+)
+"""
+    for import_root in (wheel, source, support):
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", script, str(import_root)],
+            cwd=tmp_path,
+            env={
+                **os.environ,
+                "QWENPAW_WORKING_DIR": str(tmp_path / "host"),
+                "QWENPAW_SECRET_DIR": str(tmp_path / "secrets"),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(result.stdout) == {
+            "user_id": "group",
+            "is_group": True,
+        }

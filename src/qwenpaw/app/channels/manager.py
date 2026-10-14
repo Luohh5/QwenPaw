@@ -50,6 +50,7 @@ class ChannelHandle:
 
     key: str
     channel: Any
+    manager: Any = None
 
 
 @dataclass
@@ -73,6 +74,38 @@ class OwnedQueuePayload:
     instance_id: str
     generation: int
     payload: Any
+
+
+def runtime_stop_receipt(receipt, handle):
+    """Translate Channel evidence at the adapter boundary."""
+    from ...plugins.ownership import RuntimeStopReceipt
+
+    channel = handle.channel
+    lease = (
+        getattr(channel, "_runtime_lease", None)
+        if isinstance(channel, IsolatedChannelProxy)
+        else None
+    )
+    if lease is not None:
+        # An already released exact lease is safe even if its Manager now
+        # holds a successor. A current lease still requires identity proof.
+        if lease not in channel._owner_registry.runtime_owners.leases():
+            return RuntimeStopReceipt(True, receipt.detail)
+        identity_matches = (
+            receipt.instance_id == lease.instance_id
+            and receipt.generation == lease.generation
+        )
+    else:
+        identity_matches = True
+    process_backed = isinstance(channel, IsolatedChannelProxy)
+    return RuntimeStopReceipt(
+        receipt.stopped and identity_matches,
+        receipt.detail,
+        exited=receipt.exited is True if process_backed else True,
+        returncode=receipt.returncode,
+        forced=receipt.forced,
+        residual=receipt.residual,
+    )
 
 
 def channel_cfg_for_key(workspace_config: Any, key: str) -> Any | None:
@@ -101,6 +134,24 @@ def channel_enabled(ch_cfg: Any) -> bool:
     if isinstance(ch_cfg, dict):
         return bool(ch_cfg.get("enabled", False))
     return bool(getattr(ch_cfg, "enabled", False))
+
+
+def live_channel_managers() -> list[Any]:
+    """ChannelManager instances on the current live workspace set."""
+    from ...plugins.workspace_projector import default_live_workspaces
+
+    managers: list[Any] = []
+    seen: set[int] = set()
+    for workspace in default_live_workspaces():
+        manager = getattr(workspace, "channel_manager", None)
+        if manager is None:
+            continue
+        ident = id(manager)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        managers.append(manager)
+    return managers
 
 
 def instantiate_channel(
@@ -139,41 +190,57 @@ def instantiate_channel(
                 (str(Path(workspace_dir).resolve()) + "\0" + key).encode(),
             ).hexdigest()
         )
-        generation = plugin_registry.next_channel_generation(instance_id)
-        settings = row.runtime_settings
-        channel = row.description_record.create_proxy(
-            process,
-            ch_cfg,
-            python_executable=settings.python_executable,
-            support_root=settings.support_root,
-            qwenpaw_version=settings.qwenpaw_version,
-            dependency_paths=settings.dependency_paths,
-            runtime_identity=settings.runtime_identity,
+        from ...plugins.ownership import RuntimeKey, RuntimeStopReceipt
+
+        lease = plugin_registry.runtime_owners.reserve(
+            row.plugin_id,
+            RuntimeKey("channel", key, str(Path(workspace_dir).resolve())),
+            row.description_record.code_root,
             instance_id=instance_id,
-            generation=generation,
-            workspace_dir=workspace_dir,
-            on_reply_sent=on_last_dispatch,
-            display_config=ChannelDisplayConfig.from_config(
-                ch_cfg,
-                show_tool_details=getattr(
-                    workspace_config,
-                    "show_tool_details",
-                    True,
-                ),
-            ),
-            no_text_debounce=getattr(ch_cfg, "no_text_debounce", True),
-            startup_timeout=settings.startup_timeout,
-            shutdown_timeout=settings.shutdown_timeout,
         )
+        settings = row.runtime_settings
+        try:
+            plugin_registry.dependency_usage.bind(lease, row.dependency_token)
+            channel = row.description_record.create_proxy(
+                process,
+                ch_cfg,
+                python_executable=settings.python_executable,
+                support_root=settings.support_root,
+                qwenpaw_version=settings.qwenpaw_version,
+                dependency_paths=settings.dependency_paths,
+                runtime_identity=settings.runtime_identity,
+                instance_id=instance_id,
+                generation=lease.generation,
+                workspace_dir=workspace_dir,
+                on_reply_sent=on_last_dispatch,
+                display_config=ChannelDisplayConfig.from_config(
+                    ch_cfg,
+                    show_tool_details=getattr(
+                        workspace_config,
+                        "show_tool_details",
+                        True,
+                    ),
+                ),
+                no_text_debounce=getattr(ch_cfg, "no_text_debounce", True),
+                startup_timeout=settings.startup_timeout,
+                shutdown_timeout=settings.shutdown_timeout,
+            )
+        except BaseException:
+            plugin_registry.runtime_owners.release(
+                lease,
+                RuntimeStopReceipt(True, "construction produced no resources"),
+            )
+            raise
         channel._owner_registry = plugin_registry
+        channel.bind_dependency_usage(plugin_registry.dependency_usage, lease)
+        channel._runtime_lease = lease
         channel._registration = row
         channel._admission_timeout = settings.admission_timeout
-        plugin_registry._channel_owners[instance_id] = channel
         return channel
     registry = get_channel_registry()
     ch_cls = registry.get(key)
     if ch_cls is None:
-        raise RuntimeError(f"Channel '{key}' is not in the registry")
+        raise RuntimeError("CHANNEL_UNAVAILABLE")
     ch_cfg = channel_cfg_for_key(workspace_config, key)
     if ch_cfg is None:
         raise RuntimeError(f"No config found for channel '{key}'")
@@ -355,6 +422,48 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
         # Track channel-start tasks for graceful shutdown
         self._start_tasks: set[asyncio.Task] = set()
         self._start_task_channels: dict[asyncio.Task, BaseChannel] = {}
+        for channel in channels:
+            self._attach_runtime(channel)
+
+    def _channel_handle(self, channel):
+        handle = channel.__dict__.get("_manager_handle")
+        if not isinstance(handle, ChannelHandle) or handle.manager is not self:
+            handle = ChannelHandle(channel.channel, channel, self)
+            channel._manager_handle = handle
+        return handle
+
+    def _attach_runtime(self, channel):
+        handle = self._channel_handle(channel)
+        if not isinstance(channel, IsolatedChannelProxy):
+            return
+        lease = getattr(channel, "_runtime_lease", None)
+        if lease is None:
+            return
+
+        async def stop():
+            receipt = await self.stop_one(channel.channel, expected=handle)
+            return runtime_stop_receipt(receipt, handle)
+
+        channel._owner_registry.runtime_owners.attach(
+            lease,
+            stop,
+            resource=channel,
+        )
+
+    def _replace_binding(self, key, old, handle):
+        from ...plugins.registry import PluginRegistry
+
+        registry = PluginRegistry()
+        row = registry.get_channel_registration(key)
+        if self._workspace is not None and row is not None and old is not None:
+            registry.projector.replace_binding(
+                "channel",
+                key,
+                row.plugin_id,
+                self._workspace,
+                expected=self._channel_handle(old),
+                token=handle,
+            )
 
     def register_control_command(
         self,
@@ -498,9 +607,11 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
             isinstance(channel, IsolatedChannelProxy)
             and channel._owner_registry is not None
         ):
-            channel._owner_registry.release_channel_owner(
-                channel._launch_spec.instance_id,
-                channel,
+            from ...plugins.ownership import RuntimeStopReceipt
+
+            channel._owner_registry.runtime_owners.release(
+                channel._runtime_lease,
+                RuntimeStopReceipt(True, "never started"),
             )
 
     async def enqueue_async(
@@ -1020,7 +1131,7 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
                 is not expected_registration
             ):
                 raise RuntimeError("stale channel registration")
-            return ChannelHandle(key, existing)
+            return self._channel_handle(existing)
         lock = self._channel_lifecycle_locks.setdefault(key, asyncio.Lock())
         async with lock:
             if self._stopping or self._defer_channel_start:
@@ -1044,8 +1155,14 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
     ) -> ChannelHandle:
         from ...plugins.registry import PluginRegistry
 
-        projector = PluginRegistry().projector
-        if not projector.channel_start_allowed(self._workspace, key):
+        registry = PluginRegistry()
+        row = registry.get_channel_registration(key)
+        if not registry.projector.start_allowed(
+            "channel",
+            key,
+            row.plugin_id if row is not None else key,
+            self._workspace,
+        ):
             raise RuntimeError("CHANNEL_STOPPING")
         existing = self._find_channel(key)
         from .registry import selected_process_channels
@@ -1059,9 +1176,9 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
                 raise RuntimeError("CHANNEL_ALREADY_OWNED")
             if key in self._failed_channels:
                 exc = RuntimeError(f"Channel '{key}' has not stopped")
-                exc.binding = ChannelHandle(key=key, channel=existing)
+                exc.binding = self._channel_handle(existing)
                 raise exc
-            return ChannelHandle(key=key, channel=existing)
+            return self._channel_handle(existing)
 
         process = self._process
         if process is None and self._workspace is not None:
@@ -1073,16 +1190,16 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
         workspace_dir = self._workspace_dir
         if workspace_dir is None and self._workspace is not None:
             workspace_dir = getattr(self._workspace, "workspace_dir", None)
-        config = workspace_config or self._workspace_config
         channel = instantiate_channel(
             key,
-            config,
+            workspace_config or self._workspace_config,
             process=process,
             on_last_dispatch=self._on_last_dispatch,
             workspace_dir=workspace_dir,
         )
         registered = False
         try:
+            self._attach_runtime(channel)
             if self._workspace is not None:
                 channel.set_workspace(self._workspace, self._command_registry)
             self._bind_enqueue(channel)
@@ -1091,11 +1208,10 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
             async with self._lock:
                 self.channels.append(channel)
                 registered = True
-                projector.replace_channel_binding(
-                    self._workspace,
+                self._replace_binding(
                     key,
                     replace_from,
-                    ChannelHandle(key, channel),
+                    self._channel_handle(channel),
                 )
             self._failed_channels.add(key)
             await self._start_owned(channel)
@@ -1110,13 +1226,13 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
                     self._stop_one_unlocked(key),
                 )
             except BaseException as cleanup_exc:
-                exc.binding = ChannelHandle(key=key, channel=channel)
+                exc.binding = self._channel_handle(channel)
                 raise exc from cleanup_exc
             if not receipt.stopped:
-                exc.binding = ChannelHandle(key=key, channel=channel)
+                exc.binding = self._channel_handle(channel)
             raise
         self._failed_channels.discard(key)
-        return ChannelHandle(key=key, channel=channel)
+        return self._channel_handle(channel)
 
     async def stop_one(
         self,
@@ -1206,13 +1322,28 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
                 False,
                 str(exc),
             )
+        receipt = self._stop_receipt(channel, True)
+        evidence = runtime_stop_receipt(receipt, self._channel_handle(channel))
+        if not evidence.stopped:
+            self._failed_channels.add(key)
+            receipt.stopped = False
+            receipt.detail = receipt.detail or "CHANNEL_STOP_INCOMPLETE"
+            return receipt
         async with self._lock:
             self.channels = [
                 item for item in self.channels if item is not channel
             ]
         self._failed_channels.discard(key)
         self._started_channels.discard(id(channel))
-        return self._stop_receipt(channel, True)
+        if (
+            isinstance(channel, IsolatedChannelProxy)
+            and getattr(channel, "_runtime_lease", None) is not None
+        ):
+            channel._owner_registry.runtime_owners.release(
+                channel._runtime_lease,
+                evidence,
+            )
+        return receipt
 
     @staticmethod
     def _stop_receipt(channel, stopped, detail=""):
@@ -1343,7 +1474,6 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
     ) -> None:
         """Drain and stop the old owner before constructing its successor."""
         from ...plugins.lifecycle import QuiescenceError
-        from ...plugins.registry import PluginRegistry
         from ...utils.io_utils import run_async_to_completion
 
         key = (
@@ -1375,6 +1505,7 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
             else:
                 # Legacy object callers still use the identical owner lock.
                 self.channels.append(new_channel)
+                self._attach_runtime(new_channel)
                 if self._workspace is not None:
                     new_channel.set_workspace(
                         self._workspace,
@@ -1382,23 +1513,17 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
                     )
                 self._bind_enqueue(new_channel)
                 try:
-                    PluginRegistry().projector.replace_channel_binding(
-                        self._workspace,
+                    self._replace_binding(
                         key,
                         old,
-                        ChannelHandle(key, new_channel),
+                        self._channel_handle(new_channel),
                     )
                     await self._start_owned(new_channel)
                 except BaseException:
                     await run_async_to_completion(self._stop_one_unlocked(key))
                     raise
-                handle = ChannelHandle(key, new_channel)
-            PluginRegistry().projector.replace_channel_binding(
-                self._workspace,
-                key,
-                old,
-                handle,
-            )
+                handle = self._channel_handle(new_channel)
+            self._replace_binding(key, old, handle)
 
     async def send_event(
         self,

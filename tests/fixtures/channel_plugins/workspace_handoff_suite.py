@@ -7,6 +7,8 @@ import asyncio
 import psutil
 import pytest
 
+from ownership_helpers import channel_leases, channel_owner, channel_resources
+
 from workspace_runtime_suite import (
     KEY,
     framework as _runtime_framework,
@@ -19,6 +21,71 @@ from workspace_runtime_suite import (
 
 
 framework = _runtime_framework
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [False, True])
+async def test_generic_owner_stop_uses_complete_manager_drain(
+    framework,
+    monkeypatch,
+    timeout,
+):
+    """The ownership adapter must await business work before process exit."""
+    import qwenpaw.app.channels.manager as manager_module
+
+    if timeout:
+        monkeypatch.setattr(manager_module, "_CHANNEL_DRAIN_TIMEOUT", 0.02)
+    ws = await framework.workspace("generic-owner-stop")
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_agent = ws.stream_query
+
+    async def agent(request):
+        entered.set()
+        await release.wait()
+        async for output in original_agent(request):
+            yield output
+
+    ws.stream_query = agent
+    await framework.activate()
+    channel = await ws.channel_manager.get_channel(KEY)
+    owners = framework.registry.runtime_owners
+    (held,) = channel_leases(framework.registry)
+    assert owners.resource(held) is channel
+    assert held.instance_id == channel._launch_spec.instance_id
+    assert held.generation == channel._launch_spec.generation
+    assert held.code_root == channel._launch_spec.code_root
+    pid = channel.channel_process.health_snapshot()["pid"]
+    work = framework.mailbox(channel)
+    await native.eventually(lambda: rows(work, "connected"))
+    emit(work, native.message("generic-owner-stop"))
+    await asyncio.wait_for(entered.wait(), 5)
+    stopping = asyncio.create_task(owners.stop_all(KEY))
+    try:
+        if timeout:
+            receipts = await asyncio.wait_for(stopping, 2)
+            assert len(receipts) == 1 and not receipts[0].stopped
+            assert owners.leases(KEY) == (held,)
+            assert owners.resource(held) is channel
+        else:
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert not stopping.done()
+        assert psutil.pid_exists(pid) and not rows(work, "closed")
+        assert await ws.channel_manager.get_channel(KEY) is channel
+        release.set()
+        if timeout:
+            await native.eventually(lambda: sent(work))
+            receipts = await asyncio.wait_for(owners.stop_all(KEY), 8)
+        else:
+            receipts = await asyncio.wait_for(stopping, 8)
+        assert len(receipts) == 1 and receipts[0].stopped
+        assert len(ws.requests) == len(sent(work)) == 1
+        assert not psutil.pid_exists(pid) and not owners.leases(KEY)
+        assert owners.resource(held) is None
+        assert await ws.channel_manager.get_channel(KEY) is None
+    finally:
+        release.set()
+        await asyncio.gather(stopping, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -202,7 +269,7 @@ async def test_drain_timeout_preserves_accepted_work_and_owner_for_retry(
         assert await manager.get_channel(KEY) is old
         assert psutil.pid_exists(pid) and not rows(work, "closed")
         assert (
-            framework.registry._channel_owners[old._launch_spec.instance_id]
+            channel_owner(framework.registry, old._launch_spec.instance_id)
             is old
         )
         with pytest.raises(Exception):
@@ -371,7 +438,7 @@ async def test_actual_workspace_reload_drains_before_factory_handoff(
         assert len(sent(work)) == 1 and len(old.requests) == 1
         assert not candidate.requests
         await manager.stop_all()
-        assert not framework.registry._channel_owners
+        assert not channel_leases(framework.registry)
     finally:
         release.set()
         if not reload_task.done():
@@ -607,7 +674,7 @@ async def test_real_core_ready_console_serves_while_selected_sdk_waits(
             await asyncio.wait_for(activation, 12)
         if offline:
             assert await ws.channel_manager.get_channel(KEY) is None
-            assert not framework.registry._channel_owners
+            assert not channel_leases(framework.registry)
             record = framework.loader.get_loaded_plugin(KEY)
             assert record.status == "failed" and record.diagnostics
         else:
@@ -660,7 +727,7 @@ async def test_rejected_or_cancelled_reload_retains_old_owner_and_work(
         assert (
             psutil.pid_exists(pid) and len(consumers(framework.network)) == 1
         )
-        assert list(framework.registry._channel_owners.values()) == [channel]
+        assert channel_resources(framework.registry) == [channel]
         assert await old.task_tracker.has_active_tasks()
         release.set()
         await native.eventually(lambda: sent(work))
@@ -688,16 +755,15 @@ async def test_stop_during_sdk_startup_reaps_before_next_generation(framework):
         )
         old = await ws.channel_manager.get_channel(KEY)
         pid = old.channel_process.health_snapshot()["pid"]
-        assert list(framework.registry._channel_owners.values()) == [old]
+        assert channel_resources(framework.registry) == [old]
         receipt = await asyncio.wait_for(ws.channel_manager.stop_one(KEY), 5)
         assert receipt.stopped and receipt.exited
         await asyncio.wait_for(
             asyncio.gather(activating, return_exceptions=True),
             5,
         )
-        assert (
-            not psutil.pid_exists(pid)
-            and not framework.registry._channel_owners
+        assert not psutil.pid_exists(pid) and not channel_leases(
+            framework.registry,
         )
         assert await ws.channel_manager.get_channel(KEY) is None
         assert len(consumers(framework.network)) == 1
@@ -736,9 +802,10 @@ if KEY == "dingtalk":
             assert manager.get_loaded_agent("real-agent") is ws
             assert await ws.channel_manager.get_channel(KEY) is channel
             assert (
-                framework.registry._channel_owners[
-                    channel._launch_spec.instance_id
-                ]
+                channel_owner(
+                    framework.registry,
+                    channel._launch_spec.instance_id,
+                )
                 is channel
             )
             assert psutil.pid_exists(pid)
@@ -795,7 +862,7 @@ async def test_unload_during_replacement_start_cannot_leave_new_owner(
             outcome  # Replacement may be cancelled by the authorized unload.
         )
         assert await ws.channel_manager.get_channel(KEY) is None
-        assert not framework.registry._channel_owners
+        assert not channel_leases(framework.registry)
         assert not psutil.pid_exists(new_pid)
     finally:
         (framework.network / "network-release").touch()
@@ -1041,7 +1108,7 @@ async def test_cancel_before_publication_cleans_or_retains_actual_workspace(
         if stop_failure:
             assert manager.get_loaded_agent("real-agent") is ws
             assert psutil.pid_exists(pid) and len(created) == 1
-            assert list(framework.registry._channel_owners.values()) == [
+            assert channel_resources(framework.registry) == [
                 channel,
             ]
             assert "PROCESS_RUNNING" in channel.last_stop_result.residual
@@ -1054,7 +1121,7 @@ async def test_cancel_before_publication_cleans_or_retains_actual_workspace(
         else:
             assert manager.get_loaded_agent("real-agent") is None
             assert not ws._started and not psutil.pid_exists(pid)
-            assert not framework.registry._channel_owners
+            assert not channel_leases(framework.registry)
             replacement = await manager.get_agent("real-agent")
             assert replacement is not ws and len(created) == 2
     finally:

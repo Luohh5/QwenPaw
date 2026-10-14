@@ -9,7 +9,25 @@ import warnings
 from pathlib import Path
 from typing import Any, Callable, Collection, Dict, List, Optional, Type
 
+from ..config import get_available_channels
+
 logger = logging.getLogger(__name__)
+
+
+def channel_passes_gates(workspace: Any, key: str) -> bool:
+    """Three-gate: available, has a config section, and enabled."""
+    from ..app.channels.manager import channel_cfg_for_key, channel_enabled
+
+    available = get_available_channels()
+    if key not in available:
+        return False
+    config = getattr(workspace, "_config", None)
+    if config is None:
+        return False
+    ch_cfg = channel_cfg_for_key(config, key)
+    if ch_cfg is None:
+        return False
+    return channel_enabled(ch_cfg)
 
 
 def get_tool_config(tool_name: str) -> Optional[Dict[str, Any]]:
@@ -565,6 +583,8 @@ class PluginApi:  # pylint: disable=too-many-public-methods
         plugin_id: str,
         config: Dict[str, Any],
         manifest: Dict[str, Any] = None,
+        *,
+        dependency_token=None,
     ):
         """Initialize plugin API.
 
@@ -578,6 +598,7 @@ class PluginApi:  # pylint: disable=too-many-public-methods
         self.manifest = manifest or {}
         self._registry = None
         self._instance = None
+        self.dependency_token = dependency_token
 
     def set_registry(self, registry):
         """Set registry reference (called by loader).
@@ -710,7 +731,7 @@ class PluginApi:  # pylint: disable=too-many-public-methods
                 from ..runtime.commands.control import (
                     unregister_command as unregister_handler,
                 )
-                from .workspace_projector import live_channel_managers
+                from ..app.channels.manager import live_channel_managers
 
                 unregister_handler(
                     command_name,
@@ -831,13 +852,23 @@ class PluginApi:  # pylint: disable=too-many-public-methods
         *,
         priority: int = 60,
         extra_teardown=None,
+        can_apply=None,
+        binding_is_current=None,
     ) -> None:
         """Remember an intent, project it, and record revoke on the ledger."""
         if self._registry is None:
             return
         self._guard_register()
         projector = self._registry.projector
-        intent = projector.intend(kind, name, self.plugin_id, apply, revoke)
+        intent = projector.intend(
+            kind,
+            name,
+            self.plugin_id,
+            apply,
+            revoke,
+            can_apply=can_apply,
+            binding_is_current=binding_is_current,
+        )
         row = (
             self._registry.get_channel_registration(name)
             if kind == "channel"
@@ -1500,6 +1531,7 @@ class PluginApi:  # pylint: disable=too-many-public-methods
             description,
             runtime_settings=runtime_settings,
             global_enabled=global_enabled,
+            dependency_token=self.dependency_token,
         )
         if runtime_settings is not None:
             self._project_channel(row.channel_key)
@@ -2172,9 +2204,27 @@ class PluginApi:  # pylint: disable=too-many-public-methods
 
     def _project_channel(self, channel_key: str) -> None:
         """Project a registered channel onto live workspaces."""
-        from .workspace_projector import channel_passes_gates
+        from ..app.channels.manager import runtime_stop_receipt
+        from .ownership import RuntimeStopReceipt
 
         registration = self._registry.get_channel_registration(channel_key)
+
+        def can_apply(workspace):
+            return (
+                not getattr(workspace, "_defer_channel_start", False)
+                and getattr(registration, "global_enabled", True)
+                and channel_passes_gates(workspace, channel_key)
+                and getattr(workspace, "channel_manager", None) is not None
+            )
+
+        def binding_is_current(workspace, token):
+            # pylint: disable=protected-access
+            manager = getattr(workspace, "channel_manager", None)
+            return (
+                manager is not None
+                and (token.manager is None or token.manager is manager)
+                and manager._find_channel(channel_key) is token.channel
+            )
 
         def extra_teardown():
             if self._registry is not None:
@@ -2190,14 +2240,7 @@ class PluginApi:  # pylint: disable=too-many-public-methods
                 is not registration
             ):
                 raise RuntimeError("stale channel registration")
-            if not getattr(
-                registration,
-                "global_enabled",
-                True,
-            ) or not channel_passes_gates(
-                workspace,
-                channel_key,
-            ):
+            if not can_apply(workspace):
                 return None
             manager = getattr(workspace, "channel_manager", None)
             if manager is None:
@@ -2213,10 +2256,21 @@ class PluginApi:  # pylint: disable=too-many-public-methods
             return handle
 
         async def revoke(workspace, token=None):
-            manager = getattr(workspace, "channel_manager", None)
-            if manager is None or token is None:
+            if token is None:
                 return None
-            return await manager.stop_one(channel_key, expected=token)
+            manager = token.manager or getattr(
+                workspace,
+                "channel_manager",
+                None,
+            )
+            if manager is None:
+                return RuntimeStopReceipt(
+                    False,
+                    "Channel manager unavailable",
+                    exited=False,
+                )
+            receipt = await manager.stop_one(channel_key, expected=token)
+            return runtime_stop_receipt(receipt, token)
 
         self._schedule_workspace_intent(
             "channel",
@@ -2225,6 +2279,8 @@ class PluginApi:  # pylint: disable=too-many-public-methods
             revoke,
             priority=80,
             extra_teardown=extra_teardown,
+            can_apply=can_apply,
+            binding_is_current=binding_is_current,
         )
 
     # ================================================================

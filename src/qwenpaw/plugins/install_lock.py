@@ -20,14 +20,55 @@ rather than the mere existence of a lock file.
 from __future__ import annotations
 
 import contextlib
+import asyncio
 import errno
 import logging
 import os
 import time
+from weakref import WeakKeyDictionary
 from pathlib import Path
 from typing import Iterator
 
+from .execution.dependencies import canonical_environment_path
+
 logger = logging.getLogger(__name__)
+
+_environment_locks: WeakKeyDictionary = WeakKeyDictionary()
+
+
+@contextlib.asynccontextmanager
+async def async_lock(lock):
+    """Settle threaded acquisition before cancellation releases custody."""
+    from .execution.process import _settle
+
+    acquisition = asyncio.create_task(asyncio.to_thread(lock.__enter__))
+    try:
+        await asyncio.shield(acquisition)
+    except asyncio.CancelledError:
+        try:
+            await _settle(acquisition)
+        finally:
+            if not acquisition.cancelled() and acquisition.exception() is None:
+                lock.__exit__(None, None, None)
+        raise
+    try:
+        yield
+    finally:
+        lock.__exit__(None, None, None)
+
+
+@contextlib.asynccontextmanager
+async def environment_coordinator(targets):
+    """Serialize overlapping in-process admissions and publications."""
+    keys = sorted({canonical_environment_path(path) for path in targets})
+    locks = _environment_locks.setdefault(asyncio.get_running_loop(), {})
+    async with contextlib.AsyncExitStack() as stack:
+        for key in keys:
+            await stack.enter_async_context(
+                locks.setdefault(key, asyncio.Lock()),
+            )
+        yield
+
 
 # Poll interval while waiting for a contended lock.
 _RETRY_INTERVAL_SECONDS = 0.25
@@ -87,7 +128,7 @@ class InstallLockError(RuntimeError):
 
 def environment_install_lock_path(target: Path) -> Path:
     """Key exclusion by the canonical write destination, across workspaces."""
-    root = Path(os.path.normcase(os.path.realpath(target)))
+    root = canonical_environment_path(target)
     return root.parent / f".{root.name}.dependencies.lock"
 
 

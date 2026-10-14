@@ -282,6 +282,8 @@ with plugin_install_lock(environment_install_lock_path(Path(sys.argv[1]))):
     print('held',flush=True)
     sys.stdin.readline()
 """
+        source_root = str(Path(lock_mod.__file__).resolve().parents[2])
+        script = f"import sys\nsys.path.insert(0, {source_root!r})\n" + script
         with subprocess.Popen(
             [sys.executable, "-I", "-c", script, str(alias)],
             stdin=subprocess.PIPE,

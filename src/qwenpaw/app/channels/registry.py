@@ -153,9 +153,11 @@ def selected_process_channels() -> frozenset[str]:
     """Host rollout reservation is independent of installed registrations."""
     from ...plugins.registry import PluginRegistry
 
-    settings = PluginRegistry().channel_runtime
+    registry = PluginRegistry()
     from .catalog import OFFICIAL_CHANNEL_OWNERS
 
-    return frozenset(OFFICIAL_CHANNEL_OWNERS) | (
-        settings.selected_channels if settings is not None else frozenset()
+    return frozenset(OFFICIAL_CHANNEL_OWNERS) | frozenset(
+        key
+        for key, row in registry.get_channel_catalog().items()
+        if row.description_record is not None
     )

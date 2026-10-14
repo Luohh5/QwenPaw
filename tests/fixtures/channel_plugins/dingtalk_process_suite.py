@@ -418,22 +418,36 @@ async def test_original_identity_short_hash_group_hash_and_proactive_handle(
     else:
         assert request.session_id == request2.session_id
     assert request.session_id == expected
-    assert (
-        rt.channel.to_handle_from_target(
-            user_id=request.user_id,
-            session_id=request.session_id,
-        )
-        == f"dingtalk:sw:{request.user_id}_{request.session_id}"
+    from qwenpaw.channel_protocol.targets import decode_reply_target
+
+    target = rt.channel.to_handle_from_target(
+        user_id=request.user_id,
+        session_id=request.session_id,
     )
+    assert decode_reply_target(target) == {
+        "user_id": "group" if shared else "Alice#1234",
+        "session_id": expected,
+    }
     dm = await inbound(rt, message("dm-identity", group=False))
     assert (
         rt.channel.build_agent_request_from_native(dm).user_id == "Alice#1234"
     )
     assert rt.channel.resolve_session_id("one", {}) == "dingtalk:one"
-    changed = {**first, "sender_id": "Bob#5678"}
+    other_member = await inbound(
+        rt,
+        message(
+            "session-other-member",
+            group=True,
+            conversationId="prefixA_same_suffix",
+            senderId="ding5678",
+            senderNick="Bob",
+            senderStaffId="staff-two",
+        ),
+    )
+    assert other_member["acl_sender_id"] == "ding5678"
     assert (
         rt.channel.get_debounce_key(first)
-        == rt.channel.get_debounce_key(changed)
+        == rt.channel.get_debounce_key(other_member)
     ) is shared
 
 
@@ -1327,7 +1341,7 @@ async def test_mention_policy_acks_rejection_then_accepts_dm(runtime):
     await eventually(lambda: len(rt.rows("ack")) == 1)
     assert rt.queued == []
     payload = await inbound(rt, message("dm-unmentioned", mentioned=False))
-    assert payload["message_id"] == "dm-unmentioned"
+    assert payload["meta"]["message_id"] == "dm-unmentioned"
     assert all(r["frame"]["code"] == 200 for r in rt.rows("ack"))
 
 
@@ -1744,7 +1758,9 @@ async def test_lost_host_admission_ack_dedups_and_preserves_accepted_route(
     await asyncio.wait_for(recovered.wait(), 38)
     await eventually(lambda: len(rt.rows("ack")) == 1)
     await inbound(rt, message("after-ack-recovery"))
-    assert [p["message_id"] for p in rt.queued].count("accepted-ack-lost") == 1
+    assert [p["meta"]["message_id"] for p in rt.queued].count(
+        "accepted-ack-lost",
+    ) == 1
     assert (
         persisted_routes(rt)[payload["meta"]["response_handle"]]["kind"]
         == "active"

@@ -16,6 +16,8 @@ from types import SimpleNamespace as NS
 
 import psutil
 import pytest
+
+from ownership_helpers import channel_leases
 import pytest_asyncio
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -389,8 +391,11 @@ async def test_closed_activation_gate_never_spawns(
         await framework.activate(global_enabled=gate != "global")
     assert await ws.channel_manager.get_channel(KEY) is None
     assert not consumers(framework.network)
-    assert not framework.registry._channel_owners
-    assert not framework.loader._channel_preparations
+    assert not channel_leases(framework.registry)
+    assert not any(
+        lease.key.kind == "preparation"
+        for lease in framework.registry.runtime_owners.leases()
+    )
     assert all(
         not psutil.pid_exists(int(path.name))
         for path in framework.network.iterdir()
@@ -523,7 +528,19 @@ async def test_backlog_uses_old_owner_after_same_key_replacement(framework):
         "sender_id": "ou_alice",
         "acl_sender_id": "ou_alice",
         "content_parts": [TextContent(text="old backlog")],
-        "meta": {},
+        "meta": {
+            "session_id": "backlog-session",
+            "user_id": "ou_alice",
+            "debounce_key": "backlog-session",
+            "feishu_receive_id": "ou_alice",
+            "feishu_receive_id_type": "open_id",
+            "session_webhook": (
+                "https://oapi.dingtalk.com/robot/"
+                "sendBySession?session=old-session"
+            ),
+            "conversation_id": "backlog-session",
+            "conversation_type": "single",
+        },
     }
     fresh_requests = []
 
@@ -610,6 +627,19 @@ async def test_stop_wakes_capacity_wait_with_negative_ack_and_no_commit(
         "session_id": "session-one",
         "sender_id": "ou_alice",
         "content_parts": [],
+        "meta": {
+            "session_id": "session-one",
+            "user_id": "ou_alice",
+            "debounce_key": "session-one",
+            "feishu_receive_id": "ou_alice",
+            "feishu_receive_id_type": "open_id",
+            "session_webhook": (
+                "https://oapi.dingtalk.com/robot/"
+                "sendBySession?session=old-session"
+            ),
+            "conversation_id": "session-one",
+            "conversation_type": "single",
+        },
     }
     admit_entered = asyncio.Event()
 
@@ -673,7 +703,10 @@ async def test_existing_builtin_owner_refuses_process_projection(framework):
     assert not any(
         rows(path, "connected") for path in framework.network.iterdir()
     )
-    assert not framework.loader._channel_preparations
+    assert not any(
+        lease.key.kind == "preparation"
+        for lease in framework.registry.runtime_owners.leases()
+    )
 
 
 @pytest.mark.asyncio
@@ -733,38 +766,38 @@ async def test_cancel_before_manager_binding_releases_unstarted_owner(
     manager.set_workspace(ws)
     await manager.start_all()
     allocated = asyncio.Event()
-    next_generation = framework.registry.next_channel_generation
+    reserve = framework.registry.runtime_owners.reserve
 
-    def allocate(instance_id):
-        generation = next_generation(instance_id)
-        allocated.set()
-        return generation
+    def allocate(*args, **kwargs):
+        lease = reserve(*args, **kwargs)
+        if lease.key.kind == "channel":
+            allocated.set()
+        return lease
 
     monkeypatch.setattr(
-        framework.registry,
-        "next_channel_generation",
+        framework.registry.runtime_owners,
+        "reserve",
         allocate,
     )
     await manager._lock.acquire()
     task = asyncio.create_task(manager.start_one(KEY, ws._config))
     try:
         await asyncio.wait_for(allocated.wait(), 2)
-        assert framework.registry._channel_owners
+        assert channel_leases(framework.registry)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
     finally:
         manager._lock.release()
     try:
-        assert not framework.registry._channel_owners
+        assert not channel_leases(framework.registry)
         assert not list(framework.network.iterdir())
         assert await manager.get_channel(KEY) is None
         replacement = (await manager.start_one(KEY, ws._config)).channel
         assert replacement.channel_process.health_snapshot()["pid"]
         assert (await manager.stop_one(KEY)).stopped
     finally:
-        for owner in list(framework.registry._channel_owners.values()):
-            await owner.stop()
+        await framework.registry.runtime_owners.stop_all(KEY)
 
 
 if KEY == "dingtalk":

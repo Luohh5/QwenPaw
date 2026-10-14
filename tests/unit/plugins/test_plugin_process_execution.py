@@ -37,6 +37,12 @@ def test_plugin_process_execution(tmp_path):
 
 def test_existing_plugin_exports_keep_object_identity(tmp_path):
     script = """
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(source))
+import qwenpaw
+assert Path(qwenpaw.__file__).resolve().is_relative_to(source)
 import qwenpaw.plugins as plugins
 from qwenpaw.plugins import (
     PluginLoader, PluginRegistry, PluginApi,
@@ -76,7 +82,13 @@ for name, public, direct in (
     assert getattr(plugins, name) is public, name
 """
     result = subprocess.run(
-        [sys.executable, "-I", "-c", script],
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            script,
+            str(Path(__file__).resolve().parents[3] / "src"),
+        ],
         env={
             **os.environ,
             "QWENPAW_WORKING_DIR": str(tmp_path / "plugin-exports"),

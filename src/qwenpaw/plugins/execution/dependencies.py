@@ -9,6 +9,7 @@ import inspect
 import os
 from pathlib import Path
 import sys
+import sysconfig
 from typing import Any, Mapping
 
 from packaging.markers import default_environment
@@ -31,9 +32,14 @@ def valid_metadata_headers(message, required, optional=()) -> bool:
     ) and all(len(message.get_all(name, [])) <= 1 for name in optional)
 
 
+def canonical_environment_path(target: str | Path) -> Path:
+    """One identity for publication, admission, lock and repair paths."""
+    return Path(os.path.normcase(os.path.realpath(target)))
+
+
 def repair_marker(site: str | Path) -> Path:
     """Persistent evidence that an interrupted shared write needs repair."""
-    root = Path(site).resolve()
+    root = canonical_environment_path(Path(site))
     return root.parent / f".{root.name}.dependencies-repair-required"
 
 
@@ -47,10 +53,11 @@ class DependencySnapshot:
     marker_environment: Mapping[str, str]
     supported_tags: tuple[str, ...]
     distributions: Mapping[str, Mapping[str, Any]]
+    dependency_sites: tuple[str, ...] | None = None
 
     def to_mapping(self) -> dict[str, Any]:
         """Encode independent JSON data for the private transport."""
-        return {
+        value = {
             "executable": self.executable,
             "prefix": self.prefix,
             "sites": list(self.sites),
@@ -65,6 +72,9 @@ class DependencySnapshot:
                 for key, row in self.distributions.items()
             },
         }
+        if self.dependency_sites is not None:
+            value["dependency_sites"] = list(self.dependency_sites)
+        return value
 
     @classmethod
     # Closed metadata validation intentionally checks every untrusted field.
@@ -79,7 +89,10 @@ class DependencySnapshot:
             "supported_tags",
             "distributions",
         }
-        if not isinstance(value, Mapping) or set(value) != fields:
+        if not isinstance(value, Mapping) or set(value) not in (
+            fields,
+            fields | {"dependency_sites"},
+        ):
             raise dependency_error()
         data = dict(value)
         for key in ("executable", "prefix"):
@@ -94,6 +107,18 @@ class DependencySnapshot:
             ):
                 raise dependency_error()
         if any(not Path(site).is_absolute() for site in data["sites"]):
+            raise dependency_error()
+        package_sites = data.get("dependency_sites")
+        if "dependency_sites" in data and (
+            not isinstance(package_sites, list)
+            or any(
+                not isinstance(site, str)
+                or not Path(site).is_absolute()
+                or str(Path(site).resolve())
+                not in {str(Path(root).resolve()) for root in data["sites"]}
+                for site in package_sites
+            )
+        ):
             raise dependency_error()
         environment = data["marker_environment"]
         if (
@@ -150,6 +175,7 @@ class DependencySnapshot:
             dict(environment),
             tuple(data["supported_tags"]),
             copied,
+            tuple(package_sites) if package_sites is not None else None,
         )
 
     @property
@@ -158,6 +184,50 @@ class DependencySnapshot:
         return {
             name: row["version"] for name, row in self.distributions.items()
         }
+
+
+def protected_dependency_target(path):
+    """Protect local stdlib/support while preserving actual package sites."""
+    target = Path(path).resolve()
+    package_roots = {
+        str(Path(path).resolve())
+        for path in (
+            sysconfig.get_path("purelib"),
+            sysconfig.get_path("platlib"),
+        )
+        if path
+    }
+    standard = {
+        str(Path(path).resolve())
+        for path in (
+            sysconfig.get_path("stdlib"),
+            sysconfig.get_path("platstdlib"),
+            sysconfig.get_config_var("DESTSHARED"),
+        )
+        if path
+    }
+    support = {
+        str(Path(__file__).resolve().parents[3]),
+        str(Path(__file__).resolve().parent),
+    }
+    return any(
+        target.is_relative_to(root) for root in support - package_roots
+    ) or (
+        any(target.is_relative_to(root) for root in standard)
+        and not any(target.is_relative_to(root) for root in package_roots)
+    )
+
+
+def dependency_sites(sites, *, explicit=(), distributions=()):
+    """Classify roots without granting explicit paths protected writes."""
+    del explicit, distributions
+    return tuple(
+        dict.fromkeys(
+            str(Path(path).resolve())
+            for path in sites
+            if path and not protected_dependency_target(path)
+        ),
+    )
 
 
 # Inventory and relevant-closure rejection form one child-only audit.
@@ -261,6 +331,13 @@ def observe_dependencies(packet: Mapping[str, Any]) -> DependencySnapshot:
             "marker_environment": default_environment(),
             "supported_tags": [str(tag) for tag in sys_tags()],
             "distributions": rows,
+            "dependency_sites": list(
+                dependency_sites(
+                    sites,
+                    explicit=packet.get("dependency_paths", ()),
+                    distributions=rows.values(),
+                ),
+            ),
         },
     )
 

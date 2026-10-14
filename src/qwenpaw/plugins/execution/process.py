@@ -155,6 +155,7 @@ class PluginProcess:
         self._forced = False
         self._mode = "run"
         self.dependency_snapshot: DependencySnapshot | None = None
+        self.dependency_observer = None
         self.observed_hello: Mapping[str, Any] | None = None
         self.last_cleanup: StopResult | None = None
 
@@ -235,6 +236,8 @@ class PluginProcess:
         ):
             raise self.error_type("DEPENDENCY_ORIGIN_INVALID")
         self.dependency_snapshot = snapshot
+        if self.dependency_observer is not None:
+            self.dependency_observer(snapshot)
         return {"accepted": True}
 
     def _register(

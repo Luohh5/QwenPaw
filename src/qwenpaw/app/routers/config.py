@@ -120,6 +120,38 @@ def _channel_config_class(name: str) -> Optional[type[BaseModel]]:
     return None
 
 
+def _validated_channel_config(name: str, values: dict):
+    """Use static descriptor validation wherever an installed schema exists."""
+    from ...plugins.registry import PluginRegistry
+    from ...plugins.channel_config import validate_channel_config
+
+    if not isinstance(values, dict):
+        raise HTTPException(
+            status_code=422,
+            detail="Channel configuration must be an object",
+        )
+    row = PluginRegistry().get_channel_catalog_entry(name)
+    try:
+        if row is not None and row.description_record is not None:
+            schema = row.description_record.descriptor.config_schema
+            return validate_channel_config(
+                schema,
+                clean_channel_config(values, schema),
+            )
+        values = clean_channel_config(values)
+        model = _channel_config_class(name)
+        if model is not None:
+            return model.model_validate(values).model_dump(mode="json")
+        return values
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=exc.errors(include_context=False),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 _ALLOWED_ACP_TOOL_PARSE_MODES = {
     "call_title",
     "update_detail",
@@ -247,7 +279,7 @@ async def list_channel_schemas(request: Request) -> dict:
 )
 async def put_channels(
     request: Request,
-    channels_config: ChannelConfig = Body(
+    channels_config: dict = Body(
         ...,
         description="Complete channel configuration",
     ),
@@ -260,10 +292,19 @@ async def put_channels(
     current = (
         agent.config.channels.model_dump() if agent.config.channels else {}
     )
-    incoming = channels_config.model_dump()
-    for key in channels_config.model_fields_set:
-        current[key] = clean_channel_config(incoming[key])
-    channels_config = ChannelConfig.model_validate(current)
+    from ...plugins.channel_config import channel_config_dict
+
+    incoming = channel_config_dict(channels_config)
+    keys = getattr(channels_config, "model_fields_set", incoming.keys())
+    for key in keys:
+        current[key] = _validated_channel_config(key, incoming[key])
+    try:
+        channels_config = ChannelConfig.model_validate(current)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=exc.errors(include_context=False),
+        ) from exc
     agent.config.channels = channels_config
     save_agent_config(agent.agent_id, agent.config)
 
@@ -586,26 +627,15 @@ async def put_channel(
 
     agent = await get_agent_for_request(request)
 
-    # Initialize channels if not exists
-    if agent.config.channels is None:
-        agent.config.channels = ChannelConfig()
-
-    single_channel_config = clean_channel_config(single_channel_config)
-    config_class = _channel_config_class(channel_name)
-    if config_class is not None:
-        try:
-            channel_config = config_class(**single_channel_config)
-        except ValidationError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail=exc.errors(include_context=False),
-            ) from exc
-    else:
-        # For custom channels, just use the dict
-        channel_config = single_channel_config
-
-    # Set channel config in agent's config
-    setattr(agent.config.channels, channel_name, channel_config)
+    channel_config = _validated_channel_config(
+        channel_name,
+        single_channel_config,
+    )
+    current = (
+        agent.config.channels.model_dump() if agent.config.channels else {}
+    )
+    current[channel_name] = channel_config
+    agent.config.channels = ChannelConfig.model_validate(current)
     save_agent_config(agent.agent_id, agent.config)
 
     # Hot reload config (async, non-blocking)

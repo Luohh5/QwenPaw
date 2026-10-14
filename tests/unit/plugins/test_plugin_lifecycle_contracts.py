@@ -1150,9 +1150,11 @@ async def test_install_cancel_waits_for_copy_before_next_load(
     loader = PluginLoader(plugin_dirs=[install_dir])
     loader.registry = fresh_registry
     finished = {"done": False}
+    copy_started = threading.Event()
     real_copy = shutil.copytree
 
     def _slow_copy(src, dst, *args, **kwargs):
+        copy_started.set()
         time.sleep(0.12)
         result = real_copy(src, dst, *args, **kwargs)
         finished["done"] = True
@@ -1162,7 +1164,7 @@ async def test_install_cancel_waits_for_copy_before_next_load(
     task = asyncio.create_task(
         loader.load_plugin_from_path(source, install_dir=install_dir),
     )
-    await asyncio.sleep(0.02)
+    assert await asyncio.to_thread(copy_started.wait, 5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -2548,7 +2550,7 @@ async def test_startup_stop_failure_keeps_channel(
 
     with (
         patch(
-            "qwenpaw.plugins.workspace_projector.get_available_channels",
+            "qwenpaw.plugins.api.get_available_channels",
             return_value=("sticky-ch",),
         ),
         patch(
@@ -3445,7 +3447,10 @@ async def test_unloaded_force_keeps_old_dir_on_copy_failure(
             return shutil.copy2(src_file, dst_file, *a, **k)
 
         patched = dict(kwargs)
-        patched["copy_function"] = _copy
+        if len(args) > 2:
+            args = (*args[:2], _copy, *args[3:])
+        else:
+            patched["copy_function"] = _copy
         return real_copytree(src, dst, *args, **patched)
 
     monkeypatch.setattr(shutil, "copytree", _copytree)
@@ -3743,7 +3748,7 @@ async def test_unloaded_force_unquiescent_activate_keeps_new_dir(
 
     with (
         patch(
-            "qwenpaw.plugins.workspace_projector.get_available_channels",
+            "qwenpaw.plugins.api.get_available_channels",
             return_value=("force-ch",),
         ),
         patch(

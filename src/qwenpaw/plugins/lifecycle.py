@@ -472,6 +472,29 @@ class PluginLifecycle:
         self.delegate = LifecycleDelegate()
         self._instances: dict[str, PluginInstance] = {}
 
+    async def prepare_backend(
+        self,
+        binding,
+        *,
+        allow_install,
+        probe,
+        wheels=(),
+        owns_dependency_env=True,
+    ):
+        """Enforce dependency ownership while retaining read-only checks."""
+        owns_dependency_env = (
+            self.delegate.owns_dependency_env(
+                binding.description.manifest.id,
+            )
+            and owns_dependency_env
+        )
+        return await binding.prepare(
+            allow_install=allow_install and owns_dependency_env,
+            probe=probe,
+            wheels=wheels if owns_dependency_env else (),
+            owns_dependency_env=owns_dependency_env,
+        )
+
     def get_instance(self, plugin_id: str) -> PluginInstance | None:
         return self._instances.get(plugin_id)
 
@@ -652,6 +675,7 @@ class PluginLifecycle:
         confirm_legacy: bool,
     ) -> ConfigUpdateReport:
         from .settings import persist_plugin_settings, runtime_config
+        from .execution_backend import probes_before_activation
 
         if not isinstance(new_config, dict):
             return ConfigUpdateReport(
@@ -662,14 +686,26 @@ class PluginLifecycle:
             )
         inst = self._instances.get(plugin_id)
         record = self._loader.get_loaded_plugin(plugin_id)
-        if record is not None and record.manifest.entry.descriptor is not None:
-            from .channel_adapter import describe_channel
-
+        previous_diagnostics = list(record.diagnostics) if record else []
+        if record is not None:
             try:
-                self._loader._require_channel_selection(record.manifest)
-                if record.enabled:
-                    await self._loader._prepare_channel_candidate(
-                        describe_channel(record.source_path, record.manifest),
+                binding = self._loader._binding_for_record(record)
+                validate = getattr(
+                    binding.backend,
+                    "validate_config_update",
+                    None,
+                )
+                if validate is not None:
+                    validate(binding.description, new_config)
+                if (
+                    record.global_enabled
+                    if record.global_enabled is not None
+                    else record.enabled
+                ):
+                    await self.prepare_backend(
+                        binding,
+                        allow_install=False,
+                        probe=probes_before_activation(binding),
                     )
             except Exception as exc:
                 return ConfigUpdateReport(
@@ -715,6 +751,8 @@ class PluginLifecycle:
         previous_state = inst.state
         previous_status = record.status
         previous_enabled = record.enabled
+        previous_global_enabled = record.global_enabled
+        previous_definition = record.instance
         from ..utils.io_utils import run_sync_io
 
         persisted = False
@@ -775,6 +813,9 @@ class PluginLifecycle:
             restore_cleanup: UnloadReport | None = None
             try:
                 self._loader.registry.unregister_plugin(plugin_id)
+                record.instance = previous_definition
+                record.enabled = previous_enabled
+                record.global_enabled = previous_global_enabled
                 await self._loader.reregister_unlocked(plugin_id, previous)
                 await self._loader.activate_plugin_unlocked(
                     plugin_id,
@@ -784,6 +825,8 @@ class PluginLifecycle:
                 inst.state = previous_state
                 record.status = previous_status
                 record.enabled = previous_enabled
+                record.global_enabled = previous_global_enabled
+                record.diagnostics = previous_diagnostics
             except BaseException as restore_exc:
                 restore_cleanup = getattr(
                     restore_exc,
@@ -822,126 +865,110 @@ class PluginLifecycle:
 
     # Lifecycle and Loader share the locked load boundary.
     # pylint: disable=protected-access
-    async def set_enabled(
-        self,
-        plugin_id: str,
-        enabled: bool,
-    ) -> Any:
-        """Load or unload first; persist ``enabled`` only when it is true."""
-        from .settings import persist_plugin_settings
-
+    async def set_enabled(self, plugin_id: str, enabled: bool) -> Any:
+        """Persist an enable only after the bound definition activates."""
+        from .settings import persist_plugin_settings, runtime_config
+        from .execution_backend import probes_before_activation
+        from ..config.utils import load_config
         from ..utils.io_utils import run_sync_io
 
         async with self._loader.plugin_lifecycle(plugin_id):
             record = self._loader.get_loaded_plugin(plugin_id)
-            if enabled:
-                from .channel_adapter import require_channel_runtime_integrated
-
-                manifest = record.manifest if record is not None else None
-                if manifest is None:
-                    path = self._loader.find_installed_plugin_dir(plugin_id)
-                    if path is not None:
-                        # Lifecycle and Loader share this internal boundary.
-                        # pylint: disable=protected-access
-                        _, manifest = await run_sync_io(
-                            self._loader._read_source_manifest,
-                            path,
-                        )
-                        # pylint: enable=protected-access
-                # pylint: disable=protected-access
-                if (
-                    manifest is not None
-                    and self._loader._channel_runtime_for(manifest) is None
-                ):
-                    require_channel_runtime_integrated(manifest)
-                if (
-                    manifest is not None
-                    and manifest.entry.descriptor is not None
-                ):
-                    return await self._enable_channel_unlocked(
+            if not enabled:
+                if record is not None:
+                    report = await self._unload_unlocked(
                         plugin_id,
-                        record,
-                        manifest,
+                        UnloadMode.UNLOAD,
+                        delete_files=False,
                     )
-            loaded = record is not None
-            if not enabled and loaded:
-                report = await self._unload_unlocked(
+                    if not report.quiescent:
+                        return report
+                else:
+                    report = None
+                await run_sync_io(
+                    persist_plugin_settings,
                     plugin_id,
-                    UnloadMode.UNLOAD,
-                    delete_files=False,
+                    enabled=False,
                 )
-                if report.quiescent:
-                    await run_sync_io(
-                        persist_plugin_settings,
-                        plugin_id,
-                        enabled=False,
-                    )
                 return report
-            if enabled and not loaded:
+            if (
+                record is not None
+                and record.enabled
+                and record.status == "active"
+            ):
                 await run_sync_io(
                     persist_plugin_settings,
                     plugin_id,
                     enabled=True,
                 )
-                return await self._loader.load_installed_unlocked(plugin_id)
-            await run_sync_io(
-                persist_plugin_settings,
-                plugin_id,
-                enabled=enabled,
+                return record
+            source = (
+                record.source_path
+                if record is not None
+                else self._loader.find_installed_plugin_dir(plugin_id)
             )
-            return self._loader.get_loaded_plugin(plugin_id)
-
-    async def _enable_channel_unlocked(self, plugin_id, record, manifest):
-        """Enable selected descriptors without a directory transaction."""
-        from .settings import persist_plugin_settings, runtime_config
-        from ..config.utils import load_config
-        from .channel_adapter import describe_channel
-        from ..utils.io_utils import run_sync_io
-
-        if record is not None and record.enabled and record.status == "active":
+            if source is None:
+                raise KeyError(f"Plugin '{plugin_id}' is not installed")
+            if record is not None:
+                binding = self._loader._binding_for_record(record)
+                manifest = binding.description.manifest
+            else:
+                _, manifest = await run_sync_io(
+                    self._loader._read_source_manifest,
+                    source,
+                )
+                binding = self._loader.backend_resolver.resolve(
+                    source,
+                    manifest,
+                )
+            inst = self._instances.get(plugin_id)
+            config = (
+                dict(inst.config or {})
+                if inst is not None
+                else runtime_config(
+                    (load_config().plugins or {}).get(plugin_id),
+                )
+            )
+            await self.prepare_backend(
+                binding,
+                allow_install=False,
+                probe=probes_before_activation(binding),
+            )
+            await binding.backend.before_activate(binding.description)
+            if record is not None:
+                report = await self._unload_unlocked(
+                    plugin_id,
+                    UnloadMode.UNLOAD,
+                    delete_files=False,
+                )
+                if not report.quiescent:
+                    return report
+            record = await self._loader._load_plugin_unlocked(
+                manifest,
+                source,
+                {**config, "enabled": True},
+                activate=True,
+                backend_binding=binding,
+                prepared=True,
+            )
+            if record.status == "active" and record.enabled:
+                await run_sync_io(
+                    persist_plugin_settings,
+                    plugin_id,
+                    enabled=True,
+                )
             return record
-        source = (
-            record.source_path
-            if record is not None
-            else self._loader.find_installed_plugin_dir(plugin_id)
-        )
-        inst = self._instances.get(plugin_id)
-        config = (
-            dict(inst.config or {})
-            if inst is not None
-            else runtime_config((load_config().plugins or {}).get(plugin_id))
-        )
-        await self._loader._prepare_channel_candidate(
-            describe_channel(source, manifest),
-        )
-        if record is not None:
-            report = await self._unload_unlocked(
-                plugin_id,
-                UnloadMode.UNLOAD,
-                delete_files=False,
-            )
-            if not report.quiescent:
-                return report
-        config["enabled"] = True
-        record = await self._loader._load_plugin_unlocked(
-            manifest,
-            source,
-            config,
-            activate=True,
-        )
-        if record.status == "active" and record.enabled:
-            await run_sync_io(persist_plugin_settings, plugin_id, enabled=True)
-        return record
 
     async def unload_all(self, mode: UnloadMode) -> list[UnloadReport]:
         """Unload every known instance (used at process shutdown)."""
         reports: list[UnloadReport] = []
-        owners = self._loader.registry.channel_owner_registrations()
         for plugin_id in dict.fromkeys(
             (
                 *self._instances,
-                *self._loader._channel_preparations,
-                *(row.plugin_id for row in owners),
+                *(
+                    lease.plugin_id
+                    for lease in self._loader.registry.runtime_owners.leases()
+                ),
             ),
         ):
             try:

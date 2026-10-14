@@ -288,19 +288,27 @@ def test_factory_validates_and_snapshots_without_spawn_or_media_writes(
     assert not calls
 
 
-def test_unknown_config_model_fails_at_factory_not_discovery(tmp_path):
-    source, manifest = candidate(tmp_path, "future")
+def test_generic_config_factory_succeeds_without_host_model(tmp_path):
+    """G1 replaces the old unknown-Config rejection with schema support."""
+    from extension_admission_suite import sample_plugin
+
+    source, manifest = sample_plugin(tmp_path, "future")
     description = describe(source, manifest)
-    with pytest.raises((ValueError, NotImplementedError)):
-        description.create_proxy(
-            unused_process,
-            {},
-            python_executable=sys.executable,
-            support_root=ROOT / "src",
-            instance_id="w",
-            generation=1,
-            qwenpaw_version="2.2.2b4",
-        )
+    channel = description.create_proxy(
+        unused_process,
+        {"api_token": "test-token", "options": {"retries": 6}},
+        python_executable=sys.executable,
+        support_root=ROOT / "src",
+        instance_id="w",
+        generation=1,
+        qwenpaw_version="2.2.2b4",
+    )
+    assert channel.channel == "future"
+    assert channel._launch_spec.config["options"] == {
+        "retries": 6,
+        "headers": {"X-Test": "yes"},
+    }
+    assert channel.channel_process.health_snapshot()["pid"] is None
 
 
 def test_catalog_is_inactive_owner_checked_and_identity_guarded(
@@ -484,7 +492,7 @@ async def test_old_class_projection_ledger_callback_cannot_revoke_new_intent(
         live_workspaces=lambda: [workspace],
     )
     monkeypatch.setattr(
-        "qwenpaw.plugins.workspace_projector.get_available_channels",
+        "qwenpaw.plugins.api.get_available_channels",
         lambda: ("custom",),
     )
     created = []
@@ -942,7 +950,7 @@ async def test_legacy_api_normalized_channel_projects_canonical_identity(
         live_workspaces=lambda: [workspace],
     )
     monkeypatch.setattr(
-        "qwenpaw.plugins.workspace_projector.get_available_channels",
+        "qwenpaw.plugins.api.get_available_channels",
         lambda: ("custom",),
     )
     current = live_channel()
