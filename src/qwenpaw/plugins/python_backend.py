@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
+import csv
 import importlib.util
 import logging
 import os
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable
 
 from .execution_backend import DefinitionResult, PluginDescription
@@ -42,6 +43,29 @@ def _relative_module_origins(origins, root):
             # A different drive cannot belong to this root.
             continue
     return relative
+
+
+def _files_for_loaded_origins(distribution, origins):
+    """Validate fresh RECORD rows, then stat only loaded-origin candidates."""
+    record = distribution.read_text("RECORD")
+    if not record:
+        return distribution.files
+    candidates = []
+    for row in csv.reader(record.splitlines()):
+        if not 1 <= len(row) <= 3:
+            raise ValueError("Invalid RECORD row")
+        if len(row) == 3 and row[2]:
+            int(row[2])
+        path = PurePosixPath(row[0])
+        if os.path.normcase(os.path.normpath(path)) in origins:
+            candidates.append(path)
+    if sys.version_info < (3, 12):
+        return candidates
+    # Validate every row before checking candidates, and check all candidates
+    # so a later matching-origin error cannot be hidden by an earlier match.
+    return [
+        path for path in candidates if distribution.locate_file(path).exists()
+    ]
 
 
 async def _probe_incoming(
@@ -229,13 +253,16 @@ class PythonBackend:
             for name, row in snapshot.distributions.items():
                 root = Path(row["metadata_path"]).parent
                 distribution = PathDistribution(Path(row["metadata_path"]))
-                files = distribution.files
+                if root not in relative_origins:
+                    relative_origins[root] = _relative_module_origins(
+                        origins,
+                        root,
+                    )
+                files = _files_for_loaded_origins(
+                    distribution,
+                    relative_origins[root],
+                )
                 if files is not None:
-                    if root not in relative_origins:
-                        relative_origins[root] = _relative_module_origins(
-                            origins,
-                            root,
-                        )
                     if any(
                         os.path.normcase(os.path.normpath(item))
                         in relative_origins[root]

@@ -5,7 +5,6 @@ from pathlib import Path
 import subprocess
 import sys
 
-
 SUITE = (
     Path(__file__).parents[2]
     / "fixtures"
@@ -21,12 +20,21 @@ def test_ch_0_008_in_isolated_pytest_process() -> None:
         [
             sys.executable,
             "-I",
-            "-m",
-            "pytest",
-            "--confcutdir",
-            str(SUITE.parent),
+            "-c",
+            """
+import pathlib, sys
+source = pathlib.Path(sys.argv[1]).resolve()
+suite = pathlib.Path(sys.argv[2]).resolve()
+sys.path.insert(0, str(source))
+import qwenpaw
+assert pathlib.Path(qwenpaw.__file__).resolve().is_relative_to(source)
+import pytest
+raise SystemExit(pytest.main([
+    '--confcutdir', str(suite.parent), str(suite), '-q',
+]))
+""",
+            str(SUITE.parents[4] / "src"),
             str(SUITE),
-            "-q",
         ],
         capture_output=True,
         check=False,

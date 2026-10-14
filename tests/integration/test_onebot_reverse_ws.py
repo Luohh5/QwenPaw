@@ -16,6 +16,7 @@ API endpoints:
   - PUT /api/config/channels/onebot
   - GET /api/config/channels/onebot
 """
+
 from __future__ import annotations
 
 import json
@@ -44,9 +45,6 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-_WS_PORT = _free_port()
-
-
 @pytest.fixture(scope="module")
 def mock_llm():
     """Module-scoped mock OpenAI server for deterministic replies."""
@@ -63,13 +61,14 @@ def mock_llm():
 @pytest.fixture(scope="module")
 def onebot_channel_up(app_server):
     """Enable the OneBot channel (reverse WS server on a fixed port)."""
+    ws_port = _free_port()
     put = app_server.api_request(
         "PUT",
         "/api/config/channels/onebot",
         json={
             "enabled": True,
             "ws_host": "127.0.0.1",
-            "ws_port": _WS_PORT,
+            "ws_port": ws_port,
             "require_mention": True,
         },
         timeout=_HTTP_TIMEOUT,
@@ -81,7 +80,7 @@ def onebot_channel_up(app_server):
     while time.time() < deadline and not ready:
         try:
             with socket.create_connection(
-                ("127.0.0.1", _WS_PORT),
+                ("127.0.0.1", ws_port),
                 timeout=1.0,
             ):
                 ready = True
@@ -91,7 +90,7 @@ def onebot_channel_up(app_server):
         "onebot reverse WS port never opened: "
         + app_server.logs_tail()[-3000:]
     )
-    yield _WS_PORT
+    yield ws_port
     app_server.api_request(
         "PUT",
         "/api/config/channels/onebot",

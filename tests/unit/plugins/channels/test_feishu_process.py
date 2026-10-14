@@ -22,6 +22,8 @@ def test_feishu_actual_process(tmp_path):
             str(suite.parent),
             str(suite),
             "-q",
+            "-n",
+            "2",
         ],
         env={**os.environ, "QWENPAW_WORKING_DIR": str(tmp_path / "b3-host")},
         capture_output=True,

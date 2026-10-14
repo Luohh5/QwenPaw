@@ -9,6 +9,20 @@ import sys
 
 import pytest
 
+# Package initialization reads global paths and opens its rotating log.
+# Give parallel suite hosts separate roots before importing qwenpaw/constants.
+if worker := os.environ.get("PYTEST_XDIST_WORKER"):
+    working_root = Path(os.environ["QWENPAW_WORKING_DIR"])
+    secret_root = Path(
+        os.environ.get("QWENPAW_SECRET_DIR", f"{working_root}.secret"),
+    )
+    backup_root = Path(
+        os.environ.get("QWENPAW_BACKUP_DIR", f"{working_root}.backups"),
+    )
+    os.environ["QWENPAW_WORKING_DIR"] = str(working_root / worker)
+    os.environ["QWENPAW_SECRET_DIR"] = str(secret_root / worker)
+    os.environ["QWENPAW_BACKUP_DIR"] = str(backup_root / worker)
+
 SOURCE_ROOT = (
     Path(os.environ["QWENPAW_C7_RELEASE_ROOT"])
     if "QWENPAW_C7_RELEASE_ROOT" in os.environ
