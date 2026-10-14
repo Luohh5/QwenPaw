@@ -912,7 +912,7 @@ class PluginApi:  # pylint: disable=too-many-public-methods
         if not str(dest).strip() or dest == Path("."):
             raise ValueError("refusing to provision an empty dest")
         if not dest.is_absolute():
-            dest = dest.resolve()
+            dest = dest.absolute()
         branch = _provision_files(
             self.plugin_id,
             Path(src),

@@ -555,6 +555,12 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
         """
         return self._shutdown_hooks.copy()
 
+    def remove_shutdown_hook(self, hook: HookRegistration) -> None:
+        """Retire one completed callback without removing a replacement."""
+        self._shutdown_hooks = [
+            h for h in self._shutdown_hooks if h is not hook
+        ]
+
     def register_uninstall_hook(
         self,
         plugin_id: str,

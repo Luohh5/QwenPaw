@@ -798,7 +798,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             return None
         try:
             if use_teardown:
-                report = await instance.teardown_runtime()
+                report = await self.teardown_config_runtime(
+                    plugin_id,
+                    instance,
+                )
             else:
                 report = await instance.dispose(UnloadMode.UNLOAD)
         except BaseException:
@@ -3097,6 +3100,8 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         self,
         plugin_id: str,
         report: UnloadReport,
+        *,
+        retire_successful: bool = False,
     ) -> None:
         """Run registry shutdown hooks and record failures on *report*."""
         hooks = [
@@ -3114,6 +3119,8 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                         what=f"shutdown hook '{hook.hook_name}'",
                         plugin_id=plugin_id,
                     )
+                if retire_successful:
+                    self.registry.remove_shutdown_hook(hook)
             except Exception as exc:
                 logger.error(
                     f"Error in shutdown hook '{hook.hook_name}' "
@@ -3121,6 +3128,43 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 )
                 report.errors.append(f"shutdown:{hook.hook_name}:{exc}")
                 report.clean = False
+
+    async def teardown_config_runtime(
+        self,
+        plugin_id: str,
+        instance: Any,
+    ) -> UnloadReport:
+        """Flush author state before retiring a config generation's ledger."""
+        report = UnloadReport(plugin_id=plugin_id, mode=UnloadMode.UNLOAD)
+        instance.state = PluginState.UNLOADING
+        instance.activated = False
+        try:
+            await self._run_shutdown_hooks(
+                plugin_id,
+                report,
+                retire_successful=True,
+            )
+            if report.clean:
+                report.absorb(await instance.teardown_runtime())
+            else:
+                report.quiescent = False
+                report.needs_restart = True
+        except BaseException as exc:
+            report.clean = False
+            report.quiescent = False
+            report.needs_restart = True
+            report.errors.append(str(exc) or type(exc).__name__)
+            setattr(exc, "plugin_cleanup_report", report)
+            raise
+        finally:
+            if not report.quiescent:
+                instance.mark_failed("; ".join(report.errors))
+                instance.add_diagnostic("needs_restart")
+                record = self._loaded_plugins.get(plugin_id)
+                if record is not None:
+                    record.status = "failed"
+                    record.diagnostics = list(instance.diagnostics)
+        return report
 
     async def _run_legacy_uninstall_hooks(
         self,

@@ -728,7 +728,10 @@ class PluginLifecycle:
             # its outcome so cancellation cannot undo a completed disk commit.
             persisted = True
 
-        teardown_report = await inst.teardown_runtime()
+        teardown_report = await self._loader.teardown_config_runtime(
+            plugin_id,
+            inst,
+        )
         if not teardown_report.quiescent:
             record.status = "failed"
             record.diagnostics = list(inst.diagnostics)
@@ -753,7 +756,12 @@ class PluginLifecycle:
             if persisted:
                 inst.config = incoming
                 raise
-            undo_report = await inst.teardown_runtime()
+            undo_report = getattr(exc, "plugin_cleanup_report", None)
+            if undo_report is None:
+                undo_report = await self._loader.teardown_config_runtime(
+                    plugin_id,
+                    inst,
+                )
             if not undo_report.quiescent:
                 inst.mark_failed(
                     str(exc) or "config update did not go quiescent",
