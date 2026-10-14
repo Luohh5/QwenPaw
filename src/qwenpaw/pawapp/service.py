@@ -402,12 +402,15 @@ class ManagedService:
                     process.wait(),
                     timeout=self.spec.shutdown_timeout,
                 )
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+                # An outer close budget must not restart this grace period.
                 try:
                     process.kill()
                 except ProcessLookupError:
                     pass
                 await process.wait()
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
         self._process = None
         for task in self._log_tasks:
             task.cancel()

@@ -2,6 +2,7 @@
 """Sidecar availability must not remove a PawApp's diagnostic routes."""
 
 import asyncio
+import signal
 import sys
 from unittest.mock import MagicMock
 
@@ -11,6 +12,7 @@ from fastapi import FastAPI
 
 from qwenpaw.app.routers.pawapps import router as pawapps_router
 from qwenpaw.pawapp import PawApp
+from qwenpaw.pawapp import ManagedService, ManagedServiceSpec
 from qwenpaw.pawapp import service as service_module
 from qwenpaw.plugins.architecture import PluginManifest
 from qwenpaw.plugins import custody
@@ -354,3 +356,70 @@ async def test_stuck_service_close_retains_retry_and_blocks_reregister(
         report = await loader.lifecycle.unload(manifest.id, UnloadMode.UNLOAD)
         assert report.clean and report.quiescent
         assert calls == [service]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal handling")
+@pytest.mark.parametrize("interruption", ["timeout", "cancel"])
+@pytest.mark.asyncio
+async def test_service_close_interruption_does_not_reset_kill_deadline(
+    tmp_path,
+    monkeypatch,
+    interruption,
+):
+    ready = tmp_path / "ready"
+
+    async def await_ready(_service):
+        async with asyncio.timeout(5):
+            while not ready.exists():
+                await asyncio.sleep(0.001)
+
+    monkeypatch.setattr(ManagedService, "_wait_until_healthy", await_ready)
+    monkeypatch.setattr(custody, "CONNECTION_STOP_SECONDS", 0.01)
+    service = ManagedService(
+        ManagedServiceSpec(
+            name="context",
+            command=(
+                sys.executable,
+                "-c",
+                "import signal,time; from pathlib import Path; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                f"Path({str(ready)!r}).write_text('ready'); time.sleep(60)",
+            ),
+            shutdown_timeout=0.05,
+        ),
+    )
+    await service.start()
+    process = service._process  # pylint: disable=protected-access
+    terminating = asyncio.Event()
+    terminate = process.terminate
+
+    def mark_terminate():
+        terminate()
+        terminating.set()
+
+    monkeypatch.setattr(process, "terminate", mark_terminate)
+    closer = custody.ConnectionCloser(service, "context")
+    try:
+        closing = asyncio.create_task(closer())
+        if interruption == "cancel":
+            await asyncio.wait_for(terminating.wait(), timeout=1)
+            closing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await closing
+        else:
+            with pytest.raises(TimeoutError):
+                await closing
+        assert service._process is process  # pylint: disable=protected-access
+        assert (
+            await asyncio.wait_for(process.wait(), timeout=2)
+            == -signal.SIGKILL
+        )
+        with pytest.raises(RuntimeError, match="close was cancelled"):
+            await closer()
+        await closer()
+        assert service._process is None  # pylint: disable=protected-access
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
+        await service.stop()
