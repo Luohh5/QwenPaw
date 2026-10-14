@@ -19,7 +19,6 @@ from workspace_runtime_suite import (
     consumers,
 )
 
-
 framework = _runtime_framework
 
 
@@ -792,13 +791,14 @@ if KEY == "dingtalk":
         channel = await ws.channel_manager.get_channel(KEY)
         pid = channel.channel_process.health_snapshot()["pid"]
         work = framework.mailbox(channel)
-        (work / "send-mode").write_text("close-block")
+        (work / "send-mode").write_text("close-unreapable")
         tree = channel.channel_process._tree
         signal = tree.signal
         monkeypatch.setattr(tree, "signal", lambda **_kwargs: None)
         try:
             with pytest.raises(Exception):
                 await manager.stop_all()
+            assert rows(work, "close-unreapable")
             assert manager.get_loaded_agent("real-agent") is ws
             assert await ws.channel_manager.get_channel(KEY) is channel
             assert (
@@ -1093,7 +1093,7 @@ async def test_cancel_before_publication_cleans_or_retains_actual_workspace(
         pid = channel.channel_process.health_snapshot()["pid"]
         if stop_failure:
             work = framework.mailbox(channel)
-            (work / "send-mode").write_text("close-block")
+            (work / "send-mode").write_text("close-unreapable")
             tree = channel.channel_process._tree
             signal = tree.signal
             monkeypatch.setattr(tree, "signal", lambda **_kwargs: None)
@@ -1106,6 +1106,7 @@ async def test_cancel_before_publication_cleans_or_retains_actual_workspace(
         with pytest.raises(asyncio.CancelledError):
             await startup
         if stop_failure:
+            assert rows(work, "close-unreapable")
             assert manager.get_loaded_agent("real-agent") is ws
             assert psutil.pid_exists(pid) and len(created) == 1
             assert channel_resources(framework.registry) == [

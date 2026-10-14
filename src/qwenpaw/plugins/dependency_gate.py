@@ -6,6 +6,8 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
+import re
+import shlex
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,6 +90,18 @@ def parse_requirements_file(requirements_file: Path) -> ParsedRequirements:
         if not line or line.startswith("#"):
             continue
         if line.startswith("-"):
+            try:
+                # Match pip's comment rules; '#' inside a URL is not a comment.
+                args = shlex.split(re.split(r"\s+#", line, maxsplit=1)[0])
+            except ValueError:
+                args = []
+            value = ""
+            if len(args) == 2 and args[0] == "--index-url":
+                value = args[1]
+            elif len(args) == 1 and args[0].startswith("--index-url="):
+                value = args[0].partition("=")[2]
+            if value and not value.startswith("-"):
+                continue
             parsed.unsupported.append(line)
             continue
         try:
@@ -440,9 +454,11 @@ def evaluate_shared_dependencies(
         visible = (
             {canonical(path) for path in evidence.sites}
             if evidence is not None
-            else {canonical(path) for path in environment.sites}
-            if environment is not None
-            else None
+            else (
+                {canonical(path) for path in environment.sites}
+                if environment is not None
+                else None
+            )
         )
         if environment is not None and (
             target not in (visible or set())
@@ -550,13 +566,17 @@ def evaluate_shared_dependencies(
     code = (
         "DEPENDENCY_REPAIR_REQUIRED"
         if dirty
-        else "DEPENDENCY_PLAN_UNVERIFIED"
-        if unsupported
-        else "DEPENDENCY_RESTART_REQUIRED"
-        if conflicts
-        else "DEPENDENCY_UNSATISFIED"
-        if missing
-        else ""
+        else (
+            "DEPENDENCY_PLAN_UNVERIFIED"
+            if unsupported
+            else (
+                "DEPENDENCY_RESTART_REQUIRED"
+                if conflicts
+                else "DEPENDENCY_UNSATISFIED"
+                if missing
+                else ""
+            )
+        )
     )
     detail = ", ".join(sorted(set(missing + conflicts + unsupported)))
     origins = ", ".join(

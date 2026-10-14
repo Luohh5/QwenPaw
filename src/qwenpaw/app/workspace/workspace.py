@@ -419,6 +419,9 @@ class Workspace:
 
         Drop-in replacement for the old ``Runner.stream_query()``.
         """
+        available = getattr(self._manager, "assert_agent_available", None)
+        if available is not None:
+            available(self.agent_id)
         config = load_agent_config(self.agent_id)
         backend = config.backend
         if backend != "qwenpaw":
@@ -827,6 +830,9 @@ class Workspace:
     ):
         """Stop agent instance and clean up all resources.
 
+        Attempt every independent cleanup stage before reporting errors.
+        Failed cleanup retains running flags and unfinished handles for retry.
+
         Args:
             final: If True (default), stop ALL services including reusable.
                    If False, skip reusable services (for reload scenario).
@@ -853,19 +859,41 @@ class Workspace:
 
             if not await self.channel_manager.quiesce():
                 raise QuiescenceError("CHANNEL_DRAIN_TIMEOUT")
-        await PluginRegistry().projector.revoke_workspace(self)
+        errors: list[tuple[str, Exception]] = []
+        try:
+            await PluginRegistry().projector.revoke_workspace(self)
+        except Exception as exc:
+            errors.append(("plugin bindings", exc))
         if self.channel_manager is not None:
-            await self.channel_manager.stop_all()
+            try:
+                await self.channel_manager.stop_all()
+            except Exception as exc:
+                errors.append(("channels", exc))
 
         # Stop all services via ServiceManager (handles reuse automatically)
-        await self._service_manager.stop_all(
-            final=final,
-            preserve_reused=preserve_reused,
-        )
+        try:
+            await self._service_manager.stop_all(
+                final=final,
+                preserve_reused=preserve_reused,
+            )
+        except Exception as exc:
+            errors.append(("services", exc))
 
         if self._harness_runtime is not None:
-            await self._harness_runtime.stop()
-            self._harness_runtime = None
+            try:
+                await self._harness_runtime.stop()
+            except Exception as exc:
+                errors.append(("harness", exc))
+            else:
+                self._harness_runtime = None
+
+        if len(errors) == 1:
+            raise errors[0][1]
+        if errors:
+            details = "; ".join(f"{stage}: {exc}" for stage, exc in errors)
+            raise RuntimeError(f"Workspace cleanup failed: {details}") from (
+                errors[0][1]
+            )
 
         self._started = False
         self._start_attempted = False

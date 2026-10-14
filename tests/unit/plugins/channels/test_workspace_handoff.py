@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Run C3 behavioral contracts in hosts without global platform mocks."""
+
 import os
 from pathlib import Path
 import subprocess
@@ -24,6 +25,7 @@ def test_workspace_channel_handoff(channel, tmp_path):
             str(suite.parent),
             str(suite),
             "-q",
+            *(["-n", "2"] if channel == "feishu" else []),
         ],
         env={
             **os.environ,
@@ -34,7 +36,7 @@ def test_workspace_channel_handoff(channel, tmp_path):
         text=True,
         check=False,
         # C4 admission inspections add bounded child work to every fixture.
-        # Feishu partitions total about 240s; runtime limits unchanged.
+        # Feishu serial cases exceed 410s; independent hosts share this cap.
         timeout=300,
     )
     assert result.returncode == 0, result.stdout + result.stderr

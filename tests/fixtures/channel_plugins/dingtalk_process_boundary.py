@@ -257,6 +257,10 @@ close_http = aiohttp.ClientSession.close
 
 
 async def tracked_close(session):
+    if mode() == "close-unreapable":
+        record("close-unreapable")
+        while not (work / "close-release").exists():
+            threading.Event().wait(0.01)
     await close_http(session)
     record("http-close", closed=session.closed)
 

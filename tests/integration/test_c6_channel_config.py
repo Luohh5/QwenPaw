@@ -23,7 +23,6 @@ def c6_agent(app_server):
             "app_id": "cli_saved",
             "app_secret": "test-only-feishu",
             "domain": "lark",
-            "allow_from": ["user-a"],
             "media_dir": None,
         },
         "dingtalk": {
@@ -42,7 +41,26 @@ def c6_agent(app_server):
     }
     response = app_server.api_request("PUT", endpoint, json=saved)
     assert response.status_code == 200, app_server.logs_tail()
-    baseline = response.json()
+    headers = {"X-Agent-Id": agent_id}
+    response = app_server.api_request(
+        "POST",
+        "/api/access-control/whitelist/add",
+        headers=headers,
+        json={"entries": [{"channel": "feishu", "user_id": "user-a"}]},
+    )
+    assert response.status_code == 200, app_server.logs_tail()
+    response = app_server.api_request(
+        "GET",
+        "/api/access-control/feishu",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["whitelist"] == {
+        "user-a": {"remark": "", "username": ""},
+    }
+    response = app_server.api_request("GET", f"/api/agents/{agent_id}")
+    assert response.status_code == 200, response.text
+    baseline = response.json()["channels"]
     try:
         yield app_server, agent_id, endpoint, baseline
     finally:
@@ -128,3 +146,12 @@ def test_c6_catalog_metadata_never_persists_on_config_put(c6_agent, single):
         "channels"
     ]["feishu"]
     assert saved == baseline["feishu"]
+    acl = server.api_request(
+        "GET",
+        "/api/access-control/feishu",
+        headers={"X-Agent-Id": agent_id},
+    )
+    assert acl.status_code == 200, acl.text
+    assert acl.json()["whitelist"] == {
+        "user-a": {"remark": "", "username": ""},
+    }

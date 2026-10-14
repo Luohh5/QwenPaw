@@ -545,9 +545,81 @@ def test_platform_marker_is_skipped(tmp_path: Path):
     assert not decision.unsupported
 
 
-def test_unsupported_requirement_is_loud(tmp_path: Path):
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "--index-url https://example.com/simple",
+        "--index-url=https://example.com/simple",
+        '--index-url "https://example.com/simple" # mirror',
+    ],
+)
+@pytest.mark.asyncio
+async def test_index_url_preserves_dependency_policy(
+    tmp_path: Path,
+    monkeypatch,
+    declaration: str,
+):
     req = tmp_path / "requirements.txt"
-    req.write_text("-r extra.txt\n", encoding="utf-8")
+    contents = declaration + "\ndefinitely-missing-package-xyz==1.0\n"
+    req.write_text(contents, encoding="utf-8")
+    installed: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        "qwenpaw.plugins.dependency_gate.is_requirement_satisfied",
+        lambda requirement: bool(installed),
+    )
+    loader = PluginLoader([tmp_path])
+
+    async def prepare_dependencies(path, plugin_id):
+        installed.append((path, plugin_id))
+
+    monkeypatch.setattr(
+        loader,
+        "_prepare_python_dependencies",
+        prepare_dependencies,
+    )
+    boot = await loader._ensure_dependencies_installed(tmp_path, "indexed")
+    assert not boot.unsupported
+    assert boot.missing == ["definitely-missing-package-xyz==1.0"]
+    assert not boot.allow_install
+    assert not installed
+    explicit = await loader._ensure_dependencies_installed(
+        tmp_path,
+        "indexed",
+        allow_install=True,
+    )
+    assert explicit.already_satisfied
+    assert installed == [(req, "indexed")]
+    assert req.read_text(encoding="utf-8") == contents
+
+    installed.clear()
+    req.write_text(declaration + "\nopenai<0.1\n", encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace())
+    conflict = DependencyGate().evaluate(
+        req,
+        allow_install=True,
+        plugin_id="indexed",
+    )
+    assert conflict.host_conflicts == ["openai<0.1"]
+    assert conflict.require_restart
+    assert not conflict.allow_install
+    assert not conflict.unsupported
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "-r extra.txt",
+        "--extra-index-url https://example.com/simple",
+        "--index-url",
+        "--index-url=",
+        '--index-url ""',
+        "--index-url https://example.com/simple --trusted-host example.com",
+        "--index-url https://example.com/#fragment --trusted-host example.com",
+    ],
+)
+def test_unsupported_requirement_is_loud(tmp_path: Path, declaration: str):
+    req = tmp_path / "requirements.txt"
+    req.write_text(declaration + "\n", encoding="utf-8")
     decision = DependencyGate().evaluate(
         req,
         allow_install=True,
@@ -600,6 +672,67 @@ async def test_failed_register_undoes_this_txn_create(
     record = await loader.load_plugin(manifest, installed)
     assert record.status == "failed"
     assert not dest.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["register", "startup"])
+@pytest.mark.parametrize("user_owned", [False, True])
+async def test_failed_provision_relative_target_respects_ownership(
+    tmp_path: Path,
+    fresh_registry,
+    monkeypatch,
+    phase: str,
+    user_owned: bool,
+):
+    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
+    monkeypatch.chdir(tmp_path)
+    plugin_id = "relative-provision"
+    factory = tmp_path / "factory"
+    factory.mkdir()
+    (factory / "note.md").write_text("factory\n", encoding="utf-8")
+    dest = tmp_path / "data" / "config"
+    if user_owned:
+        dest.mkdir(parents=True)
+        (dest / "note.md").write_text("user\n", encoding="utf-8")
+        assert provision_files(plugin_id, factory, dest, "1.0.0") == "keep"
+    else:
+        # Keep an old inventory key but recreate its missing destination.
+        # Newly added keys already have a separate rollback cleanup path.
+        assert provision_files(plugin_id, factory, dest, "1.0.0") == "create"
+        shutil.rmtree(dest)
+    root = _write_plugin(tmp_path / "plugins" / plugin_id, plugin_id)
+    branch = "keep" if user_owned else "create"
+    provision = (
+        f"        assert api.provision_files({str(factory)!r}, "
+        f"'data/config', '1.0.0') == {branch!r}\n"
+        "        raise RuntimeError('provision hook failed')\n"
+    )
+    register = provision
+    if phase == "startup":
+        register = (
+            "        def startup():\n"
+            + "".join("    " + line for line in provision.splitlines(True))
+            + "        api.register_startup_hook('fail', startup)\n"
+        )
+    (root / "main.py").write_text(
+        "class Plugin:\n"
+        "    def register(self, api):\n" + register + "plugin = Plugin()\n",
+        encoding="utf-8",
+    )
+    loader = PluginLoader(plugin_dirs=[root.parent])
+    loader.registry = fresh_registry
+    manifest = PluginManifest.from_dict(
+        json.loads((root / "plugin.json").read_text(encoding="utf-8")),
+    )
+    record = await loader.load_plugin(manifest, root)
+    assert record.status == "failed"
+    locations = load_inventory(plugin_id).get("locations", {})
+    if user_owned:
+        assert (dest / "note.md").read_text(encoding="utf-8") == "user\n"
+        assert locations[str(dest)]["owned"] is False
+    else:
+        assert not dest.exists()
+        assert str(dest) not in locations
 
 
 @pytest.mark.asyncio
@@ -1301,6 +1434,78 @@ async def test_http_uninstall_does_not_delete_tools_from_meta(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("copy_started", [True, False])
+async def test_workspace_skill_copy_cannot_outlive_uninstall(
+    tmp_path,
+    fresh_registry,
+    monkeypatch,
+    copy_started,
+):
+    from qwenpaw.plugins import provision as provision_mod
+
+    _isolate_working_dir(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "qwenpaw.agents.skill_system.registry.list_workspaces",
+        lambda: [],
+    )
+    source = tmp_path / "skills"
+    (source / "weather").mkdir(parents=True)
+    (source / "weather" / "SKILL.md").write_text("# Weather\n")
+    loader, _, installed = await _load(
+        tmp_path,
+        fresh_registry,
+        "skiller",
+        "from pathlib import Path\n"
+        f"        api.register_skill_provider(Path({str(source)!r}))",
+    )
+    callback = fresh_registry.get_workspace_created_hooks()[0].callback
+    workspace = tmp_path / "new-workspace"
+    workspace.mkdir()
+    info = {"workspace_dir": str(workspace), "agent_id": "new"}
+    started = threading.Event()
+    release = threading.Event()
+    real_copy = provision_mod._apply_factory_copy
+
+    def blocked_copy(*args):
+        started.set()
+        assert release.wait(5), "test did not release skill copy"
+        return real_copy(*args)
+
+    monkeypatch.setattr(
+        provision_mod,
+        "_apply_factory_copy",
+        blocked_copy,
+    )
+    monkeypatch.setattr(
+        "qwenpaw.agents.skill_system.registry.list_workspaces",
+        lambda: [info],
+    )
+    copying = None
+    if copy_started:
+        copying = asyncio.create_task(callback(info))
+        assert await asyncio.to_thread(started.wait, 2)
+    uninstall = asyncio.create_task(
+        loader.lifecycle.unload("skiller", mode=UnloadMode.UNINSTALL),
+    )
+    try:
+        if copy_started:
+            await asyncio.sleep(0.05)
+            assert not uninstall.done(), "uninstall passed an active writer"
+    finally:
+        release.set()
+        if copying is not None:
+            await copying
+        report = await uninstall
+    assert report.clean and report.quiescent
+    # A hook already fetched by a dispatcher must also reject stale work.
+    await callback(info)
+    assert started.is_set() is copy_started
+    assert not (workspace / "skills" / "weather").exists()
+    assert not inventory_path("skiller").exists()
+    assert not installed.exists()
+
+
+@pytest.mark.asyncio
 async def test_activate_skill_copy_does_not_block_event_loop(
     tmp_path: Path,
     fresh_registry,
@@ -1684,6 +1889,62 @@ async def test_meta_only_tool_is_not_written_to_agents(
     assert record.status == "active"
     assert "meta_ghost" not in _raw_agent_tools(talk)
     assert "meta_ghost" not in _raw_agent_tools(other)
+    _clear_tool_owners()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live_instance", [True, False])
+async def test_uninstall_tool_config_save_failure_is_retryable(
+    tmp_path: Path,
+    fresh_registry,
+    monkeypatch,
+    live_instance: bool,
+):
+    from qwenpaw.config import config as config_module
+
+    talk, other = _seed_two_agents(tmp_path, monkeypatch)
+    _clear_tool_owners()
+    plugin_id = "config-cleanup"
+    tool_name = "cleanup_message"
+    loader, _workspace, installed = await _load(
+        tmp_path,
+        fresh_registry,
+        plugin_id,
+        _tool_body(tool_name),
+    )
+    assert loader.get_loaded_plugin(plugin_id).status == "active"
+    if not live_instance:
+        await loader.lifecycle.unload(plugin_id, UnloadMode.UNLOAD)
+        assert loader.get_loaded_plugin(plugin_id) is None
+    inventory_before = load_inventory(plugin_id)
+    assert tool_name in inventory_before["tools"]
+    original_save = config_module.save_agent_config
+
+    def fail_save(agent_id, config):
+        if agent_id == "talk":
+            raise PermissionError("agent config write denied")
+        return original_save(agent_id, config)
+
+    monkeypatch.setattr(config_module, "save_agent_config", fail_save)
+    report = await loader.lifecycle.unload(plugin_id, UnloadMode.UNINSTALL)
+
+    assert not report.clean
+    assert report.quiescent and not report.needs_restart
+    assert any(
+        "talk" in error and "agent config write denied" in error
+        for error in report.errors
+    )
+    assert tool_name in _raw_agent_tools(talk)
+    assert tool_name not in _raw_agent_tools(other)
+    assert load_inventory(plugin_id) == inventory_before
+    assert installed.exists()
+
+    monkeypatch.setattr(config_module, "save_agent_config", original_save)
+    report = await loader.lifecycle.unload(plugin_id, UnloadMode.UNINSTALL)
+    assert report.clean and report.quiescent and not report.errors
+    assert tool_name not in _raw_agent_tools(talk)
+    assert not inventory_path(plugin_id).exists()
+    assert not installed.exists()
     _clear_tool_owners()
 
 
@@ -2687,10 +2948,21 @@ async def test_commit_persist_then_error_does_not_rollback(
 
 
 @pytest.mark.asyncio
-async def test_http_unload_unquiescent_is_409(
+@pytest.mark.parametrize(
+    "route,method,mode",
+    [
+        ("plugins/{id}/unload", "post", UnloadMode.UNLOAD),
+        ("plugins/{id}", "delete", UnloadMode.UNINSTALL),
+        ("pawapps/{id}", "delete", UnloadMode.UNINSTALL),
+    ],
+)
+async def test_http_stop_unquiescent_is_409(
     tmp_path: Path,
     fresh_registry,
     monkeypatch,
+    route,
+    method,
+    mode,
 ):
     monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
     loader, _workspace, _installed = await _load(
@@ -2703,7 +2975,7 @@ async def test_http_unload_unquiescent_is_409(
     async def _busy(*_args, **_kwargs):
         return UnloadReport(
             plugin_id="stay-loaded",
-            mode=UnloadMode.UNLOAD,
+            mode=mode,
             clean=False,
             quiescent=False,
             needs_restart=True,
@@ -2712,18 +2984,38 @@ async def test_http_unload_unquiescent_is_409(
 
     monkeypatch.setattr(loader, "_unload_plugin_unlocked", _busy)
     from qwenpaw.app.routers.plugins import router as plugins_router
+    from qwenpaw.app.routers.pawapps import router as pawapps_router
+
+    monkeypatch.setattr(
+        "qwenpaw.app.routers.pawapps._get_apps_dir",
+        lambda: tmp_path / "plugins",
+    )
 
     app = FastAPI()
-    app.include_router(plugins_router, prefix="/api")
+    router = pawapps_router if route.startswith("pawapps/") else plugins_router
+    app.include_router(router, prefix="/api")
     app.state.plugin_loader = loader
     client = TestClient(app)
-    response = client.post("/api/plugins/stay-loaded/unload")
+    url = "/api/" + route.format(id="stay-loaded")
+    response = getattr(client, method)(url)
     assert response.status_code == 409
     detail = response.json()["detail"]
     assert detail["loaded"] is True
     assert detail["quiescent"] is False
     assert detail["needs_restart"] is True
     assert loader.get_loaded_plugin("stay-loaded") is not None
+
+    if route.startswith("pawapps/"):
+
+        async def _memory(*_args, **_kwargs):
+            raise RuntimeError("memory backend is in use")
+
+        monkeypatch.setattr(loader, "_unload_plugin_unlocked", _memory)
+        memory_resp = client.delete(url)
+        assert memory_resp.status_code == 409
+        memory_detail = memory_resp.json()["detail"]
+        assert memory_detail["needs_restart"] is True
+        assert memory_detail["quiescent"] is False
 
 
 @pytest.mark.asyncio
@@ -3238,100 +3530,6 @@ async def test_provision_create_mid_copy_retries_owned(
     )
     assert not dest.exists()
     assert not inventory_path(plugin_id).is_file()
-
-
-@pytest.mark.asyncio
-async def test_http_delete_uninstall_unquiescent_is_409(
-    tmp_path: Path,
-    fresh_registry,
-    monkeypatch,
-):
-    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
-    loader, _workspace, _installed = await _load(
-        tmp_path,
-        fresh_registry,
-        "stay-del",
-        "api.register_slash_command('ping', lambda c, a: None)",
-    )
-
-    async def _busy(*_args, **_kwargs):
-        return UnloadReport(
-            plugin_id="stay-del",
-            mode=UnloadMode.UNINSTALL,
-            clean=False,
-            quiescent=False,
-            needs_restart=True,
-            errors=["channel stop failed"],
-        )
-
-    monkeypatch.setattr(loader, "_unload_plugin_unlocked", _busy)
-    from qwenpaw.app.routers.plugins import router as plugins_router
-
-    app = FastAPI()
-    app.include_router(plugins_router, prefix="/api")
-    app.state.plugin_loader = loader
-    client = TestClient(app)
-    response = client.delete("/api/plugins/stay-del")
-    assert response.status_code == 409
-    detail = response.json()["detail"]
-    assert detail["loaded"] is True
-    assert detail["quiescent"] is False
-    assert detail["needs_restart"] is True
-    assert loader.get_loaded_plugin("stay-del") is not None
-
-
-@pytest.mark.asyncio
-async def test_http_delete_pawapp_unquiescent_is_409(
-    tmp_path: Path,
-    fresh_registry,
-    monkeypatch,
-):
-    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
-    monkeypatch.setattr(
-        "qwenpaw.app.routers.pawapps._get_apps_dir",
-        lambda: tmp_path / "plugins",
-    )
-    (tmp_path / "plugins").mkdir(parents=True, exist_ok=True)
-    loader, _workspace, _installed = await _load(
-        tmp_path,
-        fresh_registry,
-        "stay-app",
-        "api.register_slash_command('ping', lambda c, a: None)",
-    )
-
-    async def _busy(*_args, **_kwargs):
-        return UnloadReport(
-            plugin_id="stay-app",
-            mode=UnloadMode.UNINSTALL,
-            clean=False,
-            quiescent=False,
-            needs_restart=True,
-            errors=["channel stop failed"],
-        )
-
-    monkeypatch.setattr(loader, "_unload_plugin_unlocked", _busy)
-    from qwenpaw.app.routers.pawapps import router as pawapps_router
-
-    app = FastAPI()
-    app.include_router(pawapps_router, prefix="/api")
-    app.state.plugin_loader = loader
-    client = TestClient(app)
-    response = client.delete("/api/pawapps/stay-app")
-    assert response.status_code == 409
-    detail = response.json()["detail"]
-    assert detail["loaded"] is True
-    assert detail["quiescent"] is False
-    assert detail["needs_restart"] is True
-
-    async def _memory(*_args, **_kwargs):
-        raise RuntimeError("memory backend is in use")
-
-    monkeypatch.setattr(loader, "_unload_plugin_unlocked", _memory)
-    memory_resp = client.delete("/api/pawapps/stay-app")
-    assert memory_resp.status_code == 409
-    memory_detail = memory_resp.json()["detail"]
-    assert memory_detail["needs_restart"] is True
-    assert memory_detail["quiescent"] is False
 
 
 @pytest.mark.asyncio
@@ -3882,10 +4080,12 @@ async def test_finish_committed_keeps_marker_if_prepared_commit_fails(
 
 
 @pytest.mark.asyncio
-async def test_unload_keeps_post_activate_workspace_create(
+@pytest.mark.parametrize("mode", [UnloadMode.UNLOAD, UnloadMode.UNINSTALL])
+async def test_post_activate_workspace_create_respects_unload_mode(
     tmp_path: Path,
     fresh_registry,
     monkeypatch,
+    mode,
 ):
     from qwenpaw.plugins.api import PluginApi
     from qwenpaw.plugins.provision import commit_migrations
@@ -3919,50 +4119,25 @@ async def test_unload_keeps_post_activate_workspace_create(
     commit_migrations("ws-keep")
     assert dest.exists()
     assert inst.created_dests() == []
-    report = await loader.unload_plugin("ws-keep", delete_files=False)
-    assert report.quiescent
-    assert dest.exists()
-    assert first.exists()
     loc = (load_inventory("ws-keep").get("locations") or {}).get(str(dest))
     assert loc is not None
     assert loc.get("owned") is True
-
-
-@pytest.mark.asyncio
-async def test_uninstall_removes_owned_after_post_activate_create(
-    tmp_path: Path,
-    fresh_registry,
-    monkeypatch,
-):
-    from qwenpaw.plugins.api import PluginApi
-    from qwenpaw.plugins.provision import commit_migrations
-
-    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
-    factory = tmp_path / "owned-factory"
-    factory.mkdir()
-    (factory / "note.md").write_text("v1\n", encoding="utf-8")
-    dest = tmp_path / "owned-later"
-    loader, _workspace, _installed = await _load(
-        tmp_path,
-        fresh_registry,
-        "ws-drop",
-        "api.register_slash_command('ping', lambda c, a: None)",
-    )
-    inst = loader.lifecycle.get_instance("ws-drop")
-    assert inst is not None
-    api = PluginApi("ws-drop", config={}, manifest={"id": "ws-drop"})
-    api.bind_instance(inst)
-    assert api.provision_files(factory, dest, "1.0.0") == "create"
-    commit_migrations("ws-drop")
-    assert dest.exists()
     report = await loader.unload_plugin(
-        "ws-drop",
-        delete_files=True,
-        mode=UnloadMode.UNINSTALL,
+        "ws-keep",
+        delete_files=mode is UnloadMode.UNINSTALL,
+        mode=mode,
     )
     assert report.quiescent
-    assert not dest.exists()
-    assert str(dest) not in (load_inventory("ws-drop").get("locations") or {})
+    retained = mode is UnloadMode.UNLOAD
+    assert dest.exists() is retained
+    assert first.exists() is retained
+    if retained:
+        assert (
+            load_inventory("ws-keep")["locations"][str(dest)]["owned"] is True
+        )
+    assert (
+        str(dest) in load_inventory("ws-keep").get("locations", {})
+    ) is retained
 
 
 @pytest.mark.asyncio

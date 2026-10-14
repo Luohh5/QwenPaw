@@ -399,6 +399,7 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
         self._lock = asyncio.Lock()
         self._channel_lifecycle_locks: dict[str, asyncio.Lock] = {}
         self._failed_channels: set[str] = set()
+        self._stopping = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._process: ProcessHandler | None = None
         self._on_last_dispatch: OnLastDispatch = None
@@ -944,6 +945,7 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
         async with lock:
             if (
                 self._stopping
+                or channel.channel in self._failed_channels
                 or self._find_channel(channel.channel) is not channel
             ):
                 return
@@ -1481,11 +1483,17 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
             if isinstance(new_channel, str)
             else new_channel.channel
         )
+        # Reject pending boot starts before waiting on their lifecycle lock.
+        old = self._find_channel(key)
+        if old is not None and self._pending_channel_starts(old):
+            raise RuntimeError(f"Channel '{key}' is still starting")
         lock = self._channel_lifecycle_locks.setdefault(key, asyncio.Lock())
         async with lock:
             if self._stopping:
                 raise RuntimeError("CHANNEL_STOPPING")
             old = self._find_channel(key)
+            if old is not None and self._pending_channel_starts(old):
+                raise RuntimeError(f"Channel '{key}' is still starting")
             if old is not None:
                 receipt = await run_async_to_completion(
                     self._stop_one_unlocked(key),

@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """DingTalk static factory config and display preservation without SDKs."""
+
 # pylint: disable=protected-access
+import json
 import sys
 import pytest
-from c6_artifacts import description, proxy
+from c6_artifacts import artifact_module, description, proxy
 from qwenpaw.app.channels.base import BaseChannel
 from qwenpaw.app.channels.renderer import ChannelDisplayConfig
 from qwenpaw.config.config import DingTalkConfig
@@ -25,6 +27,7 @@ def test_registration_and_construction_without_sdk_or_work(tmp_path):
 @pytest.mark.parametrize("message_type", ["markdown", "card"])
 def test_config_preserves_workspace_routing_and_host_arguments(
     tmp_path,
+    monkeypatch,
     message_type,
 ):
     config = DingTalkConfig(
@@ -54,11 +57,24 @@ def test_config_preserves_workspace_routing_and_host_arguments(
         no_text_debounce=False,
     )
     for key, value in original.items():
-        if key not in {"no_text_debounce", "streaming_enabled"}:
+        if key != "no_text_debounce":
             assert instance._launch_spec.config[key] == value, key
-    assert instance._launch_spec.config["streaming_enabled"] is (
-        message_type == "card"
+    driver = artifact_module("dingtalk", "driver").DingTalkDriver()
+    driver._config = dict(instance._launch_spec.config)
+    monkeypatch.setattr(
+        driver,
+        "_route_attrs",
+        lambda _handle: {
+            "session_ctx": json.dumps(
+                {"message_id": "message-one", "conversation_id": "room-one"},
+            ),
+        },
     )
+    policy = driver.response_policy("response-one")
+    assert policy.streaming is (message_type == "card")
+    assert policy.prepare is True
+    driver._config["streaming_enabled"] = False
+    assert driver.response_policy("response-one").streaming is False
     assert instance.allow_from == {"staff-one"}
     assert (
         instance._display_config is display

@@ -485,6 +485,85 @@ async def test_unload_drains_boot_channel_start(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["replace", "restart"])
+@pytest.mark.parametrize("ignore_cancel", [False, True])
+async def test_unload_drains_channel_replacement(
+    fresh_registry,
+    monkeypatch,
+    operation,
+    ignore_cancel,
+):
+    workspace = FakeWorkspace("replace", config=_enabled_config("boot-race"))
+    manager = workspace.channel_manager
+    old, new = _BootChannel(False), _BootChannel(ignore_cancel)
+    old.alive = True
+    manager.channels.append(old)
+    fresh_registry.projector = WorkspaceProjector(
+        live_workspaces=lambda: [workspace],
+    )
+    monkeypatch.setattr(
+        "qwenpaw.plugins.api.get_available_channels",
+        lambda: ("boot-race",),
+    )
+    monkeypatch.setattr(
+        "qwenpaw.app.channels.manager._CHANNEL_START_STOP_TIMEOUT",
+        0.01,
+    )
+    monkeypatch.setattr(
+        "qwenpaw.config.config.load_agent_config",
+        lambda _agent_id: workspace._config,
+    )
+    monkeypatch.setattr(
+        _BootChannel,
+        "from_config",
+        classmethod(lambda _cls, **_kwargs: new),
+    )
+    api = PluginApi("replace-plugin", {}, {"id": "replace-plugin"})
+    api.set_registry(fresh_registry)
+    instance = PluginInstance("replace-plugin")
+    api.bind_instance(instance)
+    api.register_channel(_BootChannel)
+    await fresh_registry.projector.project(
+        "channel",
+        "boot-race",
+        "replace-plugin",
+    )
+    replacement = asyncio.create_task(
+        (
+            manager.replace_channel(new)
+            if operation == "replace"
+            else manager.restart_channel("boot-race")
+        ),
+    )
+    await asyncio.wait_for(new.entered.wait(), timeout=1)
+    try:
+        report = await asyncio.wait_for(
+            instance.dispose(UnloadMode.UNLOAD),
+            timeout=1,
+        )
+        if ignore_cancel:
+            assert not report.quiescent
+            assert not report.clean
+            assert report.needs_restart
+            assert instance._runtime
+        else:
+            assert report.clean and report.quiescent
+            assert not manager.channels
+        new.release.set()
+        await asyncio.gather(replacement, return_exceptions=True)
+        if ignore_cancel:
+            report = await instance.dispose(UnloadMode.UNLOAD)
+            assert report.clean and report.quiescent
+        assert not manager.channels
+        assert not old.alive and not new.alive
+        assert old.stops == 1 and new.stops == 1
+    finally:
+        new.release.set()
+        await asyncio.gather(replacement, return_exceptions=True)
+        await manager.stop_all()
+
+
+@pytest.mark.asyncio
 async def test_unload_removes_plugin_manifest(
     tmp_path,
     fresh_registry,

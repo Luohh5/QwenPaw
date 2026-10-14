@@ -565,6 +565,164 @@ async def test_no_record_residual_owner_prevents_force_directory_replacement(
 
 
 @pytest.mark.asyncio
+async def test_offline_descriptor_install_prepares_without_runtime_effects(
+    host,
+    tmp_path,
+):
+    loader, backend, commands = host
+    candidate = write_source(tmp_path / "candidate", "new", failure="probe")
+
+    record = await loader.install_plugin_files(candidate)
+
+    installed = loader.plugin_dirs[0] / KEY
+    assert record.status == "inactive" and not record.enabled
+    assert record.backend_binding.backend is backend
+    assert record.source_path == installed
+    assert (installed / "worker").read_text() == "new"
+    assert backend.events == [("prepare", "new", True, False)]
+    assert backend.running == {} and commands.names() == []
+    assert not loader.registry.runtime_owners.leases(KEY)
+    assert not marker_path(KEY).exists()
+
+
+@pytest.mark.asyncio
+async def test_offline_prepare_failure_preserves_active_source_and_user_files(
+    host,
+    tmp_path,
+    monkeypatch,
+):
+    loader, backend, commands = host
+    installed, old = await seed(host)
+    (installed / "user.txt").write_text("keep user content")
+    before = {
+        path.relative_to(installed): path.read_bytes()
+        for path in installed.rglob("*")
+        if path.is_file()
+    }
+    candidate = write_source(tmp_path / "candidate", "new")
+
+    async def fail_prepare(description, *, allow_install, probe, wheels=()):
+        assert description.source_path == candidate
+        assert allow_install and not probe and wheels == ()
+        raise RuntimeError("OFFLINE_PREPARATION_FAILED")
+
+    monkeypatch.setattr(backend, "prepare", fail_prepare)
+    with pytest.raises(RuntimeError, match="OFFLINE_PREPARATION_FAILED"):
+        await loader.install_plugin_files(candidate, force=True)
+
+    assert {
+        path.relative_to(installed): path.read_bytes()
+        for path in installed.rglob("*")
+        if path.is_file()
+    } == before
+    assert loader.get_loaded_plugin(KEY) is old
+    assert commands.names() == ["old"]
+    assert backend.running == {
+        "old": (installed / "worker", {"kept": "config"}),
+    }
+    assert not marker_path(KEY).exists()
+
+
+@pytest.mark.asyncio
+async def test_offline_force_install_cannot_replace_retained_runtime_source(
+    host,
+    tmp_path,
+):
+    from qwenpaw.plugins.ownership import RuntimeKey, RuntimeStopReceipt
+
+    loader, _, commands = host
+    installed = write_source(loader.plugin_dirs[0] / KEY)
+    candidate = write_source(tmp_path / "candidate", "new")
+    owners = loader.registry.runtime_owners
+    lease = owners.reserve(
+        KEY,
+        RuntimeKey("worker", "retained-offline", "global"),
+        installed,
+        instance_id="retained-offline-runtime",
+    )
+
+    async def stop():
+        return RuntimeStopReceipt(True, "process still alive", exited=False)
+
+    owners.attach(lease, stop, resource=object())
+    try:
+        with pytest.raises(RuntimeError, match="STILL_OWNED|restart"):
+            await loader.install_plugin_files(candidate, force=True)
+        assert manifest(installed).version == "1.0.0"
+        assert (installed / "worker").read_text() == "old"
+        assert owners.leases(KEY) == (lease,)
+        assert loader.get_loaded_plugin(KEY) is None
+        assert commands.names() == [] and not marker_path(KEY).exists()
+    finally:
+        assert owners.release(lease, RuntimeStopReceipt(True))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("incomplete", ["business", "process", "residual"])
+async def test_uninstall_preserves_settings_and_artifact_until_owner_stops(
+    host,
+    tmp_path,
+    incomplete,
+):
+    from qwenpaw.config.utils import load_config
+    from qwenpaw.plugins.ownership import RuntimeKey, RuntimeStopReceipt
+
+    loader, _, _ = host
+    installed, record = await seed(host)
+    artifact = tmp_path / "owned-artifact"
+    artifact.write_text("keep until stop receipt")
+    instance = loader.lifecycle.get_instance(KEY)
+    instance.record_install("owned artifact", artifact.unlink)
+    owners = loader.registry.runtime_owners
+    lease = owners.reserve(
+        KEY,
+        RuntimeKey("worker", "untracked-by-ledger", "global"),
+        installed,
+        instance_id="retained-runtime",
+    )
+    receipt = {
+        "business": RuntimeStopReceipt(False, "business still live"),
+        "process": RuntimeStopReceipt(
+            True,
+            "process still live",
+            exited=False,
+        ),
+        "residual": RuntimeStopReceipt(True, residual=("retained child",)),
+    }[incomplete]
+
+    async def stop():
+        return receipt
+
+    owners.attach(lease, stop, resource=object())
+    try:
+        report = await loader.unload_plugin(KEY, mode=UnloadMode.UNINSTALL)
+        assert (
+            not report.clean and not report.quiescent and report.needs_restart
+        )
+        assert loader.get_loaded_plugin(KEY) is record
+        assert owners.leases(KEY) == (lease,)
+        assert (
+            installed.exists()
+            and artifact.read_text() == "keep until stop receipt"
+        )
+        assert load_config().plugins[KEY] == {
+            "kept": "config",
+            "enabled": True,
+        }
+
+        receipt = RuntimeStopReceipt(True)
+        report = await loader.unload_plugin(KEY, mode=UnloadMode.UNINSTALL)
+        assert report.clean and report.quiescent, report.errors
+        assert not owners.leases(KEY)
+        assert not installed.exists() and not artifact.exists()
+        assert KEY not in (load_config().plugins or {})
+        assert loader.get_loaded_plugin(KEY) is None
+    finally:
+        receipt = RuntimeStopReceipt(True)
+        await owners.stop(lease)
+
+
+@pytest.mark.asyncio
 async def test_python_reload_honors_explicit_foreign_dependency_ownership(
     host,
     tmp_path,

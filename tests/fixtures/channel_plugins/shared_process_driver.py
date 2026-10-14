@@ -66,7 +66,7 @@ class Driver:
                 f"fixture.{name}",
                 getattr(self, name),
             )
-        if MODE in {"descendant", "stop_hang", "connect_hang"}:
+        if MODE in {"descendant", "stop_hang"}:
             self.child = descendant()
             Path(MARKER + ".child").write_text(
                 str(self.child.pid),
@@ -86,6 +86,11 @@ class Driver:
         self.config = config
         self.started.set()
         if MODE == "connect_hang":
+            self.child = descendant()
+            Path(MARKER + ".child").write_text(
+                str(self.child.pid),
+                encoding="utf-8",
+            )
             Path(MARKER).write_text(str(os.getpid()), encoding="utf-8")
             threading.Event().wait()
         if MODE == "secret_failure":

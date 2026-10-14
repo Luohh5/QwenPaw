@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Finite runtime manifest and fresh managed-site acc
 eptance, actual A/child."""
+
 # pylint: disable=protected-access,redefined-outer-name,unused-argument
 import hashlib
 import json
@@ -242,10 +243,8 @@ async def test_actual_child_identity_mismatch_blocks_before_dependency_write(
     assert transaction.loader.get_loaded_plugin(KEY) is None
 
 
-def test_offline_CLI_A_uninstall_tombstone_and_explicit_reinstall_commit(
-    transaction,
-    monkeypatch,
-):
+def _offline_cli_case(transaction, monkeypatch):
+    """Seed the real offline CLI with managed runtime and preserved config."""
     from click.testing import CliRunner
     from qwenpaw.cli import plugin_commands as cli
     from qwenpaw.config.utils import load_config, save_config
@@ -268,8 +267,17 @@ def test_offline_CLI_A_uninstall_tombstone_and_explicit_reinstall_commit(
     root.channel_plugin_state.version = 1
     root.channel_plugin_state.preset = "channels-full"
     save_config(root)
+    return CliRunner(), cli
+
+
+def test_offline_CLI_A_uninstall_tombstone_and_explicit_reinstall_commit(
+    transaction,
+    monkeypatch,
+):
+    from qwenpaw.config.utils import load_config
+
+    runner, cli = _offline_cli_case(transaction, monkeypatch)
     source = transaction.artifact()
-    runner = CliRunner()
     installed = runner.invoke(cli.plugin, ["install", str(source)])
     assert installed.exit_code == 0, installed.output
     assert transaction.installed.is_dir()
@@ -281,14 +289,78 @@ def test_offline_CLI_A_uninstall_tombstone_and_explicit_reinstall_commit(
     assert deleted.exit_code == 0, deleted.output
     assert not transaction.installed.exists()
     assert KEY in load_config().channel_plugin_state.uninstalled
+    assert KEY not in load_config().plugins
     broken = transaction.artifact("2.0.0", broken=True)
+    descriptor = json.loads((broken / "channel.json").read_text())
+    descriptor["schema_version"] = 3
+    (broken / "channel.json").write_text(json.dumps(descriptor))
     failed = runner.invoke(cli.plugin, ["install", str(broken)])
     assert failed.exit_code != 0, failed.output
+    assert "schema_version must be integer 2" in failed.output
     assert KEY in load_config().channel_plugin_state.uninstalled
     assert not transaction.installed.exists()
     reinstalled = runner.invoke(cli.plugin, ["install", str(source)])
     assert reinstalled.exit_code == 0, reinstalled.output
     assert transaction.installed.is_dir()
+    assert KEY not in load_config().channel_plugin_state.uninstalled
+    persisted = load_config().model_dump()
+    committed = {
+        path.relative_to(transaction.installed): path.read_bytes()
+        for path in transaction.installed.rglob("*")
+        if path.is_file()
+    }
+    failed_force = runner.invoke(
+        cli.plugin,
+        ["install", str(broken), "--force"],
+    )
+    assert failed_force.exit_code != 0, failed_force.output
+    assert "schema_version must be integer 2" in failed_force.output
+    assert {
+        path.relative_to(transaction.installed): path.read_bytes()
+        for path in transaction.installed.rglob("*")
+        if path.is_file()
+    } == committed
+    assert KEY not in load_config().channel_plugin_state.uninstalled
+    assert load_config().model_dump() == persisted
+
+
+def test_offline_CLI_force_installs_without_importing_driver(
+    transaction,
+    monkeypatch,
+):
+    """Commit a valid static Driver without executing its failing body."""
+    from qwenpaw.config.utils import load_config
+
+    runner, cli = _offline_cli_case(transaction, monkeypatch)
+    source = transaction.artifact()
+    installed = runner.invoke(cli.plugin, ["install", str(source)])
+    assert installed.exit_code == 0, installed.output
+    assert transaction.installed.is_dir()
+    persisted = load_config().model_dump()
+    raises_on_import = transaction.artifact("2.1.0", broken=True)
+    driver = raises_on_import / KEY / "c5_driver.py"
+    imported = raises_on_import.parent / "driver-imported"
+    driver.write_text(
+        "from pathlib import Path as _OfflinePath\n"
+        f"_OfflinePath({str(imported)!r}).write_text('imported')\n"
+        + driver.read_text(),
+    )
+    offline = runner.invoke(
+        cli.plugin,
+        ["install", str(raises_on_import), "--force"],
+    )
+    assert offline.exit_code == 0, offline.output
+    assert not imported.exists() and not transaction.network.exists()
+    assert (transaction.installed / KEY / "c5_driver.py").read_bytes() == (
+        driver.read_bytes()
+    )
+    assert (
+        json.loads((transaction.installed / "plugin.json").read_text())[
+            "version"
+        ]
+        == "2.1.0"
+    )
+    assert load_config().model_dump() == persisted
     assert KEY not in load_config().channel_plugin_state.uninstalled
 
 

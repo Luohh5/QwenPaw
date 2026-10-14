@@ -17,7 +17,6 @@ import psutil
 import pytest
 import pytest_asyncio
 
-
 ROOT = Path(__file__).resolve().parents[3]
 DRIVER = Path(__file__).with_name("shared_process_driver.py")
 
@@ -211,6 +210,10 @@ async def test_blocked_sdk_keeps_parent_loop_responsive(
         health = await starting
         await ticker
         await eventually(marker.exists)
+        child_marker = Path(str(marker) + ".child")
+        assert child_marker.is_file()
+        child_pid = int(child_marker.read_text())
+        assert child_pid != health["pid"] and alive(child_pid)
         assert health["state"] == "ready"
         assert health["platform_state"] == "connecting"
         stopping = asyncio.create_task(process.stop(timeout=0.5))
@@ -218,6 +221,7 @@ async def test_blocked_sdk_keeps_parent_loop_responsive(
         result = await stopping
         assert ticks >= 1 and result.exited and result.forced
         assert not alive(int(marker.read_text()))
+        assert not alive(child_pid)
 
 
 @pytest.mark.asyncio
@@ -233,9 +237,9 @@ async def test_child_rejects_invalid_launch_before_readiness(
 ):
     """Audit and trusted source/identity validation occur in the real child."""
     spec, _ = launch(
-        requirements="b2-uninstalled-sdk-314159>=1\n"
-        if change == "missing_sdk"
-        else "",
+        requirements=(
+            "b2-uninstalled-sdk-314159>=1\n" if change == "missing_sdk" else ""
+        ),
     )
     if change == "source":
         spec = replace(spec, source_revision="0" * 64)

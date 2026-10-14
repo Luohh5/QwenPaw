@@ -5,6 +5,7 @@
 import asyncio
 import builtins
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -42,6 +43,98 @@ def registry(tmp_path, monkeypatch):
 
 def workspace():
     return SimpleNamespace(agent_id="same-agent", plugins=WorkspacePlugins())
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tool_config_write_revokes_published_tool(
+    tmp_path,
+    registry,
+    monkeypatch,
+):
+    from qwenpaw.agents import tools
+    from qwenpaw.governance.tool_registry import DEFAULT_REGISTRY
+    from qwenpaw.plugins.api import (
+        _TOOL_PLUGIN_OWNERS,
+        release_tool_ownership_for_plugin,
+    )
+    from qwenpaw.runtime.tool_registry import ToolRegistry
+
+    plugin_id = "cancelled-tool-write"
+    tool_name = "cancelled_plugin_tool"
+    tool_registry = ToolRegistry()
+    registry.set_workspace_manager(
+        SimpleNamespace(
+            agents={
+                "qa": SimpleNamespace(
+                    agent_id="qa",
+                    plugins=SimpleNamespace(tool_registry=tool_registry),
+                ),
+            },
+            _bootstrap_kwargs={},
+        ),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def write_config(*args, **kwargs):
+        entered.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("test did not release config writer")
+
+    monkeypatch.setattr("qwenpaw.plugins.api._write_tool_config", write_config)
+    root = tmp_path / "plugins" / plugin_id
+    root.mkdir(parents=True)
+    manifest = PluginManifest.from_dict(
+        {
+            "id": plugin_id,
+            "name": plugin_id,
+            "version": "1.0.0",
+            "entry": {"backend": "main.py"},
+        },
+    )
+    (root / "main.py").write_text(
+        "def tool():\n    return 'sent'\n"
+        "class Plugin:\n"
+        "    def register(self, api):\n"
+        f"        api.register_tool('{tool_name}', tool)\n"
+        "plugin = Plugin()\n",
+        encoding="utf-8",
+    )
+    loader = PluginLoader([root.parent])
+    loader.registry = registry
+    await loader.load_plugin(manifest, root, activate=False)
+    activation = asyncio.create_task(loader.lifecycle.activate(plugin_id))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert tool_registry.get(tool_name) is not None
+        assert hasattr(tools, tool_name)
+        assert tool_name in tools.__all__
+        activation.cancel()
+        # Let cancellation reach the I/O boundary before releasing its worker.
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await activation
+        assert (
+            loader.lifecycle.get_instance(plugin_id).state
+            is PluginState.FAILED
+        )
+        assert tool_registry.get(tool_name) is None
+        assert not hasattr(tools, tool_name)
+        assert tool_name not in tools.__all__
+        assert tool_name not in _TOOL_PLUGIN_OWNERS
+        assert DEFAULT_REGISTRY.get_owner(tool_name) is None
+    finally:
+        release.set()
+        if not activation.done():
+            activation.cancel()
+            await asyncio.gather(activation, return_exceptions=True)
+        await loader.unload_plugin(plugin_id)
+        release_tool_ownership_for_plugin(plugin_id)
+        if hasattr(tools, tool_name):
+            delattr(tools, tool_name)
+        if tool_name in tools.__all__:
+            tools.__all__.remove(tool_name)
 
 
 @pytest.mark.asyncio
@@ -837,6 +930,94 @@ async def test_workspace_stop_releases_its_plugin_bindings(registry):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "final,preserve_reused",
+    [(False, False), (True, True)],
+)
+async def test_workspace_stop_continues_after_failed_plugin_revoke(
+    registry,
+    final,
+    preserve_reused,
+):
+    from qwenpaw.app.workspace.workspace import Workspace
+    from qwenpaw.plugins.lifecycle import QuiescenceError
+
+    old = Workspace.__new__(Workspace)
+    old.agent_id = "retiring"
+    old._started = old._start_attempted = True
+    old._service_manager = SimpleNamespace(stop_all=AsyncMock(), services={})
+    harness = SimpleNamespace(stop=AsyncMock())
+    old._harness_runtime = harness
+    registry.projector = WorkspaceProjector(lambda: [])
+    registry.projector.track_workspace(old)
+    token, revokes = object(), []
+
+    async def revoke(workspace, binding):
+        assert workspace is old and binding is token
+        revokes.append(binding)
+        if len(revokes) == 1:
+            raise QuiescenceError("plugin still alive")
+
+    registry.projector.intend(
+        "worker",
+        "retiring-worker",
+        "recovery",
+        lambda _ws: token,
+        revoke,
+    )
+    await registry.projector.project_workspace(old)
+
+    with pytest.raises(QuiescenceError, match="plugin still alive"):
+        await old.stop(final=final, preserve_reused=preserve_reused)
+
+    old._service_manager.stop_all.assert_awaited_once_with(
+        final=final,
+        preserve_reused=preserve_reused,
+    )
+    harness.stop.assert_awaited_once()
+    assert old._started and old._start_attempted
+    assert old._harness_runtime is None
+    assert old in registry.projector.workspaces()
+
+    await old.stop(final=final, preserve_reused=preserve_reused)
+    assert not old._started and not old._start_attempted
+    harness.stop.assert_awaited_once()
+    assert old not in registry.projector.workspaces()
+    assert revokes == [token, token]
+
+
+@pytest.mark.asyncio
+async def test_workspace_stop_retains_failed_harness_for_retry(registry):
+    from qwenpaw.app.workspace.workspace import Workspace
+
+    old = Workspace.__new__(Workspace)
+    old.agent_id = "retiring"
+    old._started = old._start_attempted = True
+    old._service_manager = SimpleNamespace(
+        stop_all=AsyncMock(side_effect=[RuntimeError("service busy"), None]),
+        services={},
+    )
+    harness = SimpleNamespace(
+        stop=AsyncMock(side_effect=[RuntimeError("harness busy"), None]),
+    )
+    old._harness_runtime = harness
+    registry.projector = WorkspaceProjector(lambda: [])
+    registry.projector.track_workspace(old)
+    with pytest.raises(RuntimeError) as raised:
+        await old.stop(final=False)
+    assert "service busy" in str(raised.value)
+    assert "harness busy" in str(raised.value)
+    assert old._harness_runtime is harness
+    assert old._started and old._start_attempted
+    assert old in registry.projector.workspaces()
+    await old.stop(final=False)
+    assert old._harness_runtime is None
+    assert not old._started and not old._start_attempted
+    assert harness.stop.await_count == 2
+    assert old not in registry.projector.workspaces()
+
+
+@pytest.mark.asyncio
 async def test_unresolved_restart_cleanup_returns_http_conflict(
     tmp_path,
     registry,
@@ -996,6 +1177,177 @@ async def test_stop_task_accepts_normal_cancellation():
     await started.wait()
     await stop_task(hosted, "normal")
     assert hosted.cancelled()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_method", ["aclose", "close", "sync_close"])
+async def test_connection_timeout_preserves_owned_files_and_retry_handle(
+    tmp_path,
+    registry,
+    monkeypatch,
+    close_method,
+):
+    # pylint: disable=too-many-statements
+    from qwenpaw.plugins import custody
+
+    monkeypatch.setattr(custody, "CONNECTION_STOP_SECONDS", 0.01)
+    loader = PluginLoader([])
+    inst = loader.lifecycle.ensure_instance("stubborn-connection")
+    api = PluginApi("stubborn-connection", {}, {"id": inst.plugin_id})
+    api.set_registry(registry)
+    api.bind_instance(inst)
+    source = tmp_path / "factory.txt"
+    source.write_text("owned", encoding="utf-8")
+    dest = tmp_path / "installed.txt"
+    assert api.provision_files(source, dest, "1.0.0") == "create"
+    finish = asyncio.Event()
+    cancelled = asyncio.Event()
+    started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    thread_finish = threading.Event()
+    close_calls = []
+
+    async def close():
+        close_calls.append(True)
+        while not finish.is_set():
+            try:
+                await finish.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+
+    def sync_close():
+        close_calls.append(True)
+        loop.call_soon_threadsafe(started.set)
+        thread_finish.wait()
+
+    client = SimpleNamespace(
+        **{
+            "close"
+            if close_method == "sync_close"
+            else close_method: (
+                sync_close if close_method == "sync_close" else close
+            ),
+        },
+    )
+    assert api.hold_connection(client, "stubborn") is client
+    inst.state = PluginState.ACTIVE
+    inst.activated = True
+    root = tmp_path / "plugin"
+    root.mkdir()
+    loader._loaded_plugins[inst.plugin_id] = PluginRecord(
+        manifest=PluginManifest.from_dict(
+            {"id": inst.plugin_id, "name": "Connection", "version": "1.0.0"},
+        ),
+        source_path=root,
+        enabled=True,
+        status="active",
+        instance=object(),
+    )
+    monkeypatch.setattr(loader, "_drop_uninstalled_settings", AsyncMock())
+    operations = []
+    closer = inst._runtime[-1].teardown
+    try:
+        if close_method == "sync_close":
+            monkeypatch.setattr(custody, "CONNECTION_STOP_SECONDS", 1)
+            operation = asyncio.create_task(
+                loader.lifecycle.unload(inst.plugin_id, UnloadMode.UNINSTALL),
+            )
+            operations.append(operation)
+            await asyncio.wait_for(started.wait(), timeout=0.3)
+            operation.cancel()
+            done, _ = await asyncio.wait({operation}, timeout=0.3)
+            assert operation in done, "cancellation waited for sync close"
+            with pytest.raises(asyncio.CancelledError):
+                operation.result()
+            assert closer.task is not None and not closer.task.done()
+            monkeypatch.setattr(custody, "CONNECTION_STOP_SECONDS", 0.01)
+        for _ in range(2):
+            operation = asyncio.create_task(
+                loader.lifecycle.unload(inst.plugin_id, UnloadMode.UNINSTALL),
+            )
+            operations.append(operation)
+            done, _ = await asyncio.wait({operation}, timeout=0.3)
+            assert operation in done, "connection cleanup exceeded its budget"
+            report = operation.result()
+            assert not report.clean
+            assert not report.quiescent
+            assert report.needs_restart
+            assert any("stubborn" in error for error in report.errors)
+            assert dest.read_text(encoding="utf-8") == "owned"
+            assert root.is_dir()
+            assert load_inventory(inst.plugin_id)["locations"]
+            assert inst.state is PluginState.FAILED
+            assert inst.has_runtime_ledger()
+            assert len(close_calls) == 1
+            assert closer.task is not None and not closer.task.done()
+            if close_method == "sync_close":
+                assert not closer.task.cancelling()
+        if close_method != "sync_close":
+            await asyncio.wait_for(cancelled.wait(), timeout=0.3)
+    finally:
+        finish.set()
+        thread_finish.set()
+        tasks = [*operations]
+        if closer.task is not None:
+            tasks.append(closer.task)
+        await asyncio.gather(*tasks, return_exceptions=True)
+    report = await loader.lifecycle.unload(
+        inst.plugin_id,
+        UnloadMode.UNINSTALL,
+    )
+    assert report.clean
+    assert report.quiescent
+    assert not report.needs_restart
+    assert len(close_calls) == 1
+    assert inst.state is PluginState.DISPOSED
+    assert not dest.exists()
+    assert not root.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_method", ["aclose", "close", "sync_close"])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_connection_cleanup_reports_actual_result(
+    registry,
+    close_method,
+    fails,
+):
+    inst = PluginLoader([]).lifecycle.ensure_instance("connection-result")
+    api = PluginApi(inst.plugin_id, {}, {"id": inst.plugin_id})
+    api.set_registry(registry)
+    api.bind_instance(inst)
+
+    async def close():
+        await asyncio.sleep(0)
+        if fails:
+            raise OSError("connection close failed")
+
+    def sync_close():
+        if fails:
+            raise OSError("connection close failed")
+
+    api.hold_connection(
+        SimpleNamespace(
+            **{
+                "close"
+                if close_method == "sync_close"
+                else close_method: (
+                    sync_close if close_method == "sync_close" else close
+                ),
+            },
+        ),
+    )
+    report = await inst.dispose(UnloadMode.UNLOAD)
+    assert report.clean is not fails
+    assert report.quiescent is not fails
+    assert inst.state is (
+        PluginState.FAILED if fails else PluginState.DISPOSED
+    )
+    if fails:
+        assert inst.has_runtime_ledger()
+        assert any(
+            "connection close failed" in error for error in report.errors
+        )
 
 
 @pytest.mark.asyncio

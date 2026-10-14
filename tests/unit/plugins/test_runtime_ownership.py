@@ -402,7 +402,14 @@ async def test_swap_excludes_new_root_custody_until_filesystem_thread_settles(
         installed,
         plugin="another-plugin",
     )
-    assert (held.code_root / "code.txt").read_text() == "new"
+    assert (held.code_root / "code.txt").read_text() == (
+        "old" if cancelled else "new"
+    )
+    if cancelled:
+        from qwenpaw.plugins.updates import marker_path
+
+        assert not marker_path("indexer").exists()
+        assert not installed.with_name("indexer.indexer.staging").exists()
     assert loader.registry.runtime_owners.release(held, receipt(ownership))
 
 

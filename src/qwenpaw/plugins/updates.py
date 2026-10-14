@@ -65,6 +65,8 @@ def write_updating_marker(
     target_path: Path,
     staging_path: Path | None = None,
     status: str = STATUS_PREPARED,
+    phase: str | None = None,
+    old_version: str | None = None,
 ) -> None:
     """Record an in-flight directory swap so boot can restore it."""
     payload: dict[str, Any] = {
@@ -75,7 +77,20 @@ def write_updating_marker(
     }
     if staging_path is not None:
         payload["staging_path"] = str(staging_path)
+    if phase is not None:
+        payload["phase"] = phase
+    if old_version is not None:
+        payload["old_version"] = old_version
     write_json_atomic(marker_path(plugin_id), payload)
+
+
+def mark_update_restored(plugin_id: str) -> None:
+    """Record that the old directory is back before restoring its service."""
+    path = marker_path(plugin_id)
+    if path.is_file():
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["phase"] = "restored"
+        write_json_atomic(path, data)
 
 
 def mark_update_committed(plugin_id: str) -> None:
@@ -162,7 +177,22 @@ def recover_one_update(plugin_id: str) -> str | None:
     return _restore_one_marker(path)
 
 
-def recover_interrupted_updates(owns_commit=None) -> RecoveryResult:
+def interrupted_update_ids() -> list[str]:
+    """Return marker ids without restoring current-process transactions."""
+    from ..constant import WORKING_DIR
+
+    root = Path(WORKING_DIR) / "plugin_updates"
+    return [
+        _peek_marker_plugin_id(path) or path.stem
+        for path in sorted(root.glob("*.json"))
+    ]
+
+
+def recover_interrupted_updates(
+    owns_commit=None,
+    *,
+    plugin_id: str | None = None,
+) -> RecoveryResult:
     """Restore plugin dirs still marked updating. Returns restored ids.
 
     Each marker is isolated: an occupied target must not stop the rest.
@@ -173,7 +203,14 @@ def recover_interrupted_updates(owns_commit=None) -> RecoveryResult:
     restored = RecoveryResult()
     if not root.is_dir():
         return restored
-    for path in sorted(root.glob("*.json")):
+    paths = (
+        [marker_path(plugin_id)]
+        if plugin_id is not None
+        else sorted(root.glob("*.json"))
+    )
+    for path in paths:
+        if not path.is_file():
+            continue
         plugin_id = _peek_marker_plugin_id(path) or path.stem
         if (
             plugin_id
@@ -239,7 +276,15 @@ def _restore_one_marker(path: Path) -> str | None:
             f"Update marker for '{plugin_id}' has missing recovery paths",
         )
     if not backup.exists():
-        raise OSError(f"Update marker for '{plugin_id}' has no usable backup")
+        if data.get("phase") not in {"staging", "restored"}:
+            raise OSError(
+                f"Update marker for '{plugin_id}' has no usable backup",
+            )
+        _validate_old_target(plugin_id, target, data.get("old_version"))
+        if staging is not None:
+            safe_remove(staging, purpose="drop interrupted update staging")
+        path.unlink(missing_ok=True)
+        return plugin_id
     if staging is not None:
         safe_remove(staging, purpose="drop prepared update staging")
     if target.exists():
@@ -251,3 +296,28 @@ def _restore_one_marker(path: Path) -> str | None:
         plugin_id,
     )
     return plugin_id
+
+
+def _validate_old_target(
+    plugin_id: str,
+    target: Path,
+    old_version: object,
+) -> None:
+    """Require the unchanged old plugin before recovery without a backup."""
+    from .architecture import PluginManifest
+
+    if target.is_symlink() or not target.is_dir():
+        raise OSError(f"Old plugin directory is unavailable: {target}")
+    try:
+        manifest_path = target / "plugin.json"
+        if manifest_path.is_symlink():
+            raise ValueError("old plugin manifest is a symlink")
+        manifest = PluginManifest.from_dict(
+            json.loads(manifest_path.read_text(encoding="utf-8")),
+        )
+        if manifest.id != plugin_id or manifest.version != old_version:
+            raise ValueError("old plugin identity does not match marker")
+    except (OSError, ValueError, KeyError) as exc:
+        raise OSError(
+            f"Cannot validate old plugin '{plugin_id}': {exc}",
+        ) from exc

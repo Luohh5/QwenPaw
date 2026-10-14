@@ -8,7 +8,7 @@ import inspect
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -345,7 +345,12 @@ class PluginInstance:
             self._dispose_task = None
         return report
 
-    async def dispose(self, mode: UnloadMode) -> UnloadReport:
+    async def dispose(
+        self,
+        mode: UnloadMode,
+        *,
+        before_install: Callable[[], Awaitable[None]] | None = None,
+    ) -> UnloadReport:
         """Run the ledger for *mode*. Waitable and idempotent."""
         if (
             self._dispose_task is not None
@@ -360,7 +365,9 @@ class PluginInstance:
                 clean=True,
             )
         loop = asyncio.get_running_loop()
-        self._dispose_task = loop.create_task(self._dispose_body(mode))
+        self._dispose_task = loop.create_task(
+            self._dispose_body(mode, before_install),
+        )
         try:
             return await self._dispose_task
         except asyncio.CancelledError:
@@ -372,7 +379,11 @@ class PluginInstance:
                     pass
             raise
 
-    async def _dispose_body(self, mode: UnloadMode) -> UnloadReport:
+    async def _dispose_body(
+        self,
+        mode: UnloadMode,
+        before_install: Callable[[], Awaitable[None]] | None = None,
+    ) -> UnloadReport:
         self.state = PluginState.UNLOADING
         self.activated = False
         report = UnloadReport(plugin_id=self.plugin_id, mode=mode)
@@ -383,6 +394,15 @@ class PluginInstance:
             entries = _runtime_entries_for_mode(self._runtime, mode)
             await _run_ledger_teardowns(entries, report)
             if mode is UnloadMode.UNINSTALL and report.quiescent:
+                if before_install is not None:
+                    try:
+                        await before_install()
+                    except Exception as exc:  # noqa: BLE001
+                        report.clean = False
+                        report.errors.append(
+                            f"persisted config cleanup: {exc}",
+                        )
+                        return report
                 await _run_ledger_teardowns(list(self._install), report)
         except BaseException:
             interrupted = True
@@ -391,7 +411,7 @@ class PluginInstance:
             report.needs_restart = True
             raise
         finally:
-            if interrupted or not report.quiescent:
+            if interrupted or not report.clean:
                 self.state = PluginState.FAILED
             else:
                 self.state = PluginState.DISPOSED

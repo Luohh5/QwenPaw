@@ -4,8 +4,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import shutil
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +17,7 @@ import pytest
 from qwenpaw.plugins.architecture import PluginManifest
 from qwenpaw.plugins.lifecycle import PluginInstance, UnloadMode
 from qwenpaw.plugins.loader import PluginLoader
+from qwenpaw.memory import MemoryBackendRegistry
 from qwenpaw.plugins.module_isolation import (
     finish_probe_import,
     get_namespace_finder,
@@ -43,13 +47,14 @@ def _write_plugin(
     *,
     body: str = "pass",
     extra_py: str | None = None,
+    version: str = "1.0.0",
 ) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     (root / "plugin.json").write_text(
         json.dumps(
             {
                 "id": plugin_id,
-                "version": "1.0.0",
+                "version": version,
                 "name": plugin_id,
                 "entry": {"backend": "main.py"},
             },
@@ -69,10 +74,16 @@ def _write_plugin(
 
 
 @pytest.mark.asyncio
-async def test_syntax_error_reload_keeps_old(
+@pytest.mark.parametrize(
+    "broken_code",
+    ["def (\n", "raise RuntimeError('module boom')\n"],
+    ids=["syntax", "module-level"],
+)
+async def test_probe_failure_keeps_old(
     tmp_path: Path,
     fresh_registry,
     monkeypatch,
+    broken_code,
 ):
     monkeypatch.setattr(
         "qwenpaw.constant.WORKING_DIR",
@@ -110,7 +121,7 @@ async def test_syntax_error_reload_keeps_old(
 
     broken = tmp_path / "staging-broken"
     _write_plugin(broken, "keep-old", body="pass")
-    (broken / "main.py").write_text("def (\n", encoding="utf-8")
+    (broken / "main.py").write_text(broken_code, encoding="utf-8")
 
     report = await loader.lifecycle.reload(
         "keep-old",
@@ -119,6 +130,7 @@ async def test_syntax_error_reload_keeps_old(
     assert report.unchanged
     assert not report.ok
     assert "keep-old" in loader.get_all_loaded_plugins()
+    assert "keep-old" in fresh_registry.get_all_plugin_manifests()
     assert "ping" in workspace.plugins.slash_command_registry.names()
     assert (
         (installed / "main.py")
@@ -127,36 +139,6 @@ async def test_syntax_error_reload_keeps_old(
             "register_slash_command",
         )
     )
-
-
-@pytest.mark.asyncio
-async def test_module_level_probe_failure_keeps_old(
-    tmp_path: Path,
-    fresh_registry,
-    monkeypatch,
-):
-    monkeypatch.setattr(
-        "qwenpaw.constant.WORKING_DIR",
-        tmp_path / "work",
-    )
-    installed = _write_plugin(tmp_path / "plugins" / "boom", "boom")
-    loader = PluginLoader(plugin_dirs=[tmp_path / "plugins"])
-    loader.registry = fresh_registry
-    manifest = PluginManifest.from_dict(
-        json.loads((installed / "plugin.json").read_text(encoding="utf-8")),
-    )
-    await loader.load_plugin(manifest, installed)
-
-    staging = tmp_path / "staging-boom"
-    _write_plugin(staging, "boom")
-    (staging / "main.py").write_text(
-        "raise RuntimeError('module boom')\n",
-        encoding="utf-8",
-    )
-    report = await loader.lifecycle.reload("boom", new_source=staging)
-    assert report.unchanged
-    assert "boom" in loader.get_all_loaded_plugins()
-    assert "boom" in fresh_registry.get_all_plugin_manifests()
 
 
 def test_probe_cleans_finder_and_modules(tmp_path: Path):
@@ -188,6 +170,74 @@ def test_updating_marker_restores_old_directory(tmp_path: Path, monkeypatch):
     assert recover_interrupted_updates() == ["mid"]
     assert (target / "main.py").read_text(encoding="utf-8") == "OLD\n"
     assert not backup.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupted_at", ["copy", "move"])
+async def test_boot_recovers_only_before_swap_starts(
+    tmp_path: Path,
+    fresh_registry,
+    monkeypatch,
+    interrupted_at: str,
+):
+    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
+    plugin_id = f"interrupted-staging-{interrupted_at}"
+    installed = _write_plugin(
+        tmp_path / "plugins" / plugin_id,
+        plugin_id,
+        body="self.version = 'old'",
+    )
+    incoming = _write_plugin(
+        tmp_path / "incoming",
+        plugin_id,
+        body="self.version = 'new'",
+        version="2.0.0",
+    )
+    loader = PluginLoader([installed.parent])
+    loader.registry = fresh_registry
+
+    class InterruptedProcess(BaseException):
+        pass
+
+    def interrupt_copy(_source, destination):
+        Path(destination).mkdir()
+        (Path(destination) / "partial").write_text("incomplete")
+        raise InterruptedProcess
+
+    def interrupt_move(_source, _destination):
+        raise InterruptedProcess
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            shutil,
+            "copytree" if interrupted_at == "copy" else "move",
+            interrupt_copy if interrupted_at == "copy" else interrupt_move,
+        )
+        with pytest.raises(InterruptedProcess):
+            await loader._swap_plugin_dir(plugin_id, installed, incoming)
+
+    marker = json.loads(marker_path(plugin_id).read_text())
+    assert not Path(marker["backup_path"]).exists()
+    boot_loader = PluginLoader([installed.parent])
+    boot_loader.registry = fresh_registry
+    await boot_loader.load_all_plugins(activate=True)
+    record = boot_loader.get_loaded_plugin(plugin_id)
+    if interrupted_at == "copy":
+        assert record.status == "active"
+        assert record.manifest.version == "1.0.0"
+        assert sys.modules[plugin_module_name(plugin_id)].plugin.version == (
+            "old"
+        )
+        assert not Path(marker["staging_path"]).exists()
+        assert not marker_path(plugin_id).exists()
+    else:
+        assert record.status == "failed"
+        assert "needs_restart" in record.diagnostics
+        assert plugin_module_name(plugin_id) not in sys.modules
+        assert marker_path(plugin_id).exists()
+    assert marker["phase"] == (
+        "staging" if interrupted_at == "copy" else "swapping"
+    )
 
 
 def test_tool_fields_follow_plugin_keep_user(tmp_path: Path, monkeypatch):
@@ -291,6 +341,7 @@ async def test_reload_rollback_leaves_old_on_disk(
     assert not report.unchanged
     assert (installed / "main.py").read_text(encoding="utf-8") == old_text
     assert "roll" in loader.get_all_loaded_plugins()
+    assert any("previous service was restored" in e for e in report.errors)
 
 
 def test_commit_migrations_clears_marker(tmp_path: Path, monkeypatch):
@@ -312,6 +363,99 @@ def test_commit_migrations_clears_marker(tmp_path: Path, monkeypatch):
     commit_migrations("cid")
     loc = load_inventory("cid")["locations"][str(dest)]
     assert loc.get("migrating") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plugin_type", ["channel", "memory"])
+async def test_two_phase_boot_keeps_current_provision_migration(
+    tmp_path: Path,
+    fresh_registry,
+    monkeypatch,
+    plugin_type: str,
+):
+    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
+    plugin_id = f"two-phase-{plugin_type}"
+    source = tmp_path / "factory"
+    source.mkdir()
+    (source / "version.txt").write_text("1.0.0")
+    dest = tmp_path / "data"
+    provision_files(plugin_id, source, dest, "1.0.0")
+    (source / "version.txt").write_text("2.0.0")
+    installed = _write_plugin(
+        tmp_path / "plugins" / plugin_id,
+        plugin_id,
+        version="2.0.0",
+        body=(f"api.provision_files({str(source)!r}, {str(dest)!r}, '2.0.0')"),
+    )
+    manifest = json.loads((installed / "plugin.json").read_text())
+    manifest["type"] = plugin_type
+    (installed / "plugin.json").write_text(json.dumps(manifest))
+    loader = PluginLoader([installed.parent])
+    loader.registry = fresh_registry
+
+    await loader.load_all_plugins(types=["channel", "memory"])
+    record = loader.get_loaded_plugin(plugin_id)
+    location = load_inventory(plugin_id)["locations"][str(dest)]
+    assert record.status == "registered"
+    assert location["migrating"]["status"] == "prepared"
+    backup = Path(location["migrating"]["backup_path"])
+    assert (dest / "version.txt").read_text() == "2.0.0"
+
+    await loader.load_all_plugins()
+    assert loader.get_loaded_plugin(plugin_id) is record
+    location = load_inventory(plugin_id)["locations"][str(dest)]
+    assert location["version"] == "2.0.0"
+    assert location["migrating"]["status"] == "prepared"
+    assert backup.exists()
+    assert (dest / "version.txt").read_text() == "2.0.0"
+
+    await loader.activate_all_loaded()
+    assert record.status == "active"
+    assert record.manifest.version == "2.0.0"
+    location = load_inventory(plugin_id)["locations"][str(dest)]
+    assert location["version"] == "2.0.0"
+    assert location["migrating"] is None
+    assert not backup.exists()
+    assert (dest / "version.txt").read_text() == "2.0.0"
+
+
+@pytest.mark.asyncio
+async def test_boot_recovers_leftover_provision_under_lifecycle_lock(
+    tmp_path: Path,
+    fresh_registry,
+    monkeypatch,
+):
+    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
+    plugin_id = "locked-boot-recovery"
+    source = tmp_path / "factory"
+    source.mkdir()
+    (source / "version.txt").write_text("1.0.0")
+    dest = tmp_path / "data"
+    provision_files(plugin_id, source, dest, "1.0.0")
+    (source / "version.txt").write_text("2.0.0")
+    provision_files(plugin_id, source, dest, "2.0.0")
+    location = load_inventory(plugin_id)["locations"][str(dest)]
+    backup = Path(location["migrating"]["backup_path"])
+    installed = _write_plugin(tmp_path / "plugins" / plugin_id, plugin_id)
+    loader = PluginLoader([installed.parent])
+    loader.registry = fresh_registry
+
+    async with loader.plugin_lifecycle(plugin_id):
+        recovery = asyncio.create_task(loader.load_all_plugins(activate=True))
+        await asyncio.sleep(0.05)
+        pending = not recovery.done()
+        content_while_locked = (dest / "version.txt").read_text()
+        backup_while_locked = backup.exists()
+    await asyncio.wait_for(recovery, timeout=5)
+    assert pending
+    assert content_while_locked == "2.0.0"
+    assert backup_while_locked
+    assert loader.get_loaded_plugin(plugin_id).status == "active"
+    location = load_inventory(plugin_id)["locations"][str(dest)]
+    assert location["version"] == "1.0.0"
+    assert location["migrating"] is None
+    assert (dest / "version.txt").read_text() == "1.0.0"
+    assert not backup.exists()
 
 
 @pytest.mark.asyncio
@@ -352,19 +496,12 @@ async def test_reload_restore_failure_preserves_backups_and_blocks_activation(
     staging = _write_plugin(
         tmp_path / "staging",
         plugin_id,
+        version="2.0.0",
         body=(
             f"api.provision_files({str(tmp_path / '2.0.0')!r}, "
             f"{str(dest)!r}, '2.0.0')\n"
             "        raise RuntimeError('register boom')"
         ),
-    )
-    incoming = json.loads(
-        (staging / "plugin.json").read_text(encoding="utf-8"),
-    )
-    incoming["version"] = "2.0.0"
-    (staging / "plugin.json").write_text(
-        json.dumps(incoming),
-        encoding="utf-8",
     )
 
     def deny_restore(_backup, _dest):
@@ -376,6 +513,7 @@ async def test_reload_restore_failure_preserves_backups_and_blocks_activation(
     assert not report.ok
     assert report.needs_restart
     assert any("register boom" in error for error in report.errors)
+    assert any("previous service was not restored" in e for e in report.errors)
     assert any(
         "provision restore occupied" in error for error in report.errors
     )
@@ -594,10 +732,12 @@ async def test_reload_register_failure_keeps_user_provision(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_fails", [False, True])
 async def test_successful_reload_replaces_source(
     tmp_path: Path,
     fresh_registry,
     monkeypatch,
+    cleanup_fails,
 ):
     monkeypatch.setattr(
         "qwenpaw.constant.WORKING_DIR",
@@ -610,6 +750,14 @@ async def test_successful_reload_replaces_source(
         json.loads((installed / "plugin.json").read_text(encoding="utf-8")),
     )
     await loader.load_plugin(manifest, installed)
+    old_instance = loader.lifecycle.get_instance("swap")
+    assert old_instance is not None
+    if cleanup_fails:
+
+        def fail_cleanup(_path):
+            raise PermissionError("committed backup is busy")
+
+        monkeypatch.setattr("qwenpaw.plugins.loader._remove_dir", fail_cleanup)
     staging = _write_plugin(
         tmp_path / "staging-swap",
         "swap",
@@ -618,9 +766,193 @@ async def test_successful_reload_replaces_source(
     report = await loader.lifecycle.reload("swap", new_source=staging)
     assert report.ok
     assert not report.unchanged
+    new_instance = loader.lifecycle.get_instance("swap")
+    assert new_instance is not None and new_instance is not old_instance
+    assert new_instance.generation == old_instance.generation + 1
+    assert report.needs_restart is cleanup_fails
+    if cleanup_fails:
+        assert any("committed backup is busy" in e for e in report.errors)
     assert "register_slash_command" in (installed / "main.py").read_text(
         encoding="utf-8",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_ids", [("default",), ("default", "other")])
+@pytest.mark.parametrize("entry", ["reload", "force"])
+async def test_memory_in_use_does_not_report_upgrade_success(
+    tmp_path,
+    fresh_registry,
+    monkeypatch,
+    agent_ids,
+    entry,
+):
+    from qwenpaw import memory
+
+    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
+    isolated = MemoryBackendRegistry()
+    monkeypatch.setattr(memory, "memory_registry", isolated)
+    installed = _write_plugin(
+        tmp_path / "plugins" / "memory-upgrade",
+        "memory-upgrade",
+        body=(
+            "api.register_memory_backend(backend_id='selected', "
+            "factory=type('Factory', (), {}))"
+        ),
+    )
+    loader = PluginLoader([tmp_path / "plugins"])
+    loader.registry = fresh_registry
+    manifest = PluginManifest.from_dict(
+        json.loads(
+            (installed / "plugin.json").read_text(encoding="utf-8"),
+        ),
+    )
+    old_record = await loader.load_plugin(manifest, installed)
+    old_instance = loader.lifecycle.get_instance("memory-upgrade")
+    fresh_registry.set_workspace_manager(
+        SimpleNamespace(
+            agents={
+                agent_id: SimpleNamespace(
+                    agent_id=agent_id,
+                    _config=SimpleNamespace(
+                        running=SimpleNamespace(
+                            memory_manager_backend="selected",
+                        ),
+                    ),
+                )
+                for agent_id in agent_ids
+            },
+        ),
+    )
+    incoming = _write_plugin(
+        tmp_path / "incoming",
+        "memory-upgrade",
+        version="2.0.0",
+    )
+
+    async def unexpected_commit(*_args):
+        pytest.fail("rejected update must not finish a commit")
+
+    monkeypatch.setattr(loader, "_finish_committed_reload", unexpected_commit)
+    if entry == "force":
+        with pytest.raises(RuntimeError) as exc:
+            await loader.load_plugin_from_path(incoming, force=True)
+        errors = str(exc.value)
+    else:
+        report = await loader.lifecycle.reload(
+            "memory-upgrade",
+            new_source=incoming,
+        )
+        assert not report.ok and report.unchanged
+        assert not report.needs_restart
+        assert report.generation == old_instance.generation
+        errors = "; ".join(report.errors)
+    assert all(agent_id in errors for agent_id in agent_ids)
+    assert "New version was not enabled" in errors
+    assert "previous service is still active" in errors
+    assert loader.lifecycle.get_instance("memory-upgrade") is old_instance
+    assert loader.get_loaded_plugin("memory-upgrade") is old_record
+    assert old_record.status == "active"
+    assert old_record.manifest.version == "1.0.0"
+    assert not marker_path("memory-upgrade").exists()
+    assert (
+        json.loads((installed / "plugin.json").read_text())["version"]
+        == "1.0.0"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "entry,restore_blocked",
+    [("reload", False), ("reload", True), ("force", False)],
+)
+async def test_cancel_during_completed_swap_restores_old_disk(
+    tmp_path: Path,
+    fresh_registry,
+    monkeypatch,
+    entry: str,
+    restore_blocked: bool,
+):
+    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
+    plugin_id = "cancel-swap"
+    installed = _write_plugin(
+        tmp_path / "plugins" / plugin_id,
+        plugin_id,
+        body="self.version = 'old'",
+    )
+    staging = _write_plugin(
+        tmp_path / "incoming",
+        plugin_id,
+        body="self.version = 'new'",
+        version="2.0.0",
+    )
+    loader = PluginLoader(plugin_dirs=[installed.parent])
+    loader.registry = fresh_registry
+    if entry == "reload":
+        await loader.load_plugin(
+            PluginManifest.from_dict(
+                json.loads((installed / "plugin.json").read_text()),
+            ),
+            installed,
+        )
+    loop = asyncio.get_running_loop()
+    cancelled = threading.Event()
+    move = shutil.move
+    task = None
+
+    def cancel_reload():
+        task.cancel()
+        cancelled.set()
+
+    def move_then_cancel(src, dest, *args, **kwargs):
+        source = Path(src)
+        if restore_blocked and ".bak" in source.name:
+            raise PermissionError("plugin restore occupied")
+        result = move(src, dest, *args, **kwargs)
+        if source.name.endswith(".staging") and Path(dest) == installed:
+            loop.call_soon_threadsafe(cancel_reload)
+            assert cancelled.wait(5), "reload cancellation was not delivered"
+        return result
+
+    monkeypatch.setattr(shutil, "move", move_then_cancel)
+    operation = (
+        loader.lifecycle.reload(plugin_id, new_source=staging)
+        if entry == "reload"
+        else loader.load_plugin_from_path(staging, force=True)
+    )
+    task = asyncio.create_task(operation)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    record = loader.get_loaded_plugin(plugin_id)
+    if restore_blocked:
+        marker = json.loads(marker_path(plugin_id).read_text())
+        assert marker["status"] == "prepared"
+        backup = Path(marker["backup_path"])
+        assert json.loads((backup / "plugin.json").read_text())["version"] == (
+            "1.0.0"
+        )
+        assert record is None or record.status == "failed"
+        instance = loader.lifecycle.get_instance(plugin_id)
+        assert "needs_restart" in instance.diagnostics
+        assert any(
+            "plugin restore occupied" in error
+            for error in instance.diagnostics
+        )
+        with pytest.raises(RuntimeError, match="plugin restore occupied"):
+            await loader.lifecycle.activate(plugin_id)
+    else:
+        assert json.loads((installed / "plugin.json").read_text())[
+            "version"
+        ] == ("1.0.0")
+        if entry == "reload":
+            assert record.status == "active"
+            assert record.manifest.version == "1.0.0"
+            module = sys.modules[plugin_module_name(plugin_id)]
+            assert module.plugin.version == "old"
+        else:
+            assert record is None
+        assert not marker_path(plugin_id).exists()
+        assert not list(installed.parent.glob(f"{plugin_id}*.bak*"))
 
 
 @pytest.mark.asyncio

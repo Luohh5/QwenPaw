@@ -196,6 +196,100 @@ describe("plugin module", () => {
     );
   });
 
+  it("uninstallPlugin displays the memory conflict without repeating its cause", async () => {
+    const cause = "memory backend is in use by Agent 'default'";
+    const message = `Plugin 'powercontext-memory': ${cause}`;
+    global.fetch = vi.fn().mockResolvedValue(
+      mockResponse({
+        ok: false,
+        status: 409,
+        json: {
+          detail: {
+            id: "powercontext-memory",
+            loaded: true,
+            clean: false,
+            quiescent: false,
+            needs_restart: true,
+            message,
+            errors: [cause],
+          },
+        },
+      }),
+    );
+
+    await expect(uninstallPlugin("powercontext-memory")).rejects.toThrow(
+      new Error(message),
+    );
+  });
+
+  it.each([
+    ["string detail", "Permission denied", ["Permission denied"]],
+    ["message only", { message: "Still in use" }, ["Still in use"]],
+    ["errors only", { errors: ["Save failed"] }, ["Save failed"]],
+    [
+      "message and distinct errors",
+      { message: "Cleanup incomplete", errors: ["Save failed", "Stop failed"] },
+      ["Cleanup incomplete", "Save failed", "Stop failed"],
+    ],
+    [
+      "validation errors",
+      [{ loc: ["body", "source"], msg: "Field required", type: "missing" }],
+      ["Field required"],
+    ],
+    [
+      "unusable detail",
+      { message: null, errors: [null, {}] },
+      ["Uninstall failed (409)"],
+    ],
+  ])("uninstallPlugin displays %s", async (_, detail, messages) => {
+    global.fetch = vi
+      .fn()
+      .mockResolvedValue(
+        mockResponse({ ok: false, status: 409, json: { detail } }),
+      );
+
+    const error = await uninstallPlugin("p1").catch(
+      (failure: Error) => failure,
+    );
+
+    expect(error).toBeInstanceOf(Error);
+    for (const message of messages) {
+      expect((error as Error).message).toContain(message);
+    }
+    expect((error as Error).message).not.toContain("[object Object]");
+  });
+
+  it("uninstallPlugin keeps its fallback when the error body is not JSON", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 502,
+      json: async () => {
+        throw new SyntaxError("Invalid JSON");
+      },
+    });
+
+    await expect(uninstallPlugin("p1")).rejects.toThrow(
+      "Uninstall failed (502)",
+    );
+  });
+
+  it.each([
+    ["catalog", () => fetchPluginCatalog()],
+    ["install", () => installPlugin("/local/path")],
+    ["upload", () => uploadPlugin(new File(["zip"], "p.zip"))],
+    ["status", () => fetchPluginStatus("p1")],
+  ])("%s displays structured plugin failures", async (_, request) => {
+    global.fetch = vi.fn().mockResolvedValue(
+      mockResponse({
+        ok: false,
+        status: 409,
+        json: { detail: { message: "Plugin operation failed" } },
+      }),
+    );
+
+    await expect(request()).rejects.toThrow("Plugin operation failed");
+  });
+
   it("fetchPluginStatus throws Status fetch failed on non-ok", async () => {
     global.fetch = vi
       .fn()

@@ -12,6 +12,7 @@ from collections.abc import (
     AsyncIterator,
     Callable,
     Coroutine,
+    Generator,
 )
 from typing import Any
 
@@ -19,6 +20,50 @@ from agentscope.event import ReplyEndEvent
 from agentscope.middleware import MiddlewareBase
 
 logger = logging.getLogger(__name__)
+_CANCEL_TIMEOUT = 1.0
+
+
+class _DeferredCall(Coroutine[Any, Any, Any]):
+    """A hosted coroutine whose downstream task starts on its first await."""
+
+    def __init__(self, run: Callable[[], Coroutine[Any, Any, Any]]) -> None:
+        self.run = run
+        self.task: asyncio.Task[Any] | None = None
+        self.waiter: Coroutine[Any, Any, Any] | None = None
+        self.closed = False
+
+    async def result(self) -> Any:
+        if self.task is None:
+            if self.closed:
+                return None
+            self.task = asyncio.create_task(self.run())
+        return await asyncio.shield(self.task)
+
+    def __await__(self) -> Generator[Any, None, Any]:
+        return (yield from self)
+
+    def __iter__(self) -> _DeferredCall:
+        return self
+
+    def __next__(self) -> Any:
+        return self.send(None)
+
+    def send(self, value: Any) -> Any:
+        if self.closed:
+            raise StopIteration
+        if self.waiter is None:
+            self.waiter = self.result()
+        return self.waiter.send(value)
+
+    def throw(self, typ: Any, val: Any = None, tb: Any = None) -> Any:
+        if self.waiter is None or self.closed:
+            raise typ if isinstance(typ, BaseException) else typ(val)
+        return self.waiter.throw(typ, val, tb)
+
+    def close(self) -> None:
+        self.closed = True
+        if self.waiter is not None:
+            self.waiter.close()
 
 
 class _TrackedStream:
@@ -67,7 +112,7 @@ class _HookCall:
     def __init__(self, next_handler: Callable[..., Any]) -> None:
         self.next_handler = next_handler
         self.streams: list[_TrackedStream] = []
-        self.tasks: list[asyncio.Task[Any]] = []
+        self.calls: list[_DeferredCall] = []
         self.downstream_errors: list[Exception] = []
 
     def stream_next(self, **kwargs: Any) -> AsyncIterator[Any]:
@@ -81,7 +126,7 @@ class _HookCall:
         return tracked.relay()
 
     def await_next(self, **kwargs: Any) -> Coroutine[Any, Any, Any]:
-        """Register immediately, returning a coroutine for hosted-task APIs."""
+        """Record immediately without changing downstream execution timing."""
 
         async def run() -> Any:
             try:
@@ -95,13 +140,9 @@ class _HookCall:
                 self.downstream_errors.append(exc)
                 raise
 
-        task = asyncio.create_task(run())
-        self.tasks.append(task)
-
-        async def wait() -> Any:
-            return await task
-
-        return wait()
+        pending = _DeferredCall(run)
+        self.calls.append(pending)
+        return pending
 
     def delivered(self, item: Any) -> None:
         """Acknowledge end events, including copies made by a plugin."""
@@ -137,10 +178,15 @@ class _HookCall:
                 yield item
 
     async def recover_result(self, kwargs: dict[str, Any]) -> Any:
-        if not self.tasks:
-            return await self.await_next(**kwargs)
-        # Reuse even an in-flight downstream call. Never replay a tool/model.
-        return await self.tasks[-1]
+        # A closed waiter can still own a completed or in-flight task.
+        for entry in reversed(self.calls):
+            if entry.task is not None:
+                return await entry.result()
+        # Retire unused calls before bypassing the faulty plugin. Hosted
+        # waiters that run later must not start another downstream call.
+        for entry in self.calls:
+            entry.close()
+        return await self.await_next(**kwargs)
 
     async def close_streams(self) -> None:
         for stream in self.streams:
@@ -155,6 +201,48 @@ class PluginMiddlewareGuard(MiddlewareBase):
     def __init__(self, middleware: MiddlewareBase, plugin_id: str) -> None:
         self.middleware = middleware
         self.plugin_id = plugin_id
+        self._pending_cleanup: set[asyncio.Task[Any]] = set()
+
+    def _cleanup_done(self, task: asyncio.Task[Any]) -> None:
+        self._pending_cleanup.discard(task)
+        if not task.cancelled():
+            # Retrieve faults without misclassifying downstream failures.
+            task.exception()
+
+    async def _drain(self, tasks: set[asyncio.Task[Any]], hook: str) -> None:
+        if not tasks:
+            return
+        self._pending_cleanup.update(tasks)
+        for task in tasks:
+            task.add_done_callback(self._cleanup_done)
+        _, pending = await asyncio.wait(tasks, timeout=_CANCEL_TIMEOUT)
+        if pending:
+            self._diagnose(
+                hook,
+                TimeoutError("middleware cleanup did not finish in time"),
+            )
+
+    async def _cleanup(self, call: _HookCall, hook: str) -> None:
+        tasks = {entry.task for entry in call.calls if entry.task is not None}
+        for entry in call.calls:
+            entry.close()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await self._drain(tasks, hook)
+        if call.streams:
+
+            async def close() -> None:
+                try:
+                    await call.close_streams()
+                except Exception as exc:
+                    self._diagnose(hook, exc)
+                    raise
+
+            closing = asyncio.create_task(close())
+            await self._drain({closing}, hook)
+            if closing.done() and not closing.cancelled():
+                closing.result()
 
     def is_implemented(self, hook_name: str) -> bool:
         return self.middleware.is_implemented(hook_name)
@@ -162,10 +250,11 @@ class PluginMiddlewareGuard(MiddlewareBase):
     def _diagnose(self, hook: str, exc: Exception) -> None:
         from ..plugins.lifecycle import note_plugin_diagnostic
 
-        logger.exception(
+        logger.error(
             "Plugin '%s' middleware %s failed; bypassing",
             self.plugin_id,
             hook,
+            exc_info=(type(exc), exc, exc.__traceback__),
         )
         note_plugin_diagnostic(self.plugin_id, f"middleware {hook}: {exc}")
 
@@ -197,7 +286,7 @@ class PluginMiddlewareGuard(MiddlewareBase):
                 async for item in call.recover_stream(original_kwargs):
                     yield item
         finally:
-            await call.close_streams()
+            await self._cleanup(call, hook)
 
     async def _result_hook(
         self,
@@ -226,9 +315,9 @@ class PluginMiddlewareGuard(MiddlewareBase):
             if isinstance(result, AsyncIterable):
                 return self._result_stream(hook, result, call, original_kwargs)
         except BaseException:
-            await call.close_streams()
+            await self._cleanup(call, hook)
             raise
-        await call.close_streams()
+        await self._cleanup(call, hook)
         return result
 
     async def _result_stream(
@@ -259,7 +348,7 @@ class PluginMiddlewareGuard(MiddlewareBase):
                     async for item in stream.recover():
                         yield item
         finally:
-            await call.close_streams()
+            await self._cleanup(call, hook)
 
     async def on_reply(
         self,
