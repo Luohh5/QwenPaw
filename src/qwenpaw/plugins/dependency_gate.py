@@ -344,7 +344,7 @@ async def admit_shared_dependencies(
 
 
 # Each consumer retains its marker and origin context through closure checks.
-# pylint: disable=too-many-statements
+# pylint: disable=too-many-statements,too-many-branches
 def evaluate_shared_dependencies(
     requirements_file: Path,
     snapshot,
@@ -357,7 +357,7 @@ def evaluate_shared_dependencies(
     """Validate each consumer in its own observed environment."""
     from packaging.utils import canonicalize_name
     from packaging.version import Version
-    from .execution.dependencies import repair_marker
+    from .execution.dependencies import _installed_metadata, repair_marker
     from .install_lock import canonical_environment_path as canonical
 
     parsed = (
@@ -369,8 +369,17 @@ def evaluate_shared_dependencies(
     affected = []
     target = canonical(install_target) if install_target is not None else None
     sites = {canonical(path) for path in snapshot.dependency_sites or ()}
+    host_inventories = {}
+    host_dirty = False
+    extra_requirements = tuple(extra_requirements)
+    additions = set()
+    for value in extra_requirements:
+        try:
+            additions.add(str(canonicalize_name(Requirement(str(value)).name)))
+        except ValueError:
+            pass  # The normal requirement checker reports unsupported syntax.
 
-    def check(values, inventory, markers):
+    def check(values, inventory, markers, invalid=()):
         pending = [(value, (), False) for value in values]
         visited = set()
         while pending:
@@ -400,6 +409,9 @@ def evaluate_shared_dependencies(
                     unsupported.append(str(value))
                     continue
                 name = str(canonicalize_name(requirement.name))
+                if name in invalid:
+                    unsupported.append(f"{invalid[name]}: {name}")
+                    continue
                 row = inventory.get(name)
                 if row is None:
                     missing.append(str(value))
@@ -465,6 +477,37 @@ def evaluate_shared_dependencies(
                 f"{name}=={row['version']}"
                 for name, row in evidence.distributions.items()
             ]
+            roots = tuple(
+                dict.fromkeys(str(canonical(path)) for path in evidence.sites),
+            )
+            try:
+                if roots not in host_inventories:
+                    rows, invalid, _observed = _installed_metadata(roots)
+                    del _observed
+                    host_inventories[roots] = (rows, invalid)
+                rows, invalid = host_inventories[roots]
+            except Exception as exc:
+                code = getattr(
+                    exc,
+                    "reason_code",
+                    "DEPENDENCY_PLAN_UNVERIFIED",
+                )
+                host_dirty |= code == "DEPENDENCY_REPAIR_REQUIRED"
+                unsupported.append(f"host {use.plugin_id}: {code}")
+                continue
+            inventory = {
+                name: row for name, row in rows.items() if name not in invalid
+            }
+            for name, pin in evidence.distributions.items():
+                fresh = inventory.get(name)
+                if fresh is None:
+                    missing.append(f"{name}=={pin['version']}")
+                elif fresh["version"] != pin["version"] or canonical(
+                    fresh["metadata_path"],
+                ) != canonical(pin["metadata_path"]):
+                    conflicts.append(
+                        f"host {use.plugin_id}: {name} origin/version differs",
+                    )
         elif use.requirements is None:
             unsupported.append(
                 f"{use.origin} {use.plugin_id}: requirements unavailable",
@@ -472,9 +515,11 @@ def evaluate_shared_dependencies(
             continue
         else:
             values = use.requirements
-        inventory = (
-            dict(evidence.distributions) if evidence is not None else {}
-        )
+        if use.origin != "host":
+            inventory = (
+                dict(evidence.distributions) if evidence is not None else {}
+            )
+            invalid = ()
         relevant_rows = {
             name: row
             for name, row in snapshot.distributions.items()
@@ -483,6 +528,10 @@ def evaluate_shared_dependencies(
         }
         for name, row in relevant_rows.items():
             previous = inventory.get(name)
+            if use.origin == "host" and (
+                name in invalid or (previous is None and name not in additions)
+            ):
+                continue
             if previous is not None and (
                 previous["version"] != row["version"]
                 or canonical(previous["metadata_path"])
@@ -492,10 +541,12 @@ def evaluate_shared_dependencies(
                     f"{use.origin} {use.plugin_id}: "
                     f"{name} origin/version differs",
                 )
-            else:
+            elif use.origin != "host" or previous is None:
                 inventory[name] = row
-        check(values, inventory, environment.marker_environment)
-    dirty = any(repair_marker(site).exists() for site in snapshot.sites)
+        check(values, inventory, environment.marker_environment, invalid)
+    dirty = host_dirty or any(
+        repair_marker(site).exists() for site in snapshot.sites
+    )
     code = (
         "DEPENDENCY_REPAIR_REQUIRED"
         if dirty

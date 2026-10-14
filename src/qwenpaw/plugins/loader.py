@@ -712,6 +712,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         )
         from .execution import PluginLaunchSpec, PluginProcess
         from .execution.bootstrap import _hash_code_root
+        from .execution.environment import shared_dependency_paths
 
         python = _desktop_python() if _is_frozen() else sys.executable
         if (
@@ -722,7 +723,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 "Shared runtime requires explicit administrator repair",
             )
         root = requirements_file.parent.resolve()
-        paths = ()
+        paths = () if _is_frozen() else shared_dependency_paths()
         await self._stop_preparation(plugin_id)
         process, lease = self._own_preparation(
             plugin_id,
@@ -780,12 +781,16 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 usage.observe(lease, snapshot)
             from .dependency_usage import current_admission_token
 
-            targets = list(paths) or [
-                Path(site)
-                for site in snapshot.dependency_sites or ()
-                if Path(site).name in {"site-packages", "dist-packages"}
-                and Path(site).is_relative_to(snapshot.prefix)
-            ]
+            targets = (
+                list(paths)
+                if _is_frozen()
+                else [
+                    Path(site)
+                    for site in snapshot.dependency_sites or ()
+                    if Path(site).name in {"site-packages", "dist-packages"}
+                    and Path(site).is_relative_to(snapshot.prefix)
+                ]
+            )
             target = targets[0] if len(targets) == 1 else None
             try:
                 await prepare_shared_dependencies(

@@ -20,7 +20,6 @@ import pytest
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
-
 ROOT = Path(__file__).resolve().parents[3]
 OFFICIAL_IDS = ("dingtalk", "feishu")
 EXCLUSIVE_SDKS = {
@@ -62,12 +61,24 @@ def _copy_release_inputs(source: Path, destination: Path) -> None:
     )
 
 
-def _build(stage: Path, output: Path, method: str) -> Path:
+def _build(
+    stage: Path,
+    output: Path,
+    method: str,
+    config_settings: dict | None = None,
+    metadata_directory: Path | None = None,
+) -> Path:
     output.mkdir(parents=True)
+    metadata_arg = (
+        f", metadata_directory={str(metadata_directory)!r}"
+        if metadata_directory is not None
+        else ""
+    )
     script = (
         "import os, setuptools.build_meta as backend; "
         f"os.chdir({str(stage)!r}); "
-        f"print('C7_ARTIFACT=' + backend.{method}({str(output)!r}))"
+        f"print('C7_ARTIFACT=' + backend.{method}("
+        f"{str(output)!r}, config_settings={config_settings!r}{metadata_arg}))"
     )
     result = subprocess.run(
         [sys.executable, "-I", "-c", script],
@@ -88,7 +99,10 @@ def _build(stage: Path, output: Path, method: str) -> Path:
     ]
     assert len(names) == 1, result.stdout[-4000:]
     artifact = output / names[0]
-    assert artifact.is_file()
+    if method.startswith("prepare_metadata"):
+        assert artifact.is_dir()
+    else:
+        assert artifact.is_file()
     return artifact
 
 
@@ -166,6 +180,185 @@ def _assert_official_bundle(wheel: Path, source: Path) -> dict:
 def test_c7_wheel_has_closed_private_official_bundle(c7_artifacts) -> None:
     stage, wheel, _ = c7_artifacts
     _assert_official_bundle(wheel, stage)
+
+
+def _assert_editable_official_sources(
+    stage: Path,
+    wheel: Path,
+    tmp_path,
+) -> None:
+    """Extract canonical sources from the isolated installed artifact."""
+    installed = tmp_path / "site"
+    with zipfile.ZipFile(wheel) as archive:
+        archive.extractall(installed)
+
+    script = r"""
+import hashlib, importlib.abc, io, json, pathlib, site, sys, zipfile
+from importlib import resources
+
+stage = pathlib.Path(sys.argv[1]).resolve()
+installed = pathlib.Path(sys.argv[2]).resolve()
+# -S avoids the current environment's editable .pth finder. Process only
+# the wheel under test, then expose dependency directories without their .pths.
+site.addsitedir(str(installed))
+for dependency_dir in json.loads(sys.argv[3]):
+    if dependency_dir not in sys.path:
+        sys.path.append(dependency_dir)
+
+
+class NoPlatformImports(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.startswith(
+            (
+                "lark_oapi",
+                "dingtalk_stream",
+                "alibabacloud_dingtalk",
+                "feishu",
+                "dingtalk",
+                "qwenpaw.app.channels.feishu",
+                "qwenpaw.app.channels.dingtalk",
+            )
+        ):
+            raise AssertionError(
+                "Platform import during extraction: " + fullname
+            )
+
+
+sys.meta_path.insert(0, NoPlatformImports())
+import qwenpaw
+from qwenpaw.__version__ import __version__
+from qwenpaw.plugins.official_channels import bundled_channel_source
+
+assert pathlib.Path(qwenpaw.__file__).resolve().is_relative_to(stage), (
+    qwenpaw.__file__
+)
+root = resources.files("qwenpaw").joinpath("official_channels")
+assert root.joinpath("index.json").is_file(), (
+    "Editable install is missing official_channels/index.json: " + str(root)
+)
+index = json.loads(root.joinpath("index.json").read_bytes())
+assert set(index) == {"schema_version", "host_version", "plugins"}
+assert index["schema_version"] == 1
+assert index["host_version"] == __version__
+assert [row["plugin_id"] for row in index["plugins"]] == ["dingtalk", "feishu"]
+for row in index["plugins"]:
+    channel = row["plugin_id"]
+    original = stage / "plugins/channel" / channel
+    manifest = json.loads((original / "plugin.json").read_bytes())
+    assert set(row) == {
+        "plugin_id", "version", "filename", "sha256", "descriptor_sha256",
+        "requirements_sha256", "qwenpaw_version",
+    }
+    assert row["version"] == manifest["version"]
+    assert row["qwenpaw_version"] == manifest["qwenpaw_version"]
+    assert row["filename"] == f"{channel}-{manifest['version']}.zip"
+    payload = root.joinpath(row["filename"]).read_bytes()
+    assert hashlib.sha256(payload).hexdigest() == row["sha256"]
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        assert archive.testzip() is None
+        assert archive.read(f"{channel}/plugin.json") == (
+            original / "plugin.json"
+        ).read_bytes()
+        for relative, key in (
+            ("channel.json", "descriptor_sha256"),
+            ("requirements.txt", "requirements_sha256"),
+        ):
+            assert hashlib.sha256(
+                archive.read(f"{channel}/{relative}")
+            ).hexdigest() == row[key]
+    with bundled_channel_source(channel) as source:
+        expected = {
+            path.relative_to(original).as_posix(): path.read_bytes()
+            for path in original.rglob("*") if path.is_file()
+        }
+        extracted = {
+            path.relative_to(source).as_posix(): path.read_bytes()
+            for path in source.rglob("*") if path.is_file()
+        }
+        assert extracted == expected
+        extracted_manifest = json.loads((source / "plugin.json").read_bytes())
+        assert extracted_manifest["publish"] is False
+    assert not source.exists()
+print("C7_EDITABLE_SOURCES_OK")
+"""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("QWENPAW_")
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            script,
+            str(stage),
+            str(installed),
+            json.dumps(
+                [
+                    path
+                    for path in sys.path
+                    if Path(path).name in {"site-packages", "dist-packages"}
+                ],
+            ),
+        ],
+        cwd=tmp_path,
+        env={
+            **env,
+            "QWENPAW_WORKING_DIR": str(tmp_path / "host"),
+            "QWENPAW_SECRET_DIR": str(tmp_path / "secrets"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "C7_EDITABLE_SOURCES_OK"
+
+
+@pytest.mark.parametrize("mode", [None, "strict"], ids=["default", "strict"])
+@pytest.mark.parametrize(
+    "versions",
+    [("0.1.0.dev0",), ("0.1.0.dev0", "0.1.1.dev0")],
+    ids=["install", "reinstall"],
+)
+def test_c7_editable_install_exposes_official_channel_sources(
+    tmp_path,
+    mode,
+    versions,
+) -> None:
+    """Editable resources survive metadata preparation and version updates."""
+    stage = tmp_path / "stage"
+    _copy_release_inputs(ROOT, stage)
+    source_bundle = stage / "src/qwenpaw/official_channels"
+    shutil.rmtree(source_bundle, ignore_errors=True)
+    assert not source_bundle.exists()
+    config = {"editable_mode": mode} if mode else None
+    manifest_path = stage / "plugins/channel/feishu/plugin.json"
+    for attempt, version in enumerate(versions):
+        manifest = json.loads(manifest_path.read_text())
+        manifest["version"] = version
+        manifest_path.write_text(json.dumps(manifest) + "\n")
+        metadata = _build(
+            stage,
+            tmp_path / f"metadata-{attempt}",
+            "prepare_metadata_for_build_editable",
+            config,
+        )
+        wheel = _build(
+            stage,
+            tmp_path / f"editable-wheel-{attempt}",
+            "build_editable",
+            config,
+            metadata_directory=metadata.parent,
+        )
+        _assert_editable_official_sources(
+            stage,
+            wheel,
+            tmp_path / f"runtime-{attempt}",
+        )
 
 
 def test_c7_metadata_moves_exclusive_sdks_to_channels(

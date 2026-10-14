@@ -127,6 +127,20 @@ class Audit:
         )
 
 
+def materialize_host_metadata(snapshot):
+    """Give imported host evidence an honest metadata-only refresh source."""
+    for name, row in snapshot.distributions.items():
+        info = Path(row["metadata_path"])
+        info.mkdir(parents=True, exist_ok=True)
+        (info / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: {row['version']}\n"
+            + "".join(
+                f"Requires-Dist: {value}\n" for value in row["requires_dist"]
+            ),
+        )
+        (info / "top_level.txt").write_text("\n".join(row["top_level"]) + "\n")
+
+
 def inputs(tmp_path, requirements="", snapshot=None):
     site = tmp_path / "site"
     site.mkdir(exist_ok=True)
@@ -389,6 +403,7 @@ async def test_withdrawn_host_protects_only_imported_requirements(
     site = tmp_path / "site"
     usage = DependencyUsageRegistry(RuntimeOwners())
     imported = evidence(site, versions={"f32-imported": "1.0"})
+    materialize_host_metadata(imported)
     token = declare(
         usage,
         "host",
@@ -1232,8 +1247,14 @@ async def test_host_closure_keeps_distinct_requested_extra_paths(
     """A base visit must not suppress a later extra-conditioned constraint."""
     prepare_api()
     site = tmp_path / "site"
+    host_site = tmp_path / "host-site"
     versions = {"f32-left": "1.0", "f32-right": "1.0", "f32-bridge": "1.0"}
-    observed = evidence(site, versions=versions, python_version="3.10")
+    observed = evidence(
+        host_site,
+        versions=versions,
+        python_version="3.10",
+        package_sites=(host_site, site),
+    )
     distributions = {
         name: dict(row) for name, row in observed.distributions.items()
     }
@@ -1246,6 +1267,7 @@ async def test_host_closure_keeps_distinct_requested_extra_paths(
     # Red is compatible here, Blue's differing path is the decisive branch;
     # reverse declaration iteration must not mask it through a visited name.
     observed = replace(observed, distributions=distributions)
+    materialize_host_metadata(observed)
     usage = DependencyUsageRegistry(RuntimeOwners())
     token = declare(usage, "imported-host", observed, ())
     usage.observe_host(token, observed)

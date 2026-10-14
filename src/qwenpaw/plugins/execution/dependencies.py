@@ -230,22 +230,9 @@ def dependency_sites(sites, *, explicit=(), distributions=()):
     )
 
 
-# Inventory and relevant-closure rejection form one child-only audit.
-# pylint: disable=too-many-branches,too-many-statements,protected-access
-def observe_dependencies(packet: Mapping[str, Any]) -> DependencySnapshot:
-    """Inspect this interpreter's paths before candidate imports execute."""
-    excluded = {Path(packet["code_root"]).resolve()}
-    sites = tuple(
-        dict.fromkeys(
-            str(Path(item).resolve())
-            for item in packet["_audit_sites"]
-            if item
-            and Path(item).is_dir()
-            and not any(
-                Path(item).resolve().is_relative_to(root) for root in excluded
-            )
-        ),
-    )
+def _installed_metadata(sites):
+    """Read metadata headers and invalid names without importing code."""
+    # pylint: disable=protected-access
     if any(repair_marker(site).exists() for site in sites):
         raise dependency_error("DEPENDENCY_REPAIR_REQUIRED")
     rows, invalid, observed = {}, {}, {}
@@ -253,7 +240,7 @@ def observe_dependencies(packet: Mapping[str, Any]) -> DependencySnapshot:
         # importlib.metadata exposes the on-disk metadata origin here.
         origin = Path(
             distribution._path,
-        ).resolve()  # pylint: disable=protected-access
+        ).resolve()
         installed_metadata = distribution.metadata
         name = installed_metadata.get("Name")
         version = installed_metadata.get("Version")
@@ -292,6 +279,26 @@ def observe_dependencies(packet: Mapping[str, Any]) -> DependencySnapshot:
             "top_level": tuple(sorted(tops)),
         }
         observed[key] = distribution
+    return rows, invalid, observed
+
+
+# Inventory and relevant-closure rejection form one child-only audit.
+# pylint: disable=too-many-branches,too-many-statements,protected-access
+def observe_dependencies(packet: Mapping[str, Any]) -> DependencySnapshot:
+    """Inspect this interpreter's paths before candidate imports execute."""
+    excluded = {Path(packet["code_root"]).resolve()}
+    sites = tuple(
+        dict.fromkeys(
+            str(Path(item).resolve())
+            for item in packet["_audit_sites"]
+            if item
+            and Path(item).is_dir()
+            and not any(
+                Path(item).resolve().is_relative_to(root) for root in excluded
+            )
+        ),
+    )
+    rows, invalid, observed = _installed_metadata(sites)
     from packaging.requirements import Requirement
     from .runtime import _requirements
 

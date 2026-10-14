@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import sysconfig
 import types
 from typing import Any
 
@@ -49,11 +50,47 @@ def _configure(
         *(item for item in sys.path if item),
     ]
     sys.dont_write_bytecode = True
-    sys.path[:] = [str(support)] + [
+    inherited = [
         item
         for item in sys.path
         if item and Path(item).resolve() not in {root, support}
     ]
+    stdlib = {
+        Path(value).resolve()
+        for value in (
+            sysconfig.get_path("stdlib"),
+            sysconfig.get_path("platstdlib"),
+        )
+        if value
+    }
+    zip_name = f"python{sys.version_info.major}{sys.version_info.minor}.zip"
+    standard_paths = {
+        *stdlib,
+        *((path.parent / zip_name).resolve() for path in stdlib),
+        (Path(sys.base_prefix) / zip_name).resolve(),
+    }
+    extension_path = sysconfig.get_config_var("DESTSHARED")
+    if extension_path:
+        standard_paths.add(Path(extension_path).resolve())
+    if sys.platform == "win32":
+        standard_paths.add((Path(sys.base_exec_prefix) / "DLLs").resolve())
+    # Explicit sites preserve their order after trusted bootstrap/stdlib.
+    dependencies = [
+        str(boot._absolute_existing_directory(value, "dependency_path"))
+        for value in packet["dependency_paths"]
+    ]
+    sys.path[:] = list(
+        dict.fromkeys(
+            [str(support)]
+            + [
+                item
+                for item in inherited
+                if Path(item).resolve() in standard_paths
+            ]
+            + dependencies
+            + inherited,
+        ),
+    )
     package = types.ModuleType("qwenpaw")
     package.__package__ = "qwenpaw"
     package.__path__ = [str(support / "qwenpaw")]
@@ -62,10 +99,7 @@ def _configure(
     plugins.__package__ = "qwenpaw.plugins"
     plugins.__path__ = [str(support / "qwenpaw/plugins")]
     sys.modules["qwenpaw.plugins"] = plugins
-    for value in reversed(packet["dependency_paths"]):
-        path = boot._absolute_existing_directory(value, "dependency_path")
-        # Explicit directories do not execute .pth files.
-        sys.path.insert(1, str(path))
+    # Direct path assignment never executes additional .pth files.
     boot._clean_environment(())
 
 
@@ -199,7 +233,9 @@ async def _prepare_component(boot, packet, runtime, identity, peer):
             )
         return None
     relevant = require_dependencies(snapshot, packet)
-    packet["dependency_versions"] = snapshot.versions
+    packet["dependency_versions"] = {
+        name: snapshot.distributions[name]["version"] for name in relevant
+    }
     entrypoint, source, hello = runtime.verify(boot, packet, identity)
     accepted = await peer.call(
         runtime.hello_method,

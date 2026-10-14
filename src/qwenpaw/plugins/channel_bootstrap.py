@@ -172,9 +172,11 @@ def resolve_default_channel_runtime():
     if getattr(sys, "frozen", False):
         executable, support, sites, identity, _preset = runtime_manifest()
     else:
+        from .execution.environment import shared_dependency_paths
+
         executable = Path(sys.executable).absolute()
         support = Path(__file__).resolve().parents[2]
-        sites = ()
+        sites = shared_dependency_paths()
         identity = {
             "version": list(sys.version_info[:2]),
             "system": platform.system(),
