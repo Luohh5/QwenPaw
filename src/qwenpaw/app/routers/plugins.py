@@ -459,6 +459,7 @@ async def install_plugin(
         "description": record.manifest.description,
         "author": record.manifest.author,
         "loaded": True,
+        "diagnostics": list(record.diagnostics or []),
         "message": (
             f"Plugin '{record.manifest.name}' installed successfully."
         ),
@@ -533,6 +534,7 @@ async def upload_plugin(
         "description": record.manifest.description,
         "author": record.manifest.author,
         "loaded": True,
+        "diagnostics": list(record.diagnostics or []),
         "message": (
             f"Plugin '{record.manifest.name}' installed successfully."
         ),

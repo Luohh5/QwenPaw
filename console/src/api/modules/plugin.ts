@@ -26,6 +26,7 @@ export interface PluginInfo {
   enabled: boolean;
   /** Whether the plugin is currently loaded in memory. */
   loaded: boolean;
+  status?: string;
   /** Primary capability type declared in plugin.json. */
   plugin_type: PluginType;
   /** Frontend JS entry-point path (if any). */
@@ -45,6 +46,7 @@ export interface InstallPluginResult {
 export interface PluginStatus {
   id: string;
   loaded: boolean;
+  status?: string;
   enabled: boolean;
   version?: string;
 }

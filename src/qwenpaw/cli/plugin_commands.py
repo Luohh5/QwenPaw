@@ -76,6 +76,8 @@ def _api_install_plugin(source: str, force: bool = False) -> bool:
         click.echo(
             f"✅ Plugin '{name}' installed and loaded (hot reload).",
         )
+        for diagnostic in body.get("diagnostics", []):
+            click.echo(diagnostic)
         return True
     except httpx.HTTPStatusError as exc:
         try:
@@ -142,6 +144,8 @@ def _api_upload_plugin(zip_path: Path, force: bool = False) -> bool:
         click.echo(
             f"✅ Plugin '{name}' installed and loaded (hot reload).",
         )
+        for diagnostic in result.get("diagnostics", []):
+            click.echo(diagnostic)
         return True
     except httpx.HTTPStatusError as exc:
         try:
@@ -363,6 +367,8 @@ def install(source: str, force: bool):
         f"\n✅ Plugin '{record.manifest.name}' installed successfully!",
     )
     click.echo(f"Location: {record.source_path}")
+    for diagnostic in record.diagnostics:
+        click.echo(diagnostic)
     click.echo("\nNext steps:")
     click.echo("   1. Start QwenPaw to load the plugin")
     click.echo("   2. Configure the plugin in the web UI")

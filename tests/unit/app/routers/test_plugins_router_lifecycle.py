@@ -686,11 +686,17 @@ class TestUninstallPluginSource:
 
 
 class TestInstallPluginRoute:
-    def test_success_payload(self, tmp_path):
+    @pytest.mark.parametrize(
+        "diagnostics",
+        [[], ["Existing files preserved at: /plugins/.plug.bak"]],
+    )
+    def test_success_payload(self, tmp_path, diagnostics):
         loader = _loader_stub([])
+        record = _record("plug")
+        record.diagnostics = diagnostics
         with patch(
             "qwenpaw.app.routers.plugins.install_plugin_source",
-            new=AsyncMock(return_value=_record("plug")),
+            new=AsyncMock(return_value=record),
         ):
             response = _client(loader).post(
                 "/api/plugins/install",
@@ -704,6 +710,7 @@ class TestInstallPluginRoute:
             "description": "desc",
             "author": "auth",
             "loaded": True,
+            "diagnostics": diagnostics,
             "message": "Plugin 'plug display name' installed successfully.",
         }
 
@@ -990,13 +997,19 @@ class TestUninstallPluginRoute:
 
 
 class TestUploadPluginRoute:
-    def test_success_payload(self):
+    @pytest.mark.parametrize(
+        "diagnostics",
+        [[], ["Existing files preserved at: /plugins/.plug.bak"]],
+    )
+    def test_success_payload(self, diagnostics):
         loader = _loader_stub([])
+        record = _record("plug")
+        record.diagnostics = diagnostics
         payload = _zip_bytes({"plugin.json": '{"id": "p"}'})
         with patch(
             "qwenpaw.app.routers.plugins."
             "_load_plugin_with_optional_force_reinstall",
-            new=AsyncMock(return_value=_record("plug")),
+            new=AsyncMock(return_value=record),
         ):
             response = _client(loader).post(
                 "/api/plugins/upload?force=true",
@@ -1005,6 +1018,7 @@ class TestUploadPluginRoute:
         assert response.status_code == 200
         assert response.json()["id"] == "plug"
         assert response.json()["loaded"] is True
+        assert response.json()["diagnostics"] == diagnostics
 
     def test_non_zip_filename_is_400(self):
         loader = _loader_stub([])

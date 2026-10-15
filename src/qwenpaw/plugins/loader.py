@@ -1842,6 +1842,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         from ..utils.io_utils import run_sync_io
         from .provision import commit_prepared_migrations
         from .updates import clear_updating_marker, mark_update_committed
+        from .updates import preserved_update_backup
 
         errors: list[str] = []
         try:
@@ -1856,7 +1857,11 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             return errors
         if swapped is not None:
             try:
-                await run_sync_io(_remove_dir, swapped)
+                if (
+                    await run_sync_io(preserved_update_backup, plugin_id)
+                    is None
+                ):
+                    await run_sync_io(_remove_dir, swapped)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"committed backup cleanup failed: {exc}")
                 return errors
@@ -1894,6 +1899,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         incoming: Path,
         *,
         preserve_marker_on_cancel: bool = False,
+        allow_incomplete_target: bool = False,
     ) -> Path | None:
         """Stage on the same volume, then short-swap. None if in-place."""
         if not self.lifecycle.delegate.owns_commit(plugin_id):
@@ -1904,11 +1910,34 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         from .updates import allocate_update_backup_path, write_updating_marker
 
         await self._recover_or_refuse_prepared_update(plugin_id)
-        backup = allocate_update_backup_path(old_path, plugin_id)
         staging = old_path.with_name(old_path.name + f".{plugin_id}.staging")
-        old_manifest = self._load_manifest(
-            resolved_plugin_manifest_path(old_path),
-        )
+        old_identity = None
+        try:
+            if (old_path / "plugin.json").is_symlink():
+                raise RuntimeError("refusing to replace a linked manifest")
+            old_manifest = self._load_manifest(
+                resolved_plugin_manifest_path(old_path),
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            if not allow_incomplete_target:
+                raise
+            instance = self.lifecycle.get_instance(plugin_id)
+            if (
+                old_path.is_symlink()
+                or not old_path.is_dir()
+                or (instance is not None and instance.has_runtime_ledger())
+            ):
+                raise RuntimeError(
+                    "incomplete plugin target is not quiescent",
+                ) from exc
+            identity = old_path.lstat()
+            old_identity = (identity.st_dev, identity.st_ino)
+            old_manifest = None
+        if old_manifest is not None and old_manifest.id != plugin_id:
+            raise ValueError("existing plugin manifest has a different id")
+        backup = allocate_update_backup_path(old_path, plugin_id)
+        if old_identity is not None:
+            backup = backup.with_name("." + backup.name)
 
         def _mark_phase(phase: str) -> None:
             write_updating_marker(
@@ -1917,7 +1946,9 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 target_path=old_path,
                 staging_path=staging,
                 phase=phase,
-                old_version=old_manifest.version,
+                old_version=old_manifest.version if old_manifest else None,
+                preserve_backup=old_identity is not None,
+                old_identity=old_identity,
             )
 
         def _swap() -> None:
@@ -1989,7 +2020,11 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
     ) -> None:
         """Put the previous directory back after a failed short-swap."""
         from ..utils.io_utils import run_sync_io
-        from .updates import clear_updating_marker, mark_update_restored
+        from .updates import (
+            clear_updating_marker,
+            mark_update_restored,
+            preserved_update_backup,
+        )
 
         def _restore() -> None:
             if staging.exists():
@@ -2001,7 +2036,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                         purpose="remove partial swap target",
                     )
                 shutil.move(str(backup), str(old_path))
-            if not clear_marker_if_restored:
+            if (
+                not clear_marker_if_restored
+                or preserved_update_backup(plugin_id) is not None
+            ):
                 mark_update_restored(plugin_id)
 
         try:
@@ -2403,7 +2441,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 "Uninstall it first before reinstalling.",
             )
 
-        _, target_dir = await asyncio.to_thread(
+        install_base, target_dir = await asyncio.to_thread(
             self._install_paths,
             plugin_id,
             install_dir,
@@ -2488,6 +2526,9 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     plugin_id,
                     target_dir,
                     source_path,
+                    allow_incomplete_target=not (
+                        install_base / plugin_id
+                    ).is_symlink(),
                 )
                 if pawport_owner is not None:
                     await run_sync_io(_write_pawport)
@@ -2501,7 +2542,15 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             target_dir.name + f".{plugin_id}.staging",
         )
         files_committed = False
+        retained = None
         try:
+            if swapped is not None:
+                from .updates import preserved_update_backup
+
+                retained = await asyncio.to_thread(
+                    preserved_update_backup,
+                    plugin_id,
+                )
             # Re-read manifest from the installed location so that
             # source_path in the record points to the correct directory
             _installed_path, installed_manifest = await asyncio.to_thread(
@@ -2531,6 +2580,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 )
                 raise RuntimeError(reason)
             if swapped is not None:
+                if retained is not None:
+                    message = f"Existing files preserved at: {retained}"
+                    record.diagnostics.append(message)
+                    logger.warning("%s", message)
                 files_committed = True
                 cleanup_errors = await self._finish_committed_reload(
                     plugin_id,
@@ -2574,6 +2627,22 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                         staging_hint,
                         clear_marker_if_restored=True,
                     )
+                    if (
+                        retained is not None
+                        and current is not None
+                        and current.status == "failed"
+                        and self._loaded_plugins.get(plugin_id) is current
+                    ):
+                        if (
+                            instance is not None
+                            and instance.state is PluginState.FAILED
+                            and not instance.activated
+                            and not instance.has_runtime_ledger()
+                            and self.lifecycle.get_instance(plugin_id)
+                            is instance
+                        ):
+                            self._loaded_plugins.pop(plugin_id)
+                            self.lifecycle.drop_instance(plugin_id)
                 except Exception:  # noqa: BLE001
                     logger.exception(
                         "Failed to restore plugin '%s' after "
