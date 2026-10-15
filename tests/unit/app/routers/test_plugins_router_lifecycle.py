@@ -960,6 +960,17 @@ class TestUninstallPluginRoute:
         assert detail["needs_restart"] is True
         assert detail["errors"] == ["memory backend is in use"]
 
+    def test_busy_market_provider_returns_409(self):
+        from qwenpaw.market.registry import MarketProviderBusyError
+
+        loader = _loader_stub([], record=_record())
+        loader.lifecycle.unload.side_effect = MarketProviderBusyError(
+            "Hub plugin 'plug' is in use; please retry later",
+        )
+        response = _client(loader).delete("/api/plugins/plug")
+        assert response.status_code == 409
+        assert "please retry later" in response.json()["detail"]
+
     def test_success_payload(self):
         loader = _loader_stub([])
         with patch(

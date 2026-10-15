@@ -756,6 +756,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
     ) -> None:
         """Bind the current instance and run ``plugin_def.register``."""
         from .settings import runtime_config
+        from qwenpaw.market import market_registry
 
         api = PluginApi(plugin_id, runtime_config(config), manifest_dict)
         api.set_registry(self.registry)
@@ -772,6 +773,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             raise AttributeError(
                 "Plugin must implement 'register(api)' method",
             )
+        market_registry.begin_load(plugin_id)
         try:
             result = plugin_def.register(api)
             await await_with_budget(
@@ -784,6 +786,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             instance.mark_failed(str(exc) or type(exc).__name__)
             await self._dispose_then_undo_txn_disk(plugin_id, instance)
             raise
+        market_registry.finish_load(plugin_id)
 
     async def _dispose_then_undo_txn_disk(
         self,
@@ -1002,6 +1005,11 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         instance.source_path = source_path
         self._add_recovery_diagnostics(plugin_id)
         from .settings import runtime_config
+
+        if config is None:
+            from ..config import load_config
+
+            config = load_config().plugins.get(plugin_id, {})
 
         instance.config = runtime_config(config)
 
@@ -2359,7 +2367,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     )
                 return record
             record = None
-            from ..config.utils import load_config
+            from ..config import load_config
             from .settings import is_plugin_enabled, runtime_config
 
             saved = await asyncio.to_thread(load_config)
@@ -2794,7 +2802,9 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
     ) -> UnloadReport:
         """Unload a plugin and release a failed unload reservation."""
         from qwenpaw.memory import memory_registry
+        from qwenpaw.market import market_registry
 
+        market_registry.begin_unload(plugin_id)
         try:
             return await self._unload_plugin_reserved(
                 plugin_id,
@@ -2806,6 +2816,8 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         except BaseException:
             memory_registry.cancel_owner_unload(plugin_id)
             raise
+        finally:
+            market_registry.cancel_unload(plugin_id)
 
     async def _unload_plugin_reserved(
         self,
@@ -3478,6 +3490,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
     ) -> None:
         """Bind a fresh API and run ``register()``; do not dispose on error."""
         from .settings import runtime_config
+        from qwenpaw.market import market_registry
 
         api = PluginApi(plugin_id, runtime_config(config), manifest_dict)
         api.set_registry(self.registry)
@@ -3494,6 +3507,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             raise AttributeError(
                 "Plugin must implement 'register(api)' method",
             )
+        market_registry.begin_load(plugin_id)
         try:
             result = plugin_def.register(api)
             await await_with_budget(
@@ -3510,6 +3524,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             )
             setattr(exc, "plugin_cleanup_report", cleanup_report)
             raise
+        market_registry.finish_load(plugin_id)
 
     async def activate_plugin_unlocked(
         self,

@@ -353,15 +353,26 @@ export default function Sidebar({
   }, [collapsed]);
 
   useEffect(() => {
+    let inFlight = false;
     const loadUnreadState = async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
-        const [inboxRes, pushRes] = await Promise.all([
+        const [inboxResult, pushResult] = await Promise.allSettled([
           api.getInboxEvents({
             unread_only: true,
             limit: 1,
           }),
           api.getPushMessages(),
         ]);
+        if (
+          inboxResult.status === "rejected" ||
+          pushResult.status === "rejected"
+        ) {
+          return;
+        }
+        const inboxRes = inboxResult.value;
+        const pushRes = pushResult.value;
         const hasUnreadEvents = (inboxRes?.events?.length || 0) > 0;
         const approvals = pushRes?.pending_approvals || [];
         const currentIds = new Set(
@@ -380,6 +391,8 @@ export default function Sidebar({
         setHasPendingApprovals(currentIds.size > 0);
       } catch {
         // Keep previous state when polling fails.
+      } finally {
+        inFlight = false;
       }
     };
     void loadUnreadState();
@@ -628,7 +641,11 @@ export default function Sidebar({
             if (item.href) {
               openExternalLink(item.href);
             } else {
-              navigate(item.path);
+              navigate(
+                item.key === "core.inbox" && hasPendingApprovals
+                  ? `${item.path}?tab=approvals`
+                  : item.path,
+              );
             }
           }}
           onMouseEnter={
@@ -663,7 +680,11 @@ export default function Sidebar({
             if (entry.href) {
               openExternalLink(entry.href);
             } else {
-              navigate(entry.path);
+              navigate(
+                isInbox && hasPendingApprovals
+                  ? `${entry.path}?tab=approvals`
+                  : entry.path,
+              );
             }
           }}
         >

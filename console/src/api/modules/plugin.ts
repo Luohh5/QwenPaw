@@ -1,3 +1,4 @@
+import { notifyPluginChange } from "../../utils/pluginChangeEvents";
 import { getApiUrl } from "../config";
 import { buildAuthHeaders } from "../authHeaders";
 import { responseErrorMessage } from "../error";
@@ -11,6 +12,7 @@ export type PluginType =
   | "frontend"
   | "channel"
   | "memory"
+  | "hub"
   | "app"
   | "general";
 
@@ -140,7 +142,9 @@ export async function installPlugin(
     );
   }
 
-  return response.json();
+  const result = await response.json();
+  notifyPluginChange();
+  return result;
 }
 
 /**
@@ -165,7 +169,9 @@ export async function uploadPlugin(file: File): Promise<InstallPluginResult> {
     );
   }
 
-  return response.json();
+  const result = await response.json();
+  notifyPluginChange();
+  return result;
 }
 
 /**
@@ -185,6 +191,7 @@ export async function uninstallPlugin(pluginId: string): Promise<void> {
       ),
     );
   }
+  notifyPluginChange();
 }
 
 /**
