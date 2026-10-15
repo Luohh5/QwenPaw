@@ -98,10 +98,12 @@ class TestSlashCommandLifecycle:
         )
         plugin_api.register_slash_command("owned", MagicMock())
         await fresh_registry.projector.project(
-            "slash_command", "owned", "test-plugin"
+            "slash_command",
+            "owned",
+            "test-plugin",
         )
         spec, _args = workspace.plugins.slash_command_registry.resolve(
-            "/owned"
+            "/owned",
         )
         assert spec.owner_plugin_id == "test-plugin"
 
@@ -125,11 +127,15 @@ class TestSlashCommandLifecycle:
         with caplog.at_level(logging.ERROR, logger="qwenpaw.plugins.api"):
             with pytest.raises(ProjectionError):
                 await fresh_registry.projector.project(
-                    "slash_command", "reserved", "test-plugin"
+                    "slash_command",
+                    "reserved",
+                    "test-plugin",
                 )
         assert "Projection slash_command failed" in caplog.text
         await fresh_registry.projector.revoke(
-            "slash_command", "reserved", "test-plugin"
+            "slash_command",
+            "reserved",
+            "test-plugin",
         )
         assert (
             workspace.plugins.slash_command_registry.resolve("/reserved")[0]
@@ -155,10 +161,14 @@ class TestSlashCommandLifecycle:
         plugin_api.register_slash_command("reserved", MagicMock())
         with pytest.raises(ProjectionError):
             await fresh_registry.projector.project(
-                "slash_command", "reserved", "test-plugin"
+                "slash_command",
+                "reserved",
+                "test-plugin",
             )
         await fresh_registry.projector.revoke(
-            "slash_command", "reserved", "test-plugin"
+            "slash_command",
+            "reserved",
+            "test-plugin",
         )
         assert (
             first.plugins.slash_command_registry.resolve("/reserved") is None
@@ -194,16 +204,20 @@ class TestSlashCommandLifecycle:
         commands.register(builtin)
         commands.register(untracked)
         fresh_registry.set_workspace_manager(
-            SimpleNamespace(agents={workspace.agent_id: workspace})
+            SimpleNamespace(agents={workspace.agent_id: workspace}),
         )
         loader = PluginLoader(plugin_dirs=[])
         instance = loader.lifecycle.ensure_instance("test-plugin")
         plugin_api.bind_instance(instance)
         plugin_api.register_slash_command(
-            "reloadable", MagicMock(), aliases=("stale",)
+            "reloadable",
+            MagicMock(),
+            aliases=("stale",),
         )
         await fresh_registry.projector.project(
-            "slash_command", "reloadable", "test-plugin"
+            "slash_command",
+            "reloadable",
+            "test-plugin",
         )
         loader._loaded_plugins["test-plugin"] = PluginRecord(
             manifest=PluginManifest(

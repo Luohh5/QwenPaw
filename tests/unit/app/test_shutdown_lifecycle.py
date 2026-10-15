@@ -78,7 +78,8 @@ async def test_import_worker_and_plugin_hook_finish_before_workspace_stop():
 
 @pytest.mark.asyncio
 async def test_plugin_resource_finishes_before_workspace_stop(
-    monkeypatch, tmp_path
+    monkeypatch,
+    tmp_path,
 ):
     from qwenpaw.plugins.api import PluginApi
     from qwenpaw.plugins.architecture import (
@@ -111,6 +112,8 @@ async def test_plugin_resource_finishes_before_workspace_stop(
     with pytest.warns(DeprecationWarning):
         api.register_shutdown_hook("test", hook)
     instance.record_runtime("connection", close_resource, kind="custody")
+    # Seed a loaded record without importing a real plugin.
+    # pylint: disable-next=protected-access
     loader._loaded_plugins["test"] = PluginRecord(
         manifest=PluginManifest(
             id="test",

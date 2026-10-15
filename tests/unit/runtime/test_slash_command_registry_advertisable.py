@@ -290,6 +290,6 @@ class TestOwnerAwareRegistration:
                     name="search",
                     aliases=aliases,
                     handler=_noop_handler,
-                )
+                ),
             )
         assert registry.names() == []
