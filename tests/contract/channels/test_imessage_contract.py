@@ -1,47 +1,51 @@
 # -*- coding: utf-8 -*-
+"""Isolated official iMessage tests after moving platform code out of Core.
+
+Original 37 direct / 19 inherited oracles are retained in the scoped suites;
+see imessage-closeout-oracle-map.json in the pluginization evidence directory.
+No legacy Channel compatibility class or global SDK mocks are used.
 """
-iMessage Channel Contract Test
+import os
+from pathlib import Path
+import subprocess
+import sys
 
-Ensures IMessageChannel satisfies all BaseChannel contracts.
-When BaseChannel changes, this test validates IMessageChannel still complies.
-"""
-
-from __future__ import annotations
-
-from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock
-
-from qwenpaw.app.channels.renderer import ChannelDisplayConfig
-
-from tests.contract.channels import ChannelContractTest
-
-if TYPE_CHECKING:
-    from qwenpaw.app.channels.base import BaseChannel
+import pytest
 
 
-class TestIMessageChannelContract(ChannelContractTest):
-    """
-    Contract tests for IMessageChannel.
-
-    This validates that IMessageChannel properly implements all BaseChannel
-    abstract methods and maintains interface compatibility.
-    """
-
-    def create_instance(self) -> "BaseChannel":
-        """Provide an IMessageChannel instance for contract testing."""
-        from qwenpaw.app.channels.imessage.channel import IMessageChannel
-
-        process = AsyncMock()
-
-        # IMessageChannel requires database path and poll interval
-        return IMessageChannel(
-            process=process,
-            enabled=True,
-            db_path="~/Library/Messages/chat.db",
-            poll_sec=5.0,
-            bot_prefix="[Test]",
-            display_config=ChannelDisplayConfig(
-                show_tool_calls=False,
-                show_tool_results=False,
-            ),
-        )
+def test_imessage_inherited_contracts(tmp_path):
+    suite = "imessage_contract_suite.py"
+    fixture = Path(__file__).resolve().parents[2] / "fixtures/channel_plugins"
+    for name in ("home", "work", "secret", "backup", "tmp"):
+        (tmp_path / name).mkdir()
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "pytest",
+            "-p",
+            "pytest_asyncio.plugin",
+            "--confcutdir",
+            str(fixture),
+            str(fixture / suite),
+            "-q",
+            "--tb=short",
+        ],
+        env={
+            **os.environ,
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "HOME": str(tmp_path / "home"),
+            "TMPDIR": str(tmp_path / "tmp"),
+            "TMP": str(tmp_path / "tmp"),
+            "TEMP": str(tmp_path / "tmp"),
+            "QWENPAW_WORKING_DIR": str(tmp_path / "work"),
+            "QWENPAW_SECRET_DIR": str(tmp_path / "secret"),
+            "QWENPAW_BACKUP_DIR": str(tmp_path / "backup"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

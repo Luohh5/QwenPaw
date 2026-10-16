@@ -282,6 +282,37 @@ def _installed_metadata(sites):
     return rows, invalid, observed
 
 
+def _dependency_closure(requirements, rows, environment):
+    """Traverse active metadata edges with their requested extras intact."""
+    from packaging.requirements import Requirement
+
+    pending = [(value, (), False) for value in requirements]
+    visited = set()
+    while pending:
+        value, parent_extras, transitive = pending.pop()
+        identity = (value, parent_extras, transitive)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        requirement = Requirement(value)
+        if requirement.marker and not any(
+            requirement.marker.evaluate({**environment, "extra": extra})
+            for extra in ("", *parent_extras)
+        ):
+            continue
+        if requirement.url or (requirement.extras and not transitive):
+            raise dependency_error("DEPENDENCY_UNSATISFIED")
+        name = str(canonicalize_name(requirement.name))
+        yield name, requirement
+        row = rows.get(name)
+        if row is not None:
+            extras = tuple(sorted(requirement.extras))
+            pending.extend(
+                (dependency, extras, True)
+                for dependency in row["requires_dist"]
+            )
+
+
 # Inventory and relevant-closure rejection form one child-only audit.
 # pylint: disable=too-many-branches,too-many-statements,protected-access
 def observe_dependencies(packet: Mapping[str, Any]) -> DependencySnapshot:
@@ -299,26 +330,18 @@ def observe_dependencies(packet: Mapping[str, Any]) -> DependencySnapshot:
         ),
     )
     rows, invalid, observed = _installed_metadata(sites)
-    from packaging.requirements import Requirement
     from .runtime import _requirements
 
-    pending = list(_requirements(packet.get("requirements_path")))
-    visited = set()
+    scanned = set()
     environment = default_environment()
-    while pending:
-        value = pending.pop()
-        if value in visited:
-            continue
-        visited.add(value)
-        requirement = Requirement(value)
-        if requirement.marker and not requirement.marker.evaluate(
-            environment=environment,
-        ):
-            continue
-        name = str(canonicalize_name(requirement.name))
+    for name, _ in _dependency_closure(
+        _requirements(packet.get("requirements_path")),
+        rows,
+        environment,
+    ):
         if name in invalid:
             raise dependency_error(invalid[name])
-        if name in rows:
+        if name in rows and name not in scanned:
             tops = set(rows[name]["top_level"])
             for path in observed[name].files or ():
                 part = str(path).replace("\\", "/").split("/", 1)[0]
@@ -327,7 +350,7 @@ def observe_dependencies(packet: Mapping[str, Any]) -> DependencySnapshot:
                 ):
                     tops.add(part.split(".", 1)[0])
             rows[name]["top_level"] = tuple(sorted(tops))
-            pending.extend(rows[name]["requires_dist"])
+            scanned.add(name)
     for name in invalid:
         rows.pop(name, None)
     return DependencySnapshot.from_mapping(
@@ -470,34 +493,19 @@ def require_dependencies(
     packet: Mapping[str, Any],
 ) -> set[str]:
     """Require the closure and return its canonical distribution names."""
-    from packaging.requirements import Requirement
     from .runtime import _requirements
 
-    pending = list(_requirements(packet.get("requirements_path")))
-    visited, relevant = set(), set()
-    while pending:
-        value = pending.pop()
-        if value in visited:
-            continue
-        visited.add(value)
-        requirement = Requirement(value)
-        if requirement.marker and not requirement.marker.evaluate(
-            environment=dict(snapshot.marker_environment),
-        ):
-            continue
-        row = snapshot.distributions.get(
-            str(canonicalize_name(requirement.name)),
-        )
-        if (
-            requirement.url
-            or requirement.extras
-            or row is None
-            or not requirement.specifier.contains(
-                Version(row["version"]),
-                prereleases=True,
-            )
+    relevant = set()
+    for name, requirement in _dependency_closure(
+        _requirements(packet.get("requirements_path")),
+        snapshot.distributions,
+        snapshot.marker_environment,
+    ):
+        row = snapshot.distributions.get(name)
+        if row is None or not requirement.specifier.contains(
+            Version(row["version"]),
+            prereleases=True,
         ):
             raise dependency_error("DEPENDENCY_UNSATISFIED")
-        relevant.add(str(canonicalize_name(requirement.name)))
-        pending.extend(row["requires_dist"])
+        relevant.add(name)
     return relevant

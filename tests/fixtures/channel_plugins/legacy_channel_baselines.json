@@ -1,0 +1,59 @@
+{
+  "git_revision": "0cf784381f053370141d45f203a02d9c086deefd",
+  "azure": {
+    "__init__.py": {
+      "source": "plugins/channel/azure_bot/__init__.py",
+      "sha256": "aa8ac318b1963444940f5cd28dcf387036c21ff024403ed736a624b23fe26a67",
+      "snapshot_and_HEAD_identical": true
+    },
+    "auth.py": {
+      "source": "plugins/channel/azure_bot/auth.py",
+      "sha256": "c6e0eb4838d264e3d9212e5d9ba332055b9014d7ba2ee4cdd72c09ed0e04b1eb",
+      "snapshot_and_HEAD_identical": true
+    },
+    "channel.py": {
+      "source": "plugins/channel/azure_bot/channel.py",
+      "sha256": "d2989f864e15add05a91dd72079e3867c01067770a62005a43b78ff7101baf41",
+      "snapshot_and_HEAD_identical": true
+    },
+    "constants.py": {
+      "source": "plugins/channel/azure_bot/constants.py",
+      "sha256": "161657a89802098d4a13c2f3d3a503acf4bc8603132afba0b47f42f10af87aea",
+      "snapshot_and_HEAD_identical": true
+    }
+  },
+  "voice": {
+    "_build_agent_request": {
+      "source": "src/qwenpaw/app/channels/voice/conversation_relay.py",
+      "lines": [
+        164,
+        183
+      ],
+      "ast_sha256": "0802f6062452cee93c51b08b9a50e5281b470f0eed134768c91a649d474517ce"
+    },
+    "_extract_text_from_event": {
+      "source": "src/qwenpaw/app/channels/voice/conversation_relay.py",
+      "lines": [
+        227,
+        245
+      ],
+      "ast_sha256": "a5ae011be15302322310a7b844184b40a01a7e3bf643c50be477e7aca50fbb74"
+    }
+  },
+  "voice_source_sha256": "30070fe2aa9e365efadcd56546759a68fe90a1990218e24b42981cc5ec4a2fe7",
+  "voice_fixture_sha256": "c7dcd20275cc862f75947979cdc8865e52cb30212c08bfd95d7fd1024434461b",
+  "azure_registration_fields": {
+    "source": "plugins/channel/azure_bot/plugin.py",
+    "sha256": "01da0c5c570f17846e5d29563443b93b70f5973b7e849470f5d6281ab7e8a01a",
+    "snapshot_and_HEAD_identical": true,
+    "reason": "Full legacy registration module is not delivered; its actual config_fields literal is preserved for the UI oracle.",
+    "fixture": "tests/fixtures/channel_plugins/legacy_azure_registration_fields.json",
+    "fixture_sha256": "6a40b3ec6749c34e8ba4dd637d67ecb786e427478d49dab7dc4a155b3d7bf713",
+    "field_count": 10,
+    "source_lines": [
+      42,
+      307
+    ],
+    "literal_ast_sha256": "3279b431ccc72245684708a494105182c0ff0c6b94f84009dfa2847eb7a5d731"
+  }
+}

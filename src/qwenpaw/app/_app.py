@@ -190,7 +190,24 @@ async def _stop_workspaces_after_dependents_impl(
     app: FastAPI,
     import_jobs: Any,
 ) -> None:
-    """Quiesce imports and plugin hooks before destroying workspaces."""
+    """Quiesce management, imports and hooks before destroying workspaces."""
+    failures = []
+    for name in (
+        "channel_ingress",
+        "channel_qrcode_sessions",
+        "channel_management",
+    ):
+        service = getattr(app.state, name, None)
+        if service is not None:
+            try:
+                await service.aclose()
+            except (Exception, asyncio.CancelledError) as exc:
+                failures.append(exc)
+    if failures:
+        for error in failures:
+            if not isinstance(error, asyncio.CancelledError):
+                raise error
+        raise failures[0]
     imports_quiesced = await import_jobs.shutdown()
     while not imports_quiesced:
         # A bounded cancellation attempt is not proof that a worker has
@@ -446,6 +463,8 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
     app.state.backup_manager = backup_manager
     app.state.plugin_loader = None
     app.state.plugin_registry = None
+    app.state.channel_management = None
+    app.state.channel_qrcode_sessions = None
 
     async def _get_agent_by_id(agent_id: str = None):
         """Get agent instance by ID, or active agent if not specified."""
@@ -530,6 +549,33 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
             plugin_loader = PluginLoader(
                 plugin_dirs,
                 channel_runtime=channel_runtime,
+            )
+            from .channels.management import ChannelManagementService
+            from .channels.qrcode_sessions import ChannelQRCodeSessions
+
+            app.state.plugin_loader = plugin_loader
+            app.state.plugin_registry = plugin_loader.registry
+            from .channels.ingress import ChannelIngressService
+            from .server_context import server_port
+            from .auth import is_trusted_proxy
+
+            app.state.channel_ingress = ChannelIngressService(
+                plugin_loader.registry,
+                host_port=server_port(app),
+                trusted_proxy=is_trusted_proxy,
+            )
+            plugin_loader.registry.channel_ingress_service = (
+                app.state.channel_ingress
+            )
+            app.state.channel_management = ChannelManagementService(
+                plugin_loader,
+            )
+            app.state.channel_qrcode_sessions = ChannelQRCodeSessions(
+                plugin_loader,
+                app.state.channel_management,
+            )
+            workspace_registry.channel_qrcode_sessions = (
+                app.state.channel_qrcode_sessions
             )
 
             plugin_loader.registry.set_workspace_manager(workspace_registry)

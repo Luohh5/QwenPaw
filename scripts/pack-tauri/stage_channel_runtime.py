@@ -10,8 +10,10 @@ build. Neither editable environments nor PyInstaller archives are copied.
 from __future__ import annotations
 
 import argparse
+import ast
 from email.parser import BytesParser
 import hashlib
+import io
 import json
 from pathlib import Path, PurePosixPath
 import shutil
@@ -20,19 +22,23 @@ import subprocess
 import tempfile
 import zipfile
 
+import packaging
 from packaging.requirements import Requirement
 from packaging.tags import parse_tag
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
-
 _SNAPSHOT = r"""
 import importlib.metadata as metadata
 import json, platform, sys
-if sys.argv[1]:
-    sys.path.insert(0, sys.argv[1])
+# This directory contains only the trusted build tool's packaging source.
+# The extracted wheel site is metadata input, never an import search path.
+sys.path.insert(0, sys.argv[2])
 rows = []
-for dist in metadata.distributions():
+providers = list(metadata.distributions())
+if sys.argv[1]:
+    providers.extend(metadata.distributions(path=[sys.argv[1]]))
+for dist in providers:
     direct = json.loads(dist.read_text("direct_url.json") or "{}")
     rows.append({
         "name": dist.metadata["Name"], "version": dist.version,
@@ -62,14 +68,32 @@ print(json.dumps({
 
 
 def _snapshot(python: Path, site: Path | None = None) -> dict:
-    result = subprocess.run(
-        [str(python), "-I", "-c", _SNAPSHOT, str(site) if site else ""],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        cwd=python.parent,
-    )
+    # Target runtimes may not yet contain packaging. Its pure Python build
+    # helper computes tags and markers under the target ABI, without executing
+    # a wheelhouse provider or substituting this process's platform identity.
+    with tempfile.TemporaryDirectory(
+        prefix="qwenpaw-channel-snapshot-",
+    ) as helper:
+        shutil.copytree(
+            Path(packaging.__file__).parent,
+            Path(helper) / "packaging",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        result = subprocess.run(
+            [
+                str(python),
+                "-I",
+                "-c",
+                _SNAPSHOT,
+                str(site) if site else "",
+                helper,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=python.parent,
+        )
     return json.loads(result.stdout)
 
 
@@ -187,6 +211,145 @@ def _validate_closure(snapshot: dict, host_version: str) -> None:
                 pending.append(child)
 
 
+# Closed identity guards are kept together for auditability.
+# pylint: disable=too-many-boolean-expressions
+def _validate_official_resources(site: Path, host_version: str) -> None:
+    """Authenticate dormant sources without importing staged code or SDKs."""
+    inventory_file = site / "qwenpaw/plugins/official_channel_catalog.py"
+    tree = ast.parse(inventory_file.read_text(encoding="utf-8"))
+    declarations = []
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign) and isinstance(
+            node.target,
+            ast.Name,
+        ):
+            if (
+                node.target.id == "OFFICIAL_CHANNELS"
+                and node.value is not None
+            ):
+                declarations.append(node.value)
+        elif isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "OFFICIAL_CHANNELS"
+            for target in node.targets
+        ):
+            declarations.append(node.value)
+    if len(declarations) != 1:
+        raise ValueError("Bundled official inventory missing or ambiguous")
+    inventory = ast.literal_eval(declarations[0])
+    owners = {row["plugin_id"]: row["channel_key"] for row in inventory}
+    if len(owners) != len(inventory):
+        raise ValueError("Bundled official inventory duplicate owner")
+    directory = site / "qwenpaw/official_channels"
+    content = (directory / "index.json").read_bytes()
+    if len(content) > 64 * 1024:
+        raise ValueError("Bundled official index exceeds limits")
+    data = json.loads(content)
+    if (
+        not isinstance(data, dict)
+        or set(data) != {"schema_version", "host_version", "plugins"}
+        or type(data["schema_version"]) is not int
+        or data["schema_version"] != 1
+        or data["host_version"] != host_version
+        or not isinstance(data["plugins"], list)
+        or any(not isinstance(row, dict) for row in data["plugins"])
+        or [row.get("plugin_id") for row in data["plugins"]] != sorted(owners)
+    ):
+        raise ValueError("Bundled official index identity mismatch")
+    for row in data["plugins"]:
+        if set(row) != {
+            "plugin_id",
+            "version",
+            "filename",
+            "sha256",
+            "descriptor_sha256",
+            "requirements_sha256",
+            "qwenpaw_version",
+        }:
+            raise ValueError("Bundled official index fields mismatch")
+        filename = row["filename"]
+        if (
+            not isinstance(filename, str)
+            or Path(filename).name != filename
+            or any(char in filename for char in "\\:")
+            or not filename.endswith(".zip")
+        ):
+            raise ValueError("Bundled official archive filename invalid")
+        for field in ("sha256", "descriptor_sha256", "requirements_sha256"):
+            value = row[field]
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(char not in "0123456789abcdef" for char in value)
+            ):
+                raise ValueError("Bundled official digest invalid")
+        payload = (directory / filename).read_bytes()
+        if (
+            len(payload) > 64 * 1024 * 1024
+            or hashlib.sha256(payload).hexdigest() != row["sha256"]
+        ):
+            raise ValueError("Bundled channel archive digest mismatch")
+        _validate_official_archive(
+            payload,
+            row,
+            owners[row["plugin_id"]],
+            host_version,
+        )
+
+
+def _validate_official_archive(payload, row, channel_key, host_version):
+    """Validate the closed manifest, descriptor and digest archive identity."""
+    prefix = row["plugin_id"] + "/"
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        names = set()
+        for info in archive.infolist():
+            relative = PurePosixPath(info.filename)
+            if (
+                not info.filename.startswith(prefix)
+                or relative.is_absolute()
+                or ".." in relative.parts
+                or any(char in info.filename for char in "\\:")
+                or stat.S_ISLNK(info.external_attr >> 16)
+                or info.filename in names
+            ):
+                raise ValueError("Bundled official archive root invalid")
+            names.add(info.filename)
+        manifest = json.loads(archive.read(prefix + "plugin.json"))
+        entry = manifest.get("entry", {}).get("descriptor", "")
+        if (
+            manifest.get("id") != row["plugin_id"]
+            or manifest.get("version") != row["version"]
+            or manifest.get("type") != "channel"
+            or manifest.get("qwenpaw_version") != row["qwenpaw_version"]
+            or not isinstance(entry, str)
+            or not entry
+            or any(char in entry for char in "\\:")
+            or any(part in {"", ".", ".."} for part in entry.split("/"))
+        ):
+            raise ValueError("Bundled official manifest identity mismatch")
+        current = Version(host_version)
+        if current.pre is not None:
+            current = Version(current.base_version)
+        minimum = manifest.get("qwenpaw_version", {}).get("min", "0")
+        if current < Version(minimum):
+            raise ValueError("Bundled official host version incompatible")
+        descriptor_bytes = archive.read(prefix + entry)
+        requirements = archive.read(prefix + "requirements.txt")
+        descriptor = json.loads(descriptor_bytes)
+        if (
+            descriptor.get("channel_key") != channel_key
+            or descriptor.get("schema_version") != 2
+            or descriptor.get("process_mode") != "runner_process"
+            or descriptor.get("dependency_mode") != "shared"
+            or descriptor.get("requirements_file") != "requirements.txt"
+            or hashlib.sha256(descriptor_bytes).hexdigest()
+            != row["descriptor_sha256"]
+            or hashlib.sha256(requirements).hexdigest()
+            != row["requirements_sha256"]
+        ):
+            raise ValueError("Bundled official source identity mismatch")
+
+
+# pylint: enable=too-many-boolean-expressions
 def stage_channel_runtime(
     *,
     python: Path,
@@ -234,16 +397,7 @@ def stage_channel_runtime(
         snapshot = _snapshot(python, site)
         _validate_closure(snapshot, version)
         index = site / "qwenpaw/official_channels/index.json"
-        data = json.loads(index.read_text("utf-8"))
-        if data.get("host_version") != version:
-            raise ValueError("Bundled index host version mismatch")
-        for row in data["plugins"]:
-            archive = index.parent / row["filename"]
-            if (
-                archive.parent != index.parent
-                or _digest(archive) != row["sha256"]
-            ):
-                raise ValueError("Bundled channel archive digest mismatch")
+        _validate_official_resources(site, version)
         support = "binaries/channel-runtime/site"
         manifest = {
             "schema_version": 1,

@@ -5,13 +5,23 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from dataclasses import replace
 import hashlib
 import json
 import uuid
 
-from qwenpaw.channel_protocol.errors import RPC_LIFECYCLE_ERROR, RpcError
+from qwenpaw.channel_protocol.errors import (
+    RPC_LIFECYCLE_ERROR,
+    RPC_RESPONSE_OPEN_FAILED,
+    RpcError,
+    RpcTimeoutError,
+)
 from qwenpaw.channel_protocol.models import (
+    send_source_capability,
+    RAW_COMPLETED_TEXT_CAPABILITY,
+    UNKNOWN_ACTOR_CAPABILITY,
+    APPROVAL_RESOLUTION_CAPABILITY,
     EventBatchAck,
     EventBatchParams,
     HostStateParams,
@@ -19,6 +29,7 @@ from qwenpaw.channel_protocol.models import (
     OutboundResult,
     DeliveryState,
     ResponseFinishResult,
+    ResponsePrepareOperation,
 )
 from qwenpaw.channel_protocol.response_policy import ResponsePolicy
 from qwenpaw.channel_protocol.reliability import RetryPolicy, events_for_retry
@@ -36,7 +47,14 @@ _MAX_ROUTES = 128
 class SharedResponseDriver:
     """Journal platform intent before effects and retain unknown receipts."""
 
-    def __init__(self, kind, state_key, delivery_error):
+    def __init__(
+        self,
+        kind,
+        state_key,
+        delivery_error,
+        *,
+        extra_rpc_pressure_reasons=(),
+    ):
         self._kind = kind
         self._state_key = state_key
         self.delivery_error = delivery_error
@@ -49,6 +67,26 @@ class SharedResponseDriver:
         self._connected = False
         self._stopping = False
         self._connection_generation = 0
+        self._rpc_pressure_reasons = frozenset(
+            (
+                "INGRESS_BACKPRESSURE",
+                "RPC_BACKPRESSURE",
+                *extra_rpc_pressure_reasons,
+            ),
+        )
+        self._core_batch_backpressure_total = 0
+        self._core_batch_timeout_total = 0
+        self._core_batch_retry_total = 0
+
+    def diagnostics(self) -> dict[str, int]:
+        """Return a detached snapshot of this Driver's Core admission counts."""
+        return {
+            "core_batch_backpressure_total": (
+                self._core_batch_backpressure_total
+            ),
+            "core_batch_timeout_total": self._core_batch_timeout_total,
+            "core_batch_retry_total": self._core_batch_retry_total,
+        }
 
     async def _restore_responses(self):
         rows = (await self._state("get", self._state_key))["value"] or []
@@ -92,6 +130,7 @@ class SharedResponseDriver:
             ("channel.send", self._send),
             ("channel.reaction", self._reaction),
             ("channel.response.open", self._open),
+            ("channel.response.prepare", self._prepare),
             ("channel.response.finish", self._finish),
             ("channel.response.describe", self._describe),
         ):
@@ -100,6 +139,41 @@ class SharedResponseDriver:
     def response_policy(self, response_handle: str) -> ResponsePolicy:
         """Read route policy; subclasses may narrow optional operations."""
         return ResponsePolicy()
+
+    def response_open_policy(self) -> ResponsePolicy:
+        """Default to strict delivery before any response route exists."""
+        return ResponsePolicy()
+
+    @contextmanager
+    def target_resolution(self):
+        """Classify only a determinate target refusal, before route allocation."""
+        try:
+            yield
+        except self.delivery_error as exc:
+            if exc.side_effect_possible is not False:
+                raise
+            policy = self.response_open_policy()
+            if not isinstance(policy, ResponsePolicy):
+                raise ValueError("SCHEMA_MISMATCH") from exc
+            result = OutboundResult.from_mapping(
+                {
+                    "delivery_id": "unroutable",
+                    "state": "failed",
+                    "reason_code": exc.reason_code,
+                    "retryable": exc.retryable,
+                },
+            )
+            if not result.reason_code:
+                raise ValueError("SCHEMA_MISMATCH") from exc
+            raise RpcError(
+                RPC_RESPONSE_OPEN_FAILED,
+                "response target unavailable",
+                data={
+                    "operation": "channel.response.open",
+                    "result": result.to_mapping(),
+                    "continue_on_delivery_error": policy.continue_on_delivery_error,
+                },
+            ) from exc
 
     async def _describe(self, params, request):
         self._identity(params)
@@ -205,6 +279,16 @@ class SharedResponseDriver:
         return self._locks[handle]
 
     async def _admit_event(self, event, created):
+        if getattr(
+            event,
+            "actor_unknown",
+            False,
+        ) and UNKNOWN_ACTOR_CAPABILITY not in getattr(
+            self._context,
+            "capabilities",
+            (),
+        ):
+            raise RpcError(-32602, "Unknown actor capability was not declared")
         generation = self._connection_generation
         policy = RetryPolicy(initial_delay=0.1, max_delay=1.0, max_attempts=5)
         batch = EventBatchParams(uuid.uuid4().hex, (event,))
@@ -221,7 +305,20 @@ class SharedResponseDriver:
                 )
                 if ack.batch_id not in {None, batch.batch_id}:
                     raise ValueError("HOST_ACK_IDENTITY_MISMATCH")
-            except Exception:
+                self._core_batch_backpressure_total += sum(
+                    row.reason_code == "INGRESS_BACKPRESSURE"
+                    for row in ack.rejected_events
+                )
+            except Exception as exc:
+                if isinstance(exc, RpcTimeoutError):
+                    self._core_batch_timeout_total += 1
+                elif (
+                    isinstance(exc, RpcError)
+                    and isinstance(exc.data, dict)
+                    and isinstance(exc.data.get("reason_code"), str)
+                    and exc.data["reason_code"] in self._rpc_pressure_reasons
+                ):
+                    self._core_batch_backpressure_total += 1
                 uncertain = True
                 ack = None
             self._check_connection(generation)
@@ -229,6 +326,20 @@ class SharedResponseDriver:
                 *ack.accepted_event_ids,
                 *ack.duplicate_event_ids,
             ):
+                if (
+                    created
+                    and not uncertain
+                    and event.event_id in ack.duplicate_event_ids
+                ):
+                    from qwenpaw.channel_protocol.models import ResponseOutcome
+
+                    async with self._lock(event.response_handle):
+                        snapshot = self._routes.begin_finish(
+                            event.response_handle,
+                            ResponseOutcome.CANCELLED,
+                        )
+                        await self._checkpoint()
+                        await self._cleanup(snapshot)
                 return ack, uncertain
             retries, delay = events_for_retry(
                 batch,
@@ -262,11 +373,16 @@ class SharedResponseDriver:
                         )
                         await self._checkpoint()
                         await self._cleanup(snapshot)
-                        self._evict(event.response_handle)
-                        await self._checkpoint()
+                        if self._evictable(
+                            self._routes.snapshot(event.response_handle),
+                        ):
+                            self._evict(event.response_handle)
+                            await self._checkpoint()
                 if not exhausted:
                     return None
                 raise RuntimeError("HOST_ADMISSION_EXHAUSTED")
+            if delay is not None:
+                self._core_batch_retry_total += 1
             await asyncio.sleep(delay)
         raise RuntimeError("HOST_ADMISSION_EXHAUSTED")
 
@@ -280,14 +396,75 @@ class SharedResponseDriver:
 
     async def _send(self, params, request):
         self._identity(params)
+        source_capability = send_source_capability(
+            params.content_source,
+            getattr(self._context, "capabilities", ()),
+        )
+        for field, capability in (
+            (params.content_source, source_capability),
+            (params.approval_resolution, APPROVAL_RESOLUTION_CAPABILITY),
+            (params.raw_completed_text_sources, RAW_COMPLETED_TEXT_CAPABILITY),
+        ):
+            if field is not None and capability not in (
+                getattr(self._context, "capabilities", ())
+            ):
+                raise RpcError(-32602, "Send capability was not declared")
         handle = params.to_handle
         async with self._lock(handle):
             return await self._delivery(params, self._perform_send)
 
+    async def _prepare(self, params, request):
+        self._identity(params)
+        if (
+            set(params)
+            != {
+                *self._context.identity.to_mapping(),
+                "response_handle",
+                "delivery_id",
+            }
+            or not isinstance(params["response_handle"], str)
+            or not params["response_handle"]
+            or not isinstance(params["delivery_id"], str)
+            or params["delivery_id"]
+            != hashlib.sha256(
+                (params["response_handle"] + ":prepare").encode(),
+            ).hexdigest()
+        ):
+            raise ValueError("SCHEMA_MISMATCH")
+        operation = ResponsePrepareOperation(
+            **self._context.identity.to_mapping(),
+            delivery_id=params["delivery_id"],
+            to_handle=params["response_handle"],
+        )
+        async with self._lock(operation.to_handle):
+            return await self._delivery(operation, self._perform_prepare)
+
+    async def _perform_prepare(self, params):
+        raise self.delivery_error(
+            "PREPARE_UNSUPPORTED",
+            side_effect_possible=False,
+        )
+
+    def _legacy_prepare_operation(self, params):
+        """Read exact legacy intent without authorizing arbitrary conflicts."""
+        return None
+
+    @staticmethod
+    def _operation_fingerprint(params):
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    key: value
+                    for key, value in params.to_mapping().items()
+                    if key != "generation"
+                },
+                sort_keys=True,
+            ).encode(),
+        ).hexdigest()
+
     async def _delivery(self, params, perform):
         delivery_id, handle = params.delivery_id, params.to_handle
         try:
-            self._require_connected()
             snapshot = self._routes.snapshot(handle)
             if snapshot is None:
                 return self._result(
@@ -295,16 +472,7 @@ class SharedResponseDriver:
                     "failed",
                     "RESPONSE_HANDLE_UNKNOWN",
                 )
-            fingerprint = hashlib.sha256(
-                json.dumps(
-                    {
-                        key: value
-                        for key, value in params.to_mapping().items()
-                        if key != "generation"
-                    },
-                    sort_keys=True,
-                ).encode(),
-            ).hexdigest()
+            fingerprint = self._operation_fingerprint(params)
             previous = next(
                 (
                     ref
@@ -316,7 +484,17 @@ class SharedResponseDriver:
             )
             if previous:
                 attrs = dict(previous.attributes)
-                if attrs["fingerprint"] != fingerprint:
+                legacy = (
+                    self._legacy_prepare_operation(params)
+                    if isinstance(params, ResponsePrepareOperation)
+                    and attrs.get("operation") == "stream.start"
+                    else None
+                )
+                if attrs["fingerprint"] != fingerprint and (
+                    legacy is None
+                    or attrs["fingerprint"]
+                    != self._operation_fingerprint(legacy)
+                ):
                     return self._result(
                         delivery_id,
                         "failed",
@@ -327,6 +505,7 @@ class SharedResponseDriver:
                     attrs["state"],
                     attrs.get("reason_code") or None,
                 )
+            self._require_connected()
             self._routes.admit_operation(handle)
             intent = {
                 "fingerprint": fingerprint,
@@ -470,12 +649,11 @@ class SharedResponseDriver:
     async def _cleanup(self, snapshot):
         if snapshot.cleanup_state is ResponseCleanupState.COMPLETE:
             return
-        platform = self._require_connected()
         for ref in snapshot.resource_refs:
             resource = dict(ref.attributes)
             if (
                 ref.kind != self._kind + ".delivery"
-                or not resource.get("card_id")
+                or not self._needs_stream_cleanup(ref)
                 or resource.get("final") == "true"
             ):
                 continue
@@ -510,16 +688,7 @@ class SharedResponseDriver:
             )
             await self._checkpoint()
             try:
-                if not await platform.update_stream(
-                    resource,
-                    resource.get("text", ""),
-                    sequence,
-                    final=True,
-                ):
-                    raise self.delivery_error(
-                        "STREAM_CLEANUP_FAILED",
-                        side_effect_possible=False,
-                    )
+                await self._perform_stream_cleanup(ref, resource, sequence)
             except self.delivery_error as exc:
                 if not exc.side_effect_possible:
                     resource["cleanup"] = "failed"
@@ -545,6 +714,12 @@ class SharedResponseDriver:
         candidate = self._compact_receipt(candidate)
         await self._checkpoint(candidate)
         self._routes.commit_cleanup(candidate)
+
+    def _needs_stream_cleanup(self, ref):
+        return False
+
+    async def _perform_stream_cleanup(self, ref, resource, sequence):
+        raise NotImplementedError
 
     async def _before_cleanup_complete(self, snapshot):
         return snapshot

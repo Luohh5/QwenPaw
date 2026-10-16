@@ -71,30 +71,40 @@ async def runtime(tmp_path, monkeypatch):
         key="sample_chat",
         capabilities=None,
         capture_ingress=False,
+        source_factory=sample_source,
+        dependency_paths=(),
+        existing_loader=None,
+        workspace_name=None,
+        python_executable=None,
+        runtime_identity=None,
         **settings,
     ):
-        source = sample_source(
-            tmp_path / "incoming",
-            key,
-            capabilities=capabilities,
-        )
-        loader = PluginLoader(
+        if existing_loader is None:
+            source = source_factory(
+                tmp_path / "incoming",
+                key,
+                capabilities=capabilities,
+            )
+        loader = existing_loader or PluginLoader(
             [tmp_path / "installed"],
             channel_runtime=ChannelRuntimeSettings(
-                python_executable=sys.executable,
+                python_executable=python_executable or sys.executable,
+                runtime_identity=runtime_identity,
                 support_root=ROOT / "src",
                 qwenpaw_version="2.2.2b4",
                 selected_channels=None,
+                dependency_paths=dependency_paths,
                 startup_timeout=5,
                 shutdown_timeout=1,
             ),
         )
-        loader.registry.projector = WorkspaceProjector(
-            live_workspaces=lambda: workspaces,
-        )
+        if existing_loader is None:
+            loader.registry.projector = WorkspaceProjector(
+                live_workspaces=lambda: workspaces,
+            )
         ws = Workspace()
-        ws.agent_id = key
-        ws.workspace_dir = tmp_path / ("workspace-" + key)
+        ws.agent_id = workspace_name or key
+        ws.workspace_dir = tmp_path / ("workspace-" + ws.agent_id)
         ws.workspace_dir.mkdir()
         ws.requests = []
         ws.received = []
@@ -135,8 +145,15 @@ async def runtime(tmp_path, monkeypatch):
         )
         ws.channel_manager.set_workspace(ws)
         await ws.channel_manager.start_all()
-        loaders.append((key, loader))
-        record = await loader.load_plugin_from_path(source)
+        if existing_loader is None:
+            owner = json.loads((source / "plugin.json").read_text())["id"]
+            loaders.append((owner, loader))
+            record = await loader.load_plugin_from_path(source)
+        else:
+            registration = loader.registry.get_channel_registration(key)
+            assert registration is not None
+            record = loader.get_loaded_plugin(registration.plugin_id)
+            await loader.registry.projector.project_workspace(ws)
         assert record.status == "active" and record.enabled, record.diagnostics
         source = record.source_path
         channel = await ws.channel_manager.get_channel(key)
@@ -162,6 +179,7 @@ async def runtime(tmp_path, monkeypatch):
             process=channel.channel_process,
         )
 
+    make.workspaces = workspaces
     yield make
     try:
         for key, loader in reversed(loaders):
@@ -422,7 +440,12 @@ async def test_shared_group_acl_records_actor_and_denies_before_preparation(
             },
         },
     )
-    await emit(rt, metadata={"is_group": False, "feishu_sender_id": "forged"})
+    ack = await emit(
+        rt,
+        shared_admission=True,
+        metadata={"is_group": False, "feishu_sender_id": "forged"},
+    )
+    assert ack["accepted_event_ids"] == []
     effects = await wait_effect(rt, "finish")
     assert rt.ws.requests == []
     pending = rt.channel._get_acl_store().get_all_pending()
@@ -927,7 +950,7 @@ async def test_control_consume_cancellation_finishes_and_preserves_uncertain_att
 async def test_control_consume_acl_records_actor_before_prepare(runtime):
     rt = await runtime(
         capture_ingress=True,
-        access_control_group=True,
+        access_control_group=False,
         route_policies={
             "room-A": {
                 "streaming": False,
@@ -937,6 +960,8 @@ async def test_control_consume_acl_records_actor_before_prepare(runtime):
         },
     )
     payload = await captured_control(rt)
+    # The public admission succeeded before policy changed; consume must recheck.
+    rt.channel.access_control_group = True
     await rt.channel.consume_one(payload)
     evidence = await inspect(rt)
     assert rt.ws.requests == []

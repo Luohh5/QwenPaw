@@ -3,7 +3,9 @@
 """Shared Channel handshake and context adapter for the common worker."""
 
 from __future__ import annotations
+import asyncio
 import importlib.util
+import inspect
 import os
 from pathlib import Path
 import sys
@@ -13,8 +15,9 @@ from typing import Any
 class DriverContext:
     """Preserve the Channel context and platform state wire contract."""
 
-    def __init__(self, peer: Any, identity: Any) -> None:
+    def __init__(self, peer: Any, identity: Any, capabilities=()) -> None:
         self.peer, self.identity = peer, identity
+        self.capabilities = frozenset(capabilities)
 
     async def set_platform_state(self, state: str) -> None:
         if state not in {"connecting", "connected", "disconnected", "failed"}:
@@ -44,13 +47,178 @@ class ChannelRuntime:
     def peer(self, transport):
         from .rpc import RpcPeer
 
-        return RpcPeer(transport)
+        return RpcPeer(transport, params_validator=self._validate_params)
+
+    def _validate_params(self, method, params):
+        from .models import (
+            validate_method_params,
+            send_source_capability,
+            RAW_COMPLETED_TEXT_CAPABILITY,
+            APPROVAL_RESOLUTION_CAPABILITY,
+        )
+        from .errors import ProtocolValidationError
+
+        parsed = validate_method_params(method, params)
+        if method == "channel.send":
+            source_capability = send_source_capability(
+                parsed.content_source,
+                self._capabilities,
+            )
+            for field, capability in (
+                ("content_source", source_capability),
+                ("approval_resolution", APPROVAL_RESOLUTION_CAPABILITY),
+                ("raw_completed_text_sources", RAW_COMPLETED_TEXT_CAPABILITY),
+            ):
+                if field in params and capability not in self._capabilities:
+                    raise ProtocolValidationError(
+                        "Send capability was not declared",
+                        reason_code="CAPABILITY_REQUIRED",
+                    )
+        return parsed
 
     def context(self, peer, identity):
-        return DriverContext(peer, identity)
+        return DriverContext(peer, identity, self._capabilities)
 
     async def state(self, context, state):
         await context.set_platform_state(state)
+
+    def bind_management(self, packet, component_class, peer, identity):
+        """Bind only the fixed static operation, never a Driver instance."""
+        from .errors import ProtocolValidationError
+        from .management import (
+            MANAGEMENT_CAPABILITIES,
+            MANAGEMENT_METHOD,
+            ManagementRequest,
+            ManagementResult,
+            ManagementReason,
+            management_credential_keys,
+        )
+        from .shared import SharedChannelDescriptor
+
+        method = inspect.getattr_static(component_class, "manage", None)
+        function = (
+            method.__func__ if isinstance(method, staticmethod) else None
+        )
+        parameters = (
+            tuple(inspect.signature(function).parameters.values())
+            if function
+            else ()
+        )
+        if (
+            not inspect.iscoroutinefunction(function)
+            or len(parameters) != 1
+            or parameters[0].kind
+            not in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ):
+            raise ProtocolValidationError(
+                "invalid static management entrypoint",
+                reason_code="ENTRYPOINT_INVALID",
+            )
+        descriptor = SharedChannelDescriptor.load(packet["descriptor_path"])
+        keys = management_credential_keys(
+            descriptor.channel_key,
+            descriptor.config_schema,
+        )
+        scope = {
+            **identity.to_mapping(),
+            **{
+                name: packet.get(name)
+                for name in ("plugin_id", "workspace_id", "source_revision")
+            },
+        }
+        if any(
+            not isinstance(scope[name], str) or not scope[name]
+            for name in ("plugin_id", "workspace_id")
+        ):
+            raise ProtocolValidationError(
+                "invalid management scope",
+                reason_code="IDENTITY_MISMATCH",
+            )
+        used = False
+        current = None
+
+        async def execute(params, _request):
+            nonlocal used, current
+            if used:
+                raise ProtocolValidationError(
+                    "management already executed",
+                    reason_code="MANAGEMENT_UNSUPPORTED",
+                )
+            used = True
+            request = ManagementRequest.from_mapping(
+                (
+                    params.to_mapping()
+                    if isinstance(params, ManagementRequest)
+                    else params
+                ),
+            )
+            if any(
+                getattr(request, name) != value
+                for name, value in scope.items()
+            ):
+                raise ProtocolValidationError(
+                    "management scope mismatch",
+                    reason_code="IDENTITY_MISMATCH",
+                )
+            if (
+                MANAGEMENT_CAPABILITIES[request.operation]
+                not in descriptor.capabilities
+            ):
+                raise ProtocolValidationError(
+                    "management capability unavailable",
+                    reason_code="MANAGEMENT_UNSUPPORTED",
+                )
+            current = asyncio.current_task()
+            try:
+                try:
+                    value = await asyncio.wait_for(
+                        function(request),
+                        request.timeout_ms / 1000,
+                    )
+                except asyncio.TimeoutError:
+                    raise ProtocolValidationError(
+                        "management timed out",
+                        reason_code="MANAGEMENT_TIMEOUT",
+                    ) from None
+                except ProtocolValidationError as exc:
+                    reason = (
+                        exc.reason_code
+                        if exc.reason_code
+                        in {item.value for item in ManagementReason}
+                        else "PLATFORM_REQUEST_FAILED"
+                    )
+                    raise ProtocolValidationError(
+                        "management operation rejected",
+                        reason_code=reason,
+                    ) from None
+                except Exception:
+                    raise ProtocolValidationError(
+                        "management operation failed",
+                        reason_code="PLATFORM_REQUEST_FAILED",
+                    ) from None
+                result = ManagementResult.from_mapping(
+                    (
+                        value.to_mapping()
+                        if isinstance(value, ManagementResult)
+                        else value
+                    ),
+                )
+                result.validate_for(request, credential_keys=keys)
+                return result.to_mapping()
+            finally:
+                current = None
+
+        async def drain():
+            task = current
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        peer.register_method(MANAGEMENT_METHOD, execute)
+        return drain
 
     def verify(self, boot, packet, identity):
         from .runner_host import RunnerProtocolHost
@@ -72,6 +240,13 @@ class ChannelRuntime:
                 "descriptor outside root",
             )
         descriptor = SharedChannelDescriptor.load(path)
+        from .shared import validate_channel_contract
+
+        validate_channel_contract(
+            descriptor.channel_key,
+            descriptor.capabilities,
+        )
+        self._capabilities = descriptor.capabilities
         if descriptor.channel_key != identity.channel_key:
             raise boot.BootstrapError("IDENTITY_MISMATCH", "identity mismatch")
         requirements = (path.parent / descriptor.requirements_file).resolve(

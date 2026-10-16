@@ -179,6 +179,7 @@ echo "== Installing bundled Python helper dependencies =="
 echo ""
 
 echo "== Building readable channel runtime =="
+"$PYTHON_BIN" "${REPO_ROOT}/scripts/pack/validate_channel_contracts.py" --project-root "$REPO_ROOT"
 CHANNEL_WHEELS="${DIST}/channel-wheels"
 rm -rf "$CHANNEL_WHEELS" "${BINARIES_DIR}/channel-runtime"
 mkdir -p "$CHANNEL_WHEELS"

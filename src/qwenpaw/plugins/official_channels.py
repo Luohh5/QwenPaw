@@ -8,22 +8,26 @@ import hashlib
 from importlib import resources
 import io
 import json
+import logging
 import shutil
 import sys
 from pathlib import Path
 import tempfile
 import zipfile
 
-from ..app.channels.catalog import OFFICIAL_CHANNEL_OWNERS
+from .official_channel_catalog import (
+    official_channel_owners,
+    official_channel_for_plugin,
+)
 from .channel_bootstrap import (
     resolve_default_channel_runtime,
 )
-
 
 __all__ = [
     "resolve_default_channel_runtime",
     "provision_bundled_channels",
     "bundled_channel_source",
+    "bundled_channel_description",
 ]
 
 
@@ -58,7 +62,7 @@ def _bundled_index(root):
         or not isinstance(index["plugins"], list)
         or any(not isinstance(row, dict) for row in index["plugins"])
         or [row.get("plugin_id") for row in index["plugins"]]
-        != sorted(OFFICIAL_CHANNEL_OWNERS)
+        != sorted(official_channel_owners().values())
     ):
         raise ValueError("Official index identity mismatch")
     for row in index["plugins"]:
@@ -96,7 +100,8 @@ def bundled_channel_source(plugin_id, *, retain=None):
     from .archive import safe_extract_zip
     from .channel_adapter import describe_channel
 
-    if plugin_id not in OFFICIAL_CHANNEL_OWNERS:
+    official = official_channel_for_plugin(plugin_id)
+    if official is None:
         raise ValueError("Unknown official channel")
     root = _resource_root()
     index = _bundled_index(root)
@@ -121,7 +126,6 @@ def bundled_channel_source(plugin_id, *, retain=None):
             manifest.id != plugin_id
             or manifest.version != row["version"]
             or raw.get("qwenpaw_version") != row["qwenpaw_version"]
-            or raw.get("publish") is not False
         ):
             raise ValueError("Official manifest identity mismatch")
         from .._version_compat import check_plugin_version_compat
@@ -131,7 +135,8 @@ def bundled_channel_source(plugin_id, *, retain=None):
             raise ValueError(reason)
         description = describe_channel(source, manifest)
         if (
-            _digest(description.descriptor_path.read_bytes())
+            description.descriptor.channel_key != official["channel_key"]
+            or _digest(description.descriptor_path.read_bytes())
             != row["descriptor_sha256"]
             or _digest(description.requirements_path.read_bytes())
             != row["requirements_sha256"]
@@ -143,14 +148,52 @@ def bundled_channel_source(plugin_id, *, retain=None):
             shutil.rmtree(target)
 
 
+def bundled_channel_description(plugin_id: str):
+    """Read authenticated passive metadata; never retain executable source."""
+    from .architecture import PluginManifest
+    from .channel_adapter import describe_channel
+
+    with bundled_channel_source(plugin_id) as source:
+        manifest = PluginManifest.from_dict(
+            json.loads((source / "plugin.json").read_text(encoding="utf-8")),
+        )
+        return describe_channel(source, manifest)
+
+
 def initialize_channel_policy():
     """Capture legacy intent once from raw persisted files, never defaults."""
     from ..config.utils import get_config_path, mutate_config
     from .channel_bootstrap import default_channel_preset
+    from ..constant import WORKING_DIR
+    from .official_execution_context import capture_official_legacy
+
+    # Capture raw historical ownership before config/default migrations.
+    failed = capture_official_legacy(
+        config_path=get_config_path(),
+        legacy_state_dir=WORKING_DIR,
+        working_dir=Path.cwd(),
+    )
+    for diagnostic in failed.values():
+        logging.getLogger(__name__).warning("%s", diagnostic)
 
     def apply(config):
         state = config.channel_plugin_state
-        if state.version >= 1:
+        captured = set(state.legacy_captured)
+        # Version 1 inspected exactly these historical channels. Do not
+        # recapture their enabled settings and resurrect removed plugins.
+        if state.version == 1:
+            captured.update({"feishu", "dingtalk"})
+        owners = official_channel_owners()
+        if failed:
+            state.legacy_pending = [
+                item
+                for item in state.legacy_pending
+                if item not in {owners.get(key) for key in failed}
+            ]
+        unseen = set(owners) - captured
+        if not unseen:
+            state.legacy_captured = sorted(captured)
+            state.version = max(state.version, 1)
             return
         path = get_config_path()
         raw = (
@@ -160,24 +203,29 @@ def initialize_channel_policy():
         )
         saved = [raw]
         for profile in raw.get("agents", {}).get("profiles", {}).values():
-            agent_path = (
-                Path(profile["workspace_dir"]).expanduser() / "agent.json"
-            )
+            workspace = profile.get("workspace_dir")
+            if not workspace:
+                continue
+            agent_path = Path(workspace).expanduser() / "agent.json"
             if agent_path.is_file():
                 saved.append(
                     json.loads(agent_path.read_text(encoding="utf-8")),
                 )
-        state.legacy_pending = sorted(
-            {
-                key
+        pending = set(state.legacy_pending)
+        for key in unseen:
+            if key in failed:
+                continue
+            plugin_id = owners[key]
+            if plugin_id not in state.uninstalled and any(
+                data.get("channels", {}).get(key, {}).get("enabled") is True
                 for data in saved
-                for key in OFFICIAL_CHANNEL_OWNERS
-                if data.get("channels", {}).get(key, {}).get("enabled") is True
-                and key not in state.uninstalled
-            },
-        )
-        state.preset = default_channel_preset()
-        state.version = 1
+            ):
+                pending.add(plugin_id)
+        state.legacy_pending = sorted(pending - set(state.uninstalled))
+        state.legacy_captured = sorted(captured | (unseen - set(failed)))
+        if state.version == 0:
+            state.preset = default_channel_preset()
+        state.version = max(state.version, 1)
 
     mutate_config(apply)
 
@@ -192,7 +240,7 @@ async def provision_bundled_channels(loader):
     state = config.channel_plugin_state
     requested = set(state.legacy_pending)
     if state.preset == "channels-full":
-        requested.update(OFFICIAL_CHANNEL_OWNERS)
+        requested.update(official_channel_owners().values())
     errors = {}
     for plugin_id in sorted(requested - set(state.uninstalled)):
         try:

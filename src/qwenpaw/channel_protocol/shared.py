@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from importlib import metadata
 import json
 from pathlib import Path
@@ -15,7 +16,7 @@ from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
-from .canonical import parse_json_value
+from .canonical import canonical_json, parse_json_value
 from .descriptor import (
     Entrypoint,
     _closed_object,
@@ -73,6 +74,40 @@ def _protocol_object(value: object, fields: frozenset[str]) -> Mapping:
         return _closed_object(value, fields)
     except DescriptorValidationError as exc:
         raise ProtocolValidationError(str(exc)) from exc
+
+
+def _schema_json_copy(schema: Mapping) -> dict:
+    """Detach schema data with lossless, standard-JSON numeric values."""
+
+    def exact(value):
+        if isinstance(value, Mapping):
+            return {key: exact(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [exact(item) for item in value]
+        if isinstance(value, float):
+            # Only this schema boundary accepts native floats. Canonical JSON
+            # retains its existing binary-float rejection everywhere else.
+            return Decimal(str(float(value)))
+        return value
+
+    def native_number(value):
+        number = float(value)
+        # JSON's emitted numeric token must retain the original decimal value;
+        # rejecting unrepresentable precision is preferable to silent rounding.
+        encoded = json.dumps(number, allow_nan=False)
+        if Decimal(encoded) != value:
+            raise DescriptorValidationError(
+                "config_schema number cannot round-trip through standard JSON",
+            )
+        return number
+
+    detached = exact(schema)
+    # Preserve finite/size/int64/NFC/duplicate-key canonical validation without
+    # emitting canonical bytes as the schema's standard-JSON representation.
+    canonical_json(detached)
+    return json.loads(
+        json.dumps(detached, default=native_number, allow_nan=False),
+    )
 
 
 @dataclass(frozen=True)
@@ -142,7 +177,7 @@ class SharedChannelDescriptor:
             channel_key=validate_channel_key(data["channel_key"]),
             label=label,
             entrypoint=_parse_entrypoint(data["entrypoint"], "runner_process"),
-            config_schema=json.loads(json.dumps(schema)),
+            config_schema=_schema_json_copy(schema),
             config_fields=tuple(fields),
             capabilities=capabilities,
         )
@@ -167,7 +202,7 @@ class SharedChannelDescriptor:
             "dependency_mode": self.dependency_mode,
             "entrypoint": self.entrypoint.to_mapping(),
             "requirements_file": self.requirements_file,
-            "config_schema": json.loads(json.dumps(self.config_schema)),
+            "config_schema": _schema_json_copy(self.config_schema),
             "config_fields": list(self.config_fields),
             "capabilities": list(self.capabilities),
         }
@@ -424,6 +459,33 @@ class SharedHelloParams(IdentityParams):
 
 def validate_channel_contract(channel_key: str, capabilities) -> None:
     """Reject unimplemented contracts before candidate activation."""
+    from .models import (
+        CONTENT_SOURCE_CAPABILITY,
+        SEMANTIC_PARTS_CAPABILITY,
+        RAW_COMPLETED_TEXT_CAPABILITY,
+        UNKNOWN_ACTOR_CAPABILITY,
+        APPROVAL_RESOLUTION_CAPABILITY,
+        TEXT_MERGE_CAPABILITY,
+    )
+
+    tags = set(capabilities)
+    for supported in (
+        CONTENT_SOURCE_CAPABILITY,
+        SEMANTIC_PARTS_CAPABILITY,
+        RAW_COMPLETED_TEXT_CAPABILITY,
+        UNKNOWN_ACTOR_CAPABILITY,
+        APPROVAL_RESOLUTION_CAPABILITY,
+        TEXT_MERGE_CAPABILITY,
+    ):
+        prefix = supported.rsplit(".", 1)[0] + "."
+        claimed = {item for item in tags if item.startswith(prefix)}
+        if claimed and (
+            claimed != {supported} or "channel.generic.v1" not in tags
+        ):
+            raise ProtocolValidationError(
+                "Unsupported send capability contract",
+                reason_code="CHANNEL_CONTRACT_UNSUPPORTED",
+            )
     contracts = {
         item for item in capabilities if item.startswith("channel.generic.")
     }

@@ -7,7 +7,7 @@ import asyncio
 import threading
 from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -58,6 +58,12 @@ class RuntimeStopReceipt:
 @dataclass
 class _OwnedRuntime:
     lease: RuntimeLease
+    identity_claims: tuple[tuple[str, str], ...] = field(
+        default=(),
+        repr=False,
+    )
+    dependency_owner: RuntimeLease | None = field(default=None, repr=False)
+    custody_only: bool = field(default=False, repr=False)
     stop: Callable[[], Awaitable[RuntimeStopReceipt]] | None = None
     stopping: asyncio.Task[RuntimeStopReceipt] | None = None
     resource: object | None = None
@@ -111,11 +117,52 @@ class RuntimeOwners:
         finally:
             del self._mutations[token]
 
-    def reserve(self, plugin_id, key, code_root, *, instance_id):
+    def reserve(
+        self,
+        plugin_id,
+        key,
+        code_root,
+        *,
+        instance_id,
+        identity_claims=(),
+        dependency_owner=None,
+        custody_only=False,
+    ):
         """Occupy a slot before construction or asynchronous startup."""
         if key in self._entries:
             raise RuntimeError("RUNTIME_ALREADY_OWNED; needs_restart")
+        if type(custody_only) is not bool or (
+            custody_only and dependency_owner is not None
+        ):
+            raise ValueError("RUNTIME_CUSTODY_CLASS_INVALID")
+        claims = tuple(identity_claims)
+        if any(
+            not isinstance(claim, tuple)
+            or len(claim) != 2
+            or not all(isinstance(value, str) and value for value in claim)
+            for claim in claims
+        ):
+            raise ValueError("RUNTIME_IDENTITY_CLAIM_INVALID")
+        if any(
+            set(claims).intersection(entry.identity_claims)
+            for entry in self._entries.values()
+        ):
+            raise RuntimeError("RUNTIME_IDENTITY_ALREADY_OWNED; needs_restart")
         code_root = Path(code_root).resolve()
+        if dependency_owner is not None:
+            parent = (
+                self._entries.get(dependency_owner.key)
+                if isinstance(dependency_owner, RuntimeLease)
+                else None
+            )
+            if parent is None or parent.lease != dependency_owner:
+                raise ValueError("RUNTIME_DEPENDENCY_OWNER_STALE")
+            if (
+                dependency_owner.plugin_id != plugin_id
+                or dependency_owner.code_root != code_root
+                or dependency_owner.instance_id != instance_id
+            ):
+                raise ValueError("RUNTIME_DEPENDENCY_OWNER_MISMATCH")
         if any(
             self._overlaps(code_root, root)
             for _, roots in self._mutations.values()
@@ -130,7 +177,12 @@ class RuntimeOwners:
             generation,
             code_root,
         )
-        self._entries[key] = _OwnedRuntime(lease)
+        self._entries[key] = _OwnedRuntime(
+            lease,
+            identity_claims=claims,
+            dependency_owner=dependency_owner,
+            custody_only=custody_only,
+        )
         self._generations[key] = generation
         return lease
 
@@ -171,6 +223,20 @@ class RuntimeOwners:
             for entry in self._entries.values()
             if plugin_id is None or entry.lease.plugin_id == plugin_id
         )
+
+    def dependency_leases(self) -> tuple[RuntimeLease, ...]:
+        """Execution owners plus orphan claims, excluding pure host records."""
+        leases = []
+        for entry in self._entries.values():
+            if entry.custody_only:
+                continue
+            owner = entry.dependency_owner
+            if owner is not None:
+                parent = self._entries.get(owner.key)
+                if parent is not None and parent.lease == owner:
+                    continue
+            leases.append(entry.lease)
+        return tuple(leases)
 
     @staticmethod
     async def _invoke(entry):

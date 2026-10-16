@@ -3,14 +3,15 @@
 
 from __future__ import annotations
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+from ...plugins.execution.bootstrap import validate_private_environment
 from ...plugins.execution.process import (  # pylint: disable=unused-import
     PluginProcess,
     ProcessError,
     CallUnknown,
-    StopResult,
+    StopResult as _StopResult,
 )
 from ...channel_protocol.models import IdentityParams
 from ...channel_protocol.rpc import RpcPeer
@@ -42,10 +43,21 @@ class LaunchSpec:
     runtime_identity: Mapping[str, Any] | None = None
     restart_limit: int = 0
     restart_backoff: float = 0.1
+    plugin_id: str | None = None
+    workspace_id: str | None = None
+    private_env: Mapping[str, str] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "private_env",
+            validate_private_environment(self.private_env),
+        )
 
 
 ChannelProcessError = ProcessError
 ChannelCallUnknown = CallUnknown
+StopResult = _StopResult
 
 
 class ChannelProcess(PluginProcess):
@@ -60,6 +72,107 @@ class ChannelProcess(PluginProcess):
     connecting_state = "connecting"
     component_states = {"connecting", "connected", "disconnected", "failed"}
     failed_reason = "PLATFORM_START_FAILED"
+
+    def endpoint_observation(self) -> dict[str, Any]:
+        """Read current run/handshake custody without exposing launch secrets."""
+        ready = self._ready
+        hello = self.observed_hello
+        spec = self._spec
+        binding = getattr(self, "_endpoint_hello_binding", None)
+        current_hello = (
+            binding is not None
+            and binding[0] is self._peer
+            and binding[1] is ready
+        )
+        return {
+            **self.health_snapshot(),
+            "mode": self._mode,
+            "run_id": id(ready) if ready is not None else None,
+            "run_requested": self._restart_enabled,
+            "channel_key": spec.channel_key if spec else None,
+            "instance_id": spec.instance_id if spec else None,
+            "source_revision": spec.source_revision if spec else None,
+            "enabled": bool(spec and spec.enabled),
+            "process_alive": bool(
+                self._process is not None and self._process.returncode is None,
+            ),
+            "transport_open": bool(
+                self._peer is not None and not self._peer.is_closed,
+            ),
+            "ready_confirmed": bool(
+                current_hello
+                and ready is not None
+                and ready.done()
+                and not ready.cancelled()
+                and ready.exception() is None,
+            ),
+            "hello": (
+                {
+                    key: hello.get(key)
+                    for key in (
+                        "channel_key",
+                        "instance_id",
+                        "generation",
+                        "source_revision",
+                        "capabilities",
+                    )
+                }
+                if hello is not None
+                else None
+            ),
+        }
+
+    async def start_management(self, spec: LaunchSpec) -> dict[str, Any]:
+        """Start a scoped, single-operation worker without a runtime Driver."""
+        if (
+            any(
+                not isinstance(value, str) or not value
+                for value in (
+                    spec.plugin_id,
+                    spec.workspace_id,
+                )
+            )
+            or spec.restart_limit != 0
+        ):
+            raise self.error_type("MANAGEMENT_INVALID_REQUEST")
+        self._management_called = False
+        return await self._start(
+            replace(spec, config={}, enabled=True),
+            mode="manage",
+        )
+
+    async def call(self, method, params=None, *, timeout=5.0):
+        if self._mode == "manage":
+            from ...channel_protocol.management import (
+                MANAGEMENT_CAPABILITIES,
+                MANAGEMENT_METHOD,
+                ManagementRequest,
+            )
+
+            if method != MANAGEMENT_METHOD or self._management_called:
+                raise self.error_type("MANAGEMENT_UNSUPPORTED")
+            request = ManagementRequest.from_mapping(params)
+            spec = self._spec
+            if any(
+                getattr(request, name) != getattr(spec, name)
+                for name in (
+                    "plugin_id",
+                    "workspace_id",
+                    "channel_key",
+                    "instance_id",
+                    "generation",
+                    "source_revision",
+                )
+            ):
+                raise self.error_type("IDENTITY_MISMATCH")
+            descriptor = SharedChannelDescriptor.load(spec.descriptor_path)
+            if (
+                MANAGEMENT_CAPABILITIES[request.operation]
+                not in descriptor.capabilities
+            ):
+                raise self.error_type("MANAGEMENT_UNSUPPORTED")
+            self._management_called = True
+        return await super().call(method, params, timeout=timeout)
 
     async def _evidence(self, params, request):
         result = await super()._evidence(params, request)
@@ -130,6 +243,12 @@ class ChannelProcess(PluginProcess):
             ).resolve(),
         )
         packet["config"] = dict(spec.config)
+        packet["private_env"] = spec.private_env
+        if self._mode == "manage":
+            packet.update(
+                plugin_id=spec.plugin_id,
+                workspace_id=spec.workspace_id,
+            )
         return self._encode_packet(packet)
 
     def _worker_path(self, spec):
@@ -158,4 +277,5 @@ class ChannelProcess(PluginProcess):
         self.observed_hello = (
             hello.to_mapping() if hasattr(hello, "to_mapping") else dict(hello)
         )
+        self._endpoint_hello_binding = (self._peer, self._ready)
         return {"accepted": True}

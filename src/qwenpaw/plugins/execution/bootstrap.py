@@ -9,26 +9,130 @@ import hashlib
 import importlib
 import os
 from pathlib import Path
+import re
 import sys
 import threading
 from typing import Any
 
 _THREAD_TERMINATE = 0x0001
 _ERROR_NOT_FOUND = 1168
-_STARTUP_ENVIRONMENT = frozenset(
+NETWORK_PROXY_ENVIRONMENT = frozenset(
     {
-        "COMSPEC",
-        "PATH",
-        "PATHEXT",
-        "SYSTEMDRIVE",
-        "SYSTEMROOT",
-        "TEMP",
-        "TMP",
-        "TMPDIR",
-        "WINDIR",
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
     },
 )
+_STARTUP_ENVIRONMENT = (
+    frozenset(
+        {
+            "COMSPEC",
+            "PATH",
+            "PATHEXT",
+            "SYSTEMDRIVE",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+            "WINDIR",
+        },
+    )
+    | NETWORK_PROXY_ENVIRONMENT
+)
 _AMBIENT_IMPORT_ENVIRONMENT = frozenset({"PYTHONHOME", "PYTHONPATH"})
+_PRIVATE_ENVIRONMENT_CONTROL = frozenset(
+    name.upper() for name in _STARTUP_ENVIRONMENT
+) | frozenset(
+    {
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "VIRTUAL_ENV",
+        "CONDA_PREFIX",
+        "CONDA_DEFAULT_ENV",
+        "__PYVENV_LAUNCHER__",
+        "ENV",
+        "BASH_ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "CDPATH",
+        "IFS",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "PERL5LIB",
+        "PERL5OPT",
+        "RUBYOPT",
+        "RUBYLIB",
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "CLASSPATH",
+        "GCONV_PATH",
+        "GLIBC_TUNABLES",
+        "LIBPATH",
+        "SHLIB_PATH",
+    },
+)
+
+
+def validate_private_environment(value: Any) -> dict[str, str]:
+    """Detach bounded host launch data without authorizing import controls."""
+    from collections.abc import Mapping
+
+    def invalid():
+        return BootstrapError(
+            "LAUNCH_ENVIRONMENT_INVALID",
+            "Invalid private launch environment",
+        )
+
+    if not isinstance(value, Mapping) or len(value) > 32:
+        raise invalid() from None
+    result = {}
+    canonical = set()
+    total = 0
+    for name, item in value.items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(item, str)
+            or len(name) > 128
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None
+            or "\0" in item
+        ):
+            raise invalid() from None
+        key = name.upper()
+        if (
+            key in canonical
+            or key in _PRIVATE_ENVIRONMENT_CONTROL
+            or key.lstrip("_").startswith(
+                (
+                    "PYTHON",
+                    "PYVENV",
+                    "LD_",
+                    "DYLD_",
+                    "LDR_",
+                    "QWENPAW_",
+                    "COPAW_",
+                    "CONDA_",
+                ),
+            )
+        ):
+            raise invalid() from None
+        try:
+            size = len(item.encode("utf-8"))
+        except UnicodeError:
+            raise invalid() from None
+        total += len(name) + size + 2
+        if size > 16 * 1024 or total > 64 * 1024:
+            raise invalid() from None
+        canonical.add(key)
+        result[name] = item
+    return result
 
 
 class BootstrapError(RuntimeError):
@@ -498,6 +602,7 @@ async def _open_protocol_transport(
     *,
     input_handle: Any | None = None,
     limits: Any | None = None,
+    payloads: Any = None,
     platform_name: str | None = None,
     writer_factory: Any = None,
 ) -> Any:
@@ -554,8 +659,10 @@ async def _open_protocol_transport(
             None,
             loop,
         )
+    options = {} if payloads is None else {"payloads": payloads}
     return framed_transport_class(
         reader,
         writer,
         limits=limits,
+        **options,
     )

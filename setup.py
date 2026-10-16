@@ -3,6 +3,7 @@
 
 from pathlib import Path
 import runpy
+import shutil
 
 from setuptools import setup
 from setuptools.command.build_py import build_py
@@ -67,10 +68,27 @@ class SDist(sdist):
 
     def make_release_tree(self, base_dir, files):
         super().make_release_tree(base_dir, files)
+        root = Path(__file__).resolve().parent
+        builder = runpy.run_path(
+            str(root / "scripts/pack/generate_plugin_metadata.py"),
+        )
+        inventory = runpy.run_path(
+            str(root / "src/qwenpaw/plugins/official_channel_catalog.py"),
+        )["OFFICIAL_CHANNELS"]
         bundle(
             Path(base_dir) / "src/qwenpaw/official_channels",
             self.distribution.get_version(),
         )
+        # A wheel rebuilt from sdist uses exactly the same delivered inputs.
+        # Unmigrated plugins remain outside this official source distribution.
+        for row in inventory:
+            relative = Path("plugins/channel") / row["source_dir"]
+            shutil.copytree(
+                root / relative,
+                Path(base_dir) / relative,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns(*builder["EXCLUDE_PATTERNS"]),
+            )
 
 
 setup(cmdclass={"build_py": BuildPy, "sdist": SDist})

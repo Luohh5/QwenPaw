@@ -1,8 +1,14 @@
 # 公共插件进程组件
 
+当前接入与验收以[统一插件化方案](../../../../docs/superpowers/plans/2026-10-14-official-channel-pluginization.md)为准；下文 B3–B5 与 A 待办保留早期设计背景，不代表当前 Loader 尚未接入。
+
 模块管理器决定何时启动插件；`PluginProcess` 只负责显式启动、双向 RPC、停止和进程树回收。构造、注册处理函数、查询健康与 `enabled=False` 均不会启动进程。普通同进程插件不受影响。
 
 组件无需频道描述、频道标识、频道 SDK 或插件 Loader。共享依赖来自所选 Python 的环境及显式 `dependency_paths`；可选 `requirements_path` 必须位于可信 `code_root`，只检查已安装分发元数据，不安装包，也不执行显式目录中的 `.pth` 文件。
+
+宿主保管某个执行实例的非执行资源时，可用 `RuntimeOwners.reserve(..., dependency_owner=lease)` 关联精确父实例；父必须仍有效，且插件、代码目录、实例一致。资源仍参与停止和源码占用保护，但不虚构第二套依赖环境。独立执行的 worker 必须使用默认执行 lease，不能借此省略依赖验证；父退出或换代后遗留的资源 claim 恢复为未知依赖，继续阻止不安全变更。
+
+仅保存扫码会话等纯宿主状态、没有执行父实例的记录，可显式使用 `custody_only=True`。它与 `dependency_owner` 互斥，不代表已验证某个运行环境；真正执行管理操作的 worker 仍独立登记并验证依赖。该分类只由宿主代码声明，不接受子进程、配置或描述符指定；停止失败仍保留记录与源码锁，不能按资源名称自动豁免。
 
 代码目录中的 `indexer.py`：
 

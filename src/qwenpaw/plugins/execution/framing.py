@@ -99,6 +99,7 @@ class FrameReader:
         self._reader = reader
         self._limits = limits or FramingLimits()
         self._closed = False
+        self.message_deadline: float | None = None
 
     async def _read_chunk(self, size: int, deadline: float) -> bytes:
         """Read bytes before a frame's single absolute deadline."""
@@ -162,6 +163,7 @@ class FrameReader:
             raise FrameClosedError("frame reader is closed")
         try:
             header, deadline = await self._read_header()
+            self.message_deadline = deadline
             length = self._parse_header(header)
             try:
                 body = await asyncio.wait_for(
@@ -197,6 +199,10 @@ class _WriteItem:
     on_write_succeeded: Callable[[], Any] | None = None
     on_write_failed: Callable[[], Any] | None = None
     on_write_deferred: Callable[[], None] | None = None
+    deadline: float | None = None
+    payload_id: str | None = None
+    visible: bool = False
+    deferred: bool = False
 
 
 class FramedTransport:
@@ -208,14 +214,17 @@ class FramedTransport:
         writer: Any,
         *,
         limits: FramingLimits | None = None,
+        payloads: Any = None,
     ) -> None:
         self._limits = limits or FramingLimits()
         self._reader = FrameReader(reader, limits=self._limits)
         self._writer = writer
+        self._payloads = payloads
         self._queue: asyncio.Queue[_WriteItem] = asyncio.Queue(
             maxsize=self._limits.write_queue_size,
         )
         self._pending_writes: set[asyncio.Future[None]] = set()
+        self._write_items: dict[asyncio.Future[None], _WriteItem] = {}
         self._closed = False
         self._closed_event = asyncio.Event()
         self._close_lock = asyncio.Lock()
@@ -238,7 +247,41 @@ class FramedTransport:
             message = await message
         if not isinstance(message, str):
             raise FrameProtocolError("prepared frame must be text")
-        return encode_frame(message, limits=self._limits)
+        data, item.payload_id = await self._encode_message(
+            message,
+            item.deadline,
+        )
+        return data
+
+    async def _encode_message(self, message, deadline):
+        token = None
+        if self._payloads is not None:
+            message, token = await self._payloads.stage(
+                message,
+                max_frame_bytes=self._limits.max_frame_bytes,
+                deadline=deadline,
+            )
+        try:
+            return encode_frame(message, limits=self._limits), token
+        except BaseException:
+            if token is not None:
+                self._payloads.discard(token)
+            raise
+
+    def _remaining(self, item):
+        return (
+            self._limits.write_timeout
+            if item.deadline is None
+            else max(0, item.deadline - asyncio.get_running_loop().time())
+        )
+
+    def _discard_payload(self, item):
+        if (
+            item.payload_id is not None
+            and not item.visible
+            and not item.deferred
+        ):
+            self._payloads.discard(item.payload_id)
 
     def _write_acceptance(self) -> Awaitable[None] | None:
         """Return an adapter's deferred frame acceptance, if any."""
@@ -261,6 +304,10 @@ class FramedTransport:
             await asyncio.shield(acceptance)
         except BaseException:
             callback = item.on_write_failed
+            item.deferred = False
+            self._discard_payload(item)
+        else:
+            item.visible = True
         if callback is None:
             return
         result = callback()
@@ -282,6 +329,7 @@ class FramedTransport:
         acceptance: asyncio.Task[None],
     ) -> None:
         """Settle an adapter result without hiding timeout or cancellation."""
+        item.deferred = True
         if item.on_write_deferred is not None:
             item.on_write_deferred()
         settlement = asyncio.create_task(
@@ -308,9 +356,14 @@ class FramedTransport:
                 if item.future.done():
                     return
                 prepared = item.prepare_write is not None
-                data = await self._prepare_write_item(item)
+                data = await asyncio.wait_for(
+                    self._prepare_write_item(item),
+                    timeout=self._remaining(item),
+                )
                 if item.future.done():
                     return
+                if item.deadline is not None and self._remaining(item) <= 0:
+                    raise asyncio.TimeoutError
                 self._writer.write(data)
                 acceptance = self._write_acceptance()
                 if acceptance is not None:
@@ -318,7 +371,7 @@ class FramedTransport:
                     try:
                         done, _ = await asyncio.wait(
                             {acceptance_task},
-                            timeout=self._limits.write_timeout,
+                            timeout=self._remaining(item),
                         )
                     except asyncio.CancelledError:
                         with contextlib.suppress(Exception):
@@ -340,6 +393,7 @@ class FramedTransport:
                         raise asyncio.TimeoutError
                     acceptance_task.result()
                 visible = True
+                item.visible = True
                 if item.on_write_succeeded is not None:
                     callback_result = item.on_write_succeeded()
                     if inspect.isawaitable(callback_result):
@@ -348,11 +402,12 @@ class FramedTransport:
                         )
                 await asyncio.wait_for(
                     self._writer.drain(),
-                    timeout=self._limits.write_timeout,
+                    timeout=self._remaining(item),
                 )
         finally:
             if prepared and not visible and not deferred:
                 self._rollback_write_item(item)
+            self._discard_payload(item)
 
     async def _fail_write_item(
         self,
@@ -360,6 +415,7 @@ class FramedTransport:
         error: FrameError,
     ) -> None:
         """Fail one caller and close the complete transport."""
+        error.side_effect_possible = item.visible or item.deferred
         if not item.future.done():
             item.future.set_exception(error)
         await self._close(error)
@@ -372,9 +428,9 @@ class FramedTransport:
         """Translate one writer exception into the framing error model."""
         if isinstance(error, asyncio.CancelledError):
             if not item.future.done():
-                item.future.set_exception(
-                    FrameClosedError("stdio writer stopped"),
-                )
+                failure = FrameClosedError("stdio writer stopped")
+                failure.side_effect_possible = item.visible or item.deferred
+                item.future.set_exception(failure)
             raise error
         if isinstance(error, asyncio.TimeoutError):
             await self._fail_write_item(
@@ -426,7 +482,19 @@ class FramedTransport:
         """Enqueue one frame and wait until the OS stream accepts it."""
         if self._closed:
             raise FrameClosedError("stdio transport is closed")
-        data = encode_frame(message, limits=self._limits)
+        deadline, token = None, None
+        if self._payloads is not None:
+            deadline = (
+                asyncio.get_running_loop().time() + self._limits.write_timeout
+            )
+            if prepare_write is not None:
+                # The final prepared JSON is staged at the writer boundary.
+                self._payloads.validate_message(message)
+                data = b""
+            else:
+                data, token = await self._encode_message(message, deadline)
+        else:
+            data = encode_frame(message, limits=self._limits)
         future: asyncio.Future[
             None
         ] = asyncio.get_running_loop().create_future()
@@ -437,26 +505,37 @@ class FramedTransport:
             on_write_succeeded,
             on_write_failed,
             on_write_deferred,
+            deadline,
+            token,
         )
         self._pending_writes.add(future)
+        self._write_items[future] = item
         put_task = asyncio.create_task(self._queue.put(item))
         close_task = asyncio.create_task(self._closed_event.wait())
         try:
             done, _ = await asyncio.wait(
                 {put_task, close_task},
-                timeout=self._limits.write_timeout,
+                timeout=self._remaining(item),
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if not done:
                 raise asyncio.TimeoutError
             if put_task not in done:
                 raise FrameClosedError("stdio transport is closed")
-            await future
+            if deadline is None:
+                await future
+            else:
+                await asyncio.wait_for(
+                    asyncio.shield(future),
+                    timeout=self._remaining(item),
+                )
         except asyncio.TimeoutError as exc:
             if not future.done():
                 future.cancel()
             await self._close(exc)
-            raise FrameTimeoutError("frame write queue timed out") from exc
+            error = FrameTimeoutError("frame write queue timed out")
+            error.side_effect_possible = item.visible or item.deferred
+            raise error from exc
         except FrameClosedError:
             if future.done():
                 with contextlib.suppress(FrameError, asyncio.CancelledError):
@@ -476,6 +555,8 @@ class FramedTransport:
                 return_exceptions=True,
             )
             self._pending_writes.discard(future)
+            self._write_items.pop(future, None)
+            self._discard_payload(item)
             if future.done():
                 with contextlib.suppress(FrameError, asyncio.CancelledError):
                     future.result()
@@ -484,7 +565,7 @@ class FramedTransport:
         """Read one frame and close both directions on any transport error."""
         if self._closed:
             raise FrameClosedError("stdio transport is closed")
-        read_task = asyncio.create_task(self._reader.read_message())
+        read_task = asyncio.create_task(self._read_message())
         close_task = asyncio.create_task(self._closed_event.wait())
         try:
             done, _ = await asyncio.wait(
@@ -497,7 +578,7 @@ class FramedTransport:
         except FrameEOFError as exc:
             await self._close(exc)
             raise FrameClosedError("stdio peer closed") from exc
-        except (FrameProtocolError, FrameTimeoutError) as exc:
+        except FrameError as exc:
             await self._close(exc)
             raise
         finally:
@@ -509,6 +590,15 @@ class FramedTransport:
                 return_exceptions=True,
             )
 
+    async def _read_message(self):
+        message = await self._reader.read_message()
+        if self._payloads is not None:
+            message = await self._payloads.read(
+                message,
+                deadline=self._reader.message_deadline,
+            )
+        return message
+
     async def _close(self, reason: BaseException | None = None) -> None:
         """Close both halves and fail every queued or active write."""
         async with self._close_lock:
@@ -516,17 +606,29 @@ class FramedTransport:
                 return
             self._closed = True
             self._closed_event.set()
+            if self._payloads is not None:
+                self._payloads.close()
             error = reason if isinstance(reason, FrameError) else None
             if not isinstance(error, FrameClosedError):
                 error = FrameClosedError("stdio transport is closed")
             while not self._queue.empty():
                 item = self._queue.get_nowait()
                 if not item.future.done():
-                    item.future.set_exception(error)
+                    failure = FrameClosedError(str(error))
+                    failure.side_effect_possible = (
+                        item.visible or item.deferred
+                    )
+                    item.future.set_exception(failure)
+                self._discard_payload(item)
                 self._queue.task_done()
             for future in self._pending_writes:
                 if not future.done():
-                    future.set_exception(error)
+                    item = self._write_items[future]
+                    failure = FrameClosedError(str(error))
+                    failure.side_effect_possible = (
+                        item.visible or item.deferred
+                    )
+                    future.set_exception(failure)
             with contextlib.suppress(Exception):
                 self._writer.close()
             try:

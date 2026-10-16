@@ -114,7 +114,11 @@ def channel_cfg_for_key(workspace_config: Any, key: str) -> Any | None:
     if channels is None:
         return None
     extra = getattr(channels, "__pydantic_extra__", None) or {}
-    ch_cfg = getattr(channels, key, None)
+    ch_cfg = (
+        channels.get(key)
+        if isinstance(channels, dict)
+        else getattr(channels, key, None)
+    )
     if ch_cfg is None and key in extra:
         ch_cfg = extra[key]
     if ch_cfg is None:
@@ -161,6 +165,7 @@ def instantiate_channel(
     process: ProcessHandler,
     on_last_dispatch: OnLastDispatch = None,
     workspace_dir: Path | None = None,
+    config_source: str = "config",
 ) -> BaseChannel:
     """Build one channel instance from workspace config (three-gate caller)."""
     from ...plugins.registry import PluginRegistry
@@ -192,18 +197,79 @@ def instantiate_channel(
         )
         from ...plugins.ownership import RuntimeKey, RuntimeStopReceipt
 
+        identity_claims = ()
+        if key == "voice":
+            from .conflict import get_channel_bot_identity
+
+            identity_claims = tuple(
+                ("channel:voice:" + name, value)
+                for name, value in (
+                    get_channel_bot_identity(key, ch_cfg) or ()
+                )
+            )
         lease = plugin_registry.runtime_owners.reserve(
             row.plugin_id,
             RuntimeKey("channel", key, str(Path(workspace_dir).resolve())),
             row.description_record.code_root,
             instance_id=instance_id,
+            identity_claims=identity_claims,
         )
         settings = row.runtime_settings
+        claims = ()
+        runtime_config = ch_cfg
+        connection_timeout = settings.connection_timeout
+        if connection_timeout is None and row.plugin_id == key == "wechat":
+            from ...plugins.official_channel_catalog import (
+                official_channel_for_plugin,
+            )
+
+            official = official_channel_for_plugin(row.plugin_id)
+            if official is not None and official["channel_key"] == key:
+                connection_timeout = 330.0
         try:
+            if row.plugin_id == key == "wechat":
+                from ...config.channel_config_compat import (
+                    absolute_execution_paths,
+                )
+                from ...config.utils import load_config
+                from ...constant import WORKING_DIR
+                from ...plugins.channel_config import channel_config_dict
+                from .wechat_auth_custody import reserve_wechat_auth
+
+                values = channel_config_dict(ch_cfg)
+                values["bot_token_file"] = (
+                    values.get("bot_token_file")
+                    or WORKING_DIR / "wechat_bot_token"
+                )
+                working_dir = Path.cwd()
+                runtime_config = absolute_execution_paths(
+                    values,
+                    path_fields=("bot_token_file", "media_dir"),
+                    working_dir=working_dir,
+                )
+                workspace_id = getattr(workspace_config, "id", None)
+                if not workspace_id:
+                    profiles = load_config().agents.profiles
+                    matches = [
+                        agent_id
+                        for agent_id, profile in profiles.items()
+                        if Path(profile.workspace_dir).expanduser().resolve()
+                        == Path(workspace_dir).expanduser().resolve()
+                    ]
+                    workspace_id = (
+                        matches[0] if len(matches) == 1 else str(workspace_dir)
+                    )
+                claims = reserve_wechat_auth(
+                    plugin_registry,
+                    owner=lease,
+                    workspace_id=workspace_id,
+                    workspace_dir=workspace_dir,
+                    config=runtime_config,
+                )
             plugin_registry.dependency_usage.bind(lease, row.dependency_token)
             channel = row.description_record.create_proxy(
                 process,
-                ch_cfg,
+                runtime_config,
                 python_executable=settings.python_executable,
                 support_root=settings.support_root,
                 qwenpaw_version=settings.qwenpaw_version,
@@ -223,17 +289,27 @@ def instantiate_channel(
                 ),
                 no_text_debounce=getattr(ch_cfg, "no_text_debounce", True),
                 startup_timeout=settings.startup_timeout,
+                connection_timeout=connection_timeout,
                 shutdown_timeout=settings.shutdown_timeout,
+                config_source=config_source,
             )
         except BaseException:
+            from .wechat_auth_custody import release_wechat_auth
+
+            evidence = RuntimeStopReceipt(
+                True,
+                "construction produced no resources",
+            )
+            release_wechat_auth(plugin_registry, claims, evidence)
             plugin_registry.runtime_owners.release(
                 lease,
-                RuntimeStopReceipt(True, "construction produced no resources"),
+                evidence,
             )
             raise
         channel._owner_registry = plugin_registry
         channel.bind_dependency_usage(plugin_registry.dependency_usage, lease)
         channel._runtime_lease = lease
+        channel._wechat_auth_claims = claims
         channel._registration = row
         channel._admission_timeout = settings.admission_timeout
         return channel
@@ -450,6 +526,13 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
             stop,
             resource=channel,
         )
+        ingress = getattr(
+            channel._owner_registry,
+            "channel_ingress_service",
+            None,
+        )
+        if ingress is not None:
+            ingress.attach(channel)
 
     def _replace_binding(self, key, old, handle):
         from ...plugins.registry import PluginRegistry
@@ -501,6 +584,7 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
         cls,
         process: ProcessHandler,
         on_last_dispatch: OnLastDispatch = None,
+        workspace_dir: Path | None = None,
     ) -> "ChannelManager":
         """
         Create channels from env and inject unified process
@@ -510,14 +594,52 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
         """
         available = get_available_channels()
         registry = get_channel_registry()
+        import os
+        from types import SimpleNamespace
+        from ...config.channel_env import read_channel_env
+        from ...config.utils import get_config_path
+        from ...plugins.registry import PluginRegistry
+
         channels: list[BaseChannel] = [
             ch_cls.from_env(process, on_reply_sent=on_last_dispatch)
             for key, ch_cls in registry.items()
             if key in available
         ]
+        workspace_dir = workspace_dir or get_config_path().parent
+        env_channels = {}
+        for key, row in PluginRegistry().get_channel_catalog().items():
+            if key not in available or row.description_record is None:
+                continue
+            props = row.description_record.descriptor.config_schema.get(
+                "properties",
+                {},
+            )
+            values = {
+                name: field["default"]
+                for name, field in props.items()
+                if "default" in field
+            }
+            values.update(read_channel_env(key, os.environ) or {})
+            env_channels[key] = values
+        env_config = SimpleNamespace(channels=env_channels)
+        for key in env_channels:
+            if not channel_enabled(env_channels[key]):
+                continue
+            channels.append(
+                instantiate_channel(
+                    key,
+                    env_config,
+                    process=process,
+                    on_last_dispatch=on_last_dispatch,
+                    workspace_dir=workspace_dir,
+                    config_source="env",
+                ),
+            )
         manager = cls(channels)
         manager._process = process
         manager._on_last_dispatch = on_last_dispatch
+        manager._workspace_dir = workspace_dir
+        manager._workspace_config = env_config
         return manager
 
     @classmethod
@@ -527,6 +649,8 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
         config: "Config",
         on_last_dispatch: OnLastDispatch = None,
         workspace_dir: Path | None = None,
+        *,
+        defer_process_channels: bool = False,
     ) -> "ChannelManager":
         """Create channels from config (config.json or agent.json).
 
@@ -535,10 +659,19 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
             config: Configuration object with channels
             on_last_dispatch: Callback for dispatch events
             workspace_dir: Agent workspace directory for channel state files
+            defer_process_channels: Let the plugin projector construct process
+                channels after their dependency admission.
         """
+        if type(defer_process_channels) is not bool:
+            raise ValueError("Invalid deferred process channel policy")
         available = get_available_channels()
         channels: list[BaseChannel] = []
-        for key in get_channel_registry():
+        from .registry import selected_process_channels
+
+        process_channels = selected_process_channels()
+        for key in dict.fromkeys((*get_channel_registry(), *process_channels)):
+            if defer_process_channels and key in process_channels:
+                continue
             if key not in available:
                 continue
             ch_cfg = channel_cfg_for_key(config, key)
@@ -609,10 +742,18 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
             and channel._owner_registry is not None
         ):
             from ...plugins.ownership import RuntimeStopReceipt
+            from .wechat_auth_custody import release_wechat_auth
 
+            evidence = RuntimeStopReceipt(True, "never started")
+            release_wechat_auth(
+                channel._owner_registry,
+                getattr(channel, "_wechat_auth_claims", ()),
+                evidence,
+            )
+            channel._wechat_auth_claims = ()
             channel._owner_registry.runtime_owners.release(
                 channel._runtime_lease,
-                RuntimeStopReceipt(True, "never started"),
+                evidence,
             )
 
     async def enqueue_async(
@@ -1341,6 +1482,14 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
             isinstance(channel, IsolatedChannelProxy)
             and getattr(channel, "_runtime_lease", None) is not None
         ):
+            from .wechat_auth_custody import release_wechat_auth
+
+            release_wechat_auth(
+                channel._owner_registry,
+                getattr(channel, "_wechat_auth_claims", ()),
+                evidence,
+            )
+            channel._wechat_auth_claims = ()
             channel._owner_registry.runtime_owners.release(
                 channel._runtime_lease,
                 evidence,

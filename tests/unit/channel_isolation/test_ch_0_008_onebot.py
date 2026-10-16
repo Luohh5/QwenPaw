@@ -1,45 +1,20 @@
 # -*- coding: utf-8 -*-
-"""Run CH-0-008 tests outside legacy Channel imports."""
+"""Retained OneBot responsibilities at the actual v2 plugin boundary.
 
-from pathlib import Path
-import subprocess
-import sys
+Original assertions and contract changes: onebot-oracle-status.json.
+"""
 
-SUITE = (
-    Path(__file__).parents[2]
-    / "fixtures"
-    / "channel_isolation"
-    / "onebot"
-    / "ch_0_008_onebot_suite.py"
-)
-
-
-def test_ch_0_008_in_isolated_pytest_process() -> None:
-    """Verify the production OneBot Driver in an isolated test process."""
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            "-c",
-            """
-import pathlib, sys
-source = pathlib.Path(sys.argv[1]).resolve()
-suite = pathlib.Path(sys.argv[2]).resolve()
-sys.path.insert(0, str(source))
-import qwenpaw
-assert pathlib.Path(qwenpaw.__file__).resolve().is_relative_to(source)
 import pytest
-raise SystemExit(pytest.main([
-    '--confcutdir', str(suite.parent), str(suite), '-q',
-]))
-""",
-            str(SUITE.parents[4] / "src"),
-            str(SUITE),
-        ],
-        capture_output=True,
-        check=False,
-        timeout=60,
-    )
-    assert result.returncode == 0, result.stdout.decode(
-        errors="replace",
-    ) + result.stderr.decode(errors="replace")
+
+from tests.onebot_isolated import run_onebot_suite
+
+
+@pytest.mark.parametrize(
+    "suite",
+    [
+        "onebot_lifecycle_closeout_suite.py",
+        "onebot_watchdog_closeout_suite.py",
+    ],
+)
+def test_onebot_v2_lifecycle(suite, tmp_path):
+    run_onebot_suite(suite, tmp_path)

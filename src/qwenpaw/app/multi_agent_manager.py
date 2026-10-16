@@ -8,6 +8,7 @@ including lazy loading, lifecycle management, and hot reloading.
 import asyncio
 import logging
 import time
+from contextlib import nullcontext
 from typing import Callable, Dict, Set
 
 from qwenpaw.exceptions import (
@@ -65,6 +66,7 @@ class MultiAgentManager:
         self._operation_locks: dict[str, asyncio.Lock] = {}
         self._operations: set[asyncio.Task] = set()
         self._closing = False
+        self.channel_qrcode_sessions = None
         logger.debug("MultiAgentManager initialized")
 
     def note_agent_config_changed(self, agent_id: str) -> int:
@@ -614,7 +616,12 @@ class MultiAgentManager:
             # A queued request must not stop a replacement owner.
             if instance is not None and self.agents.get(key) is not instance:
                 return False
-            return await self._stop_agent(key)
+            sessions = self.channel_qrcode_sessions
+            guard = (
+                sessions.operation_guard(key) if sessions else nullcontext()
+            )
+            async with guard:
+                return await run_async_to_completion(self._stop_agent(key))
 
         return await self._run_agent_operation(agent_id, stop_current)
 
@@ -985,6 +992,8 @@ class MultiAgentManager:
         from ..plugins.lifecycle import QuiescenceError
 
         self._closing = True
+        if self.channel_qrcode_sessions is not None:
+            await self.channel_qrcode_sessions.aclose()
         operations = [
             task
             for task in self._operations

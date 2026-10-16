@@ -13,9 +13,15 @@ import os
 from pathlib import Path
 from typing import Any
 
+from .bootstrap import (
+    BootstrapError,
+    NETWORK_PROXY_ENVIRONMENT,
+    validate_private_environment,
+)
 from .dependencies import DependencySnapshot
-from .errors import RpcClosedError, RpcTimeoutError
+from .errors import FrameError, RpcClosedError, RpcTimeoutError
 from .framing import FramedTransport
+from .payloads import PayloadLimits, PayloadStore
 from .models import PluginIdentity
 from .process_tree import ProcessTree
 from .rpc import RpcCallNotSent, RpcPeer
@@ -42,6 +48,14 @@ class PluginLaunchSpec:
     shutdown_timeout: float = 2.0
     restart_limit: int = 0
     restart_backoff: float = 0.1
+    private_env: Mapping[str, str] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "private_env",
+            validate_private_environment(self.private_env),
+        )
 
 
 @dataclass(frozen=True)
@@ -126,7 +140,13 @@ class PluginProcess:
     connecting_state = "starting"
     failed_reason = "COMPONENT_START_FAILED"
 
-    def __init__(self) -> None:
+    def __init__(self, *, payload_limits: PayloadLimits | None = None) -> None:
+        self._payload_limits = (
+            PayloadLimits() if payload_limits is None else payload_limits
+        )
+        if not isinstance(self._payload_limits, PayloadLimits):
+            raise ValueError("PayloadLimits required")
+        self._payloads: PayloadStore | None = None
         self._spec: PluginLaunchSpec | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._spawn_task: asyncio.Task[Any] | None = None
@@ -168,14 +188,20 @@ class PluginProcess:
         return await self._inspect(spec, "probe")
 
     async def _inspect(self, spec: Any, mode: str) -> InspectionResult:
-        if self._process is not None or any(
-            task is not None and not task.done()
-            for task in (
-                self._start_task,
-                self._stop_task,
-                self._monitor_task,
-                self._spawn_task,
-                self._cleanup_task,
+        if mode not in {"audit", "probe"}:
+            raise self.error_type("EXECUTION_MODE_INVALID")
+        if (
+            self._process is not None
+            or self._payloads is not None
+            or any(
+                task is not None and not task.done()
+                for task in (
+                    self._start_task,
+                    self._stop_task,
+                    self._monitor_task,
+                    self._spawn_task,
+                    self._cleanup_task,
+                )
             )
         ):
             raise self.error_type("PROCESS_OWNED")
@@ -246,6 +272,8 @@ class PluginProcess:
         name: str,
         handler: Any,
     ) -> None:
+        if self._mode == "manage":
+            raise self.error_type("MODE_METHODS_DISABLED")
         if (
             self._state not in {"idle", "stopped", "disabled", "failed"}
             or self._process is not None
@@ -285,14 +313,24 @@ class PluginProcess:
 
     async def start(self, spec: PluginLaunchSpec) -> dict[str, Any]:
         """Handshake and bind a component before awaiting its external work."""
-        if self._process is not None or any(
-            task is not None and not task.done()
-            for task in (
-                self._start_task,
-                self._stop_task,
-                self._monitor_task,
-                self._spawn_task,
-                self._cleanup_task,
+        return await self._start(spec, mode="run")
+
+    async def _start(self, spec: Any, *, mode: str) -> dict[str, Any]:
+        """Share startup custody while keeping explicit modes separate."""
+        if mode not in {"run", "manage"}:
+            raise self.error_type("EXECUTION_MODE_INVALID")
+        if (
+            self._process is not None
+            or self._payloads is not None
+            or any(
+                task is not None and not task.done()
+                for task in (
+                    self._start_task,
+                    self._stop_task,
+                    self._monitor_task,
+                    self._spawn_task,
+                    self._cleanup_task,
+                )
             )
         ):
             raise self.error_type("PROCESS_OWNED")
@@ -300,12 +338,12 @@ class PluginProcess:
             self._state = "disabled"
             return self.health_snapshot()
         self._validate_spec(spec)
-        self._mode = "run"
+        self._mode = mode
         self.dependency_snapshot = self.observed_hello = None
         self._spec = spec
         self._generation = spec.generation
         self._restart_count = 0
-        self._restart_enabled = True
+        self._restart_enabled = mode == "run"
         self._start_task = asyncio.create_task(self._launch(spec))
         try:
             await asyncio.shield(self._start_task)
@@ -326,6 +364,10 @@ class PluginProcess:
         return self.health_snapshot()
 
     def _validate_launch(self, spec: Any) -> None:
+        try:
+            validate_private_environment(getattr(spec, "private_env", {}))
+        except BootstrapError:
+            raise self.error_type("LAUNCH_ENVIRONMENT_INVALID") from None
         for value in (
             spec.startup_timeout,
             spec.shutdown_timeout,
@@ -415,10 +457,23 @@ class PluginProcess:
             str(Path(path).resolve()) for path in spec.dependency_paths
         ]
         packet["config"] = dict(spec.config)
+        packet["private_env"] = getattr(spec, "private_env", {})
         return self._encode_packet(packet)
 
     def _encode_packet(self, packet: Mapping[str, Any]) -> bytes:
+        if self._mode not in {"run", "manage", "audit", "probe"}:
+            raise self.error_type("EXECUTION_MODE_INVALID")
         packet = {**packet, "mode": self._mode}
+        if self._payloads is not None:
+            packet["payload_transport"] = self._payloads.launch_context()
+        try:
+            private_env = validate_private_environment(
+                packet.pop("private_env", {}),
+            )
+        except BootstrapError:
+            raise self.error_type("LAUNCH_ENVIRONMENT_INVALID") from None
+        if private_env and self._mode in {"run", "manage"}:
+            packet["private_env"] = private_env
         if self._mode != "run":
             packet["config"] = {}
         try:
@@ -467,6 +522,7 @@ class PluginProcess:
             raise self.error_type(self._last_error) from None
 
     async def _open(self, spec: PluginLaunchSpec) -> None:
+        self._payloads = PayloadStore.create(self._payload_limits)
         packet = self._packet(spec)
         worker = self._worker_path(spec)
         if not worker.is_file():
@@ -487,6 +543,7 @@ class PluginProcess:
                 "TMP",
                 "TMPDIR",
             }
+            or name in NETWORK_PROXY_ENVIRONMENT
         }
         options: dict[str, Any] = (
             {"start_new_session": True} if os.name != "nt" else {}
@@ -516,7 +573,11 @@ class PluginProcess:
         assert process is not None
         assert process.stdout is not None and process.stdin is not None
         self._peer = self._make_peer(
-            FramedTransport(process.stdout, process.stdin),
+            FramedTransport(
+                process.stdout,
+                process.stdin,
+                payloads=self._payloads,
+            ),
         )
         self._peer.register_method(self.hello_method, self._hello)
         self._peer.register_method("execution.dependencies", self._evidence)
@@ -525,10 +586,11 @@ class PluginProcess:
             for suffix in ("ready", "inspected", "state", "error")
         ):
             self._peer.register_notification(name, self._control)
-        for name, handler in self._methods.items():
-            self._peer.register_method(name, handler)
-        for name, handler in self._notifications.items():
-            self._peer.register_notification(name, handler)
+        if self._mode != "manage":
+            for name, handler in self._methods.items():
+                self._peer.register_method(name, handler)
+            for name, handler in self._notifications.items():
+                self._peer.register_notification(name, handler)
         # The host Job owns the child before releasing any private launch data.
         process.stdin.write(packet)
         await process.stdin.drain()
@@ -588,7 +650,7 @@ class PluginProcess:
                 return
         except (ValueError, AttributeError):
             return
-        ready = "ready" if self._mode == "run" else "inspected"
+        ready = "ready" if self._mode in {"run", "manage"} else "inspected"
         if notification.method == self.control_prefix + ready:
             if self._ready is not None and not self._ready.done():
                 if self.dependency_snapshot is None:
@@ -599,7 +661,10 @@ class PluginProcess:
                 if self._mode == "run":
                     self._platform = self.connecting_state
                 self._ready.set_result(None)
-        elif notification.method == self.control_prefix + "state":
+        elif (
+            self._mode != "manage"
+            and notification.method == self.control_prefix + "state"
+        ):
             state = params.get(self.state_key)
             if state in self.component_states:
                 self._platform = state
@@ -609,9 +674,11 @@ class PluginProcess:
             reason = params.get("reason_code")
             self._ready.set_exception(
                 self.error_type(
-                    reason
-                    if reason in self.startup_errors
-                    else "WORKER_START_FAILED",
+                    (
+                        reason
+                        if reason in self.startup_errors
+                        else "WORKER_START_FAILED"
+                    ),
                 ),
             )
 
@@ -655,7 +722,14 @@ class PluginProcess:
             RpcTimeoutError,
             RpcClosedError,
             asyncio.CancelledError,
+            FrameError,
         ) as exc:
+            if isinstance(exc, FrameError) and not getattr(
+                exc,
+                "side_effect_possible",
+                False,
+            ):
+                raise
             unknown = self.unknown_type(request_id, method, generation)
             self._unknown.append(
                 {
@@ -750,7 +824,7 @@ class PluginProcess:
         self.last_cleanup = result
         return result
 
-    async def _close_peer(self, budget: float, *, graceful: bool) -> None:
+    async def _close_peer(self, budget: float, *, graceful: bool) -> bool:
         """Request component shutdown and bound private transport closure."""
         peer = self._peer
         if (
@@ -760,7 +834,7 @@ class PluginProcess:
             and self._spec is not None
         ):
             try:
-                await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     peer.call(
                         self.control_prefix + "stop",
                         self._identity(self._spec).to_mapping(),
@@ -769,12 +843,20 @@ class PluginProcess:
                     budget / 3,
                 )
             except Exception:
-                pass
+                return False
+            if (
+                not isinstance(result, dict)
+                or result.get("stopped") is not True
+            ):
+                return False
+        elif graceful:
+            return False
         if peer is not None:
             try:
                 await asyncio.wait_for(peer.aclose(), max(0.01, budget / 6))
             except Exception:
                 pass
+        return True
 
     async def _cleanup_owned(
         self,
@@ -795,20 +877,45 @@ class PluginProcess:
                 pass
         process, tree = self._process, self._tree
         if process is None:
+            if (
+                self._payloads is not None
+                and not await self._payloads.cleanup(
+                    deadline=asyncio.get_running_loop().time() + budget,
+                )
+            ):
+                self._state = "residual"
+                return StopResult(
+                    False,
+                    self._returncode,
+                    False,
+                    ("PAYLOAD_STORE_REMAINING",),
+                )
+            self._payloads = None
             return StopResult(True, self._returncode, False)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + budget
-        await self._close_peer(budget, graceful=graceful)
-        if graceful:
+        confirmed = await self._close_peer(budget, graceful=graceful)
+        if graceful and confirmed:
             until = min(deadline, loop.time() + budget / 6)
             while process.returncode is None and loop.time() < until:
                 await asyncio.sleep(0.01)
         forced = await self._terminate_tree(process, tree, deadline, budget)
+        if graceful and not confirmed:
+            await self._close_peer(
+                max(0.0, deadline - loop.time()),
+                graceful=False,
+            )
         residual = []
         if process.returncode is None:
             residual.append("PROCESS_RUNNING")
         if tree is not None and tree.alive():
             residual.append("PROCESS_TREE_RUNNING")
+        if (
+            not residual
+            and self._payloads is not None
+            and not await self._payloads.cleanup(deadline=deadline)
+        ):
+            residual.append("PAYLOAD_STORE_REMAINING")
         self._returncode = process.returncode
         self._platform = self.initial_state
         if residual:
@@ -827,6 +934,7 @@ class PluginProcess:
         if tree is not None:
             tree.close()
         self._process, self._tree, self._peer = None, None, None
+        self._payloads = None
         self._spawn_task = None
         if self._log_task is not None:
             try:

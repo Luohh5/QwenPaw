@@ -460,15 +460,76 @@ async def test_disabled_descriptor_reserves_key_against_same_name_legacy_class(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("key", ["console", "slack"])
+@pytest.mark.parametrize("key", ["console"])
 async def test_generic_loader_rejects_protected_builtin_name(
     tmp_path,
     registry,
     key,
 ):
-    loader, record = await load_sample(tmp_path, registry, None, True, key)
-    assert record.status == "failed"
-    assert loader.registry.get_channel_catalog_entry(key) is None
+    from qwenpaw.plugins.loader import PluginLoader
+
+    source, manifest = sample_plugin(tmp_path / "installed", key)
+    loader = PluginLoader([source.parent], channel_runtime=runtime(None))
+    with pytest.raises(ValueError, match="owner 'builtin' conflicts"):
+        await loader.load_plugin(
+            manifest, source, {"enabled": True}, activate=False
+        )
+    assert registry.get_channel_catalog_entry(key) is None
+    assert loader.get_loaded_plugin(key) is None
+    assert key + ".driver" not in sys.modules
+    assert (source / "driver.py").exists() is False
+
+
+@pytest.mark.asyncio
+async def test_generic_loader_rejects_other_owner_claiming_official_slack_key(
+    tmp_path, registry
+):
+    from qwenpaw.plugins.loader import PluginLoader
+
+    source, manifest = sample_plugin(tmp_path / "installed", "intruder")
+    path = source / "channel.json"
+    descriptor = json.loads(path.read_text())
+    descriptor["channel_key"] = "slack"
+    path.write_text(json.dumps(descriptor))
+    loader = PluginLoader([source.parent], channel_runtime=runtime(None))
+    with pytest.raises(
+        ValueError,
+        match="Channel 'slack' owner 'slack' conflicts with plugin 'intruder'",
+    ):
+        await loader.load_plugin(
+            manifest, source, {"enabled": True}, activate=False
+        )
+    assert registry.get_channel_catalog_entry("slack") is None
+    assert registry.get_channel_catalog_entry("intruder") is None
+    assert loader.get_loaded_plugin("intruder") is None
+    assert registry.runtime_owners.leases("intruder") == ()
+    assert "intruder.driver" not in sys.modules
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_generic_loader_accepts_official_slack_same_owner_without_import(
+    tmp_path, registry, enabled, monkeypatch
+):
+    from qwenpaw.plugins.loader import PluginLoader
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("Static admission launched a worker")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden)
+    source, manifest = sample_plugin(tmp_path / "installed", "slack")
+    loader = PluginLoader([source.parent], channel_runtime=runtime(None))
+    record = await loader.load_plugin(
+        manifest, source, {"enabled": enabled}, activate=False
+    )
+    assert record.status != "failed"
+    assert loader.get_loaded_plugin("slack") is record
+    row = registry.get_channel_catalog_entry("slack")
+    assert row.plugin_id == row.channel_key == "slack"
+    assert row.global_enabled is enabled
+    assert row.description_record.plugin_id == "slack"
+    assert registry.runtime_owners.leases("slack") == ()
+    assert "slack.driver" not in sys.modules
 
 
 @pytest.fixture
@@ -483,6 +544,21 @@ async def api_case(tmp_path, registry, monkeypatch, request):
     )
     from qwenpaw.config import utils
     from qwenpaw.app.routers import config as routes
+    from qwenpaw.plugins import official_channels
+    from qwenpaw.__version__ import __version__
+
+    # The real bundle builder binds every current official owner and digest.
+    builder = importlib.util.spec_from_file_location(
+        "g2_admission_bundle",
+        ROOT / "scripts/pack/generate_plugin_metadata.py",
+    )
+    module = importlib.util.module_from_spec(builder)
+    builder.loader.exec_module(module)
+    resources = tmp_path / "official-bundle"
+    module.build_official_channel_bundle(
+        ROOT, resources, host_version=__version__
+    )
+    monkeypatch.setattr(official_channels, "_resource_root", lambda: resources)
 
     workspace = tmp_path / "workspace"
     monkeypatch.setattr(

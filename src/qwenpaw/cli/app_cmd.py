@@ -60,6 +60,9 @@ def configure_server_process(
     reload: bool = False,
 ) -> None:
     """Configure shared process state for an HTTP server command."""
+    from ..app.server_context import set_server_port
+
+    set_server_port(port)
     write_last_api(probe_host_for_bind_host(host), port)
     os.environ[LOG_LEVEL_ENV] = log_level
     if reload:
@@ -175,6 +178,7 @@ def app_cmd(
         port=port,
         reload=reload,
         workers=1,
+        proxy_headers=False,
         log_level=log_level,
         # Bound shutdown so workspace SSE connections cannot block exit.
         timeout_graceful_shutdown=5,

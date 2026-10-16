@@ -26,6 +26,7 @@ import uuid
 import httpx
 
 from qwenpaw.app.channels.utils import file_url_to_local_path
+from .errors import FeishuDeliveryError
 from .card_templates import (
     build_tool_guard_approval_card,
     parse_tool_guard_action_value,
@@ -138,22 +139,6 @@ finally:
             is _declare_namespace_shim
         ):
             delattr(_pkg_resources_module, "declare_namespace")
-
-
-class FeishuDeliveryError(RuntimeError):
-    """Describe a determinate or uncertain platform delivery failure."""
-
-    def __init__(
-        self,
-        reason_code: str,
-        *,
-        side_effect_possible: bool,
-        retryable: bool = False,
-    ) -> None:
-        self.reason_code = reason_code
-        self.side_effect_possible = side_effect_possible
-        self.retryable = retryable
-        super().__init__(reason_code)
 
 
 def _owned_operation(method):

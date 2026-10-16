@@ -13,17 +13,27 @@ import { useAppMessage } from "../../../../hooks/useAppMessage";
 import { Alert, Collapse, ConfigProvider } from "antd";
 import { Link as LinkOutlined } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { useEffect, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import type { FormInstance } from "antd";
 import { getChannelLabel, isLoopbackHost, type ChannelKey } from "./constants";
 import { QrcodeAuthBlock } from "./QrcodeAuthBlock";
+import type { ChannelQrcodeCustody } from "./useChannelQrcode";
 import {
   channelApi,
   type ChannelSchema,
+  type ChannelAuthProvenance,
+  type ChannelSaveJob,
 } from "../../../../api/modules/channel";
 import styles from "../index.module.less";
 import { useAgentStore } from "../../../../stores/agentStore";
 import { openExternalLink } from "../../../../utils/openExternalLink";
+import { captureChannelSaveJob } from "./channelConfig";
 
 const CHANNELS_WITH_ACCESS_CONTROL: ChannelKey[] = [
   "telegram",
@@ -156,6 +166,7 @@ interface ChannelDrawerProps {
   onRuntimeChange?: () => void | Promise<void>;
   onClose: () => void;
   onSubmit: (values: Record<string, unknown>) => void | Promise<void>;
+  onSubmitSnapshot?: (job: ChannelSaveJob) => Promise<void | boolean>;
 }
 
 export function ChannelDrawer({
@@ -168,6 +179,7 @@ export function ChannelDrawer({
   channelSchema,
   onClose,
   onSubmit,
+  onSubmitSnapshot,
   onRuntimeChange,
 }: ChannelDrawerProps) {
   const { t, i18n } = useTranslation();
@@ -183,6 +195,33 @@ export function ChannelDrawer({
       setExpandedSections(Array.isArray(keys) ? keys : [keys]),
   };
   const { selectedAgent, agents } = useAgentStore();
+  const agentId = selectedAgent || "default";
+  const formRevision = useRef(0);
+  const scopeGeneration = useRef(0);
+  const authorization = useRef<{
+    provenance: ChannelAuthProvenance;
+    fields: string[];
+    receipt: { credentials?: Record<string, unknown> };
+    custody: ChannelQrcodeCustody;
+  }>();
+  const pendingValidation = useRef<Promise<boolean>>();
+  const invalidateScope = useCallback(() => {
+    scopeGeneration.current += 1;
+    formRevision.current += 1;
+    authorization.current?.custody.cancel();
+    authorization.current = undefined;
+    pendingValidation.current = undefined;
+  }, []);
+  useLayoutEffect(invalidateScope, [agentId, activeKey, open, invalidateScope]);
+  useLayoutEffect(() => {
+    const unsubscribe = useAgentStore.subscribe((next, previous) => {
+      if (next.selectedAgent !== previous.selectedAgent) invalidateScope();
+    });
+    return () => {
+      unsubscribe();
+      invalidateScope();
+    };
+  }, [invalidateScope]);
   const currentAgent = agents.find((a) => a.id === selectedAgent);
   const defaultMediaDir = currentAgent?.workspace_dir
     ? `${currentAgent.workspace_dir}/media`
@@ -431,6 +470,7 @@ export function ChannelDrawer({
               />
             </ConfigProvider>
             <QrcodeAuthBlock
+              agentId={agentId}
               label={t("channels.dingtalkScanAuth")}
               buttonText={t("channels.dingtalkGetQrcode")}
               imageAlt="DingTalk QR Code"
@@ -439,12 +479,15 @@ export function ChannelDrawer({
               successStatus="success"
               successCredentialKey="client_id"
               pollInterval={5000}
-              onSuccess={(credentials) => {
-                form.setFieldsValue({
-                  client_id: credentials.client_id,
-                  client_secret: credentials.client_secret,
-                });
-                schedule();
+              onSuccess={(credentials, provenance, custody) => {
+                acceptCredentials(
+                  {
+                    client_id: credentials.client_id,
+                    client_secret: credentials.client_secret,
+                  },
+                  provenance,
+                  custody,
+                );
                 message.success(t("channels.dingtalkAuthSuccess"));
               }}
               onError={(type) => {
@@ -625,6 +668,7 @@ export function ChannelDrawer({
               />
             </ConfigProvider>
             <QrcodeAuthBlock
+              agentId={agentId}
               label={t("channels.feishuScanLogin")}
               buttonText={t("channels.feishuGetQrcode")}
               imageAlt="Feishu QR Code"
@@ -634,12 +678,15 @@ export function ChannelDrawer({
               successCredentialKey="app_id"
               pollInterval={2000}
               params={{ domain: feishuDomain }}
-              onSuccess={(credentials) => {
-                form.setFieldsValue({
-                  app_id: credentials.app_id,
-                  app_secret: credentials.app_secret,
-                });
-                schedule();
+              onSuccess={(credentials, provenance, custody) => {
+                acceptCredentials(
+                  {
+                    app_id: credentials.app_id,
+                    app_secret: credentials.app_secret,
+                  },
+                  provenance,
+                  custody,
+                );
                 message.success(t("channels.feishuAuthSuccess"));
               }}
               onError={(type) => {
@@ -699,6 +746,7 @@ export function ChannelDrawer({
               />
             </ConfigProvider>
             <QrcodeAuthBlock
+              agentId={agentId}
               label={t("channels.qqScanAuth")}
               buttonText={t("channels.qqGetQrcode")}
               imageAlt="QQ QR Code"
@@ -709,13 +757,16 @@ export function ChannelDrawer({
               pollInterval={2000}
               pollTimeout={300000}
               maxPollCount={180}
-              onSuccess={(credentials) => {
-                form.setFieldsValue({
-                  app_id: credentials.app_id,
-                  client_secret: credentials.client_secret,
-                  user_openid: credentials.user_openid,
-                });
-                schedule();
+              onSuccess={(credentials, provenance, custody) => {
+                acceptCredentials(
+                  {
+                    app_id: credentials.app_id,
+                    client_secret: credentials.client_secret,
+                    user_openid: credentials.user_openid,
+                  },
+                  provenance,
+                  custody,
+                );
                 message.success(t("channels.qqAuthSuccess"));
               }}
               onError={(type) => {
@@ -1184,6 +1235,7 @@ export function ChannelDrawer({
               />
             </ConfigProvider>
             <QrcodeAuthBlock
+              agentId={agentId}
               label={t("channels.wecomScanAuth")}
               buttonText={t("channels.loginWeCom")}
               imageAlt="WeCom QR Code"
@@ -1192,12 +1244,15 @@ export function ChannelDrawer({
               successStatus="success"
               successCredentialKey="bot_id"
               pollInterval={3000}
-              onSuccess={(credentials) => {
-                form.setFieldsValue({
-                  bot_id: credentials.bot_id,
-                  secret: credentials.secret,
-                });
-                schedule();
+              onSuccess={(credentials, provenance, custody) => {
+                acceptCredentials(
+                  {
+                    bot_id: credentials.bot_id,
+                    secret: credentials.secret,
+                  },
+                  provenance,
+                  custody,
+                );
                 message.success(t("channels.wecomAuthSuccess"));
               }}
               onError={() => {
@@ -1327,6 +1382,7 @@ export function ChannelDrawer({
               />
             </ConfigProvider>
             <QrcodeAuthBlock
+              agentId={agentId}
               label={t("channels.wechatScanLogin")}
               buttonText={t("channels.wechatGetQrcode")}
               imageAlt="WeChat QR Code"
@@ -1335,9 +1391,17 @@ export function ChannelDrawer({
               successStatus="confirmed"
               successCredentialKey="bot_token"
               pollInterval={2000}
-              onSuccess={(credentials) => {
-                form.setFieldsValue({ bot_token: credentials.bot_token });
-                schedule();
+              onSuccess={(credentials, provenance, custody) => {
+                acceptCredentials(
+                  {
+                    bot_token: credentials.bot_token,
+                    ...(credentials.base_url
+                      ? { base_url: credentials.base_url }
+                      : {}),
+                  },
+                  provenance,
+                  custody,
+                );
                 message.success(t("channels.wechatLoginSuccess"));
               }}
               onError={(type) => {
@@ -1879,24 +1943,153 @@ export function ChannelDrawer({
 
   // ── Render ───────────────────────────────────────────────────────────────
 
-  const { schedule, flush } = useAutoSave(async () => {
-    const values = form.getFieldsValue(true);
+  const prepareSave = async (
+    enqueue?: (save: () => Promise<boolean>) => void,
+  ) => {
+    if (!activeKey) return undefined;
+    const values = structuredClone(form.getFieldsValue(true));
+    const validationValues = JSON.stringify(values);
+    const generation = scopeGeneration.current;
+    const capturedAuthorization = authorization.current
+      ? {
+          provenance: { ...authorization.current.provenance },
+          fields: [...authorization.current.fields],
+          receipt: authorization.current.receipt,
+          custody: authorization.current.custody,
+        }
+      : undefined;
+    const { auth_method, ...rest } = values;
+    const body =
+      activeKey !== "matrix"
+        ? values
+        : auth_method === "password"
+        ? { ...rest, access_token: "" }
+        : { ...rest, password: "", encryption: false };
+    const job = captureChannelSaveJob({
+      agentId,
+      channel: activeKey,
+      body: { ...initialValues, ...body },
+      authSession: capturedAuthorization?.provenance.token,
+      formRevision: formRevision.current,
+    });
+    const currentScope = () =>
+      generation === scopeGeneration.current &&
+      (useAgentStore.getState().selectedAgent || "default") === job.agentId;
+    const current = () =>
+      currentScope() &&
+      job.formRevision === formRevision.current &&
+      JSON.stringify(form.getFieldsValue(true)) === validationValues;
     try {
       await form.validateFields();
-    } catch {
-      return false;
+    } catch (error) {
+      // A field's own onChange validation can supersede the eager whole-form
+      // validation. Revalidate once, only while this exact snapshot is current.
+      if (
+        !current() ||
+        !error ||
+        typeof error !== "object" ||
+        !("outOfDate" in error) ||
+        error.outOfDate !== true ||
+        !("errorFields" in error) ||
+        !Array.isArray(error.errorFields) ||
+        error.errorFields.length !== 0
+      )
+        return undefined;
+      try {
+        await form.validateFields();
+      } catch {
+        return undefined;
+      }
     }
-    if (activeKey !== "matrix") {
-      await onSubmit(values);
-      return;
-    }
-    const { auth_method, ...rest } = values;
-    await onSubmit(
-      auth_method === "password"
-        ? { ...rest, access_token: "" }
-        : { ...rest, password: "", encryption: false },
-    );
+    if (!current()) return undefined;
+    // Validation transfers custody to this immutable task. Later navigation,
+    // unmount or retry must not reread the form or discard the validated write.
+    const save = async () => {
+      const committed = capturedAuthorization?.receipt.credentials;
+      const alreadyCommitted =
+        committed &&
+        job.authSession &&
+        capturedAuthorization.provenance.agentId === job.agentId &&
+        capturedAuthorization.provenance.channel === job.channel &&
+        capturedAuthorization.provenance.token === job.authSession &&
+        Object.entries(committed).every(
+          ([key, value]) => job.body[key] === value,
+        );
+      const submittedJob = alreadyCommitted
+        ? captureChannelSaveJob({ ...job, authSession: undefined })
+        : job;
+      let saved: void | boolean = undefined;
+      if (onSubmitSnapshot) saved = await onSubmitSnapshot(submittedJob);
+      else {
+        if (job.authSession)
+          throw new Error("Authorization save requires its session provenance");
+        await onSubmit(job.body);
+      }
+      if (saved === false) return true;
+      if (saved === true && capturedAuthorization && submittedJob.authSession) {
+        // Only this authorization batch shares the receipt. Its queued jobs
+        // retain it across navigation; the next scope cannot acquire it.
+        capturedAuthorization.receipt.credentials = Object.fromEntries(
+          capturedAuthorization.fields.map((key) => [key, job.body[key]]),
+        );
+      }
+      if (
+        saved === true &&
+        currentScope() &&
+        authorization.current?.provenance.token === job.authSession
+      ) {
+        authorization.current = undefined;
+      }
+      return true;
+    };
+    // Claim and enqueue without an intervening await: cleanup must see either
+    // an owned QR session or a validated task already in the existing queue.
+    if (capturedAuthorization && !capturedAuthorization.custody.take())
+      return undefined;
+    enqueue?.(save);
+    return save;
+  };
+  const { schedule, flush } = useAutoSave(async () => {
+    const save = await prepareSave();
+    return save ? save() : false;
   });
+  const validateAndSchedule = () => {
+    pendingValidation.current = prepareSave(schedule)
+      .then((save) => !!save)
+      .catch(() => {
+        message.error(t("common.autoSaveFailed"));
+        return false;
+      });
+  };
+  const scheduleSnapshot = (changed: Record<string, unknown>) => {
+    formRevision.current += 1;
+    if (authorization.current?.fields.some((field) => field in changed)) {
+      authorization.current.custody.cancel();
+      authorization.current = undefined;
+    }
+    validateAndSchedule();
+  };
+  const acceptCredentials = (
+    values: Record<string, string>,
+    provenance: ChannelAuthProvenance,
+    custody: ChannelQrcodeCustody,
+  ) => {
+    if (provenance.agentId !== agentId || provenance.channel !== activeKey)
+      return;
+    form.setFieldsValue(values);
+    formRevision.current += 1;
+    authorization.current = {
+      provenance: { ...provenance },
+      custody,
+      receipt: {},
+      fields: [
+        ...Object.keys(values),
+        "bot_token_file",
+        ...(activeKey === "wechat" ? ["base_url"] : []),
+      ],
+    };
+    validateAndSchedule();
+  };
 
   return (
     <Drawer
@@ -1905,8 +2098,13 @@ export function ChannelDrawer({
       title={drawerTitle}
       open={open}
       onClose={() => {
-        void flush().then((saved) => {
-          if (saved) onClose();
+        const generation = scopeGeneration.current;
+        void (async () => {
+          if (pendingValidation.current && !(await pendingValidation.current))
+            return false;
+          return flush();
+        })().then((saved) => {
+          if (saved && generation === scopeGeneration.current) onClose();
         });
       }}
       destroyOnHidden
@@ -1963,7 +2161,7 @@ export function ChannelDrawer({
               "advanced",
             ])
           }
-          onValuesChange={schedule}
+          onValuesChange={scheduleSnapshot}
           onFinish={() => void flush()}
         >
           <Form.Item

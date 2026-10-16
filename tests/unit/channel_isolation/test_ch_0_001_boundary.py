@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Contract checks for the CH-0-001 Core/Runner boundary document."""
+"""Historical CH-0-001 consistency plus current shared-runner boundaries."""
 
 from __future__ import annotations
 
 import ast
+import asyncio
+import importlib.abc
+import json
+import sys
+
+import pytest
 import re
 from pathlib import Path
 from pathlib import PurePosixPath, PureWindowsPath
@@ -16,8 +22,6 @@ CONFIG_PATH = ROOT / "src/qwenpaw/config/config.py"
 DESIGN_PATH = ROOT / "docs/proposals/channel-isolation/DESIGN.md"
 PLUGIN_API_PATH = ROOT / "src/qwenpaw/plugins/api.py"
 PLUGIN_REGISTRY_PATH = ROOT / "src/qwenpaw/plugins/registry.py"
-AZURE_PLUGIN_PATH = ROOT / "plugins/channel/azure_bot/plugin.py"
-AZURE_CHANNEL_PATH = ROOT / "plugins/channel/azure_bot/channel.py"
 PLAN_PATH = (
     ROOT / "docs/proposals/channel-isolation/IMPLEMENTATION_WORK_PLAN.md"
 )
@@ -243,37 +247,6 @@ def _design_rpc_methods() -> set[str]:
     }
 
 
-def _config_channel_types() -> dict[str, str]:
-    """Read ChannelConfig field-to-model annotations from source."""
-    tree = ast.parse(CONFIG_PATH.read_text(encoding="utf-8"))
-    channel_config = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "ChannelConfig"
-    )
-    result: dict[str, str] = {}
-    for child in channel_config.body:
-        if not isinstance(child, ast.AnnAssign):
-            continue
-        if isinstance(child.target, ast.Name) and isinstance(
-            child.annotation,
-            ast.Name,
-        ):
-            result[child.target.id] = child.annotation.id
-    return result
-
-
-def _class_has_field(path: Path, class_name: str, field_name: str) -> bool:
-    """Return whether a config class declares a field."""
-    node = _class_node(path, class_name)
-    return any(
-        isinstance(child, ast.AnnAssign)
-        and isinstance(child.target, ast.Name)
-        and child.target.id == field_name
-        for child in node.body
-    )
-
-
 def _method_source(path: Path, class_name: str, method_name: str) -> str:
     """Return source text for one class method."""
     node = _class_node(path, class_name)
@@ -287,18 +260,6 @@ def _method_source(path: Path, class_name: str, method_name: str) -> str:
     return "\n".join(lines[method.lineno - 1 : method.end_lineno])
 
 
-def _method_source_or_empty(
-    path: Path,
-    class_name: str,
-    method_name: str,
-) -> str:
-    """Return method source, or an empty string when no override exists."""
-    try:
-        return _method_source(path, class_name, method_name)
-    except StopIteration:
-        return ""
-
-
 def _documented_hook_overrides(text: str) -> dict[str, set[str]]:
     """Read the channel hook override table from the boundary document."""
     rows = _table_rows(text, "| channel_key | relevant hook overrides |")
@@ -309,7 +270,7 @@ def _documented_hook_overrides(text: str) -> dict[str, set[str]]:
 
 
 def test_base_channel_methods_have_one_matrix_row() -> None:
-    """Every current BaseChannel method is documented exactly once."""
+    """Historical eighty methods plus explicit current Core additions."""
     rows = _table_rows(
         DOC_PATH.read_text(encoding="utf-8"),
         "| method | declaration | owner | isolated mapping | notes |",
@@ -317,7 +278,15 @@ def test_base_channel_methods_have_one_matrix_row() -> None:
     documented = [row[0] for row in rows]
     assert len(documented) == 80
     assert len(set(documented)) == len(documented)
-    assert set(documented) == set(_base_methods())
+    additions = {"_consume_request": "Core"}
+    assert set(documented).isdisjoint(additions)
+    assert set(_base_methods()) == set(documented) | additions.keys()
+    assert additions["_consume_request"] == "Core"
+    assert "await self._run_process_loop(" in _method_source(
+        BASE_PATH,
+        "BaseChannel",
+        "_consume_request",
+    )
     assert all(len(row) == 5 for row in rows)
     assert all(
         row[2] in {"Core", "Runner", "Split", "Compatibility"} for row in rows
@@ -325,9 +294,51 @@ def test_base_channel_methods_have_one_matrix_row() -> None:
 
 
 def test_registry_and_media_tables_cover_exact_builtin_baseline() -> None:
-    """The document covers all 18 registry keys without drift."""
+    """Historical eighteen rows; current Console plus eighteen SDK-free plugins."""
     text = DOC_PATH.read_text(encoding="utf-8")
-    assert _registry_keys() == EXPECTED_CHANNELS
+    assert _registry_keys() == {"console"}
+    import qwenpaw
+
+    assert Path(qwenpaw.__file__).resolve() == ROOT / "src/qwenpaw/__init__.py"
+    from qwenpaw.plugins.official_channel_catalog import OFFICIAL_CHANNELS
+    from qwenpaw.channel_protocol.shared import SharedChannelDescriptor
+
+    official = {row["channel_key"] for row in OFFICIAL_CHANNELS}
+    assert len(OFFICIAL_CHANNELS) == len(official) == 18
+    assert official == (EXPECTED_CHANNELS - {"console"}) | {"azure_bot"}
+    assert len(official | _registry_keys()) == 19
+    modules = {
+        json.loads(
+            (
+                ROOT / "plugins/channel" / row["source_dir"] / "channel.json"
+            ).read_text(),
+        )["entrypoint"]["module"]
+        for row in OFFICIAL_CHANNELS
+    }
+
+    class NoDriverImports(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path=None, target=None):
+            if any(
+                fullname == name or fullname.startswith(name + ".")
+                for name in modules
+            ):
+                raise AssertionError(
+                    "Host descriptor discovery imported " + fullname,
+                )
+
+    guard = NoDriverImports()
+    sys.meta_path.insert(0, guard)
+    try:
+        for row in OFFICIAL_CHANNELS:
+            descriptor = SharedChannelDescriptor.load(
+                ROOT / "plugins/channel" / row["source_dir"] / "channel.json",
+            )
+            assert descriptor.channel_key == row["channel_key"]
+            assert descriptor.schema_version == 2
+            assert descriptor.process_mode == "runner_process"
+            assert descriptor.dependency_mode == "shared"
+    finally:
+        sys.meta_path.remove(guard)
     media_rows = _table_rows(
         text,
         (
@@ -341,7 +352,7 @@ def test_registry_and_media_tables_cover_exact_builtin_baseline() -> None:
 
 
 def test_dispatch_table_matches_current_queue_owners() -> None:
-    """Derive every builtin dispatch value from its concrete class."""
+    """Keep historical dispatch rows; current admission stays in Core."""
     text = DOC_PATH.read_text(encoding="utf-8")
     rows = _table_rows(
         text,
@@ -365,25 +376,57 @@ def test_dispatch_table_matches_current_queue_owners() -> None:
         actual[key] = (
             "manager_queue" if queue is not False else "direct_session"
         )
-    assert actual == DISPATCH_MODES
+    assert actual == {"console": "manager_queue"}
+    proxy = _class_node(
+        BASE_PATH.parent / "isolated_proxy.py",
+        "IsolatedChannelProxy",
+    )
+    assert any(
+        isinstance(base, ast.Name) and base.id == "BaseChannel"
+        for base in proxy.bases
+    )
+    assert _assignment_value(proxy, "uses_manager_queue") is not False
+    from qwenpaw.app.channels.unified_queue_manager import UnifiedQueueManager
+
+    async def check_real_queue():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def consume(queue, *_args):
+            entered.set()
+            await release.wait()
+
+        queues = UnifiedQueueManager(consume, queue_maxsize=1)
+        try:
+            result = await queues.admit("console", "session", 20, "first")
+            await entered.wait()
+            assert result.accepted
+            full = await queues.admit(
+                "console",
+                "session",
+                20,
+                "second",
+                timeout=0.03,
+            )
+            assert (full.accepted, full.reason_code) == (
+                False,
+                "QUEUE_CAPACITY_TIMEOUT",
+            )
+        finally:
+            release.set()
+            await queues.stop_all()
+
+    asyncio.run(check_real_queue())
 
 
 def test_hook_override_table_matches_real_builtin_and_plugin_sources() -> None:
-    """Document every relevant override in all builtin and legacy classes."""
+    """Historical overrides retain ownership; v2 owns response cleanup."""
     text = DOC_PATH.read_text(encoding="utf-8")
     documented = _documented_hook_overrides(text)
-    actual: dict[str, set[str]] = {}
-    for key, (_, class_name) in _registry_specs().items():
-        actual[key] = (
-            _class_methods(_channel_source(key), class_name)
-            & BOUNDARY_HOOK_METHODS
-        )
-    actual["azure_bot"] = (
-        _class_methods(AZURE_CHANNEL_PATH, "AzureBotChannel")
+    assert set(documented) == EXPECTED_CHANNELS | {"azure_bot"}
+    assert documented["console"] == (
+        _class_methods(_channel_source("console"), "ConsoleChannel")
         & BOUNDARY_HOOK_METHODS
     )
-    assert documented == actual
-    assert set(documented) == EXPECTED_CHANNELS | {"azure_bot"}
 
     rows = _table_rows(
         text,
@@ -407,25 +450,23 @@ def test_hook_override_table_matches_real_builtin_and_plugin_sources() -> None:
     )
     assert runner_cleanup_semantics in text
 
-    telegram_cleanup = _method_source(
-        _channel_source("telegram"),
-        _registry_specs()["telegram"][1],
-        "_consume_with_tracker",
+    # Actual runner cleanup is verified by each private native lifecycle suite;
+    # retired BaseChannel override locations are not the v2 ownership API.
+    driver = _class_node(
+        ROOT / "src/qwenpaw/channel_protocol/shared_response_driver.py",
+        "SharedResponseDriver",
     )
-    assert "except asyncio.CancelledError" in telegram_cleanup
-    assert "self._is_processing.pop" in telegram_cleanup
-    assert "self._stop_typing" in telegram_cleanup
-
-    wecom_cleanup = _method_source(
-        _channel_source("wecom"),
-        _registry_specs()["wecom"][1],
-        "_consume_with_tracker",
-    )
-    assert "finally:" in wecom_cleanup
-    assert "self._processing_sessions.discard" in wecom_cleanup
+    assert {"_finish", "_cleanup"} <= {
+        node.name
+        for node in driver.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
 
 
-def test_acl_identity_is_produced_by_runner_and_consumed_by_core() -> None:
+def test_acl_identity_is_produced_by_runner_and_consumed_by_core(
+    tmp_path,
+    monkeypatch,
+) -> None:
     """The ACL identity contract is explicit in docs and source."""
     text = DOC_PATH.read_text(encoding="utf-8")
     assert "Runner extracts the stable real sender identity" in text
@@ -437,13 +478,24 @@ def test_acl_identity_is_produced_by_runner_and_consumed_by_core() -> None:
         BASE_PATH.read_text(encoding="utf-8")
         + (BASE_PATH.parent / "manager.py").read_text(encoding="utf-8")
     )
-    for path in (
-        BASE_PATH.parent / "feishu/channel.py",
-        BASE_PATH.parent / "discord_/channel.py",
-        BASE_PATH.parent / "slack/handler.py",
-        AZURE_CHANNEL_PATH,
-    ):
-        assert "acl_sender_id" in path.read_text(encoding="utf-8")
+    from qwenpaw.app.channels.console.channel import ConsoleChannel
+    from qwenpaw.app.channels.access_control import AccessControlStore
+
+    channel = ConsoleChannel(None, True, "", workspace_dir=tmp_path)
+    store = AccessControlStore(tmp_path / "acl.json")
+    store.add_to_whitelist("console", "real-user")
+    channel.access_control_group = True
+    monkeypatch.setattr(channel, "_get_acl_store", lambda: store)
+    payload = {
+        "sender_id": "shared-room",
+        "acl_sender_id": "real-user",
+        "meta": {"is_group": True, "user_name": "display"},
+    }
+    assert asyncio.run(channel._access_control_gate(payload)) is False
+    payload["acl_sender_id"] = "unlisted-user"
+    payload["sender_id"] = "real-user"
+    assert asyncio.run(channel._access_control_gate(payload)) is True
+    assert store.get_acl("console")["pending"][0]["user_id"] == "unlisted-user"
 
 
 def test_driver_rpc_mapping_matches_design_without_checkpoint_method() -> None:
@@ -461,8 +513,11 @@ def test_driver_rpc_mapping_matches_design_without_checkpoint_method() -> None:
     assert "不是 wire API" in text
 
 
-def test_media_path_rules_and_configuration_gaps_are_source_derived() -> None:
-    """Freeze path bases and record current schema/factory/env gaps."""
+def test_media_path_rules_and_configuration_gaps_are_source_derived(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Historical gaps are not requirements; host paths ignore worker cwd."""
     text = DOC_PATH.read_text(encoding="utf-8")
     assert "Core cwd nor Runner cwd participates" in text
     assert "`~` is expanded before the absolute/relative" in text
@@ -476,75 +531,59 @@ def test_media_path_rules_and_configuration_gaps_are_source_derived() -> None:
     assert '`from_config`, `media_dir="attachments"`' in text
     assert '`from_env`, `SLACK_MEDIA_DIR="downloads"`' in text
 
-    config_types = _config_channel_types()
-    media_channels = {
-        "discord",
-        "dingtalk",
-        "feishu",
-        "qq",
-        "telegram",
-        "mattermost",
-        "matrix",
-        "slack",
-        "wecom",
-        "xiaoyi",
-        "yuanbao",
-        "wechat",
+    from qwenpaw.config.channel_config_compat import absolute_execution_paths
+
+    host, child = tmp_path / "host", tmp_path / "child"
+    host.mkdir()
+    child.mkdir()
+    monkeypatch.chdir(child)
+    monkeypatch.setenv("HOME", str(host))
+    raw = {"media_dir": "link/../media", "db_path": "~/chat.db"}
+    result = absolute_execution_paths(
+        raw,
+        path_fields=("media_dir", "db_path"),
+        working_dir=host,
+    )
+    assert result == {
+        "media_dir": str(host / "link/../media"),
+        "db_path": str(host / "chat.db"),
     }
-    for key in media_channels:
-        config_name = config_types[key]
-        has_schema = _class_has_field(CONFIG_PATH, config_name, "media_dir")
-        source = _channel_source(key)
-        _, class_name = _registry_specs()[key]
-        constructor = _method_source_or_empty(source, class_name, "__init__")
-        from_config = _method_source_or_empty(
-            source,
-            class_name,
-            "from_config",
-        )
-        from_env = _method_source_or_empty(source, class_name, "from_env")
-        assert has_schema == (
-            key not in {"qq", "telegram", "matrix", "xiaoyi"}
-        )
-        assert ("media_dir" in constructor) == (key != "matrix")
-        assert ("media_dir" in from_config) == (
-            key not in {"telegram", "matrix"}
-        )
-        env_key = f"{key.upper()}_MEDIA_DIR"
-        if key == "discord":
-            env_key = "DISCORD_MEDIA_DIR"
-        if key == "dingtalk":
-            env_key = "DINGTALK_MEDIA_DIR"
-        if key == "feishu":
-            env_key = "FEISHU_MEDIA_DIR"
-        if key == "mattermost":
-            env_key = "MATTERMOST_MEDIA_DIR"
-        if key == "wecom":
-            env_key = "WECOM_MEDIA_DIR"
-        if key == "wechat":
-            env_key = "WECHAT_MEDIA_DIR"
-        if key == "xiaoyi":
-            env_key = "XIAOYI_MEDIA_DIR"
-        assert (env_key in from_env) == (
-            key not in {"qq", "telegram", "matrix", "slack", "yuanbao"}
-        )
+    assert raw == {"media_dir": "link/../media", "db_path": "~/chat.db"}
+    assert absolute_execution_paths(
+        {"media_dir": None},
+        path_fields=("media_dir",),
+        working_dir=host,
+    ) == {"media_dir": None}
 
 
 def test_legacy_plugin_registration_is_concrete_base_channel_contract() -> (
     None
 ):
-    """Verify PluginAPI, registry, and the Azure Bot registration chain."""
+    """Retained v1 example is compatibility only; current Azure uses v2."""
     api_source = PLUGIN_API_PATH.read_text(encoding="utf-8")
     registry_source = PLUGIN_REGISTRY_PATH.read_text(encoding="utf-8")
-    azure_source = AZURE_PLUGIN_PATH.read_text(encoding="utf-8")
-    azure_channel_source = AZURE_CHANNEL_PATH.read_text(encoding="utf-8")
     assert "self._registry.register_channel(" in api_source
     assert "issubclass(channel_class, BaseChannel)" in registry_source
-    assert "channel_class=AzureBotChannel" in azure_source
-    assert "api.register_channel(" in azure_source
-    assert "class AzureBotChannel(BaseChannel):" in azure_channel_source
     assert "`PluginAPI.register_channel` accepts" in (
         DOC_PATH.read_text(encoding="utf-8")
+    )
+
+    descriptor = json.loads(
+        (ROOT / "plugins/channel/azure_bot/channel.json").read_text(),
+    )
+    assert descriptor["schema_version"] == 2
+    assert descriptor["entrypoint"] == {
+        "module": "qwenpaw_channel_azure_bot.driver",
+        "qualname": "AzureBotDriver",
+        "scope": "runner",
+    }
+    node = _class_node(
+        ROOT / "plugins/channel/azure_bot/qwenpaw_channel_azure_bot/driver.py",
+        "AzureBotDriver",
+    )
+    assert any(
+        isinstance(base, ast.Name) and base.id == "SharedResponseDriver"
+        for base in node.bases
     )
 
 
@@ -588,6 +627,33 @@ def test_interfaces_are_dto_only_and_compatibility_is_complete() -> None:
         ("plugin", "runner_process"),
     }
     assert "azure_bot" in text
+
+    from qwenpaw.channel_protocol.models import InboundEvent
+    from qwenpaw.channel_protocol.errors import ProtocolValidationError
+
+    wire = {
+        "event_id": "e",
+        "event_kind": "message",
+        "channel_key": "console",
+        "instance_id": "instance",
+        "generation": 1,
+        "conversation": {"id": "group", "type": "group"},
+        "sender_id": "actor",
+        "acl_sender_id": "actor",
+        "sender_name": "display",
+        "content_parts": [{"type": "text", "text": "hello"}],
+    }
+    event = InboundEvent.from_mapping(wire)
+    assert (
+        json.loads(json.dumps(event.to_mapping()))["acl_sender_id"] == "actor"
+    )
+    for invalid in (
+        {**wire, "agent": object()},
+        {**wire, "acl_sender_id": ""},
+        {**wire, "content_parts": [object()]},
+    ):
+        with pytest.raises(ProtocolValidationError):
+            InboundEvent.from_mapping(invalid)
 
 
 def test_boundary_invariants_and_media_rules_are_explicit() -> None:

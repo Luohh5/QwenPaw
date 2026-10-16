@@ -376,28 +376,39 @@ class BaseChannel(ABC):
 
     async def _access_control_gate(self, payload: Any) -> bool:
         """Check access control. Returns True if blocked."""
-        if not self.access_control_enabled:
-            return False
-
         # Prefer acl_sender_id (real sender, unaffected by shared session)
         if isinstance(payload, dict):
             sender_id = (
                 payload.get("acl_sender_id") or payload.get("sender_id") or ""
             )
-            meta = dict(payload.get("meta") or {})
+            raw_meta = payload.get("meta") or {}
         else:
             sender_id = (
                 getattr(payload, "acl_sender_id", "")
                 or getattr(payload, "user_id", "")
                 or ""
             )
-            meta = dict(getattr(payload, "channel_meta", None) or {})
+            raw_meta = getattr(payload, "channel_meta", None) or {}
 
+        if sender_id and not self.access_control_enabled:
+            return False
+        meta = dict(raw_meta)
+        is_group = bool(meta.get("is_group", False))
         if not sender_id:
+            # Unknown principals cannot be enrolled into pending/allowlists.
+            # Historical allow_from alone does not restrict an open policy.
+            policy = self.group_policy if is_group else self.dm_policy
+            controlled = (
+                self.access_control_group
+                if is_group
+                else self.access_control_dm
+            )
+            return policy != "open" or controlled
+
+        if not self.access_control_enabled:
             return False
 
         # Skip if access control not enabled for this chat type
-        is_group = meta.get("is_group", False)
         if is_group and not self.access_control_group:
             return False
         if not is_group and not self.access_control_dm:

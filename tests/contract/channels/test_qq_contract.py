@@ -1,47 +1,14 @@
 # -*- coding: utf-8 -*-
+"""Retained QQ responsibilities on the private driver / official host.
+
+Original records and source hashes: qq-closeout-oracle-map.json.
+Native transport and lifecycle proofs retain their existing normal entries.
 """
-QQ Channel Contract Test
+import pytest
 
-Ensures QQChannel satisfies all BaseChannel contracts.
-When BaseChannel changes, this test validates QQChannel still complies.
-"""
-
-from __future__ import annotations
-
-from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock
-
-from qwenpaw.app.channels.renderer import ChannelDisplayConfig
-
-from tests.contract.channels import ChannelContractTest
-
-if TYPE_CHECKING:
-    from qwenpaw.app.channels.base import BaseChannel
+from tests.qq_isolated import run_qq_suite
 
 
-class TestQQChannelContract(ChannelContractTest):
-    """
-    Contract tests for QQChannel.
-
-    This validates that QQChannel properly implements all BaseChannel
-    abstract methods and maintains interface compatibility.
-    """
-
-    def create_instance(self) -> "BaseChannel":
-        """Provide a QQChannel instance for contract testing."""
-        from qwenpaw.app.channels.qq.channel import QQChannel
-
-        process = AsyncMock()
-
-        return QQChannel(
-            process=process,
-            enabled=True,
-            app_id="test_app_id",
-            client_secret="test_secret",
-            bot_prefix="[Test]",
-            markdown_enabled=True,
-            display_config=ChannelDisplayConfig(
-                show_tool_calls=False,
-                show_tool_results=False,
-            ),
-        )
+@pytest.mark.parametrize("suite", ["qq_closeout_contract_suite.py"])
+def test_qq_retained_responsibilities(suite, tmp_path):
+    run_qq_suite(suite, tmp_path)

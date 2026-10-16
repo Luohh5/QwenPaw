@@ -37,6 +37,7 @@ from qwenpaw.exceptions import (
 )
 
 from .timezone import detect_system_timezone
+from .channel_normalizers import NORMALIZER_MARKER, strip_trailing_slash
 from ..constant import (
     HEARTBEAT_DEFAULT_EVERY,
     HEARTBEAT_DEFAULT_TARGET,
@@ -429,7 +430,10 @@ class FeishuConfig(BaseChannelConfig):
     verification_token: str = ""
     media_dir: Optional[str] = None
     # "feishu" / "lark", or a full http(s) base URL for custom gateways.
-    domain: str = "feishu"
+    domain: str = Field(
+        default="feishu",
+        json_schema_extra={"pattern": "^(feishu$|lark$|https?://)"},
+    )
 
     @field_validator("domain")
     @classmethod
@@ -541,12 +545,13 @@ class WecomConfig(BaseChannelConfig):
 class MatrixConfig(BaseChannelConfig):
     """Matrix channel configuration."""
 
-    homeserver: str = ""
-
-    @field_validator("homeserver")
-    @classmethod
-    def strip_trailing_slash(cls, v: str) -> str:
-        return v.rstrip("/")
+    homeserver: str = Field(
+        default="",
+        json_schema_extra={NORMALIZER_MARKER: "strip_trailing_slash"},
+    )
+    strip_trailing_slash = field_validator("homeserver", mode="after")(
+        strip_trailing_slash,
+    )
 
     user_id: str = ""
     access_token: str = ""
@@ -3249,6 +3254,7 @@ class ChannelPluginState(BaseModel):
     version: int = 0
     preset: Literal["light", "channels-full"] = "light"
     legacy_pending: list[str] = Field(default_factory=list)
+    legacy_captured: list[str] = Field(default_factory=list)
     uninstalled: list[str] = Field(default_factory=list)
 
 

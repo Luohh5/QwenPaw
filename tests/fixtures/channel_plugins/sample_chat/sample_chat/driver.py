@@ -6,7 +6,7 @@ import os
 import uuid
 
 from qwenpaw.channel_protocol.errors import RPC_LIFECYCLE_ERROR, RpcError
-from qwenpaw.channel_protocol.models import InboundEvent, SendParams
+from qwenpaw.channel_protocol.models import InboundEvent
 from qwenpaw.channel_protocol.response_lifecycle import ResponseResourceRef
 from qwenpaw.channel_protocol.shared_response_driver import (
     SharedResponseDriver,
@@ -29,7 +29,6 @@ class Driver(SharedResponseDriver):
             ("fixture.emit", self.emit),
             ("fixture.inspect", self.inspect),
             ("fixture.fault", self.set_fault),
-            ("channel.response.prepare", self.prepare),
         ):
             context.peer.register_method(method, handler)
 
@@ -156,26 +155,17 @@ class Driver(SharedResponseDriver):
                 "response_handle": handle,
             },
         )
+        if raw.get("shared_admission"):
+            admitted = await self._admit_event(event, True)
+            return (
+                admitted[0].to_mapping()
+                if admitted
+                else {"accepted_event_ids": []}
+            )
         return await self._context.peer.call(
             "event.batch",
             {"batch_id": raw["id"], "events": [event.to_mapping()]},
         )
-
-    async def prepare(self, params, _request):
-        self._identity(params)
-        operation = SendParams.from_mapping(
-            {
-                **self._context.identity.to_mapping(),
-                "to_handle": params["response_handle"],
-                "delivery_id": params["delivery_id"],
-                "operation": "stream.start",
-                "stream_type": "message",
-                "sequence": 0,
-                "accumulated_text": "preparing",
-            },
-        )
-        async with self._lock(operation.to_handle):
-            return await self._delivery(operation, self._perform_prepare)
 
     async def _perform_prepare(self, params):
         return await self.effect("prepare", params)

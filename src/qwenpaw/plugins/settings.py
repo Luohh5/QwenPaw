@@ -28,9 +28,9 @@ def drop_plugin_settings(plugin_id: str) -> None:
 
     def _apply(root) -> None:
         root.plugins.pop(plugin_id, None)
-        from ..app.channels.catalog import OFFICIAL_CHANNEL_OWNERS
+        from .official_channel_catalog import official_channel_for_plugin
 
-        if plugin_id in OFFICIAL_CHANNEL_OWNERS:
+        if official_channel_for_plugin(plugin_id) is not None:
             state = root.channel_plugin_state
             if plugin_id not in state.uninstalled:
                 state.uninstalled.append(plugin_id)
@@ -65,10 +65,10 @@ def persist_plugin_settings(
 
 def clear_channel_tombstone(plugin_id: str) -> None:
     """Explicit source commit clears that plugin's uninstall intent."""
-    from ..app.channels.catalog import OFFICIAL_CHANNEL_OWNERS
+    from .official_channel_catalog import official_channel_for_plugin
     from ..config.utils import mutate_config
 
-    if plugin_id in OFFICIAL_CHANNEL_OWNERS:
+    if official_channel_for_plugin(plugin_id) is not None:
 
         def apply(root):
             root.channel_plugin_state.uninstalled = [

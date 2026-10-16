@@ -19,7 +19,7 @@ from qwenpaw.channel_protocol.response_lifecycle import ResponseResourceRef
 from qwenpaw.channel_protocol.shared_response_driver import (
     SharedResponseDriver,
 )
-from .platform import FeishuDeliveryError, LarkOapiPlatform
+from .errors import FeishuDeliveryError
 from .utils import sender_display_string, short_session_id_from_full_id
 
 _STATE_KEY = "feishu.shared.responses"
@@ -29,6 +29,12 @@ _MAX_ROUTES = 128
 
 class FeishuDriver(SharedResponseDriver):
     """Own one SDK connection and durable reply resources."""
+
+    @staticmethod
+    async def manage(request):
+        from .management import manage
+
+        return await manage(request)
 
     def __init__(self):
         super().__init__("feishu", _STATE_KEY, FeishuDeliveryError)
@@ -42,17 +48,19 @@ class FeishuDriver(SharedResponseDriver):
             key: self._config.pop(key, "")
             for key in ("app_secret", "encrypt_key", "verification_token")
         }
-        self._platform = LarkOapiPlatform()
-        media = self._config.get("media_dir")
-        if not media:
-            workspace = self._config.get("workspace_dir")
-            if workspace:
-                media = str(Path(workspace) / "media")
-            else:
-                from qwenpaw.constant import DEFAULT_MEDIA_DIR
-
-                media = str(DEFAULT_MEDIA_DIR)
         try:
+            from .platform import LarkOapiPlatform
+
+            self._platform = LarkOapiPlatform()
+            media = self._config.get("media_dir")
+            if not media:
+                workspace = self._config.get("workspace_dir")
+                if workspace:
+                    media = str(Path(workspace) / "media")
+                else:
+                    from qwenpaw.constant import DEFAULT_MEDIA_DIR
+
+                    media = str(DEFAULT_MEDIA_DIR)
             await self._platform.prepare(
                 {**self._config, "bot_prefix": ""},
                 secret,
@@ -233,17 +241,6 @@ class FeishuDriver(SharedResponseDriver):
             return
 
     async def _open_route(self, handle, target, meta):
-        rows = self._routes.snapshots()
-        if len(rows) >= _MAX_ROUTES:
-            completed = sorted(
-                (row for row in rows if self._evictable(row)),
-                key=lambda row: row.closed_at_ms,
-            )
-            if completed:
-                self._evict(completed[0].response_handle)
-        for old in self._routes.expired_completed():
-            if self._evictable(old):
-                self._routes.commit_gc(old)
         attrs = {
             "receive_id_type": str(target[0]),
             "receive_id": str(target[1]),
@@ -267,17 +264,7 @@ class FeishuDriver(SharedResponseDriver):
                 meta.get("bot_prefix") or self._config.get("bot_prefix") or "",
             ),
         }
-        snapshot, created = self._routes.open(
-            handle,
-            [ResponseResourceRef.create("feishu.route", handle, attrs)],
-        )
-        try:
-            await self._checkpoint()
-        except BaseException:
-            if created:
-                self._routes.rollback_open(handle, snapshot.version)
-            raise
-        return handle
+        return await self._persist_route(handle, attrs)
 
     async def _open(self, params, request):
         self._identity(params)
@@ -437,15 +424,6 @@ class FeishuDriver(SharedResponseDriver):
         if admission is None:
             return
         ack, uncertain = admission
-        if event_id in ack.duplicate_event_ids and created and not uncertain:
-            from qwenpaw.channel_protocol.models import ResponseOutcome
-
-            snapshot = self._routes.begin_finish(
-                handle,
-                ResponseOutcome.CANCELLED,
-            )
-            await self._checkpoint()
-            await self._cleanup(snapshot)
         for alias in (meta["session_id"], actor, meta["feishu_chat_id"]):
             if alias:
                 self._receive_ids[alias] = target
@@ -461,6 +439,30 @@ class FeishuDriver(SharedResponseDriver):
     @staticmethod
     def _text(params):
         return params.accumulated_text or ""
+
+    def _needs_stream_cleanup(self, ref):
+        return bool(dict(ref.attributes).get("card_id"))
+
+    async def _perform_stream_cleanup(self, ref, resource, sequence):
+        try:
+            platform = self._require_connected()
+        except ValueError as exc:
+            if str(exc) != "NOT_CONNECTED":
+                raise
+            raise self.delivery_error(
+                "NOT_CONNECTED",
+                side_effect_possible=False,
+            ) from exc
+        if not await platform.update_stream(
+            resource,
+            resource.get("text", ""),
+            sequence,
+            final=True,
+        ):
+            raise FeishuDeliveryError(
+                "STREAM_CLEANUP_FAILED",
+                side_effect_possible=False,
+            )
 
     async def _perform_send(self, params):  # pylint: disable=too-many-branches
         platform = self._require_connected()

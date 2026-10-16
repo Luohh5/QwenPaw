@@ -16,22 +16,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _BUILTIN_SPECS: dict[str, tuple[str, str]] = {
-    "imessage": (".imessage", "IMessageChannel"),
-    "discord": (".discord_", "DiscordChannel"),
-    "qq": (".qq", "QQChannel"),
-    "telegram": (".telegram", "TelegramChannel"),
-    "mattermost": (".mattermost", "MattermostChannel"),
-    "mqtt": (".mqtt", "MQTTChannel"),
     "console": (".console", "ConsoleChannel"),
-    "matrix": (".matrix", "MatrixChannel"),
-    "slack": (".slack", "SlackChannel"),
-    "voice": (".voice.channel", "VoiceChannel"),
-    "sip": (".sip", "SIPChannel"),
-    "wecom": (".wecom", "WecomChannel"),
-    "xiaoyi": (".xiaoyi", "XiaoYiChannel"),
-    "yuanbao": (".yuanbao", "YuanbaoChannel"),
-    "wechat": (".wechat", "WeChatChannel"),
-    "onebot": (".onebot.channel", "OneBotChannel"),
 }
 
 # Required channels must load; failures are raised, not skipped.
@@ -154,9 +139,9 @@ def selected_process_channels() -> frozenset[str]:
     from ...plugins.registry import PluginRegistry
 
     registry = PluginRegistry()
-    from .catalog import OFFICIAL_CHANNEL_OWNERS
+    from ...plugins.official_channel_catalog import official_channel_owners
 
-    return frozenset(OFFICIAL_CHANNEL_OWNERS) | frozenset(
+    return frozenset(official_channel_owners()) | frozenset(
         key
         for key, row in registry.get_channel_catalog().items()
         if row.description_record is not None

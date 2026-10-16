@@ -240,6 +240,8 @@ Assert-LastExit "Bundled Python runtime cannot run the Native Messaging host"
 Write-Host ""
 
 Write-Host "== Building readable channel runtime ==" -ForegroundColor Yellow
+& $PYTHON_BIN (Join-Path $REPO_ROOT "scripts/pack/validate_channel_contracts.py") --project-root $REPO_ROOT
+Assert-LastExit "Official channel contract validation failed"
 $CHANNEL_WHEELS = Join-Path $DIST "channel-wheels"
 $CHANNEL_RUNTIME = Join-Path $BINARIES_DIR "channel-runtime"
 foreach ($generated in @($CHANNEL_WHEELS, $CHANNEL_RUNTIME)) {

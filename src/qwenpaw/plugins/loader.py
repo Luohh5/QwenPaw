@@ -278,7 +278,15 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             return self.registry.unregister_plugin(plugin_id)
 
         def channel_registration(plugin_id):
-            return self.registry.get_channel_registration(plugin_id)
+            return next(
+                (
+                    row
+                    for row in self.registry.get_channel_catalog().values()
+                    if row.plugin_id == plugin_id
+                    and row.description_record is not None
+                ),
+                None,
+            )
 
         # pylint: disable=unnecessary-lambda
         self._python_backend = PythonBackend(
@@ -445,6 +453,32 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 yield
             finally:
                 _LIFECYCLE_HELD.reset(token)
+
+    @asynccontextmanager
+    async def execution_source(self, plugin_id):
+        """Admit existing source custody without loading or preparing code."""
+        from .execution.process import ProcessError
+
+        lock = self._lifecycle_lock_for(plugin_id)
+        hold_key = self._lifecycle_hold_key(plugin_id)
+        if lock.locked() and (
+            hold_key is None or _LIFECYCLE_HELD.get() != hold_key
+        ):
+            raise RuntimeSourceBusyError("RUNTIME_SOURCE_MUTATING")
+        async with self.plugin_lifecycle(plugin_id):
+            record = self.get_loaded_plugin(plugin_id)
+            if record is None:
+                raise ProcessError("PLUGIN_NOT_INSTALLED")
+            enabled = (
+                record.global_enabled
+                if record.global_enabled is not None
+                else record.enabled
+            )
+            if not enabled:
+                raise ProcessError("PLUGIN_DISABLED")
+            if plugin_id in self._recovery_blocked:
+                raise ProcessError("SOURCE_UNAVAILABLE")
+            yield record
 
     def discover_plugins(self) -> List[Tuple[PluginManifest, Path]]:
         """Discover all plugins in plugin directories.
@@ -2372,14 +2406,18 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
 
     async def seed_bundled_channel(self, source_path: Path, config=None):
         """Publish absent official source without dependency or SDK work."""
-        from ..app.channels.catalog import OFFICIAL_CHANNEL_OWNERS
+        from .official_channel_catalog import official_channel_for_plugin
         from .settings import is_plugin_enabled
 
         source_path = Path(source_path).resolve()
         _, manifest = self._read_source_manifest(source_path)
         description = describe_channel(source_path, manifest)
-        if manifest.id not in OFFICIAL_CHANNEL_OWNERS:
-            raise ValueError("Unknown official channel")
+        official = official_channel_for_plugin(manifest.id)
+        if (
+            official is None
+            or description.descriptor.channel_key != official["channel_key"]
+        ):
+            raise ValueError("Unknown official channel owner")
         compatible, reason = self._check_version_compatibility(manifest)
         if not compatible:
             raise ValueError(reason)

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+import os
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from contextlib import asynccontextmanager, nullcontext
@@ -59,8 +61,15 @@ class ChannelRuntimeSettings:
     admission_timeout: float = 30.0
     dependency_install_target: Path | None = None
     runtime_identity: Mapping[str, Any] | None = None
+    connection_timeout: float | None = None
 
     def __post_init__(self):
+        if self.connection_timeout is not None and (
+            type(self.connection_timeout) not in (int, float)
+            or not math.isfinite(self.connection_timeout)
+            or self.connection_timeout <= 0
+        ):
+            raise ValueError("Connection timeout must be finite and positive")
         if (
             min(
                 self.startup_timeout,
@@ -112,6 +121,10 @@ class ChannelDescription:
         no_text_debounce: bool = True,
         startup_timeout: float = 5.0,
         shutdown_timeout: float = 2.0,
+        config_source: str = "config",
+        connection_timeout: float | None = None,
+        private_env: Mapping[str, str] | None = None,
+        legacy_references: Mapping | None = None,
     ):
         """Validate light host config and construct an unstarted proxy."""
         from .channel_config import (
@@ -122,8 +135,19 @@ class ChannelDescription:
         from ..app.channels.isolated_proxy import IsolatedChannelProxy
         from ..app.channels.process_supervisor import LaunchSpec
 
+        if config_source not in {"config", "env"}:
+            raise ValueError("CONFIG_SOURCE_INVALID")
+        raw = channel_config_dict(config)
+        if config_source == "config":
+            from ..config.channel_config_compat import normalize_channel_config
+
+            raw = normalize_channel_config(
+                self.descriptor.channel_key,
+                raw,
+                dictionary=not hasattr(config, "model_dump"),
+            )
         raw = clean_channel_config(
-            channel_config_dict(config),
+            raw,
             self.descriptor.config_schema,
         )
         raw["no_text_debounce"] = no_text_debounce
@@ -135,6 +159,34 @@ class ChannelDescription:
         values = {
             key: value for key, value in values.items() if key not in controls
         }
+        from .execution.bootstrap import validate_private_environment
+        from .official_channel_catalog import official_channel_for_plugin
+
+        environment = validate_private_environment(
+            {} if private_env is None else private_env,
+        )
+        official = official_channel_for_plugin(self.plugin_id)
+        official_owner = official is not None and (
+            official["channel_key"] == self.descriptor.channel_key
+        )
+        from .official_execution_context import prepare_official_execution
+
+        legacy_root = None
+        if official_owner:
+            from ..constant import WORKING_DIR
+
+            legacy_root = WORKING_DIR
+        values, selected = prepare_official_execution(
+            self.descriptor.channel_key,
+            values,
+            official=official if official_owner else None,
+            working_dir=Path.cwd(),
+            legacy_state_dir=legacy_root,
+            environment=os.environ,
+            workspace_dir=workspace_dir,
+            legacy_references=legacy_references,
+        )
+        environment = validate_private_environment({**selected, **environment})
         spec = LaunchSpec(
             python_executable=python_executable,
             support_root=Path(support_root),
@@ -151,6 +203,13 @@ class ChannelDescription:
             enabled=values["enabled"],
             startup_timeout=startup_timeout,
             shutdown_timeout=shutdown_timeout,
+            private_env=environment,
+            plugin_id=self.plugin_id,
+            workspace_id=(
+                str(Path(workspace_dir).resolve())
+                if workspace_dir is not None
+                else None
+            ),
         )
         return IsolatedChannelProxy(
             process,
@@ -158,6 +217,7 @@ class ChannelDescription:
             workspace_dir=workspace_dir,
             on_reply_sent=on_reply_sent,
             display_config=display_config,
+            connection_timeout=connection_timeout,
         )
 
 
@@ -179,8 +239,26 @@ def describe_channel(
 
     validate_channel_contract(descriptor.channel_key, descriptor.capabilities)
     validate_channel_config_schema(descriptor.config_schema)
-    if manifest.id != descriptor.channel_key:
-        raise ValueError("Channel descriptor owner does not match manifest id")
+    from ..app.channels.registry import BUILTIN_CHANNEL_KEYS
+    from .official_channel_catalog import (
+        official_channel_owners,
+        official_channel_for_plugin,
+    )
+
+    key = descriptor.channel_key
+    owner = official_channel_owners().get(key)
+    if key in BUILTIN_CHANNEL_KEYS or (owner and owner != manifest.id):
+        occupying = "builtin" if key in BUILTIN_CHANNEL_KEYS else owner
+        raise ValueError(
+            f"Channel '{key}' owner '{occupying}' conflicts with "
+            f"plugin '{manifest.id}'",
+        )
+    official = official_channel_for_plugin(manifest.id)
+    if official is not None and official["channel_key"] != key:
+        raise ValueError(
+            f"Channel descriptor owner '{manifest.id}' must use "
+            f"channel '{official['channel_key']}'",
+        )
     requirements_path = _contained_file(
         root,
         (descriptor_path.parent / descriptor.requirements_file)
@@ -251,13 +329,39 @@ class ChannelBackend:
         self.services = services
         self._prepared = {}
 
-    def runtime_for(self, manifest):
+    def runtime_for(self, candidate):
+        """Select by trusted routing identity, independently of plugin ID."""
         settings = self.services.runtime_settings()
-        return settings if settings and settings.allows(manifest.id) else None
+        if settings is None:
+            return None
+        payload = (
+            candidate.payload
+            if isinstance(candidate, PluginDescription)
+            else candidate
+        )
+        if isinstance(payload, ChannelDescription):
+            key = payload.descriptor.channel_key
+        else:
+            from .official_channel_catalog import official_channel_for_plugin
+
+            official = official_channel_for_plugin(candidate.id)
+            key = official["channel_key"] if official else None
+            if key is None and hasattr(self.services, "registration"):
+                row = self.services.registration(candidate.id)
+                if row is not None and row.description_record is not None:
+                    key = row.description_record.descriptor.channel_key
+        return (
+            settings
+            if (
+                settings.selected_channels is None
+                or (key is not None and settings.allows(key))
+            )
+            else None
+        )
 
     def dependency_targets(self, description):
         """Configured roots serialize inspection; the child verifies them."""
-        settings = self.runtime_for(description.manifest)
+        settings = self.runtime_for(description)
         if settings is None:
             return ()
         return (
@@ -304,7 +408,7 @@ class ChannelBackend:
         # Static discovery must not inspect/import an unselected platform SDK.
         if not allow_install and not probe:
             return
-        self.require_selection(description.manifest)
+        self.require_selection(description)
         prepared = await self.services.prepare_candidate(
             description.payload,
             allow_install=allow_install and owns_dependency_env,
@@ -338,7 +442,7 @@ class ChannelBackend:
         from .settings import is_plugin_enabled
 
         del saved_definition
-        settings = self.runtime_for(description.manifest)
+        settings = self.runtime_for(description)
         enabled = is_plugin_enabled(config)
         diagnostics = () if settings else (CHANNEL_RUNTIME_NOT_INTEGRATED,)
         prepared = self._prepared.get(description.manifest.id)
@@ -389,19 +493,20 @@ class ChannelBackend:
         from .api import channel_passes_gates
 
         plugin_id = description.manifest.id
-        self.require_selection(description.manifest)
+        self.require_selection(description)
         record = self.services.record(plugin_id)
         if record is None or not record.enabled:
             return
         row = self.services.registration(plugin_id)
+        channel_key = description.payload.descriptor.channel_key
         targets = [
             workspace
             for workspace in self.services.workspaces()
-            if channel_passes_gates(workspace, plugin_id)
+            if channel_passes_gates(workspace, channel_key)
             and getattr(workspace, "channel_manager", None) is not None
         ]
         for workspace in targets:
-            owner = await workspace.channel_manager.get_channel(plugin_id)
+            owner = await workspace.channel_manager.get_channel(channel_key)
             if (
                 owner is not None
                 and getattr(owner, "_registration", None) is not row
@@ -438,8 +543,26 @@ class ChannelBackend:
             self._validation(plugin_id, passed=False)
 
     def validate_update(self, old, candidate, *, in_place):
-        del old
-        self.require_selection(candidate.manifest)
+        old_payload = (
+            old.payload if isinstance(old, PluginDescription) else old
+        )
+        candidate_payload = (
+            candidate.payload
+            if isinstance(candidate, PluginDescription)
+            else candidate
+        )
+        if (
+            isinstance(old_payload, ChannelDescription)
+            and isinstance(candidate_payload, ChannelDescription)
+            and old_payload.descriptor.channel_key
+            != candidate_payload.descriptor.channel_key
+        ):
+            raise ValueError(
+                "Channel update cannot change channel_key from "
+                f"'{old_payload.descriptor.channel_key}' to "
+                f"'{candidate_payload.descriptor.channel_key}'",
+            )
+        self.require_selection(candidate)
         if in_place:
             raise RuntimeError(
                 "Channel in-place source update is not supported",
@@ -448,7 +571,7 @@ class ChannelBackend:
     def validate_config_update(self, description, config):
         """Reject unintegrated mutations without probing disabled plugins."""
         del config
-        self.require_selection(description.manifest)
+        self.require_selection(description)
 
     def capture_restore_state(self, record):
         """Static definitions require no host import snapshot."""

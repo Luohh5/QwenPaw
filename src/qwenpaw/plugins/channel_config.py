@@ -9,6 +9,10 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
 from ..config.config import BaseChannelConfig
+from ..config.channel_normalizers import (
+    field_normalizer,
+    normalize_channel_fields,
+)
 
 
 def channel_config_dict(value):
@@ -45,6 +49,8 @@ def validate_channel_config_schema(schema: Mapping) -> dict:
         Draft202012Validator.check_schema(normalized_schema)
     except SchemaError as exc:
         raise ValueError(f"Invalid channel schema: {exc.message}") from exc
+    for field in normalized_schema.get("properties", {}).values():
+        field_normalizer(field)
     return normalized_schema
 
 
@@ -95,4 +101,4 @@ def validate_channel_config(schema: Mapping, values: Mapping) -> dict:
         error = errors[0]
         path = ".".join(map(str, error.absolute_path)) or "config"
         raise ValueError(f"{path}: {error.message}")
-    return normalized_values
+    return normalize_channel_fields(schema, normalized_values)

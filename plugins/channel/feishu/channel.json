@@ -202,6 +202,7 @@
   "capabilities": [
     "approval_card",
     "channel.generic.v1",
+    "channel.management.qrcode.v1",
     "media",
     "reaction",
     "streaming"

@@ -1,4 +1,4 @@
 include scripts/pack/generate_plugin_metadata.py
-recursive-include plugins/channel/feishu *.py *.json *.txt *.md
-recursive-include plugins/channel/dingtalk *.py *.json *.txt *.md
+include scripts/pack/validate_channel_contracts.py
+include scripts/pack/channel-contract-requirements.txt
 global-exclude __pycache__ *.py[cod] .DS_Store

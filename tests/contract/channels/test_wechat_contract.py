@@ -1,46 +1,41 @@
 # -*- coding: utf-8 -*-
-"""Contract tests for the WeChat channel."""
+"""Original nineteen inherited contracts on authentic bundled Proxy."""
 
-from __future__ import annotations
-
-from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock
-
-import pytest
-
-from qwenpaw.app.channels.renderer import ChannelDisplayConfig
-
-from tests.contract.channels import ChannelContractTest
-
-if TYPE_CHECKING:
-    from qwenpaw.app.channels.base import BaseChannel
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 
-class TestWeChatChannelContract(ChannelContractTest):
-    """Ensure WeChatChannel satisfies the common channel contract."""
-
-    @pytest.fixture(autouse=True)
-    def _setup_paths(self, tmp_path):
-        """Keep channel files isolated from the user's workspace."""
-        self._workspace_dir = tmp_path / "workspace"
-        self._workspace_dir.mkdir()
-        self._media_dir = self._workspace_dir / "media"
-        self._media_dir.mkdir()
-        self._token_file = self._workspace_dir / "wechat_token"
-
-    def create_instance(self) -> "BaseChannel":
-        """Create a disabled WeChatChannel with an async process mock."""
-        from qwenpaw.app.channels.wechat.channel import WeChatChannel
-
-        return WeChatChannel(
-            process=AsyncMock(),
-            enabled=False,
-            bot_token="",
-            bot_token_file=str(self._token_file),
-            media_dir=str(self._media_dir),
-            workspace_dir=self._workspace_dir,
-            display_config=ChannelDisplayConfig(
-                show_tool_calls=False,
-                show_tool_results=False,
-            ),
-        )
+def test_wechat_official_inherited_contracts(tmp_path):
+    suite = (
+        Path(__file__).resolve().parents[2]
+        / "fixtures/channel_plugins/wechat_closeout_contract_suite.py"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "pytest",
+            "-p",
+            "pytest_asyncio.plugin",
+            "--confcutdir",
+            str(suite.parent),
+            str(suite),
+            "-q",
+        ],
+        env={
+            **os.environ,
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "PIP_NO_INDEX": "1",
+            "QWENPAW_WORKING_DIR": str(tmp_path / "work"),
+            "QWENPAW_SECRET_DIR": str(tmp_path / "secret"),
+            "QWENPAW_BACKUP_DIR": str(tmp_path / "backup"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

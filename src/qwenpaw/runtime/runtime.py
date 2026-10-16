@@ -55,6 +55,13 @@ class Runtime:
     ) -> AsyncGenerator[Any, None]:
         """8-phase lifecycle orchestration."""
         request = self._normalize(request)
+        from ..schemas import AgentRequest
+
+        if (
+            isinstance(request, AgentRequest)
+            and request._channel_control_state is not None
+        ):
+            request._channel_control_state.resolution = None
         ctx = self._build_context(request)
         hooks = self.workspace.plugins.hook_registry
 
@@ -219,7 +226,11 @@ class Runtime:
                         getattr(ctx, "session_id", ""),
                         exc_info=True,
                     )
-            await hooks.run(Phase.FINALLY, ctx)
+            try:
+                await hooks.run(Phase.FINALLY, ctx)
+            finally:
+                if isinstance(request, AgentRequest):
+                    request._channel_control_state = None
 
     # ----------------------------------------------------------------- helpers
 
@@ -506,7 +517,11 @@ class Runtime:
             request = AgentRequest(**request)
         if not getattr(request, "session_id", None):
             request.session_id = uuid.uuid4().hex
-        if not getattr(request, "user_id", None):
+        if not getattr(request, "user_id", None) and not (
+            isinstance(request, AgentRequest)
+            and request._channel_actor_unknown is True
+            and request.user_id == ""
+        ):
             request.user_id = request.session_id
         return request
 

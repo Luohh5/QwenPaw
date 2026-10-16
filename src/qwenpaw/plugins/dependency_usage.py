@@ -248,7 +248,7 @@ class DependencyUsageRegistry:
         admission_token=None,
     ) -> UsageSnapshot:
         """Include one exact candidate without promoting its catalogue row."""
-        leases = self._owners.leases()
+        leases = self._owners.dependency_leases()
         if leases != self._leases:
             self._leases = leases
             self._bindings = {

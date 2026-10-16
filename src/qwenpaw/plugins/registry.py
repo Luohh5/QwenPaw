@@ -891,15 +891,14 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
                 )
 
         # Prevent overriding built-in channels
-        from ..app.channels.catalog import OFFICIAL_CHANNEL_OWNERS
+        from .official_channel_catalog import official_channel_owners
 
-        if (
-            normalized_key in BUILTIN_CHANNEL_KEYS
-            or normalized_key in OFFICIAL_CHANNEL_OWNERS
-        ):
+        owners = official_channel_owners()
+        if normalized_key in BUILTIN_CHANNEL_KEYS or normalized_key in owners:
+            owner = owners.get(normalized_key, "builtin")
             raise ValueError(
-                f"Channel '{normalized_key}' conflicts with a built-in "
-                f"channel and cannot be registered by a plugin",
+                f"Channel '{normalized_key}' is reserved by owner '{owner}' "
+                f"and cannot be registered by plugin '{plugin_id}'",
             )
 
         if normalized_key in self._channels:
@@ -1012,22 +1011,23 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
 
         descriptor = description.descriptor
         key = descriptor.channel_key
-        if plugin_id != description.plugin_id or plugin_id != key:
+        if plugin_id != description.plugin_id:
             raise ValueError("Channel descriptor owner mismatch")
-        from ..app.channels.catalog import (
-            OFFICIAL_CHANNEL_OWNERS,
-            config_fields,
-        )
+        from ..app.channels.catalog import config_fields
+        from .official_channel_catalog import official_channel_owners
 
-        if key in BUILTIN_CHANNEL_KEYS or (
-            key in OFFICIAL_CHANNEL_OWNERS
-            and OFFICIAL_CHANNEL_OWNERS[key] != plugin_id
-        ):
+        owner = official_channel_owners().get(key)
+        if key in BUILTIN_CHANNEL_KEYS or (owner and owner != plugin_id):
+            occupying = "builtin" if key in BUILTIN_CHANNEL_KEYS else owner
             raise ValueError(
-                f"Channel '{key}' conflicts with a built-in channel",
+                f"Channel '{key}' owner '{occupying}' conflicts with "
+                f"plugin '{plugin_id}'",
             )
         if key in self._channels:
-            raise ValueError(f"Channel '{key}' is already registered")
+            owner = self._channels[key].plugin_id
+            raise ValueError(
+                f"Channel '{key}' is already registered by plugin '{owner}'",
+            )
         fields = config_fields(
             descriptor.config_schema,
             descriptor.config_fields,

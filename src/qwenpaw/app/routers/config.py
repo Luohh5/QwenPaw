@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 
 import asyncio
+from contextlib import AsyncExitStack, suppress
+from copy import deepcopy
 from datetime import datetime, timezone
+from pathlib import Path as FilePath
 from typing import Any, List, Optional
 
 from fastapi import (
@@ -23,7 +26,6 @@ from ...agents.acp.node_runtime import (
 )
 from ...config import (
     ChannelConfig,
-    ChannelConfigUnion,
     ToolGuardConfig,
     ToolGuardRuleConfig,
     load_config,
@@ -43,9 +45,10 @@ from ..channels.conflict import (
     get_channel_config,
 )
 from ..channels.qrcode_auth_handler import (
-    QRCODE_AUTH_HANDLERS,
     generate_qrcode_image,
 )
+from ..channels.management import ManagementError
+from ..channels.qrcode_sessions import resolve_channel_management_scope
 from ..channels.registry import BUILTIN_CHANNEL_KEYS
 from ..channels.catalog import (
     get_configurable_channel_catalog,
@@ -121,9 +124,11 @@ def _channel_config_class(name: str) -> Optional[type[BaseModel]]:
 
 
 def _validated_channel_config(name: str, values: dict):
-    """Use static descriptor validation wherever an installed schema exists."""
+    """Use trusted static schemas with or without installed channel code."""
     from ...plugins.registry import PluginRegistry
     from ...plugins.channel_config import validate_channel_config
+    from ...plugins.official_channel_catalog import official_channel_owners
+    from ...plugins.official_channels import bundled_channel_description
 
     if not isinstance(values, dict):
         raise HTTPException(
@@ -132,8 +137,15 @@ def _validated_channel_config(name: str, values: dict):
         )
     row = PluginRegistry().get_channel_catalog_entry(name)
     try:
+        schema = None
         if row is not None and row.description_record is not None:
             schema = row.description_record.descriptor.config_schema
+        elif name in official_channel_owners():
+            plugin_id = official_channel_owners()[name]
+            schema = bundled_channel_description(
+                plugin_id,
+            ).descriptor.config_schema
+        if schema is not None:
             return validate_channel_config(
                 schema,
                 clean_channel_config(values, schema),
@@ -148,7 +160,7 @@ def _validated_channel_config(name: str, values: dict):
             status_code=422,
             detail=exc.errors(include_context=False),
         ) from exc
-    except ValueError as exc:
+    except (ValueError, OSError, KeyError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
@@ -296,8 +308,15 @@ async def put_channels(
 
     incoming = channel_config_dict(channels_config)
     keys = getattr(channels_config, "model_fields_set", incoming.keys())
+    disabled = []
+    other_changes = []
     for key in keys:
-        current[key] = _validated_channel_config(key, incoming[key])
+        value = _validated_channel_config(key, incoming[key])
+        if current.get(key, {}).get("enabled") and not value.get("enabled"):
+            disabled.append(key)
+        elif current.get(key) != value:
+            other_changes.append(key)
+        current[key] = value
     try:
         channels_config = ChannelConfig.model_validate(current)
     except ValidationError as exc:
@@ -305,8 +324,19 @@ async def put_channels(
             status_code=422,
             detail=exc.errors(include_context=False),
         ) from exc
-    agent.config.channels = channels_config
-    save_agent_config(agent.agent_id, agent.config)
+    sessions = getattr(request.app.state, "channel_qrcode_sessions", None)
+    async with AsyncExitStack() as stack:
+        if sessions is not None and disabled:
+            await stack.enter_async_context(
+                sessions.operation_guard(agent.agent_id, tuple(disabled)),
+            )
+        candidate = agent.config.model_copy(deep=True)
+        candidate.channels = channels_config
+        save_agent_config(agent.agent_id, candidate)
+        if sessions is not None and other_changes:
+            await stack.enter_async_context(
+                sessions.operation_guard(agent.agent_id, tuple(other_changes)),
+            )
 
     # Hot reload config (async, non-blocking)
     schedule_agent_reload(request, agent.agent_id)
@@ -416,31 +446,128 @@ async def restart_channel(
 # ── Unified QR code endpoints for all channels ─────────────────────────────
 
 
+def _management_http_error(error: ManagementError) -> HTTPException:
+    reason = error.reason_code
+    status = 502
+    if reason in {"PLUGIN_NOT_INSTALLED", "CHANNEL_UNAVAILABLE"}:
+        status = 404
+    elif reason == "PLUGIN_DISABLED":
+        status = 403
+    elif reason in {"MANAGEMENT_INVALID_REQUEST", "MANAGEMENT_UNSUPPORTED"}:
+        status = 400
+    elif reason in {
+        "MANAGEMENT_BUSY",
+        "ACCOUNT_IN_USE",
+        "SOURCE_REVISION_MISMATCH",
+        "IDENTITY_MISMATCH",
+    }:
+        status = 409
+    elif reason == "MANAGEMENT_TIMEOUT":
+        status = 504
+    elif reason in {"MANAGEMENT_CLOSED", "MANAGEMENT_CLEANUP_FAILED"}:
+        status = 503
+    return HTTPException(status, reason)
+
+
+def _managed_qrcode_sessions(request, channel):
+    """Select QR descriptors, including offline official takeover metadata."""
+    from ...channel_protocol.management import MANAGEMENT_CAPABILITIES
+    from ...plugins.official_channel_catalog import official_channel_owners
+    from ...plugins.official_channels import bundled_channel_description
+
+    loader = getattr(request.app.state, "plugin_loader", None)
+    row = (
+        loader.registry.get_channel_catalog_entry(channel) if loader else None
+    )
+    description = row.description_record if row is not None else None
+    if description is None:
+        owner = official_channel_owners().get(channel)
+        if owner is not None:
+            try:
+                description = bundled_channel_description(owner)
+            except (OSError, ValueError, KeyError):
+                raise HTTPException(503, "CHANNEL_UNAVAILABLE") from None
+    if description is None or (
+        MANAGEMENT_CAPABILITIES["qrcode.fetch"]
+        not in description.descriptor.capabilities
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail=f"QR code not supported for channel: {channel}",
+        )
+    sessions = getattr(request.app.state, "channel_qrcode_sessions", None)
+    if sessions is None:
+        raise HTTPException(503, "MANAGEMENT_CLOSED")
+    return sessions
+
+
+async def _qrcode_request(request, operation):
+    """Disconnect cancels only this request's session waiter."""
+
+    async def disconnected():
+        while not await request.is_disconnected():
+            await asyncio.sleep(0.1)
+
+    task = asyncio.create_task(operation)
+    watcher = asyncio.create_task(disconnected())
+    try:
+        done, _ = await asyncio.wait(
+            (task, watcher),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if watcher in done:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            raise HTTPException(499, "Client disconnected")
+        return await task
+    except ManagementError as error:
+        raise _management_http_error(error) from None
+    except asyncio.CancelledError:
+        if asyncio.current_task().cancelling():
+            raise
+        raise HTTPException(400, "QR session is no longer active") from None
+    finally:
+        watcher.cancel()
+        if not task.done():
+            task.cancel()
+        from ...utils.io_utils import run_async_to_completion
+
+        await run_async_to_completion(
+            asyncio.gather(task, watcher, return_exceptions=True),
+        )
+
+
 @router.get(
     "/channels/{channel}/qrcode",
     summary="Get channel authorization QR code",
     description=(
         "Fetch a QR code image (base64 PNG) for the given channel. "
-        "Supported channels: " + ", ".join(QRCODE_AUTH_HANDLERS.keys())
+        "Available for channel descriptors that declare the QR-code "
+        "management capability."
     ),
 )
 async def get_channel_qrcode(request: Request, channel: str) -> dict:
     """Return {qrcode_img, poll_token} for the requested channel."""
-    handler = QRCODE_AUTH_HANDLERS.get(channel)
-    if handler is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"QR code not supported for channel: {channel}",
-        )
-
-    result = await handler.fetch_qrcode(request)
-    qrcode_img = generate_qrcode_image(result.scan_url)
-    return {"qrcode_img": qrcode_img, "poll_token": result.poll_token}
+    sessions = _managed_qrcode_sessions(request, channel)
+    scope = resolve_channel_management_scope(request, channel)
+    result = await _qrcode_request(
+        request,
+        sessions.fetch(scope, dict(request.query_params)),
+    )
+    return {
+        "qrcode_img": generate_qrcode_image(result.scan_url),
+        "poll_token": result.poll_token,
+    }
 
 
 @router.get(
     "/channels/{channel}/qrcode/status",
     summary="Poll channel QR code authorization status",
+    description=(
+        "Poll a scoped QR session for a channel descriptor that declares "
+        "the QR-code management capability."
+    ),
 )
 async def get_channel_qrcode_status(
     request: Request,
@@ -448,20 +575,32 @@ async def get_channel_qrcode_status(
     token: str,
 ) -> dict:
     """Return {status, credentials} for the requested channel."""
-    handler = QRCODE_AUTH_HANDLERS.get(channel)
-    if handler is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"QR code not supported for channel: {channel}",
-        )
-
-    result = await handler.poll_status(token, request)
+    sessions = _managed_qrcode_sessions(request, channel)
+    scope = resolve_channel_management_scope(request, channel)
+    result = await _qrcode_request(request, sessions.poll(scope, token))
     return {"status": result.status, "credentials": result.credentials}
+
+
+@router.delete("/channels/{channel}/qrcode", status_code=204)
+async def cancel_channel_qrcode(
+    request: Request,
+    channel: str,
+    token: str,
+) -> None:
+    """Revoke one exact scoped QR handle and settle its actual worker."""
+    sessions = getattr(request.app.state, "channel_qrcode_sessions", None)
+    if sessions is None:
+        raise HTTPException(503, "MANAGEMENT_CLOSED")
+    scope = resolve_channel_management_scope(request, channel)
+    try:
+        await sessions.cancel(scope, token)
+    except ManagementError as error:
+        raise _management_http_error(error) from None
 
 
 @router.get(
     "/channels/{channel_name}",
-    response_model=ChannelConfigUnion | dict,
+    response_model=dict,
     summary="Get channel config",
     description="Retrieve configuration for a specific channel by name",
 )
@@ -472,7 +611,7 @@ async def get_channel(
         description="Name of the channel to retrieve",
         min_length=1,
     ),
-) -> ChannelConfigUnion:
+) -> dict:
     """Get a specific channel config by name."""
     from ..agent_context import get_agent_for_request
 
@@ -503,6 +642,8 @@ async def get_channel(
             status_code=404,
             detail=f"Channel '{channel_name}' not found",
         )
+    if isinstance(single_channel_config, BaseModel):
+        return single_channel_config.model_dump(mode="json")
     return single_channel_config
 
 
@@ -595,7 +736,7 @@ async def check_channel_conflict(
 
 @router.put(
     "/channels/{channel_name}",
-    response_model=ChannelConfigUnion | dict,
+    response_model=dict,
     summary="Update channel config",
     description="Update configuration for a specific channel by name",
 )
@@ -610,10 +751,52 @@ async def put_channel(
         ...,
         description="Updated channel configuration",
     ),
-) -> ChannelConfigUnion:
+) -> dict:
     """Update a specific channel config by name."""
-    from ...config.config import save_agent_config
+    from ...config.config import load_agent_config, save_agent_config
     from ..agent_context import get_agent_for_request
+
+    token = request.headers.get("X-Channel-Auth-Session")
+    if token is not None:
+        scope = resolve_channel_management_scope(request, channel_name)
+        sessions = getattr(request.app.state, "channel_qrcode_sessions", None)
+        if sessions is None:
+            raise HTTPException(503, "MANAGEMENT_CLOSED")
+        values = deepcopy(single_channel_config)
+        if channel_name == "wechat":
+            for key in ("bot_token_file", "base_url"):
+                values.setdefault(key, scope.config.get(key, ""))
+        candidate = load_agent_config(scope.workspace_id)
+        current = candidate.channels.model_dump() if candidate.channels else {}
+        candidate.channels = ChannelConfig.model_validate(
+            {
+                **current,
+                channel_name: _validated_channel_config(channel_name, values),
+            },
+        )
+        channel_config = candidate.channels.model_dump(mode="json")[
+            channel_name
+        ]
+        try:
+            async with sessions.authorize_save(scope, token, channel_config):
+                # Everything through the persisted commit is synchronous. The
+                # session and target cannot change at an intervening await.
+                root = load_config()
+                profile = root.agents.profiles.get(scope.workspace_id)
+                if (
+                    profile is None
+                    or not profile.enabled
+                    or FilePath(profile.workspace_dir).expanduser().resolve()
+                    != scope.workspace_dir
+                ):
+                    raise HTTPException(403, "Channel scope changed")
+                if current.get(channel_name) != scope.config:
+                    raise HTTPException(409, "Channel configuration changed")
+                save_agent_config(scope.workspace_id, candidate)
+        except ManagementError as error:
+            raise _management_http_error(error) from None
+        schedule_agent_reload(request, scope.workspace_id)
+        return channel_config
 
     agent = await get_agent_for_request(request)
     available = get_configurable_channel_catalog(
@@ -625,8 +808,6 @@ async def put_channel(
             detail=f"Channel '{channel_name}' not found",
         )
 
-    agent = await get_agent_for_request(request)
-
     channel_config = _validated_channel_config(
         channel_name,
         single_channel_config,
@@ -634,9 +815,22 @@ async def put_channel(
     current = (
         agent.config.channels.model_dump() if agent.config.channels else {}
     )
+    disabling = current.get(channel_name, {}).get(
+        "enabled",
+    ) and not channel_config.get("enabled")
+    changed = current.get(channel_name) != channel_config
+    sessions = getattr(request.app.state, "channel_qrcode_sessions", None)
     current[channel_name] = channel_config
-    agent.config.channels = ChannelConfig.model_validate(current)
-    save_agent_config(agent.agent_id, agent.config)
+    candidate = agent.config.model_copy(deep=True)
+    candidate.channels = ChannelConfig.model_validate(current)
+    if sessions is not None and disabling:
+        async with sessions.operation_guard(agent.agent_id, channel_name):
+            save_agent_config(agent.agent_id, candidate)
+    else:
+        save_agent_config(agent.agent_id, candidate)
+        if sessions is not None and changed:
+            async with sessions.operation_guard(agent.agent_id, channel_name):
+                pass
 
     # Hot reload config (async, non-blocking)
     schedule_agent_reload(request, agent.agent_id)

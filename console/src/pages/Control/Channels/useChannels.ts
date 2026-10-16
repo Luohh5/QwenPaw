@@ -1,10 +1,9 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useLayoutEffect, useCallback, useMemo, useRef } from "react";
 import api from "../../../api";
 import type { ChannelSchema } from "../../../api/modules/channel";
 import { useAgentStore } from "../../../stores/agentStore";
 
 export function useChannels() {
-  const { selectedAgent } = useAgentStore();
   const [channels, setChannels] = useState<
     Record<string, Record<string, unknown>>
   >({});
@@ -13,34 +12,63 @@ export function useChannels() {
     Record<string, ChannelSchema>
   >({});
   const [loading, setLoading] = useState(true);
+  const generation = useRef(0);
+  const controller = useRef<AbortController>();
 
   const fetchChannels = useCallback(async () => {
+    const agentId = useAgentStore.getState().selectedAgent || "default";
+    const requestGeneration = ++generation.current;
+    controller.current?.abort();
+    const currentController = new AbortController();
+    controller.current = currentController;
+    const scope = { agentId, signal: currentController.signal };
+    const current = () =>
+      requestGeneration === generation.current &&
+      !currentController.signal.aborted &&
+      (useAgentStore.getState().selectedAgent || "default") === agentId;
     setLoading(true);
     try {
       const [data, types] = await Promise.all([
-        api.listChannels(),
-        api.listChannelTypes(),
+        api.listChannels(scope),
+        api.listChannelTypes(scope),
       ]);
+      if (!current()) return;
       if (data)
         setChannels(data as unknown as Record<string, Record<string, unknown>>);
       if (types) setChannelTypes(types);
     } catch (error) {
-      console.error("❌ Failed to load channels:", error);
+      if (current()) console.error("❌ Failed to load channels:", error);
     } finally {
-      setLoading(false);
+      if (current()) setLoading(false);
     }
+    if (!current()) return;
     // Fetch schemas separately so failures don't block core channel loading
     try {
-      const schemas = await api.listChannelSchemas();
-      if (schemas) setChannelSchemas(schemas);
+      const schemas = await api.listChannelSchemas(scope);
+      if (current() && schemas) setChannelSchemas(schemas);
     } catch {
       // Plugin system may not be available; non-critical
     }
   }, []);
 
-  useEffect(() => {
-    fetchChannels();
-  }, [fetchChannels, selectedAgent]);
+  useLayoutEffect(() => {
+    const changeScope = () => {
+      setChannels({});
+      setChannelTypes([]);
+      setChannelSchemas({});
+      void fetchChannels();
+    };
+    // Observe every store transition, even an ABA batched into one render.
+    const unsubscribe = useAgentStore.subscribe((next, previous) => {
+      if (next.selectedAgent !== previous.selectedAgent) changeScope();
+    });
+    changeScope();
+    return () => {
+      unsubscribe();
+      generation.current += 1;
+      controller.current?.abort();
+    };
+  }, [fetchChannels]);
 
   // Built-in channels come first (in a fixed order), then custom channels
   const builtinOrder = useMemo(

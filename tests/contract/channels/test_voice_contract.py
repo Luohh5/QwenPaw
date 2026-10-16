@@ -1,44 +1,50 @@
 # -*- coding: utf-8 -*-
-"""
-Voice Channel Contract Test
+"""Voice responsibilities on actual private Driver and official shared host."""
 
-Ensures VoiceChannel satisfies all BaseChannel contracts.
-When BaseChannel changes, this test validates VoiceChannel still complies.
-"""
+import os
+from pathlib import Path
+import subprocess
+import sys
 
-from __future__ import annotations
-
-from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock
-
-from qwenpaw.app.channels.renderer import ChannelDisplayConfig
-
-from tests.contract.channels import ChannelContractTest
-
-if TYPE_CHECKING:
-    from qwenpaw.app.channels.base import BaseChannel
+import pytest
 
 
-class TestVoiceChannelContract(ChannelContractTest):
-    """
-    Contract tests for VoiceChannel.
-
-    This validates that VoiceChannel properly implements all BaseChannel
-    abstract methods and maintains interface compatibility.
-    """
-
-    def create_instance(self) -> "BaseChannel":
-        """Provide a VoiceChannel instance for contract testing."""
-        from qwenpaw.app.channels.voice.channel import VoiceChannel
-
-        process = AsyncMock()
-
-        # VoiceChannel has a different constructor signature
-        return VoiceChannel(
-            process=process,
-            on_reply_sent=None,
-            display_config=ChannelDisplayConfig(
-                show_tool_calls=False,
-                show_tool_results=False,
-            ),
-        )
+@pytest.mark.parametrize(
+    "suite_name",
+    [
+        "voice_closeout_contract_suite.py",
+    ],
+)
+def test_voice_migrated_responsibilities(tmp_path, suite_name):
+    suite = (
+        Path(__file__).resolve().parents[2]
+        / "fixtures/channel_plugins"
+        / suite_name
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "pytest",
+            "-p",
+            "pytest_asyncio.plugin",
+            "--confcutdir",
+            str(suite.parent),
+            str(suite),
+            "-q",
+        ],
+        env={
+            **os.environ,
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "PIP_NO_INDEX": "1",
+            "QWENPAW_WORKING_DIR": str(tmp_path / "work"),
+            "QWENPAW_SECRET_DIR": str(tmp_path / "secret"),
+            "QWENPAW_BACKUP_DIR": str(tmp_path / "backup"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

@@ -1,0 +1,513 @@
+"""Original pure algorithm assertions, with only ownership imports changed."""
+
+import importlib
+import sys
+from unittest.mock import patch
+import pytest
+from extension_sample import ROOT
+
+sys.path.insert(0, str(ROOT / "plugins/channel/telegram"))
+telegram_module = importlib.import_module("qwenpaw_channel_telegram.platform")
+tg = importlib.import_module("qwenpaw_channel_telegram.cards.tool_guard")
+
+CALLBACK_DATA_BUDGET = 64
+_MARKDOWN_TABLE = "| A | B |\n|---|---|\n| 1 | 2 |"
+
+
+class TestBuildApprovalKeyboard:
+    def test_single_row_with_two_buttons(self):
+        keyboard = tg.build_approval_keyboard("rid-1")
+
+        rows = keyboard.inline_keyboard
+        assert len(rows) == 1
+        assert [button.text for button in rows[0]] == [
+            "✅ Approve",
+            "❌ Deny",
+        ]
+
+    def test_callback_data_carries_the_prefixed_request_id(self):
+        keyboard = tg.build_approval_keyboard("rid-1")
+
+        buttons = keyboard.inline_keyboard[0]
+        assert buttons[0].callback_data == "tga:rid-1"
+        assert buttons[1].callback_data == "tgd:rid-1"
+
+    def test_callback_data_stays_inside_telegrams_byte_budget(self):
+        """callback_data is hard-capped at 64 bytes by the Bot API."""
+        # A uuid4 request_id is the longest value seen in production.
+        request_id = "0" * 36
+        keyboard = tg.build_approval_keyboard(request_id)
+
+        for button in keyboard.inline_keyboard[0]:
+            assert len(button.callback_data.encode("utf-8")) <= (
+                CALLBACK_DATA_BUDGET
+            )
+
+
+class TestBuildApprovalText:
+    def test_body_is_passed_through_verbatim(self):
+        assert tg.build_approval_text("raw body") == "raw body"
+
+    @pytest.mark.parametrize("body", ["", None])
+    def test_empty_body_uses_the_placeholder(self, body):
+        assert tg.build_approval_text(body) == "🛡️ Tool Approval Required"
+
+
+class TestBuildResolvedText:
+    def test_plain_shape_keeps_the_body(self):
+        text = tg.build_resolved_text(
+            tool_name="shell",
+            action="approve",
+            operator_display="@taige",
+            body_text="raw body",
+        )
+
+        assert text == ("raw body\n\n✅ Approved by @taige  |  Tool: shell")
+
+    def test_plain_shape_without_operator(self):
+        text = tg.build_resolved_text(
+            tool_name="shell",
+            action="deny",
+            body_text="raw body",
+        )
+
+        assert text == "raw body\n\n🚫 Denied  |  Tool: shell"
+
+    def test_plain_shape_escapes_nothing(self):
+        """A body with markdown must survive untouched (parse_mode=None)."""
+        text = tg.build_resolved_text(
+            tool_name="a_b",
+            action="approve",
+            body_text="keep *this* [as is]",
+        )
+
+        assert "keep *this* [as is]" in text
+        assert "Tool: a_b" in text
+
+    def test_compact_shape_uses_markdown_v2(self):
+        text = tg.build_resolved_text(
+            tool_name="shell",
+            action="approve",
+            operator_display="@taige",
+            body_text="",
+        )
+
+        assert text == "✅ *Approved* by *@taige*  \\|  Tool: `shell`"
+
+    def test_compact_shape_denied(self):
+        text = tg.build_resolved_text(
+            tool_name="shell",
+            action="deny",
+            body_text="",
+        )
+
+        assert text == "🚫 *Denied*  \\|  Tool: `shell`"
+
+    def test_compact_shape_escapes_specials_in_the_tool_name(self):
+        text = tg.build_resolved_text(
+            tool_name="rm -rf /tmp",
+            action="approve",
+            body_text="",
+        )
+
+        assert "`rm \\-rf /tmp`" in text
+
+    @pytest.mark.parametrize("action", ["", "retry", "APPROVE"])
+    def test_unknown_action_reports_expiry(self, action):
+        text = tg.build_resolved_text(
+            tool_name="shell",
+            action=action,
+            body_text="body",
+        )
+
+        assert "⌛ Expired" in text
+
+    def test_compact_unknown_action_reports_expiry(self):
+        text = tg.build_resolved_text(
+            tool_name="shell",
+            action="whatever",
+            body_text="",
+        )
+
+        assert text == "⌛ *Expired*  \\|  Tool: `shell`"
+
+
+class TestEscapeMdv2:
+    def test_specials_are_backslashed(self):
+        assert tg._escape_mdv2("a_b.c!") == "a\\_b\\.c\\!"
+
+    def test_pipe_is_escaped(self):
+        assert tg._escape_mdv2("|") == "\\|"
+
+    def test_plain_text_is_untouched(self):
+        assert tg._escape_mdv2("shell 123") == "shell 123"
+
+    @pytest.mark.parametrize("char", ["*", "[", "]", "(", ")", "~", "`", ">"])
+    def test_each_markdown_metacharacter(self, char):
+        assert tg._escape_mdv2(char) == f"\\{char}"
+
+    @pytest.mark.parametrize(
+        "char",
+        ["#", "+", "-", "=", "{", "}", ".", "!"],
+    )
+    def test_each_punctuation_metacharacter(self, char):
+        assert tg._escape_mdv2(char) == f"\\{char}"
+
+    def test_backslash_is_escaped(self):
+        assert tg._escape_mdv2("\\") == "\\\\"
+
+
+class TestParseCallbackData:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("tga:rid-1", {"action": "approve", "request_id": "rid-1"}),
+            ("tgd:rid-1", {"action": "deny", "request_id": "rid-1"}),
+            ("tga:", {"action": "approve", "request_id": ""}),
+        ],
+    )
+    def test_known_prefixes(self, raw, expected):
+        assert tg._parse_callback_data(raw) == expected
+
+    @pytest.mark.parametrize("raw", ["", "other:rid", "TGA:rid", "tg:rid"])
+    def test_foreign_or_empty_data_is_ignored(self, raw):
+        assert tg._parse_callback_data(raw) is None
+
+
+class TestTelegramChunkText:
+    """Tests for _chunk_text method."""
+
+    def test_chunk_text_empty(self):
+        """Empty text should return empty list."""
+        result = telegram_module._chunk_text("")
+        assert result == []
+
+    def test_chunk_text_short(self):
+        """Short text should return single chunk."""
+        text = "Hello world"
+        result = telegram_module._chunk_text(text)
+        assert result == ["Hello world"]
+
+    def test_chunk_text_exact_size(self):
+        """Text at exactly chunk size should return single chunk."""
+        text = "A" * 4000
+        result = telegram_module._chunk_text(text)
+        assert len(result) == 1
+        assert len(result[0]) == 4000
+
+    def test_chunk_text_long_splits(self):
+        """Long text should be split into chunks."""
+        text = "A" * 5000
+        result = telegram_module._chunk_text(text)
+        assert len(result) > 1
+        assert all(len(chunk) <= 4000 for chunk in result)
+
+    def test_chunk_text_respects_newlines(self):
+        """Split should prefer newline boundaries."""
+        text = "Line 1\n" * 1000  # Many lines
+        result = telegram_module._chunk_text(text)
+        # Each chunk should be at chunk size or less
+        assert all(len(chunk) <= 4000 for chunk in result)
+
+    def test_chunk_text_respects_spaces(self):
+        """Split should fallback to space boundaries."""
+        text = "word " * 2000  # Many words, no newlines
+        result = telegram_module._chunk_text(text)
+        assert all(len(chunk) <= 4000 for chunk in result)
+        # First chunk should end with space
+        assert result[0].endswith(" ")
+
+    def test_chunk_text_no_good_boundary(self):
+        """Long word without spaces should be hard split."""
+        text = "A" * 5000  # Single long word
+        result = telegram_module._chunk_text(text)
+        assert len(result) > 1
+        assert all(len(chunk) <= 4000 for chunk in result)
+
+
+class TestTelegramRichMessages:
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("A | B\n:--- | ---:\n1 | 2", True),
+            ("| A | B |\n|---|---|", True),
+            ("| `a\\|b` | B |\n|---|---|\n| 1 | 2 |", True),
+            ("| [A](https://example.com/a|b) | B |\n|---|---|", True),
+            ("A | B\nnot a delimiter | row", False),
+            ("\n|---|---|\n1 | 2", False),
+            pytest.param(
+                f"{'[' * 32000}\n{_MARKDOWN_TABLE}",
+                True,
+                id="unclosed-brackets",
+            ),
+        ],
+    )
+    def test_rich_message_candidates(self, text, expected):
+        """Detect delimiters without interpreting inline Markdown."""
+        assert telegram_module._can_send_rich_message(text) is expected
+
+    @pytest.mark.parametrize("fence", ["```", "~~~", "````"])
+    def test_table_detection_ignores_fenced_code(self, fence):
+        """Only tables outside a matching code fence use the Rich API."""
+        text = f"{fence}markdown\n```\n{_MARKDOWN_TABLE}\n{fence}"
+        if fence == "```":
+            text = f"{fence}markdown\n{_MARKDOWN_TABLE}\n{fence}"
+        assert not telegram_module._can_send_rich_message(text)
+        assert telegram_module._can_send_rich_message(
+            f"{text}\n{_MARKDOWN_TABLE}",
+        )
+
+    @pytest.mark.parametrize(
+        ("columns", "expected"),
+        [(20, True), (21, False)],
+    )
+    def test_rich_table_column_limit(self, columns, expected):
+        """A wider table anywhere in a message requires legacy delivery."""
+        header = " | ".join(["A"] * columns)
+        delimiter = " | ".join(["---"] * columns)
+        text = f"{_MARKDOWN_TABLE}\n\n{header}\n{delimiter}\n{header}"
+
+        assert telegram_module._can_send_rich_message(text) is expected
+
+    @pytest.mark.parametrize(
+        "suffix",
+        ["[" * 131072, "\u4e2d" * 11000],
+        ids=["oversized-ascii", "oversized-utf8"],
+    )
+    def test_size_limit_is_checked_before_table_detection(self, suffix):
+        """Reject oversized ASCII and UTF-8 input before delimiter scanning."""
+        text = f"{_MARKDOWN_TABLE}\n{suffix}"
+        with patch.object(
+            telegram_module.re,
+            "fullmatch",
+            side_effect=AssertionError("Unexpected delimiter scan"),
+        ):
+            assert not telegram_module._can_send_rich_message(text)
+
+    def test_rich_message_accepts_exact_byte_limit(self):
+        """A message at the Rich API byte limit remains eligible."""
+        padding = 32768 - len(_MARKDOWN_TABLE) - 1
+        text = f"{_MARKDOWN_TABLE}\n{'x' * padding}"
+
+        assert telegram_module._can_send_rich_message(text)
+
+
+def test_telegram_base_urls_derive_api_and_file_prefixes():
+    assert telegram_module._telegram_base_urls("") == ("", "")
+    assert telegram_module._telegram_base_urls(
+        " https://tg-api.example.com/ "
+    ) == (
+        "https://tg-api.example.com/bot",
+        "https://tg-api.example.com/file/bot",
+    )
+
+
+@pytest.fixture
+def cache():
+    return tg.CardCache()
+
+
+def test_two_instances_keep_cache_and_eviction_separate():
+    first, second = tg.CardCache(), tg.CardCache()
+    for number in range(501):
+        first._cache_request_context(
+            str(number), "shell", "high", "body", {"session_id": "A"}
+        )
+        first._mark_processed(str(number), "approve")
+    assert len(first._request_context_cache) == 251
+    assert len(first._processed_requests) == 251
+    assert first._get_request_context("249") is None
+    assert first._get_request_context("250")["session_ctx"] == {
+        "session_id": "A"
+    }
+    assert first._get_request_context("500")["tool_name"] == "shell"
+    assert second._get_request_context("500") is None
+    assert second._processed_requests == {}
+
+
+class TestRequestContextCache:
+    def test_round_trip(self, cache):
+        cache._cache_request_context(
+            "rid-1",
+            "shell",
+            "high",
+            "body",
+            {"chat_id": "c1"},
+        )
+
+        assert cache._get_request_context("rid-1") == {
+            "tool_name": "shell",
+            "severity": "high",
+            "body_text": "body",
+            "session_ctx": {"chat_id": "c1"},
+        }
+
+    def test_unknown_request_returns_none(self, cache):
+        assert cache._get_request_context("nope") is None
+
+    def test_eviction_halves_the_cache(self, monkeypatch, cache):
+        monkeypatch.setattr(tg, "_CACHE_MAX_SIZE", 4)
+
+        for index in range(5):
+            cache._cache_request_context(f"rid-{index}", "t", "m", "", {})
+
+        assert len(cache._request_context_cache) == 3
+        assert "rid-0" not in cache._request_context_cache
+        assert "rid-4" in cache._request_context_cache
+
+    def test_cache_at_limit_is_kept(self, monkeypatch, cache):
+        monkeypatch.setattr(tg, "_CACHE_MAX_SIZE", 4)
+
+        for index in range(4):
+            cache._cache_request_context(f"rid-{index}", "t", "m", "", {})
+
+        assert len(cache._request_context_cache) == 4
+
+
+class TestMarkProcessed:
+    def test_first_click_is_new_and_repeat_is_duplicate(self, cache):
+        assert cache._mark_processed("rid-1", "approve") is False
+        assert cache._mark_processed("rid-1", "approve") is True
+
+    def test_recorded_action_is_stored(self, cache):
+        cache._mark_processed("rid-1", "deny")
+
+        assert cache._processed_requests["rid-1"] == "deny"
+
+    def test_eviction_halves_the_cache(self, monkeypatch, cache):
+        monkeypatch.setattr(tg, "_PROCESSED_MAX_SIZE", 4)
+
+        for index in range(5):
+            cache._mark_processed(f"rid-{index}", "approve")
+
+        assert len(cache._processed_requests) == 3
+        assert "rid-0" not in cache._processed_requests
+        assert "rid-4" in cache._processed_requests
+
+
+class TestTelegramExceptions:
+    """Tests for custom exception classes."""
+
+    def test_file_too_large_error(self):
+        """_FileTooLargeError should be catchable."""
+        from qwenpaw_channel_telegram.platform import _FileTooLargeError
+
+        exc = _FileTooLargeError("File is too big")
+        assert str(exc) == "File is too big"
+        assert isinstance(exc, Exception)
+
+    def test_media_file_unavailable_error(self):
+        """_MediaFileUnavailableError should be catchable."""
+        from qwenpaw_channel_telegram.platform import (
+            _MediaFileUnavailableError,
+        )
+
+        exc = _MediaFileUnavailableError("File not found")
+        assert str(exc) == "File not found"
+        assert isinstance(exc, Exception)
+
+
+class TestTelegramConstants:
+    """Tests for module constants."""
+
+    def test_max_message_length(self):
+        """TELEGRAM_MAX_MESSAGE_LENGTH should be 4096."""
+        from qwenpaw_channel_telegram.platform import (
+            TELEGRAM_MAX_MESSAGE_LENGTH,
+        )
+
+        assert TELEGRAM_MAX_MESSAGE_LENGTH == 4096
+
+    def test_send_chunk_size(self):
+        """TELEGRAM_SEND_CHUNK_SIZE should be 4000."""
+        from qwenpaw_channel_telegram.platform import (
+            TELEGRAM_SEND_CHUNK_SIZE,
+        )
+
+        assert TELEGRAM_SEND_CHUNK_SIZE == 4000
+
+    def test_max_file_size(self):
+        """TELEGRAM_MAX_FILE_SIZE_BYTES should be 50MB."""
+        from qwenpaw_channel_telegram.platform import (
+            TELEGRAM_MAX_FILE_SIZE_BYTES,
+        )
+
+        assert TELEGRAM_MAX_FILE_SIZE_BYTES == 50 * 1024 * 1024
+
+
+class TestModuleMetadata:
+    def test_dispatcher_metadata(self):
+        assert tg.NAME == "tool_guard_approval"
+        assert tg.MESSAGE_TYPE == "tool_guard_approval"
+        assert tg.CALLBACK_DATA_PREFIX == "tg"
+        assert (tg.APPROVE_PREFIX, tg.DENY_PREFIX) == ("tga:", "tgd:")
+
+
+def test_native_update_without_message_has_no_message_metadata():
+    from telegram import Update
+
+    assert telegram_module._message_meta(Update(1)) == {}
+
+
+def test_real_data_decoder_cancellation_propagates_without_upload_or_disk(
+    tmp_path,
+):
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    import httpx
+    from telegram import Bot
+    from telegram.request import HTTPXRequest
+
+    calls = []
+
+    def reject_external(request):
+        calls.append(request)
+        raise AssertionError("Decode cancellation must precede native upload")
+
+    async def exercise():
+        gate, entered = threading.Event(), threading.Event()
+        executor = ThreadPoolExecutor(max_workers=1)
+        asyncio.get_running_loop().set_default_executor(executor)
+
+        def occupy_decoder_thread():
+            entered.set()
+            gate.wait()
+
+        executor.submit(occupy_decoder_thread)
+        assert entered.wait(1)
+        request = HTTPXRequest(
+            httpx_kwargs={"transport": httpx.MockTransport(reject_external)}
+        )
+        bot = Bot("123:local-A", request=request, get_updates_request=request)
+        queue = asyncio.Queue()
+        platform = telegram_module.TelegramPlatform(
+            {"bot_token": "123:local-A", "workspace_dir": str(tmp_path)},
+            queue.put,
+            queue.put,
+            queue.put,
+        )
+        task = asyncio.create_task(
+            platform._send_media_value(
+                bot=bot,
+                chat_id=12345,
+                value="data:application/pdf;base64,cGRmLWRhdGE=",
+                method_name="send_document",
+                payload_name="document",
+                message_thread_id=None,
+            )
+        )
+        try:
+            await asyncio.sleep(0)
+            assert not task.done()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert task.cancelled()
+            assert calls == []
+            assert not platform._media_dir.exists()
+        finally:
+            gate.set()
+            await request.shutdown()
+
+    asyncio.run(exercise())

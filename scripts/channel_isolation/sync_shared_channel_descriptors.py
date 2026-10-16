@@ -18,59 +18,36 @@ def main() -> int:
     root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(root / "src"))
     # This development-only command is the sole schema-generation importer.
-    from qwenpaw.config.config import DingTalkConfig, FeishuConfig
+    from qwenpaw.config.config import ChannelConfig
     from qwenpaw.channel_protocol.shared import SharedChannelDescriptor
     from qwenpaw.plugins.architecture import PluginManifest
     from qwenpaw.plugins.channel_adapter import describe_channel
+    from qwenpaw.plugins.official_channel_catalog import OFFICIAL_CHANNELS
 
     stale = []
-    for key, model, label, driver, capabilities in (
-        (
-            "feishu",
-            FeishuConfig,
-            {"en": "Feishu / Lark", "zh": "飞书"},
-            "FeishuDriver",
-            ["approval_card", "media", "reaction", "streaming"],
-        ),
-        (
-            "dingtalk",
-            DingTalkConfig,
-            {"en": "DingTalk", "zh": "钉钉"},
-            "DingTalkDriver",
-            ["approval_card", "media", "streaming"],
-        ),
-    ):
-        schema = model.model_json_schema()
-        for name, default in model().model_dump(mode="json").items():
-            schema["properties"][name]["default"] = default
-        descriptor = SharedChannelDescriptor.from_mapping(
-            {
-                "schema_version": 2,
-                "channel_key": key,
-                "label": label,
-                "process_mode": "runner_process",
-                "dependency_mode": "shared",
-                "entrypoint": {
-                    "scope": "runner",
-                    "module": key + ".driver",
-                    "qualname": driver,
-                },
-                "requirements_file": "requirements.txt",
-                "config_schema": schema,
-                "config_fields": list(schema["properties"]),
-                "capabilities": capabilities,
-            },
-        )
-        plugin_root = root / "plugins" / "channel" / key
+    for row in OFFICIAL_CHANNELS:
+        key = row["channel_key"]
+        plugin_root = root / "plugins/channel" / row["source_dir"]
         manifest = PluginManifest.from_dict(
             json.loads((plugin_root / "plugin.json").read_text()),
         )
+        if manifest.id != row["plugin_id"]:
+            raise ValueError("Official channel owner mismatch")
         if manifest.entry.descriptor != "channel.json":
             raise ValueError("Candidate must declare channel.json")
-        for relative in (f"{key}/__init__.py", f"{key}/driver.py"):
-            if not (plugin_root / relative).is_file():
-                raise FileNotFoundError(plugin_root / relative)
         path = plugin_root / "channel.json"
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        field = ChannelConfig.model_fields.get(key)
+        if field is not None:
+            model = field.annotation
+            schema = model.model_json_schema()
+            for name, default in model().model_dump(mode="json").items():
+                schema["properties"][name]["default"] = default
+            raw["config_schema"] = schema
+            raw["config_fields"] = list(schema["properties"])
+        # Azure and third-party-style schema-only entries retain their own
+        # schema. Entrypoints, capabilities and labels are never regenerated.
+        descriptor = SharedChannelDescriptor.from_mapping(raw)
         content = (
             json.dumps(descriptor.to_mapping(), ensure_ascii=False, indent=2)
             + "\n"

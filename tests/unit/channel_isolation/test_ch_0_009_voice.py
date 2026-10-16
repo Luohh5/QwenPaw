@@ -1,45 +1,50 @@
 # -*- coding: utf-8 -*-
-"""Run CH-0-009 tests outside legacy Channel imports."""
+"""Voice responsibilities on actual private Driver and official shared host."""
 
+import os
 from pathlib import Path
 import subprocess
 import sys
 
-SUITE = (
-    Path(__file__).parents[2]
-    / "fixtures"
-    / "channel_isolation"
-    / "voice"
-    / "ch_0_009_voice_suite.py"
+import pytest
+
+
+@pytest.mark.parametrize(
+    "suite_name",
+    [
+        "voice_closeout_lifecycle_suite.py",
+    ],
 )
-
-
-def test_ch_0_009_in_isolated_pytest_process() -> None:
-    """Verify the production Voice Driver in an isolated test process."""
+def test_voice_migrated_responsibilities(tmp_path, suite_name):
+    suite = (
+        Path(__file__).resolve().parents[2]
+        / "fixtures/channel_plugins"
+        / suite_name
+    )
     result = subprocess.run(
         [
             sys.executable,
             "-I",
-            "-c",
-            """
-import pathlib, sys
-source = pathlib.Path(sys.argv[1]).resolve()
-suite = pathlib.Path(sys.argv[2]).resolve()
-sys.path.insert(0, str(source))
-import qwenpaw
-assert pathlib.Path(qwenpaw.__file__).resolve().is_relative_to(source)
-import pytest
-raise SystemExit(pytest.main([
-    '--confcutdir', str(suite.parent), str(suite), '-q',
-]))
-""",
-            str(SUITE.parents[4] / "src"),
-            str(SUITE),
+            "-m",
+            "pytest",
+            "-p",
+            "pytest_asyncio.plugin",
+            "--confcutdir",
+            str(suite.parent),
+            str(suite),
+            "-q",
         ],
+        env={
+            **os.environ,
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "PIP_NO_INDEX": "1",
+            "QWENPAW_WORKING_DIR": str(tmp_path / "work"),
+            "QWENPAW_SECRET_DIR": str(tmp_path / "secret"),
+            "QWENPAW_BACKUP_DIR": str(tmp_path / "backup"),
+        },
         capture_output=True,
+        text=True,
         check=False,
         timeout=90,
     )
-    assert result.returncode == 0, result.stdout.decode(
-        errors="replace",
-    ) + result.stderr.decode(errors="replace")
+    assert result.returncode == 0, result.stdout + result.stderr

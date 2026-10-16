@@ -47,6 +47,12 @@ class DingTalkDeliveryError(RuntimeError):
 class DingTalkDriver(SharedResponseDriver):
     """Own the SDK/Stream/Webhook/media resources and durable reply routes."""
 
+    @staticmethod
+    async def manage(request):
+        from .management import manage
+
+        return await manage(request)
+
     def __init__(self):
         super().__init__(
             "dingtalk",
@@ -55,39 +61,6 @@ class DingTalkDriver(SharedResponseDriver):
         )
         self._supervisor = None
         self._ingress = set()
-
-    def bind(self, context):
-        super().bind(context)
-        context.peer.register_method("channel.response.prepare", self._prepare)
-
-    async def _prepare(self, params, request):
-        self._identity(params)
-        if set(params) != {
-            *self._context.identity.to_mapping(),
-            "response_handle",
-            "delivery_id",
-        }:
-            raise ValueError("SCHEMA_MISMATCH")
-        operation = SendParams.from_mapping(
-            {
-                **self._context.identity.to_mapping(),
-                "delivery_id": params["delivery_id"],
-                "to_handle": params["response_handle"],
-                "operation": "stream.start",
-                "stream_type": "message",
-                "sequence": 0,
-                "accumulated_text": "...",
-            },
-        )
-        if (
-            operation.delivery_id
-            != hashlib.sha256(
-                (operation.to_handle + ":prepare").encode(),
-            ).hexdigest()
-        ):
-            raise ValueError("SCHEMA_MISMATCH")
-        async with self._lock(operation.to_handle):
-            return await self._delivery(operation, self._perform_prepare)
 
     async def _store_ref(self, snapshot, ref, *, previous=None, route=False):
         field = "route_refs" if route else "resource_refs"
@@ -207,6 +180,18 @@ class DingTalkDriver(SharedResponseDriver):
             ],
         )
         await self._checkpoint()
+
+    def _legacy_prepare_operation(self, params):
+        # Pre-G2 preparation journaled this exact internal stream-start intent.
+        return SendParams.from_mapping(
+            {
+                **params.to_mapping(),
+                "operation": "stream.start",
+                "stream_type": "message",
+                "sequence": 0,
+                "accumulated_text": "...",
+            },
+        )
 
     async def _perform_prepare(self, params):
         platform = self._require_connected()
@@ -575,17 +560,6 @@ class DingTalkDriver(SharedResponseDriver):
             if admission is None:
                 return
             ack, uncertain = admission
-            if (
-                event_id in ack.duplicate_event_ids
-                and created
-                and not uncertain
-            ):
-                snapshot = self._routes.begin_finish(
-                    handle,
-                    ResponseOutcome.CANCELLED,
-                )
-                await self._checkpoint()
-                await self._cleanup(snapshot)
         finally:
             self._ingress.discard(task)
 
@@ -766,6 +740,30 @@ class DingTalkDriver(SharedResponseDriver):
             unsettled="false",
         )
         return resource
+
+    def _needs_stream_cleanup(self, ref):
+        return bool(dict(ref.attributes).get("card_id"))
+
+    async def _perform_stream_cleanup(self, ref, resource, sequence):
+        try:
+            platform = self._require_connected()
+        except ValueError as exc:
+            if str(exc) != "NOT_CONNECTED":
+                raise
+            raise self.delivery_error(
+                "NOT_CONNECTED",
+                side_effect_possible=False,
+            ) from exc
+        if not await platform.update_stream(
+            resource,
+            resource.get("text", ""),
+            sequence,
+            final=True,
+        ):
+            raise DingTalkDeliveryError(
+                "STREAM_CLEANUP_FAILED",
+                side_effect_possible=False,
+            )
 
     async def _perform_send(self, params):
         platform = self._require_connected()

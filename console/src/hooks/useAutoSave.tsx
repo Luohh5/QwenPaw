@@ -14,6 +14,7 @@ export function useAutoSave(save: Save, delay = 1000) {
   const latest = useRef(save);
   const feedback = useRef({ message, t });
   const pending = useRef(false);
+  const pendingJob = useRef<Save>();
   const running = useRef<Promise<boolean> | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout>>();
   useLayoutEffect(() => {
@@ -28,7 +29,8 @@ export function useAutoSave(save: Save, delay = 1000) {
     }
     if (!pending.current) return true;
     pending.current = false;
-    const task = latest.current;
+    const task = pendingJob.current ?? latest.current;
+    pendingJob.current = undefined;
     const taskRevision = revision.current;
     const run = async (): Promise<boolean> => {
       try {
@@ -48,6 +50,7 @@ export function useAutoSave(save: Save, delay = 1000) {
                 onClick={() => {
                   message.destroy(errorKey);
                   if (taskRevision === revision.current) {
+                    pendingJob.current = task;
                     pending.current = true;
                     void flush();
                   }
@@ -65,18 +68,28 @@ export function useAutoSave(save: Save, delay = 1000) {
     running.current = run();
     const saved = await running.current;
     running.current = null;
-    if (!saved && taskRevision === revision.current) pending.current = true;
+    if (!saved && taskRevision === revision.current) {
+      pending.current = true;
+      pendingJob.current = task;
+    }
     return saved;
   }, [errorKey]);
-  const schedule = useCallback(() => {
-    revision.current += 1;
-    feedback.current.message.destroy(errorKey);
-    pending.current = true;
-    clearTimeout(timer.current);
-    timer.current = setTimeout(() => {
-      void flush();
-    }, delay);
-  }, [delay, flush, errorKey]);
+  const schedule = useCallback(
+    (job?: unknown) => {
+      revision.current += 1;
+      feedback.current.message.destroy(errorKey);
+      pending.current = true;
+      // Existing Form/onChange callers pass event values; only a function
+      // opts into the fixed-job path.
+      pendingJob.current =
+        typeof job === "function" ? (job as Save) : undefined;
+      clearTimeout(timer.current);
+      timer.current = setTimeout(() => {
+        void flush();
+      }, delay);
+    },
+    [delay, flush, errorKey],
+  );
   useEffect(
     () =>
       useAgentStore.subscribe((next, previous) => {

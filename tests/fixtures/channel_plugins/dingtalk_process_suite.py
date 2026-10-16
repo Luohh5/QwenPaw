@@ -1314,24 +1314,37 @@ async def test_host_acl_checks_actor_for_shared_group_and_blocks_agent(
     monkeypatch,
 ):
     rt = await runtime(access_control_group=True, share_session_in_group=True)
+    from qwenpaw.app.channels.access_control import AccessControlStore
+
     checks = []
-    store = NS(
-        is_whitelisted=lambda channel, sender: checks.append((channel, sender))
-        or False,
-        is_blacklisted=lambda *_: True,
-    )
+    store = AccessControlStore(rt.work / "acl.json")
+    original_whitelist = store.is_whitelisted
+
+    def checked_whitelist(channel, sender):
+        checks.append((channel, sender))
+        return original_whitelist(channel, sender)
+
+    monkeypatch.setattr(store, "is_whitelisted", checked_whitelist)
     monkeypatch.setattr(
         "qwenpaw.app.channels.base.get_access_control_store",
         lambda *_a, **_k: store,
     )
-    payload = await inbound(rt, message("acl", group=True))
+    rt.emit(message("acl", group=True))
+    await eventually(
+        lambda: len(deliveries(rt)) == 1 and len(rt.rows("ack")) == 1
+    )
+    assert checks == [("dingtalk", "ding1234")]
+    assert rt.requests == rt.queued == []
+    assert [
+        (row["channel"], row["user_id"]) for row in store.get_all_pending()
+    ] == [("dingtalk", "ding1234")]
+    assert len(deliveries(rt)) == 1
+    store.add_to_whitelist("dingtalk", "ding1234")
+    payload = await inbound(rt, message("authorized-shared", group=True))
     assert (
         rt.channel.build_agent_request_from_native(payload).user_id == "group"
     )
-    await rt.channel.consume_one(payload)
-    assert checks == [("dingtalk", "ding1234")]
     assert rt.requests == []
-    assert len(deliveries(rt)) == 1
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import ntpath
 import posixpath
 from dataclasses import dataclass, field
@@ -27,12 +28,31 @@ from ..plugins.execution.models import (  # pylint: disable=unused-import
     CancelParams,
 )
 from .identifiers import validate_channel_key, validate_digest
+from .management import ManagementRequest
+from .completed_text import RawCompletedTextSources
 
 JSONRPC_VERSION = "2.0"
+CONTENT_SOURCE_CAPABILITY = "send.content_source.v1"
+SEMANTIC_PARTS_CAPABILITY = "send.semantic_parts.v1"
+RAW_COMPLETED_TEXT_CAPABILITY = "send.raw_completed_text.v1"
+UNKNOWN_ACTOR_CAPABILITY = "event.unknown_actor.v1"
+APPROVAL_RESOLUTION_CAPABILITY = "send.approval_resolution.v1"
+TEXT_MERGE_CAPABILITY = "channel.text_merge.v1"
 PROTOCOL_VERSION = 1
 MAX_METHOD_LENGTH = 128
 MAX_SECRET_HANDLE_LENGTH = 256
 MAX_RESPONSE_HANDLE_LENGTH = 512
+
+
+def send_source_capability(source, capabilities):
+    """Raw completed text explicitly takes precedence over semantic output."""
+    if source is ContentSource.EVENT:
+        return (
+            RAW_COMPLETED_TEXT_CAPABILITY
+            if RAW_COMPLETED_TEXT_CAPABILITY in capabilities
+            else SEMANTIC_PARTS_CAPABILITY
+        )
+    return CONTENT_SOURCE_CAPABILITY
 
 
 def _required(
@@ -354,6 +374,29 @@ class IdentityParams:
         )
 
 
+class ResponsePrepareKind(StrEnum):
+    """Internal reply preparation intent, independent of streaming."""
+
+    PREPARE = "response.prepare"
+
+
+@dataclass(frozen=True)
+class ResponsePrepareOperation(IdentityParams):
+    """Validated internal preparation operation for the delivery journal."""
+
+    delivery_id: str
+    to_handle: str
+    operation: ResponsePrepareKind = ResponsePrepareKind.PREPARE
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            **super().to_mapping(),
+            "delivery_id": self.delivery_id,
+            "to_handle": self.to_handle,
+            "operation": self.operation.value,
+        }
+
+
 @dataclass(frozen=True)
 class PrepareParams(IdentityParams):
     """Prepare a candidate Runner for a generation."""
@@ -532,6 +575,112 @@ class EndpointParams(IdentityParams):
         }
 
 
+@dataclass(frozen=True)
+class HostForwardingBinding:
+    """Host-authorized routes and a generation-private ingress credential."""
+
+    route_query_key: str
+    route_selector: str
+    host_port: int
+    paths: tuple[str, ...]
+    bridge_token: str = field(repr=False)
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "HostForwardingBinding":
+        data = _object(value)
+        _closed(
+            data,
+            {
+                "route_query_key",
+                "route_selector",
+                "host_port",
+                "paths",
+                "bridge_token",
+            },
+        )
+        key = _string(data.get("route_query_key"), "route_query_key")
+        if key != "_qp_endpoint":
+            raise _error("invalid route query key")
+        selector = _string(data.get("route_selector"), "route_selector")
+        port = _integer(data.get("host_port"), "host_port", minimum=1)
+        if port > 65535:
+            raise _error("invalid host port")
+        paths = data.get("paths")
+        if not isinstance(paths, list) or not paths:
+            raise _error("paths must be a nonempty array")
+        paths = tuple(_string(path, "paths") for path in paths)
+        if len(set(paths)) != len(paths) or any(
+            not path.startswith("/")
+            or path.startswith("//")
+            or any(c in path for c in "?#\\")
+            or ".." in path
+            or any(ord(c) < 33 for c in path)
+            for path in paths
+        ):
+            raise _error("invalid forwarding path")
+        return cls(
+            key,
+            selector,
+            port,
+            paths,
+            _string(data.get("bridge_token"), "bridge_token"),
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "route_query_key": self.route_query_key,
+            "route_selector": self.route_selector,
+            "host_port": self.host_port,
+            "paths": list(self.paths),
+            "bridge_token": self.bridge_token,
+        }
+
+
+@dataclass(frozen=True)
+class EndpointRegistrationResult:
+    """Compatible endpoint ACK with optional host-owned forwarding."""
+
+    status: str
+    generation: int
+    readiness: str
+    forwarding: HostForwardingBinding | None = None
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "EndpointRegistrationResult":
+        data = _object(value)
+        _closed(data, {"status", "generation", "readiness", "forwarding"})
+        status = _string(data.get("status"), "status")
+        readiness = _string(data.get("readiness"), "readiness")
+        if status not in {"registered", "updated"} or readiness not in {
+            "starting",
+            "ready",
+            "degraded",
+            "stopped",
+        }:
+            raise _error("invalid endpoint registration result")
+        forwarding = data.get("forwarding")
+        return cls(
+            status,
+            _integer(data.get("generation"), "generation", minimum=1),
+            readiness,
+            (
+                HostForwardingBinding.from_mapping(forwarding)
+                if forwarding is not None
+                else None
+            ),
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        result = {
+            "status": self.status,
+            "generation": self.generation,
+            "readiness": self.readiness,
+        }
+        if self.forwarding is not None:
+            result["forwarding"] = self.forwarding.to_mapping()
+        return result
+
+
 def is_external_host(host: str) -> bool:
     """Return whether an endpoint host is exposed beyond loopback."""
     normalized = host.strip().lower()
@@ -610,6 +759,7 @@ class InboundEvent:
     event_kind: str
     metadata: Mapping[str, Any] = field(default_factory=dict)
     response_handle: str | None = None
+    actor_unknown: bool = False
 
     @classmethod
     def from_mapping(cls, value: object) -> "InboundEvent":
@@ -630,6 +780,7 @@ class InboundEvent:
                 "content_parts",
                 "metadata",
                 "response_handle",
+                "actor_unknown",
             },
         )
         content_parts = _list(data.get("content_parts"), "content_parts")
@@ -637,6 +788,26 @@ class InboundEvent:
         if not isinstance(metadata, Mapping):
             raise _error("metadata must be an object", path=("metadata",))
         event_kind = _string(data.get("event_kind"), "event_kind")
+        unknown = _boolean(data.get("actor_unknown", False), "actor_unknown")
+        sender = _string(
+            data.get("sender_id"),
+            "sender_id",
+            non_empty=not unknown,
+        )
+        acl_sender = _string(
+            data.get("acl_sender_id"),
+            "acl_sender_id",
+            non_empty=not unknown,
+        )
+        if unknown and (
+            sender != ""
+            or acl_sender != ""
+            or metadata.get("user_id") != ""
+            or event_kind not in {"message", "message.query"}
+        ):
+            raise _error(
+                "Unknown actor requires an anonymous ordinary message",
+            )
         return cls(
             event_id=_string(data.get("event_id"), "event_id"),
             event_kind=event_kind,
@@ -650,11 +821,9 @@ class InboundEvent:
                 minimum=1,
             ),
             conversation=_conversation(data.get("conversation")),
-            sender_id=_string(data.get("sender_id"), "sender_id"),
-            acl_sender_id=_string(
-                data.get("acl_sender_id"),
-                "acl_sender_id",
-            ),
+            sender_id=sender,
+            acl_sender_id=acl_sender,
+            actor_unknown=unknown,
             sender_name=_string(
                 data.get("sender_name"),
                 "sender_name",
@@ -689,6 +858,8 @@ class InboundEvent:
         result["event_kind"] = self.event_kind
         if self.response_handle is not None:
             result["response_handle"] = self.response_handle
+        if self.actor_unknown:
+            result["actor_unknown"] = True
         return result
 
 
@@ -1098,6 +1269,103 @@ class ApprovalCardParams:
         }
 
 
+class ContentSource(StrEnum):
+    """Opt-in presentation origins for existing public send methods."""
+
+    DIRECT = "direct"
+    CONTENT_PARTS = "content_parts"
+    MEDIA = "media"
+    EVENT = "event"
+
+
+def _validate_event_part(value: object) -> dict[str, Any]:
+    """Allow neutral roles only on outbound completed-event content."""
+    data = dict(_object(value))
+    if "role" not in data:
+        return validate_content_part(data)
+    role = _string(data.pop("role"), "role")
+    if role not in {"message", "reasoning", "refusal", "rendered"}:
+        raise _error("unsupported content role", path=("role",))
+    part = validate_content_part(data)
+    if role in {"reasoning", "refusal"} and part["type"] != "text":
+        raise _error("content role requires text", path=("role",))
+    return {**part, "role": role}
+
+
+class ApprovalResolutionOutcome(StrEnum):
+    """Authoritative command outcomes; admission is never a decision."""
+
+    APPROVED = "approved"
+    DENIED = "denied"
+    UNAVAILABLE = "unavailable"
+    FORBIDDEN = "forbidden"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class ApprovalResolutionParams:
+    """Bounded display semantics from an actual host approval command."""
+
+    request_id: str
+    outcome: ApprovalResolutionOutcome
+    actor_user_id: str
+    tool_name: str | None = None
+
+    def __post_init__(self):
+        try:
+            object.__setattr__(
+                self,
+                "outcome",
+                ApprovalResolutionOutcome(self.outcome),
+            )
+        except (ValueError, TypeError) as exc:
+            raise _error("unsupported approval outcome") from exc
+        for name, maximum in (
+            ("request_id", 256),
+            ("actor_user_id", 512),
+            ("tool_name", 1024),
+        ):
+            value = getattr(self, name)
+            if name == "tool_name" and value is None:
+                continue
+            _string(value, name, path=("approval_resolution",))
+            if len(value.encode("utf-8")) > maximum:
+                raise _error("approval result field too large", path=(name,))
+        success = self.outcome in {
+            ApprovalResolutionOutcome.APPROVED,
+            ApprovalResolutionOutcome.DENIED,
+        }
+        if success != (self.tool_name is not None):
+            raise _error("approval tool name requires a successful result")
+        if len(json.dumps(self.to_mapping()).encode("utf-8")) > 16384:
+            raise _error("approval result too large")
+
+    @classmethod
+    def from_mapping(cls, value):
+        data = _object(value, path=("approval_resolution",))
+        _closed(
+            data,
+            {"request_id", "outcome", "actor_user_id", "tool_name"},
+            path=("approval_resolution",),
+        )
+        return cls(
+            request_id=data.get("request_id"),
+            outcome=data.get("outcome"),
+            actor_user_id=data.get("actor_user_id"),
+            tool_name=data.get("tool_name"),
+        )
+
+    def to_mapping(self):
+        result = {
+            "request_id": self.request_id,
+            "outcome": self.outcome.value,
+            "actor_user_id": self.actor_user_id,
+        }
+        if self.tool_name is not None:
+            result["tool_name"] = self.tool_name
+        return result
+
+
 def _reject_operation_fields(
     data: Mapping[str, Any],
     names: tuple[str, ...],
@@ -1194,7 +1462,11 @@ def _validate_send_fields(
 ) -> None:
     """Validate the field combination for one outbound operation."""
     if operation is OutboundOperation.MESSAGE_CREATE:
-        _require_send_parts(parts)
+        if (
+            data.get("approval_resolution") is None
+            and data.get("raw_completed_text_sources") is None
+        ):
+            _require_send_parts(parts)
         _reject_operation_fields(
             data,
             (
@@ -1251,6 +1523,9 @@ class SendParams(IdentityParams):
     sequence: int | None = None
     accumulated_text: str | None = None
     approval: ApprovalCardParams | None = None
+    content_source: ContentSource | None = None
+    approval_resolution: ApprovalResolutionParams | None = None
+    raw_completed_text_sources: RawCompletedTextSources | None = None
 
     @classmethod
     def from_mapping(cls, value: object) -> "SendParams":
@@ -1271,6 +1546,9 @@ class SendParams(IdentityParams):
                 "sequence",
                 "accumulated_text",
                 "approval",
+                "content_source",
+                "approval_resolution",
+                "raw_completed_text_sources",
             },
         )
         identity = IdentityParams.from_mapping(
@@ -1280,8 +1558,19 @@ class SendParams(IdentityParams):
             },
         )
         operation = _parse_outbound_operation(data)
+        source = None
+        if data.get("content_source") is not None:
+            try:
+                source = ContentSource(data["content_source"])
+            except (ValueError, TypeError) as exc:
+                raise _error("unsupported content source") from exc
         raw_parts = _list(data.get("content_parts", []), "content_parts")
-        parts = tuple(validate_content_part(item) for item in raw_parts)
+        validate_part = (
+            _validate_event_part
+            if source is ContentSource.EVENT
+            else validate_content_part
+        )
+        parts = tuple(validate_part(item) for item in raw_parts)
         target_delivery_id = _optional_string(data, "target_delivery_id")
         sequence = _optional_integer(data, "sequence", minimum=0)
         accumulated_text = _optional_string(
@@ -1293,6 +1582,41 @@ class SendParams(IdentityParams):
         approval = None
         if "approval" in data and data["approval"] is not None:
             approval = ApprovalCardParams.from_mapping(data["approval"])
+        resolution = None
+        if data.get("approval_resolution") is not None:
+            resolution = ApprovalResolutionParams.from_mapping(
+                data["approval_resolution"],
+            )
+        raw_sources = None
+        if data.get("raw_completed_text_sources") is not None:
+            raw_sources = RawCompletedTextSources.from_mapping(
+                data["raw_completed_text_sources"],
+            )
+            if (
+                source is not ContentSource.EVENT
+                or operation is not OutboundOperation.MESSAGE_CREATE
+                or approval is not None
+                or resolution is not None
+                or any(part["type"] != "text" for part in parts)
+            ):
+                raise _error(
+                    "Raw text sources require an ordinary completed text event",
+                )
+            if not parts and raw_sources.error_source is None:
+                _require_send_parts(parts)
+        if operation is not OutboundOperation.MESSAGE_CREATE and (
+            source is not None or resolution is not None
+        ):
+            raise _error("presentation fields require message.create")
+        if approval is not None and resolution is not None:
+            raise _error("approval and resolution are mutually exclusive")
+        if source is ContentSource.MEDIA and (
+            len(parts) != 1
+            or parts[0]["type"] == "text"
+            or approval is not None
+            or resolution is not None
+        ):
+            raise _error("media source requires exactly one media part")
         _validate_send_fields(
             data,
             operation,
@@ -1313,6 +1637,9 @@ class SendParams(IdentityParams):
             sequence=sequence,
             accumulated_text=accumulated_text,
             approval=approval,
+            content_source=source,
+            approval_resolution=resolution,
+            raw_completed_text_sources=raw_sources,
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -1337,6 +1664,16 @@ class SendParams(IdentityParams):
             result["accumulated_text"] = self.accumulated_text
         if self.approval is not None:
             result["approval"] = self.approval.to_mapping()
+        if self.content_source is not None:
+            result["content_source"] = self.content_source.value
+        if self.approval_resolution is not None:
+            result[
+                "approval_resolution"
+            ] = self.approval_resolution.to_mapping()
+        if self.raw_completed_text_sources is not None:
+            result[
+                "raw_completed_text_sources"
+            ] = self.raw_completed_text_sources.to_mapping()
         return result
 
 
@@ -1825,6 +2162,7 @@ class GenerationStatus:
 
 
 METHOD_SCHEMAS: dict[str, type[Any]] = {
+    "channel.management.execute": ManagementRequest,
     "channel.prepare": PrepareParams,
     "runner.hello": HelloParams,
     "channel.activate": LeaseParams,

@@ -14,9 +14,10 @@ vi.mock("../../../api", () => ({
     }),
   },
 }));
-vi.mock("../../../stores/agentStore", () => ({
-  useAgentStore: () => ({ selectedAgent: "c6-agent" }),
-}));
+vi.mock("../../../stores/agentStore", async () => {
+  const { create } = await import("zustand");
+  return { useAgentStore: create(() => ({ selectedAgent: "c6-agent" })) };
+});
 
 import { useChannels } from "./useChannels";
 

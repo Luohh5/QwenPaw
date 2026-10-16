@@ -101,6 +101,12 @@ def _configure(
     sys.modules["qwenpaw.plugins"] = plugins
     # Direct path assignment never executes additional .pth files.
     boot._clean_environment(())
+    private_env = boot.validate_private_environment(
+        packet.get("private_env", {}),
+    )
+    if private_env and packet.get("mode", "run") not in {"run", "manage"}:
+        raise RuntimeError("LAUNCH_ENVIRONMENT_INVALID")
+    os.environ.update(private_env)
 
 
 async def run(
@@ -111,17 +117,25 @@ async def run(
 ) -> None:
     from .errors import ProtocolValidationError
     from .framing import FramedTransport
+    from .payloads import PayloadStore
     from .rpc import RpcResponsePublication
 
+    payloads = (
+        PayloadStore.attach(packet["payload_transport"])
+        if "payload_transport" in packet
+        else None
+    )
     transport = await boot._open_protocol_transport(
         FramedTransport,
         output,
         input_handle=sys.stdin.buffer,
+        payloads=payloads,
     )
     peer = runtime.peer(transport)
     identity = runtime.identity(packet)
     context = None
     component = None
+    management_stop = None
     start_task = None
     stopped = asyncio.Event()
 
@@ -132,6 +146,8 @@ async def run(
             start_task.cancel()
         if component is not None:
             await component.stop()
+        if management_stop is not None:
+            await management_stop()
         return RpcResponsePublication(
             result={"stopped": True},
             on_prepare=lambda: {"stopped": True},
@@ -148,7 +164,14 @@ async def run(
             await runtime.state(context, runtime.failed_state)
 
     mode = packet.get("mode", "run")
-    if mode == "run":
+    if not isinstance(mode, str) or mode not in {
+        "run",
+        "manage",
+        "audit",
+        "probe",
+    }:
+        raise boot.BootstrapError("EXECUTION_MODE_INVALID", "invalid mode")
+    if mode in {"run", "manage"}:
         peer.register_method(runtime.control_prefix + "stop", stop)
     await peer.start()
     try:
@@ -159,30 +182,40 @@ async def run(
             identity,
             peer,
         )
-        if mode != "run":
+        if mode in {"audit", "probe"}:
             await peer.notify(
                 runtime.control_prefix + "inspected",
                 identity.to_mapping(),
             )
             await peer.wait_closed()
             return
-        context = runtime.context(peer, identity)
-        component = component_class()
-        if any(
-            not callable(getattr(component, name, None))
-            for name in ("bind", "start", "stop")
-        ):
-            raise boot.BootstrapError(
-                "ENTRYPOINT_INVALID",
-                "invalid component",
-            )
-        component.bind(context)
-        await runtime.state(context, runtime.initial_state)
+        if mode == "manage":
+            bind = getattr(runtime, "bind_management", None)
+            if not callable(bind):
+                raise boot.BootstrapError(
+                    "ENTRYPOINT_INVALID",
+                    "mode unsupported",
+                )
+            management_stop = bind(packet, component_class, peer, identity)
+        else:
+            context = runtime.context(peer, identity)
+            component = component_class()
+            if any(
+                not callable(getattr(component, name, None))
+                for name in ("bind", "start", "stop")
+            ):
+                raise boot.BootstrapError(
+                    "ENTRYPOINT_INVALID",
+                    "invalid component",
+                )
+            component.bind(context)
+            await runtime.state(context, runtime.initial_state)
         await peer.notify(
             runtime.control_prefix + "ready",
             identity.to_mapping(),
         )
-        start_task = asyncio.create_task(connect())
+        if mode == "run":
+            start_task = asyncio.create_task(connect())
         closed_task = asyncio.create_task(peer.wait_closed())
         stop_task = asyncio.create_task(stopped.wait())
         await asyncio.wait(
@@ -198,7 +231,11 @@ async def run(
     finally:
         if start_task is not None:
             start_task.cancel()
+        if management_stop is not None:
+            await management_stop()
         await peer.aclose()
+        if payloads is not None:
+            await payloads.cleanup(deadline=asyncio.get_running_loop().time())
 
 
 async def _prepare_component(boot, packet, runtime, identity, peer):
@@ -322,7 +359,15 @@ def main(
         if len(raw) > 1024 * 1024 or not raw.endswith(b"\n"):
             return 70
         packet = json.loads(raw)
-        if packet.get("mode", "run") != "run":
+        mode = packet.get("mode", "run")
+        if not isinstance(mode, str) or mode not in {
+            "run",
+            "manage",
+            "audit",
+            "probe",
+        }:
+            return 70
+        if mode in {"audit", "probe"}:
             _guard_inspection(boot)
         _configure(boot, packet, protected_namespaces)
         from qwenpaw.plugins.execution.runtime import Runtime
