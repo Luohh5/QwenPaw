@@ -895,14 +895,24 @@ async def test_generic_loader_boot_zero_download_and_explicit_staged_addition(
     try:
         loader = PluginLoader([source.parent])
 
-        def download(command, **kwargs):
+        def stage_wheels(command, **kwargs):
             assert kwargs["plugin_id"] == "c4-legacy"
             assert command[command.index("-m") + 1] == "pip"
-            assert "download" in command and "install" not in command
-            assert "--only-binary=:all:" in command
+            assert "wheel" in command and "install" not in command
+            assert "--target" not in command
+            assert command[0] == str(python)
+            assert "-I" in command
             constraints = Path(command[command.index("--constraint") + 1])
-            assert "packaging==" in constraints.read_text()
-            staging = Path(command[command.index("--dest") + 1])
+            from importlib.metadata import version
+
+            assert (
+                f"packaging=={version('packaging')}"
+                in constraints.read_text().splitlines()
+            )
+            staging = Path(command[command.index("--wheel-dir") + 1])
+            assert staging.is_dir()
+            assert not staging.is_relative_to(target)
+            assert constraints.parent == staging
             shutil.copyfile(addition.path, staging / addition.path.name)
             calls.append(command)
             return SimpleNamespace(returncode=0)
@@ -910,7 +920,7 @@ async def test_generic_loader_boot_zero_download_and_explicit_staged_addition(
         monkeypatch.setattr(
             loader,
             "_run_subprocess_with_streaming_log",
-            download,
+            stage_wheels,
         )
         boot = await loader._ensure_dependencies_installed(source, "c4-legacy")
         assert (

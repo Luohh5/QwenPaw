@@ -11,6 +11,8 @@ import hashlib
 import io
 import os
 from pathlib import Path, PurePosixPath
+import re
+import shlex
 import stat
 from typing import Mapping
 import zipfile
@@ -34,6 +36,14 @@ class WheelAddition:
     sha256: str
 
 
+class WheelFiles(dict[str, bytes]):
+    """Validated target-relative files and their executable script paths."""
+
+    def __init__(self):
+        super().__init__()
+        self.executable_paths: set[str] = set()
+
+
 # lark-oapi 1.7.1 has over 11,000 installed non-pyc files.
 # Retain expanded byte limits while allowing ordinary large SDK wheels.
 def _members(addition: WheelAddition) -> dict[str, bytes]:
@@ -48,7 +58,7 @@ def _members(addition: WheelAddition) -> dict[str, bytes]:
     content = path.read_bytes()
     if hashlib.sha256(content).hexdigest() != addition.sha256:
         raise dependency_error("DEPENDENCY_PLAN_UNVERIFIED")
-    result = {}
+    result = WheelFiles()
     normalized = set()
     with zipfile.ZipFile(io.BytesIO(content)) as archive:
         if (
@@ -77,15 +87,13 @@ def _members(addition: WheelAddition) -> dict[str, bytes]:
             if info.is_dir():
                 continue
             key = os.path.normcase(name).casefold()
-            if (
-                key in normalized
-                or name.endswith(".pth")
-                or any(part.endswith(".data") for part in relative.parts)
-                or relative.name == "entry_points.txt"
-            ):
+            # Entry-point declarations remain metadata; no launchers are made.
+            if key in normalized or name.endswith(".pth"):
                 raise dependency_error("DEPENDENCY_PLAN_UNVERIFIED")
             normalized.add(key)
             result[name] = archive.read(info)
+            if info.external_attr >> 16 & 0o111:
+                result.executable_paths.add(name)
     if any(
         str(parent) in result
         for name in result
@@ -119,17 +127,164 @@ def _validate_record(files: Mapping[str, bytes], record: str) -> None:
         raise dependency_error("DEPENDENCY_PLAN_UNVERIFIED")
 
 
+def _script_bytes(content, executable, windows):
+    """Bind wheel Python scripts to the audited interpreter without running."""
+    first, _, rest = content.partition(b"\n")
+    if first.rstrip(b"\r") not in {b"#!python", b"#!pythonw"}:
+        return content, False
+    if any(character in executable for character in "\r\n\x00"):
+        raise dependency_error("DEPENDENCY_PLAN_UNVERIFIED")
+    encoded = os.fsencode(executable)
+    if windows:
+        if '"' in executable:
+            raise dependency_error("DEPENDENCY_PLAN_UNVERIFIED")
+        if any(character.isspace() for character in executable):
+            encoded = b'"' + encoded + b'"'
+        header = b"#!" + encoded + b"\n"
+    elif any(character.isspace() for character in executable) or (
+        len(encoded) + 3 > 127
+    ):
+        if "\\" in executable:
+            raise dependency_error("DEPENDENCY_PLAN_UNVERIFIED")
+        cookie, _, body = rest.partition(b"\n")
+        if re.match(rb"[ \t\f]*#.*?coding[:=][ \t]*[-\w.]+", cookie):
+            rest = body
+            cookie += b"\n"
+        else:
+            cookie = b""
+        header = (
+            b"#!/bin/sh\n"
+            + cookie
+            + b"'''exec' "
+            + os.fsencode(shlex.quote(executable))
+            + b" \"$0\" \"$@\"\n' '''\n"
+        )
+    else:
+        header = b"#!" + encoded + b"\n"
+    return header + rest, True
+
+
+# Data schemes and Windows device names must be rejected before publication.
+def _install_scripts(members, info, snapshot):
+    """Relocate verified script payloads within the target installation."""
+    # pylint: disable=too-many-boolean-expressions
+    directory = (
+        "Scripts"
+        if snapshot.marker_environment.get("os_name") == "nt"
+        or snapshot.marker_environment.get("sys_platform") == "win32"
+        else "bin"
+    )
+    data = info.removesuffix(".dist-info") + ".data"
+    installed = WheelFiles()
+    scripts = set()
+    destinations = set()
+    for path, content in members.items():
+        parts = PurePosixPath(path).parts
+        destination = path
+        if any(part.endswith(".data") for part in parts):
+            if (
+                len(parts) != 3
+                or parts[:2] != (data, "scripts")
+                or parts[2].endswith((".", " "))
+                or parts[2].split(".", 1)[0].casefold() == "__init__"
+                or any(ord(character) < 32 for character in parts[2])
+                or (
+                    directory == "Scripts"
+                    and parts[2].split(".", 1)[0].upper()
+                    in {"CON", "PRN", "AUX", "NUL"}
+                    | {
+                        f"{prefix}{number}"
+                        for prefix in ("COM", "LPT")
+                        for number in range(1, 10)
+                    }
+                )
+            ):
+                raise dependency_error("DEPENDENCY_PLAN_UNVERIFIED")
+            destination = f"{directory}/{parts[2]}"
+            scripts.add(destination)
+            content, python_script = _script_bytes(
+                content,
+                snapshot.executable,
+                directory == "Scripts",
+            )
+            if (python_script and directory == "bin") or (
+                path in members.executable_paths
+            ):
+                installed.executable_paths.add(destination)
+        if destination.casefold() in destinations:
+            raise dependency_error("DEPENDENCY_PLAN_UNVERIFIED")
+        destinations.add(destination.casefold())
+        installed[destination] = content
+    if scripts:
+        record = f"{info}/RECORD"
+        rows = io.StringIO(newline="")
+        writer = csv.writer(rows, lineterminator="\n")
+        for path, content in installed.items():
+            if path != record:
+                digest = (
+                    base64.urlsafe_b64encode(
+                        hashlib.sha256(content).digest(),
+                    )
+                    .decode()
+                    .rstrip("=")
+                )
+                writer.writerow((path, "sha256=" + digest, len(content)))
+        writer.writerow((record, "", ""))
+        installed[record] = rows.getvalue().encode("utf-8")
+    return installed, scripts, directory
+
+
+def _check_script_paths(scripts, directory, snapshot, target):
+    """Allow shared script directories without merging import providers."""
+    key = directory.casefold()
+    if any(
+        key in {top.casefold() for top in row["top_level"]}
+        for row in snapshot.distributions.values()
+    ):
+        raise dependency_error("DEPENDENCY_RESTART_REQUIRED")
+    for site in snapshot.sites:
+        root = Path(site)
+        for child in root.iterdir() if root.is_dir() else ():
+            if child.name.casefold() == key:
+                if (
+                    child.is_symlink()
+                    or not child.is_dir()
+                    or any(
+                        path.name.casefold().startswith("__init__.")
+                        for path in child.iterdir()
+                    )
+                    or (root == target and child.name != directory)
+                ):
+                    raise dependency_error("DEPENDENCY_RESTART_REQUIRED")
+            elif child.name.split(".", 1)[0].casefold() == key and (
+                child.suffix.lower() in {".py", ".pyc", ".so", ".pyd"}
+            ):
+                raise dependency_error("DEPENDENCY_RESTART_REQUIRED")
+    destination = target / directory
+    existing = (
+        {path.name.casefold() for path in destination.iterdir()}
+        if destination.is_dir()
+        else set()
+    )
+    if any(
+        PurePosixPath(path).name.casefold() in existing for path in scripts
+    ):
+        raise dependency_error("DEPENDENCY_RESTART_REQUIRED")
+
+
 # Whole-set archive and collision validation is deliberately fail-closed.
-# pylint: disable=too-many-branches,too-many-boolean-expressions
+# pylint: disable=too-many-branches,too-many-boolean-expressions,too-many-statements
 def validate_additions(
     additions: tuple[WheelAddition, ...],
     snapshot: DependencySnapshot,
     target: Path,
 ) -> tuple[dict[str, bytes], DependencySnapshot]:
     """Return verified bytes and proposed metadata for closure checks."""
-    files: dict[str, bytes] = {}
+    files = WheelFiles()
     distributions = dict(snapshot.distributions)
     occupied = set()
+    script_directories = set()
+    script_paths = set()
     try:
         for addition in additions:
             name, version, _, tags = parse_wheel_filename(
@@ -179,10 +334,32 @@ def validate_additions(
             ):
                 raise dependency_error("DEPENDENCY_PLAN_UNVERIFIED")
             _validate_record(members, f"{info}/RECORD")
-            tops = {path.split("/", 1)[0] for path in members}
+            tops = {
+                path.split("/", 1)[0]
+                for path in members
+                if not path.split("/", 1)[0].endswith(".data")
+            }
+            members, scripts, directory = _install_scripts(
+                members,
+                info,
+                snapshot,
+            )
             stems = {top.split(".", 1)[0] for top in tops}
-            if stems.intersection(occupied):
+            if (
+                stems.intersection(occupied)
+                or {stem.casefold() for stem in stems} & script_directories
+                or (
+                    scripts
+                    and directory.casefold()
+                    in {stem.casefold() for stem in stems | occupied}
+                )
+                or {path.casefold() for path in scripts} & script_paths
+            ):
                 raise dependency_error("DEPENDENCY_PLAN_UNVERIFIED")
+            if scripts:
+                _check_script_paths(scripts, directory, snapshot, target)
+                script_directories.add(directory.casefold())
+                script_paths.update(path.casefold() for path in scripts)
             for top in tops:
                 for site in snapshot.sites:
                     destination = Path(site) / top
@@ -212,6 +389,7 @@ def validate_additions(
                         raise dependency_error("DEPENDENCY_RESTART_REQUIRED")
             occupied.update(stems)
             files.update(members)
+            files.executable_paths.update(members.executable_paths)
             distributions[name] = {
                 "version": str(version),
                 "metadata_path": str(target / info),

@@ -344,7 +344,15 @@ def observe_dependencies(packet: Mapping[str, Any]) -> DependencySnapshot:
         if name in rows and name not in scanned:
             tops = set(rows[name]["top_level"])
             for path in observed[name].files or ():
-                part = str(path).replace("\\", "/").split("/", 1)[0]
+                parts = str(path).replace("\\", "/").split("/")
+                part = parts[0]
+                # Scripts are not import providers; real package markers are.
+                if (
+                    len(parts) == 2
+                    and part in {"bin", "Scripts"}
+                    and not parts[1].casefold().startswith("__init__.")
+                ):
+                    continue
                 if part not in {"", ".", ".."} and not part.endswith(
                     (".dist-info", ".egg-info"),
                 ):

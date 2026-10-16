@@ -805,7 +805,15 @@ def _write_additions(target: Path, files: dict[str, bytes]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.resolve().is_relative_to(target) or path.is_symlink():
             raise RuntimeError("DEPENDENCY_REPAIR_REQUIRED")
-        with path.open("xb") as stream:
+        mode = (
+            0o777
+            if relative in getattr(files, "executable_paths", ())
+            else 0o666
+        )
+        flags = (
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        )
+        with os.fdopen(os.open(path, flags, mode), "wb") as stream:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())

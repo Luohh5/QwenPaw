@@ -884,7 +884,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         plugin_id,
         requirements_file,
     ):
-        """Stage only; the shared gate validates every actual package write."""
+        """Build/stage wheels; the shared gate owns actual package writes."""
         import hashlib
         from packaging.utils import parse_wheel_filename
         from .dependency_gate import WheelAddition, prepare_shared_dependencies
@@ -909,11 +909,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 "-I",
                 "-m",
                 "pip",
-                "download",
+                "wheel",
                 "--disable-pip-version-check",
                 "--no-input",
-                "--only-binary=:all:",
-                "--dest",
+                "--wheel-dir",
                 str(staging),
                 "--constraint",
                 str(constraints),
@@ -922,7 +921,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             ]
             from .execution.process import _settle
 
-            download = asyncio.create_task(
+            build = asyncio.create_task(
                 asyncio.to_thread(
                     self._run_subprocess_with_streaming_log,
                     command,
@@ -931,9 +930,9 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 ),
             )
             try:
-                result = await asyncio.shield(download)
+                result = await asyncio.shield(build)
             except asyncio.CancelledError:
-                await _settle(download)
+                await _settle(build)
                 raise
             if result.returncode:
                 raise RuntimeError(
