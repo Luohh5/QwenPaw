@@ -3308,6 +3308,16 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             mode=UnloadMode.UNINSTALL,
         )
         source_path = self._find_installed_plugin_dir(plugin_id)
+        if source_path is None:
+            discovered = await asyncio.to_thread(self.discover_plugins)
+            source_path = next(
+                (
+                    path
+                    for manifest, path in discovered
+                    if manifest.id == plugin_id
+                ),
+                None,
+            )
         has_inventory = inventory_path(plugin_id).is_file()
         from .legacy_cloudpaw import has_pending_cleanup
 
