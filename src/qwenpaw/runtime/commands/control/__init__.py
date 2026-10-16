@@ -295,7 +295,10 @@ async def handle_control_command(
     )
 
     try:
-        return await handler.handle(context)
+        from ....plugins.activity import plugin_invocation
+
+        with plugin_invocation(command_owner(token)):
+            return await handler.handle(context)
     except CheckpointError as exc:
         logger.info("Checkpoint command rejected: %s", exc)
         return f"**Checkpoint error**\n\n{exc}"

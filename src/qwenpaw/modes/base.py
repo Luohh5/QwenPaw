@@ -17,6 +17,7 @@ from: it auto-skips when the owning mode's ``is_active(ctx)`` returns
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from ..runtime.hooks import HookBase, HookContext, HookResult
@@ -47,6 +48,8 @@ class AgentMode:
         """
         self._registered: list[tuple[str, object]] = []
         for spec in self.commands():
+            if self.owner_plugin_id:
+                spec = replace(spec, owner_plugin_id=self.owner_plugin_id)
             workspace.plugins.slash_command_registry.register(spec)
             self._registered.append(("command", spec))
         for desc in self.tools():

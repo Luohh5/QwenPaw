@@ -14,17 +14,23 @@ import urllib.request
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from ...market.registry import MarketProviderBusyError
+from ...plugins.activity import PluginBusyError
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/plugins", tags=["plugins"])
+
+
+def _interrupt_options(interrupt_tasks: bool) -> dict[str, Any]:
+    """Keep existing callers unchanged unless interruption is explicit."""
+    return {"interrupt_tasks": True} if interrupt_tasks else {}
 
 
 def _log_safe(value: object) -> str:
@@ -197,6 +203,7 @@ async def _load_plugin_with_optional_force_reinstall(
     source_path: Path,
     *,
     force: bool,
+    interrupt_tasks: bool = False,
     reload_agents: bool = True,
     pawport_owner: dict | None = None,
     recover_incomplete: bool = False,
@@ -229,6 +236,7 @@ async def _load_plugin_with_optional_force_reinstall(
         source_path=source_path,
         install_dir=get_plugins_dir(),
         force=force,
+        **_interrupt_options(interrupt_tasks),
         before_force_unload=_before_force_unload if force else None,
         pawport_owner=pawport_owner,
         recover_incomplete=recover_incomplete,
@@ -313,6 +321,7 @@ class InstallPluginRequest(BaseModel):
 
     source: str
     force: bool = False
+    interrupt_tasks: bool = False
 
 
 async def install_plugin_source(
@@ -320,6 +329,7 @@ async def install_plugin_source(
     *,
     app,
     force: bool = False,
+    interrupt_tasks: bool = False,
     reload_agents: bool = True,
     pawport_owner: dict | None = None,
     recover_incomplete: bool = False,
@@ -352,6 +362,7 @@ async def install_plugin_source(
             request,
             source_path,
             force=force,
+            **_interrupt_options(interrupt_tasks),
             reload_agents=reload_agents,
             pawport_owner=pawport_owner,
             recover_incomplete=recover_incomplete,
@@ -366,6 +377,7 @@ async def uninstall_plugin_source(
     *,
     app,
     reload_agents: bool = True,
+    interrupt_tasks: bool = False,
 ) -> None:
     """Uninstall through the native plugin lifecycle.
 
@@ -383,6 +395,7 @@ async def uninstall_plugin_source(
             plugin_id,
             UnloadMode.UNINSTALL,
             delete_files=True,
+            **_interrupt_options(interrupt_tasks),
         )
         still_loaded = loader.get_loaded_plugin(plugin_id) is not None
         if not report.clean or not report.quiescent or still_loaded:
@@ -423,11 +436,14 @@ async def install_plugin(
             body.source,
             app=request.app,
             force=body.force,
+            **_interrupt_options(body.interrupt_tasks),
         )
     except HTTPException:
         raise
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PluginBusyError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
     except MarketProviderBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (FileNotFoundError, RuntimeError) as exc:
@@ -466,6 +482,7 @@ async def upload_plugin(
     request: Request,
     file: UploadFile = File(..., description="Plugin ZIP archive"),
     force: bool = False,
+    interrupt_tasks: bool = False,
 ):
     """Install and hot-load a plugin from an uploaded ZIP file."""
     loader = getattr(request.app.state, "plugin_loader", None)
@@ -496,11 +513,14 @@ async def upload_plugin(
             request,
             source_path,
             force=force,
+            **_interrupt_options(interrupt_tasks),
         )
     except HTTPException:
         raise
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PluginBusyError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
     except MarketProviderBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (FileNotFoundError, RuntimeError) as exc:
@@ -537,7 +557,11 @@ async def upload_plugin(
         "that are not currently loaded (disabled or FAILED)."
     ),
 )
-async def uninstall_plugin(plugin_id: str, request: Request):
+async def uninstall_plugin(
+    plugin_id: str,
+    request: Request,
+    interrupt_tasks: bool = False,
+):
     """Unload and delete a plugin by ID."""
     loader = getattr(request.app.state, "plugin_loader", None)
     if loader is None:
@@ -550,9 +574,12 @@ async def uninstall_plugin(plugin_id: str, request: Request):
         await uninstall_plugin_source(
             plugin_id,
             app=request.app,
+            **_interrupt_options(interrupt_tasks),
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PluginBusyError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
     except MarketProviderBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except UnquiescentUnloadError as exc:
@@ -607,7 +634,11 @@ async def uninstall_plugin(plugin_id: str, request: Request):
         "agent.json and config.plugins are left unchanged."
     ),
 )
-async def unload_plugin_keep_config(plugin_id: str, request: Request):
+async def unload_plugin_keep_config(
+    plugin_id: str,
+    request: Request,
+    interrupt_tasks: bool = False,
+):
     """Callable entry for ``unload(mode=unload)``."""
     loader = getattr(request.app.state, "plugin_loader", None)
     if loader is None:
@@ -623,9 +654,12 @@ async def unload_plugin_keep_config(plugin_id: str, request: Request):
                 plugin_id,
                 UnloadMode.UNLOAD,
                 delete_files=False,
+                **_interrupt_options(interrupt_tasks),
             )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PluginBusyError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
     except RuntimeError as exc:
         if "memory backend is in use" in str(exc):
             still_loaded = loader.get_loaded_plugin(plugin_id) is not None
@@ -755,12 +789,14 @@ class UpdatePluginConfigRequest(BaseModel):
 
     config: dict
     confirm_legacy: bool = False
+    interrupt_tasks: bool = False
 
 
 class SetPluginEnabledRequest(BaseModel):
     """Enable or disable a plugin via ``config.plugins.<id>.enabled``."""
 
     enabled: bool
+    interrupt_tasks: bool = False
 
 
 @router.put(
@@ -784,11 +820,15 @@ async def update_plugin_config(
             status_code=503,
             detail="Plugin loader is not ready yet.",
         )
-    report = await loader.lifecycle.update_config(
-        plugin_id,
-        body.config,
-        confirm_legacy=body.confirm_legacy,
-    )
+    try:
+        report = await loader.lifecycle.update_config(
+            plugin_id,
+            body.config,
+            confirm_legacy=body.confirm_legacy,
+            **_interrupt_options(body.interrupt_tasks),
+        )
+    except PluginBusyError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
     if report.requires_confirmation:
         raise HTTPException(
             status_code=409,
@@ -862,7 +902,11 @@ async def set_plugin_enabled(
             )
     try:
         if not body.enabled:
-            result = await loader.lifecycle.set_enabled(plugin_id, False)
+            result = await loader.lifecycle.set_enabled(
+                plugin_id,
+                False,
+                **_interrupt_options(body.interrupt_tasks),
+            )
             clean = getattr(result, "clean", True)
             quiescent = getattr(result, "quiescent", True)
             needs_restart = getattr(result, "needs_restart", False)
@@ -907,6 +951,8 @@ async def set_plugin_enabled(
         raise
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PluginBusyError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
     except Exception as exc:
         logger.error(
             "Failed to set enabled=%s for plugin '%s': %s",

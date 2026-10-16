@@ -895,30 +895,14 @@ class PluginApi:  # pylint: disable=too-many-public-methods
             return True
         return bool(inst.owns_commit())
 
-    def provision_files(self, src, dest, version: str) -> str:
-        """Copy factory files with three-way merge.
-
-        This call is synchronous and runs on the same thread as
-        ``register()``. Keep the copied tree small. Framework-owned
-        directory swap, crash recovery, and config persistence leave
-        the event loop through ``run_sync_io``.
-        """
-        from .provision import provision_files as _provision_files
-
-        self._guard_register()
-        if not self._owns_commit():
-            return "skipped"
+    @staticmethod
+    def _provision_paths(src, dest) -> tuple[Path, Path]:
         dest = Path(dest)
         if not str(dest).strip() or dest == Path("."):
             raise ValueError("refusing to provision an empty dest")
-        if not dest.is_absolute():
-            dest = dest.absolute()
-        branch = _provision_files(
-            self.plugin_id,
-            Path(src),
-            dest,
-            version,
-        )
+        return Path(src).absolute(), dest.absolute()
+
+    def _record_provision_files(self, dest: Path, branch: str) -> str:
         if self._instance is not None and branch == "create":
             self._instance.note_created_dest(str(dest))
         self._note_install(
@@ -926,6 +910,67 @@ class PluginApi:  # pylint: disable=too-many-public-methods
             kind="provision_files",
         )
         return branch
+
+    def provision_files(self, src, dest, version: str) -> str:
+        """Provision immediately; synchronous compatibility API.
+
+        Prefer ``declare_provision_files`` during registration or await
+        ``provision_files_async`` during startup to avoid blocking the loop.
+        """
+        from .provision import provision_files as provision
+
+        self._guard_register()
+        if not self._owns_commit():
+            return "skipped"
+        src, dest = self._provision_paths(src, dest)
+        branch = provision(self.plugin_id, src, dest, version)
+        return self._record_provision_files(dest, branch)
+
+    async def provision_files_async(self, src, dest, version: str) -> str:
+        """Provision in a worker; retain rollback records on cancellation."""
+        from ..utils.io_utils import run_async_to_completion, run_sync_io
+        from .provision import provision_files as provision
+
+        self._guard_register()
+        if not self._owns_commit():
+            return "skipped"
+        src, dest = self._provision_paths(src, dest)
+
+        async def perform() -> str:
+            branch = await run_sync_io(
+                provision,
+                self.plugin_id,
+                src,
+                dest,
+                version,
+            )
+            return self._record_provision_files(dest, branch)
+
+        return await run_async_to_completion(perform())
+
+    def declare_provision_files(self, src, dest, version: str) -> None:
+        """Declare files during register; prepare them before any startup.
+
+        This returns no creation result and does not make files available
+        during register. Use the async API when files are needed immediately.
+        """
+        self._guard_register()
+        instance = self._instance
+        if instance is None or not instance.accepts_provision_declarations:
+            raise RuntimeError("declare_provision_files requires register()")
+        if not self._owns_commit():
+            return
+        src, dest = self._provision_paths(src, dest)
+
+        async def prepare() -> None:
+            await self.provision_files_async(src, dest, version)
+
+        def discard() -> None:
+            if prepare in instance.pending_provisions:
+                instance.pending_provisions.remove(prepare)
+
+        instance.pending_provisions.append(prepare)
+        self._note_runtime(f"provision_declaration:{dest}", discard)
 
     def provision(
         self,

@@ -963,6 +963,32 @@ class TestSetPluginEnabledRoute:
 
 
 class TestUninstallPluginRoute:
+    @pytest.mark.parametrize("endpoint", ["plugins", "pawapps"])
+    @pytest.mark.parametrize("interrupt_tasks", [False, True])
+    def test_busy_response_preserves_explicit_interrupt_option(
+        self,
+        endpoint,
+        interrupt_tasks,
+    ):
+        from qwenpaw.plugins.activity import PluginBusyError
+
+        loader = _loader_stub([], record=_record())
+        error = PluginBusyError("plug", 1, can_interrupt=not interrupt_tasks)
+        loader.lifecycle.unload.side_effect = error
+        response = _client(loader).delete(
+            f"/api/{endpoint}/plug"
+            f"?interrupt_tasks={str(interrupt_tasks).lower()}",
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"] == error.detail
+        assert (
+            loader.lifecycle.unload.call_args.kwargs.get(
+                "interrupt_tasks",
+                False,
+            )
+            is interrupt_tasks
+        )
+
     @pytest.mark.parametrize(
         "endpoint,kind",
         [("plugins", "Plugin"), ("pawapps", "PawApp")],

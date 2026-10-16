@@ -2,6 +2,7 @@ import { notifyPluginChange } from "../../utils/pluginChangeEvents";
 import { getApiUrl } from "../config";
 import { buildAuthHeaders } from "../authHeaders";
 import { responseErrorMessage } from "../error";
+import { requestWithPluginBusyConfirmation } from "../pluginBusy";
 
 /** Matches the backend ``PluginType`` enum values. */
 export type PluginType =
@@ -124,14 +125,22 @@ export async function installPlugin(
   source: string,
   options?: { force?: boolean },
 ): Promise<InstallPluginResult> {
-  const response = await fetch(getApiUrl("/plugins/install"), {
-    method: "POST",
-    headers: {
-      ...buildAuthHeaders(),
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ source, force: options?.force ?? false }),
-  });
+  const response = await requestWithPluginBusyConfirmation(
+    (interruptTasks) =>
+      fetch(getApiUrl("/plugins/install"), {
+        method: "POST",
+        headers: {
+          ...buildAuthHeaders(),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          source,
+          force: options?.force ?? false,
+          ...(interruptTasks ? { interrupt_tasks: true } : {}),
+        }),
+      }),
+    "update",
+  );
 
   if (!response.ok) {
     throw new Error(
@@ -154,11 +163,20 @@ export async function uploadPlugin(file: File): Promise<InstallPluginResult> {
   const form = new FormData();
   form.append("file", file);
 
-  const response = await fetch(getApiUrl("/plugins/upload"), {
-    method: "POST",
-    headers: buildAuthHeaders(),
-    body: form,
-  });
+  const response = await requestWithPluginBusyConfirmation(
+    (interruptTasks) =>
+      fetch(
+        getApiUrl(
+          `/plugins/upload${interruptTasks ? "?interrupt_tasks=true" : ""}`,
+        ),
+        {
+          method: "POST",
+          headers: buildAuthHeaders(),
+          body: form,
+        },
+      ),
+    "update",
+  );
 
   if (!response.ok) {
     throw new Error(
@@ -178,10 +196,18 @@ export async function uploadPlugin(file: File): Promise<InstallPluginResult> {
  * Uninstall (hot-unload + delete) a plugin by ID.
  */
 export async function uninstallPlugin(pluginId: string): Promise<void> {
-  const response = await fetch(getApiUrl(`/plugins/${pluginId}`), {
-    method: "DELETE",
-    headers: buildAuthHeaders(),
-  });
+  const response = await requestWithPluginBusyConfirmation(
+    (interruptTasks) =>
+      fetch(
+        getApiUrl(
+          `/plugins/${pluginId}${
+            interruptTasks ? "?interrupt_tasks=true" : ""
+          }`,
+        ),
+        { method: "DELETE", headers: buildAuthHeaders() },
+      ),
+    "uninstall",
+  );
 
   if (!response.ok) {
     throw new Error(

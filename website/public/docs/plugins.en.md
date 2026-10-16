@@ -181,9 +181,17 @@ plugin = MyPlugin()
 - `register(api)` must be synchronous. Put asynchronous initialization in a startup hook.
 - Use `api.spawn_task()` for background tasks and `api.effect()` for process-local
   effects. Teardown must be idempotent and safe after incomplete setup.
-- Use `api.provision_files()` for files. For custom persistent resources, use
-  `api.provision()` with `teardown_ref="module:function"` so cleanup works without
-  a live instance. Setup must be synchronous.
+- Prefer `api.declare_provision_files(src, dest, version)` during registration.
+  It only records a declaration and returns no creation result. Activation prepares
+  the files in a worker before startup hooks; do not read these files in register.
+- In startup hooks, use `await api.provision_files_async(src, dest, version)` when
+  files are needed immediately. It returns the actual `create`, `keep`, etc. result.
+  Both APIs preserve ownership and rollback rules. The existing
+  `api.provision_files()` remains synchronous for compatibility and can still block
+  the event loop; migrate to the new APIs where possible.
+- For custom persistent resources, use `api.provision()` with
+  `teardown_ref="module:function"` so cleanup works without a live instance.
+  Setup must be synchronous.
 - Use `api.register_*()` instead of changing host registries directly. The framework
   records their cleanup.
 

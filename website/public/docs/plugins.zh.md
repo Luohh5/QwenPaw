@@ -181,8 +181,15 @@ plugin = MyPlugin()
 - `register(api)` 必须是同步方法。异步初始化放在 startup hook 中。
 - 后台任务使用 `api.spawn_task()`；进程内副作用使用 `api.effect()` 登记清理。
   teardown 必须幂等，并能处理 setup 只完成一部分的情况。
-- 文件使用 `api.provision_files()`；自定义持久资源使用 `api.provision()`，并提供
-  `teardown_ref="模块:函数"`，让无活实例时仍能执行清理。setup 必须是同步函数。
+- 注册时推荐用 `api.declare_provision_files(src, dest, version)` 声明文件置备；
+  此时不复制文件，也不返回创建结果。激活时框架在工作线程完成置备，再执行 startup。
+  因此不能在 register 中立即读取这些文件。
+- startup 中需要立即使用文件时，使用
+  `await api.provision_files_async(src, dest, version)`，返回 `create`、`keep` 等实际结果。
+  两个入口沿用原有归属和失败回滚规则。旧 `api.provision_files()` 保留同步语义，
+  在事件循环中调用仍可能阻塞，建议迁移到上述入口。
+- 自定义持久资源使用 `api.provision()`，并提供 `teardown_ref="模块:函数"`，
+  让无活实例时仍能执行清理。setup 必须是同步函数。
 - 不直接修改宿主登记表。使用 `api.register_*()`，由框架管理撤销。
 
 ### Memory Backend 插件

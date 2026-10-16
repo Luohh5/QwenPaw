@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import importlib.util
+import os
+import py_compile
 import shutil
 import sys
 import threading
@@ -71,6 +74,291 @@ def _write_plugin(
     if extra_py is not None:
         (root / "helper.py").write_text(extra_py, encoding="utf-8")
     return root
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("incoming_id", ["renamed", "different"])
+async def test_in_place_reload_reads_incoming_manifest(
+    tmp_path,
+    fresh_registry,
+    monkeypatch,
+    incoming_id,
+):
+    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
+    stopped = tmp_path / "stopped"
+    root = _write_plugin(
+        tmp_path / "plugins" / "renamed",
+        "renamed",
+        body=(
+            "self.value = lambda: 'old'\n"
+            "        api.register_shutdown_hook('stop', "
+            f"lambda: open({str(stopped)!r}, 'w').close())"
+        ),
+    )
+    loader = PluginLoader([root.parent])
+    loader.registry = fresh_registry
+    manifest_data = json.loads((root / "plugin.json").read_text())
+    original = await loader.load_plugin(
+        PluginManifest.from_dict(manifest_data),
+        root,
+    )
+    try:
+        manifest_data.update(id=incoming_id, version="2.0.0")
+        manifest_data["entry"]["backend"] = "new_main.py"
+        (root / "plugin.json").write_text(json.dumps(manifest_data))
+        (root / "new_main.py").write_text(
+            "class Plugin:\n"
+            "    def register(self, api):\n"
+            "        self.value = lambda: 'new'\n"
+            "plugin = Plugin()\n",
+        )
+        (root / "main.py").unlink()
+        report = await loader.lifecycle.reload("renamed")
+        current = loader.get_loaded_plugin("renamed")
+        if incoming_id == "renamed":
+            assert report.ok, report.errors
+            assert current.instance.value() == "new"
+            assert current.manifest.version == "2.0.0"
+            assert stopped.exists()
+        else:
+            assert not report.ok and report.unchanged
+            assert any("id" in error.lower() for error in report.errors)
+            assert current is original and current.status == "active"
+            assert current.instance.value() == "old"
+            assert not stopped.exists()
+    finally:
+        await loader.unload_plugin("renamed")
+
+
+@pytest.mark.asyncio
+async def test_in_place_failed_start_restores_object_without_old_entry(
+    tmp_path,
+    fresh_registry,
+    monkeypatch,
+):
+    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
+    root = _write_plugin(
+        tmp_path / "plugins" / "restore-entry",
+        "restore-entry",
+        body=(
+            "self.value = api.config['value']\n"
+            "        def start():\n"
+            "            self.starts = getattr(self, 'starts', 0) + 1\n"
+            "        api.register_startup_hook('start', start)"
+        ),
+    )
+    loader = PluginLoader([root.parent])
+    loader.registry = fresh_registry
+    manifest_data = json.loads((root / "plugin.json").read_text())
+    original = await loader.load_plugin(
+        PluginManifest.from_dict(manifest_data),
+        root,
+        config={"value": "old"},
+    )
+    generation = loader.lifecycle.get_instance("restore-entry").generation
+    try:
+        manifest_data.update(version="2.0.0", entry={"backend": "new_main.py"})
+        (root / "plugin.json").write_text(json.dumps(manifest_data))
+        (root / "main.py").unlink()
+        (root / "new_main.py").write_text(
+            "class Plugin:\n"
+            "    def register(self, api):\n"
+            "        def start():\n"
+            "            raise RuntimeError('new startup failed')\n"
+            "        api.register_startup_hook('start', start)\n"
+            "plugin = Plugin()\n",
+        )
+        report = await loader.lifecycle.reload(
+            "restore-entry",
+            config={"value": "new"},
+        )
+        current = loader.get_loaded_plugin("restore-entry")
+        restored = loader.lifecycle.get_instance("restore-entry")
+        assert not report.ok and not report.needs_restart
+        assert any("new startup failed" in error for error in report.errors)
+        assert any("previous service was restored" in e for e in report.errors)
+        assert current.status == "active" and restored.activated
+        assert current.instance is original.instance
+        assert current.instance.value == "old" and current.instance.starts == 2
+        assert current.manifest.version == "1.0.0"
+        assert restored.config == {"value": "old"}
+        assert restored.generation == generation
+        assert not (root / "main.py").exists()
+        # Fresh loads still require source; object recovery does not.
+        fresh_loader = PluginLoader([root.parent])
+        with pytest.raises(
+            FileNotFoundError,
+            match="entry point files not found",
+        ):
+            await fresh_loader.load_plugin(original.manifest, root)
+    finally:
+        await loader.unload_plugin("restore-entry")
+
+
+def _link_cached_sources(root, linked_source, entry, helper):
+    if linked_source == "backend":
+        target = root / "actual_backend"
+        target.mkdir()
+        entry.write_text(
+            entry.read_text().replace(".helper", ".backend.helper"),
+        )
+        entry.rename(target / entry.name)
+        helper.rename(target / helper.name)
+        (root / "backend").symlink_to(target.name, target_is_directory=True)
+        manifest = json.loads((root / "plugin.json").read_text())
+        manifest["entry"]["backend"] = "backend/main.py"
+        (root / "plugin.json").write_text(json.dumps(manifest))
+        return root / "backend/main.py", root / "backend/helper.py"
+    if linked_source:
+        link = root / linked_source
+        target = root / "implementation.py"
+        link.rename(target)
+        link.symlink_to(target.name)
+    return entry, helper
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("linked_source", "external_cache"),
+    [
+        (None, False),
+        ("main.py", False),
+        ("helper.py", False),
+        ("backend", False),
+        ("backend", True),
+    ],
+)
+async def test_reload_ignores_same_size_same_mtime_bytecode(
+    tmp_path,
+    fresh_registry,
+    monkeypatch,
+    linked_source,
+    external_cache,
+):
+    if external_cache:
+        monkeypatch.setattr(sys, "pycache_prefix", str(tmp_path / "cache"))
+    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
+    observed = tmp_path / "imports.log"
+    root = _write_plugin(tmp_path / "plugins" / "cached", "cached")
+    entry = root / "main.py"
+    helper = root / "helper.py"
+    entry.write_text(
+        "from .helper import VALUE\n"
+        "ENTRY = 'old'\n"
+        f"with open({str(observed)!r}, 'a') as log:\n"
+        "    log.write(f'{__name__}:{ENTRY}:{VALUE}\\n')\n"
+        "class Plugin:\n"
+        "    def register(self, api):\n"
+        "        self.value = (ENTRY, VALUE)\n"
+        "plugin = Plugin()\n",
+    )
+    helper.write_text("VALUE = 'old'\n")
+    entry, helper = _link_cached_sources(root, linked_source, entry, helper)
+    vendor = root / ".venv" / "lib" / "vendor.py"
+    vendor.parent.mkdir(parents=True)
+    vendor.write_text("VALUE = 'third-party'\n")
+    if external_cache:
+        (root / "dependency_alias").symlink_to(
+            ".venv",
+            target_is_directory=True,
+        )
+        (root / "actual_backend" / "cycle").symlink_to(
+            "..",
+            target_is_directory=True,
+        )
+        vendor = root / "dependency_alias" / "lib" / "vendor.py"
+    vendor_cache = Path(py_compile.compile(str(vendor), doraise=True))
+    vendor_before = vendor_cache.read_bytes(), vendor_cache.stat().st_mtime_ns
+    for source in (entry, helper):
+        py_compile.compile(str(source), doraise=True)
+    loader = PluginLoader([root.parent])
+    loader.registry = fresh_registry
+    manifest = PluginManifest.from_dict(
+        json.loads((root / "plugin.json").read_text()),
+    )
+    await loader.load_plugin(manifest, root)
+    try:
+        assert loader.get_loaded_plugin("cached").instance.value == (
+            "old",
+            "old",
+        )
+        assert all(
+            Path(importlib.util.cache_from_source(str(source))).exists()
+            for source in (entry, helper)
+        )
+        for source in (entry, helper):
+            previous = source.stat()
+            source.write_text(source.read_text().replace("'old'", "'new'"))
+            os.utime(source, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+            assert source.stat().st_size == previous.st_size
+        observed.write_text("")
+        report = await loader.lifecycle.reload("cached")
+        assert report.ok
+        assert loader.get_loaded_plugin("cached").instance.value == (
+            "new",
+            "new",
+        )
+        assert observed.read_text().splitlines() == [
+            "plugin_cached__probe:new:new",
+            "plugin_cached:new:new",
+        ]
+        if linked_source:
+            assert (root / linked_source).is_symlink()
+        assert (
+            vendor_cache.read_bytes(),
+            vendor_cache.stat().st_mtime_ns,
+        ) == vendor_before
+    finally:
+        await loader.unload_plugin("cached")
+
+
+@pytest.mark.asyncio
+async def test_bytecode_cleanup_failure_keeps_running_plugin(
+    tmp_path,
+    fresh_registry,
+    monkeypatch,
+):
+    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
+    installed = _write_plugin(
+        tmp_path / "plugins" / "cached",
+        "cached",
+        body="self.value = 'old'",
+    )
+    incoming = _write_plugin(
+        tmp_path / "incoming",
+        "cached",
+        body="self.value = 'new'",
+        version="2.0.0",
+    )
+    py_compile.compile(str(incoming / "main.py"), doraise=True)
+    loader = PluginLoader([installed.parent])
+    loader.registry = fresh_registry
+    manifest = PluginManifest.from_dict(
+        json.loads((installed / "plugin.json").read_text()),
+    )
+    original = await loader.load_plugin(manifest, installed)
+    unlink = Path.unlink
+
+    def deny_cache_delete(path, *args, **kwargs):
+        if path.suffix == ".pyc" and incoming in path.parents:
+            raise PermissionError("bytecode cache locked")
+        return unlink(path, *args, **kwargs)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "unlink", deny_cache_delete)
+            report = await loader.lifecycle.reload(
+                "cached",
+                new_source=incoming,
+            )
+        assert not report.ok
+        assert report.unchanged
+        assert any("bytecode cache locked" in error for error in report.errors)
+        assert loader.get_loaded_plugin("cached") is original
+        assert original.instance.value == "old"
+        assert not marker_path("cached").exists()
+    finally:
+        await loader.unload_plugin("cached")
 
 
 @pytest.mark.asyncio

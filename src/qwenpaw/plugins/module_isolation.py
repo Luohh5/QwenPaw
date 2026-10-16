@@ -66,6 +66,94 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 
+def clear_plugin_bytecode(source_path: Path) -> None:
+    """Discard source-backed plugin caches without walking dependency trees.
+
+    Timestamp caches can remain valid after same-size, same-second edits.
+    Cache names follow import paths, including source-file symlinks, not
+    their targets. Internal directory aliases are also walked when an external
+    cache prefix gives each import path its own cache.
+    """
+    root = source_path.resolve()
+    excluded = {
+        "__pycache__",
+        "site-packages",
+        "dist-packages",
+        "node_modules",
+    }
+
+    def fail(exc: OSError) -> None:
+        raise exc
+
+    def walkable(path: Path) -> bool:
+        resolved = path.resolve()
+        if not resolved.is_relative_to(root):
+            return False
+        relative = resolved.relative_to(root)
+        if any(
+            part in excluded or part.startswith((".venv", "venv", ".git"))
+            for part in relative.parts
+        ):
+            return False
+        if any(
+            (ancestor / "pyvenv.cfg").is_file()
+            for ancestor in (resolved, *resolved.parents)
+            if ancestor.is_relative_to(root)
+        ):
+            return False
+        # Follow aliases separately, but never recurse back into an ancestor.
+        return all(
+            resolved != ancestor.resolve()
+            for ancestor in path.parents
+            if ancestor.is_relative_to(root)
+        )
+
+    for directory, dirs, files in os.walk(
+        root,
+        onerror=fail,
+        followlinks=bool(sys.pycache_prefix),
+    ):
+        parent = Path(directory)
+        dirs[:] = [
+            name
+            for name in dirs
+            if name not in excluded
+            and not name.startswith((".venv", "venv", ".git"))
+            and (
+                walkable(parent / name)
+                if sys.pycache_prefix
+                else not (parent / name).is_symlink()
+            )
+            and not (parent / name / "pyvenv.cfg").is_file()
+        ]
+        for name in files:
+            source = parent / name
+            if source.suffix != ".py":
+                continue
+            cache = Path(importlib.util.cache_from_source(str(source)))
+            cache_root = (
+                Path(sys.pycache_prefix) if sys.pycache_prefix else root
+            )
+            targets = [(cache, cache_root)]
+            if parent == parent.resolve():
+                # Real-path traversal handles sidecars without following links.
+                targets.append((source.with_suffix(".pyc"), root))
+            for target, boundary in targets:
+                cursor = target
+                while cursor != boundary:
+                    if cursor.is_symlink():
+                        raise OSError(
+                            f"Refusing symlinked plugin bytecode: {cursor}",
+                        )
+                    if cursor == cursor.parent:
+                        raise OSError(
+                            f"Plugin bytecode is outside cache root: {target}",
+                        )
+                    cursor = cursor.parent
+                target.unlink(missing_ok=True)
+    importlib.invalidate_caches()
+
+
 class _NamespaceLoader:
     """Wrap a real loader so the module executes with plugin builtins.
 
@@ -475,7 +563,7 @@ def probe_plugin_source(
     *,
     compiled: bool = False,
 ) -> None:
-    """Import *entry_file* under ``plugin_<id>__probe``, then clean up."""
+    """Import a probe; ``compiled`` means source/cache preparation is done."""
     probe_name = plugin_module_name(plugin_id, probe=True)
     plugin_dir = str(source_path)
     entry_dir = str(entry_file.parent)
@@ -483,6 +571,7 @@ def probe_plugin_source(
     if _norm(entry_dir) != _norm(plugin_dir):
         search_paths.append(plugin_dir)
     if not compiled:
+        clear_plugin_bytecode(source_path)
         compile_plugin_import_closure(entry_file, search_paths)
     plugin_builtins = build_plugin_builtins(
         probe_name,

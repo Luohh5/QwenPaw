@@ -172,7 +172,11 @@ async def get_pawapp(app_id: str, request: Request) -> Dict[str, Any]:
 
 
 @router.delete("/{app_id}")
-async def uninstall_pawapp(app_id: str, request: Request) -> Dict[str, Any]:
+async def uninstall_pawapp(
+    app_id: str,
+    request: Request,
+    interrupt_tasks: bool = False,
+) -> Dict[str, Any]:
     """Uninstall a PawApp by deleting its directory under ~/.copaw/apps.
 
     Falls back to unloading a plugin-based PawApp via the plugin loader
@@ -204,18 +208,22 @@ async def uninstall_pawapp(app_id: str, request: Request) -> Dict[str, Any]:
         )
     try:
         from ...plugins.lifecycle import UnloadMode
+        from ...plugins.activity import PluginBusyError
         from .plugins import memory_in_use_detail, unload_http_detail
 
         report = await loader.lifecycle.unload(
             app_id,
             UnloadMode.UNINSTALL,
             delete_files=True,
+            **({"interrupt_tasks": True} if interrupt_tasks else {}),
         )
     except KeyError as exc:
         raise HTTPException(
             status_code=404,
             detail=f"PawApp '{app_id}' not found",
         ) from exc
+    except PluginBusyError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
     except RuntimeError as exc:
         if "memory backend is in use" in str(exc):
             still_loaded = loader.get_loaded_plugin(app_id) is not None
