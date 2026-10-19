@@ -140,6 +140,18 @@ def plugin_install_lock(
 ) -> Iterator[bool]:
     """Yield True only while holding exclusion; acquisition fails closed."""
     lock_path = Path(lock_path)
+    suffix = ".dependencies.lock"
+    site = (
+        lock_path.parent / lock_path.name[1 : -len(suffix)]
+        if lock_path.name.startswith(".") and lock_path.name.endswith(suffix)
+        else None
+    )
+    if site is not None:
+        from .dependency_maintenance import check_admission
+
+        # An in-flight additive writer owns its repair marker. Wait for its
+        # exclusion before classifying that marker as inherited damage.
+        check_admission(site, check_repair=False)
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
@@ -166,6 +178,8 @@ def plugin_install_lock(
                 )
         except OSError as exc:
             raise InstallLockError("INSTALL_LOCK_UNAVAILABLE") from exc
+        if site is not None:
+            check_admission(site)
         yield True
     finally:
         if acquired:

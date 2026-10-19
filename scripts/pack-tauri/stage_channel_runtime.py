@@ -402,7 +402,7 @@ def stage_channel_runtime(
         manifest = {
             "schema_version": 1,
             "host_version": version,
-            "preset": "channels-full",
+            "preset": "light",
             "python_executable": executable,
             "support_root": support,
             "dependency_paths": [support],

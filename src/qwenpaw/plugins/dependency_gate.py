@@ -241,6 +241,7 @@ class DependencyGate:
                 missing=missing,
                 host_conflicts=conflicts,
                 require_restart=True,
+                reason_code="DEPENDENCY_RESTART_REQUIRED",
                 reason=(
                     f"Plugin '{plugin_id}' declares host packages that "
                     f"are already imported ({', '.join(conflicts)}). "
@@ -560,8 +561,11 @@ def evaluate_shared_dependencies(
             elif use.origin != "host" or previous is None:
                 inventory[name] = row
         check(values, inventory, environment.marker_environment, invalid)
+    from .dependency_maintenance import authorized
+
     dirty = host_dirty or any(
-        repair_marker(site).exists() for site in snapshot.sites
+        repair_marker(site).exists() and not authorized(site)
+        for site in snapshot.sites
     )
     code = (
         "DEPENDENCY_REPAIR_REQUIRED"
@@ -670,14 +674,28 @@ async def prepare_shared_dependencies(
         )
     async with environment_coordinator(keys), AsyncExitStack() as stack:
         if target is not None:
-            await stack.enter_async_context(
-                async_lock(
-                    plugin_install_lock(
-                        environment_install_lock_path(target),
-                        timeout=lock_timeout,
+            try:
+                await stack.enter_async_context(
+                    async_lock(
+                        plugin_install_lock(
+                            environment_install_lock_path(target),
+                            timeout=lock_timeout,
+                        ),
                     ),
-                ),
-            )
+                )
+            except RuntimeError as exc:
+                code = str(exc).partition(":")[0]
+                if not code.startswith("DEPENDENCY_"):
+                    raise
+                raise SharedDependencyError(
+                    GateDecision(
+                        False,
+                        False,
+                        reason=str(exc),
+                        reason_code=code,
+                        require_restart=code == "DEPENDENCY_REPAIR_REQUIRED",
+                    ),
+                ) from exc
         snapshot = await audit()
         if target is None and {
             canonical(path) for path in snapshot.dependency_sites or ()

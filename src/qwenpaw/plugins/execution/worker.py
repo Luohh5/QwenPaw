@@ -91,6 +91,22 @@ def _configure(
             + inherited,
         ),
     )
+    lease_spec = importlib.util.spec_from_file_location(
+        "_qwenpaw_dependency_maintenance",
+        Path(__file__).resolve().parents[1] / "dependency_maintenance.py",
+    )
+    if lease_spec is None or lease_spec.loader is None:
+        raise RuntimeError("BOOTSTRAP_UNAVAILABLE")
+    custody = importlib.util.module_from_spec(lease_spec)
+    sys.modules[lease_spec.name] = custody
+    lease_spec.loader.exec_module(custody)
+    custody.lease_environment(
+        (*dependencies, *custody.host_sites()),
+        parent_pid=int(sys.argv[1])
+        if packet.get("mode") in {"audit", "probe"}
+        else None,
+        timeout=packet["startup_timeout"],
+    )
     package = types.ModuleType("qwenpaw")
     package.__package__ = "qwenpaw"
     package.__path__ = [str(support / "qwenpaw")]
@@ -379,7 +395,16 @@ def main(
         runtime = Runtime() if runtime_factory is None else runtime_factory()
         asyncio.run(run_component(boot, packet, output, runtime))
         return 0
-    except BaseException:
+    except BaseException as exc:
+        reason = getattr(exc, "reason_code", None)
+        if reason is None:
+            reason = (
+                str(exc).split(":", 1)[0]
+                if str(exc).startswith("DEPENDENCY_")
+                else type(exc).__name__
+            )
+        sys.stderr.write(json.dumps({"error": reason}) + "\n")
+        sys.stderr.flush()
         return 70
     finally:
         if output is not None:

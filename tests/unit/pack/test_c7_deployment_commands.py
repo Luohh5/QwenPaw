@@ -18,24 +18,63 @@ def _source(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
 
 
-def test_c7_docker_preset_selects_exact_install_and_mount_handoff() -> None:
+def test_c7_docker_always_installs_full_channel_dependencies() -> None:
     docker = _source("deploy/Dockerfile")
     entrypoint = _source("deploy/entrypoint.sh")
-    assert 'ARG QWENPAW_CHANNEL_PRESET="channels-full"' in docker
-    assert "light|channels-full) ;; *) exit 1" in docker
+    assert "QWENPAW_CHANNEL_PRESET" not in docker
     assert (
-        'if [ "$QWENPAW_CHANNEL_PRESET" = channels-full ]; '
-        'then EXTRA="[channels]"' in docker
+        "uv pip install --python /app/venv/bin/python --no-cache-dir "
+        '"$1[channels]"' in docker
     )
-    assert '"$1$EXTRA"' in docker
-    assert "channel-preset.json" in docker
-    assert 'data["preset"] in {"light", "channels-full"}' in entrypoint
-    assert "export QWENPAW_CHANNEL_PRESET" in entrypoint
-    assert entrypoint.index(
-        "export QWENPAW_CHANNEL_PRESET",
-    ) < entrypoint.index(
-        "qwenpaw init --defaults --accept-security",
+    assert "channel-preset.json" not in docker
+    assert "channel-preset.json" not in entrypoint
+
+
+@pytest.mark.parametrize(
+    ("inherited_preset", "expected_preset"),
+    [
+        (None, "light"),
+        ("", "light"),
+        ("light", "light"),
+        ("channels-full", "channels-full"),
+    ],
+)
+def test_c7_docker_init_receives_selected_channel_preset(
+    tmp_path: Path,
+    inherited_preset: str | None,
+    expected_preset: str,
+) -> None:
+    """Run the real entrypoint through init, recording its child environment."""
+    entrypoint = _source("deploy/entrypoint.sh")
+    before_server = entrypoint[: entrypoint.index("export QWENPAW_PORT=")]
+    cli = tmp_path / "bin/qwenpaw"
+    cli.parent.mkdir()
+    marker = tmp_path / "init-preset"
+    cli.write_text(
+        "#!/bin/sh\n"
+        '[ "$*" = "init --defaults --accept-security" ] || exit 97\n'
+        'printf "%s\\n" "${QWENPAW_CHANNEL_PRESET-unset}" > "$C7_MARKER"\n',
+        encoding="utf-8",
     )
+    cli.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{cli.parent}{os.pathsep}{os.environ['PATH']}",
+        "QWENPAW_WORKING_DIR": str(tmp_path / "working"),
+        "C7_MARKER": str(marker),
+    }
+    env.pop("QWENPAW_CHANNEL_PRESET", None)
+    if inherited_preset is not None:
+        env["QWENPAW_CHANNEL_PRESET"] = inherited_preset
+    result = subprocess.run(
+        ["sh", "-c", before_server],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert marker.read_text(encoding="utf-8") == expected_preset + "\n"
 
 
 def test_c7_installers_apply_exact_extras_offline() -> None:
@@ -70,10 +109,20 @@ def test_c7_bash_installer_selects_exact_extras_case_insensitively(
     start = content.index("# Verify the CLI entry point exists")
     end = content.index('info "QwenPaw installed successfully"', start)
     marker = tmp_path / "preset-argv"
+    preparation = tmp_path / "prepare-argv"
     cli = tmp_path / "bin/qwenpaw"
     cli.parent.mkdir()
     cli.write_text(
-        '#!/bin/sh\nprintf "%s\\n" "$*" > "$C7_MARKER"\n',
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '  "--help") printf "  plugins\\n" ;;\n'
+        '  "plugins --help") printf "  prepare-upgrade\\n" ;;\n'
+        '  "plugins preset apply channels-full --offline")\n'
+        '    printf "%s\\n" "$*" > "$C7_MARKER" ;;\n'
+        '  "plugins prepare-upgrade")\n'
+        '    printf "%s\\n" "$*" >> "$C7_PREPARATION" ;;\n'
+        "  *) exit 97 ;;\n"
+        "esac\n",
         encoding="utf-8",
     )
     cli.chmod(0o755)
@@ -84,6 +133,7 @@ def test_c7_bash_installer_selects_exact_extras_case_insensitively(
             "EXTRAS": extras,
             "QWENPAW_VENV": str(tmp_path),
             "C7_MARKER": str(marker),
+            "C7_PREPARATION": str(preparation),
         },
         check=False,
         capture_output=True,
@@ -91,10 +141,50 @@ def test_c7_bash_installer_selects_exact_extras_case_insensitively(
     )
     assert result.returncode == 0, result.stderr
     assert marker.exists() is selected
+    assert preparation.read_text(encoding="utf-8") == (
+        "plugins prepare-upgrade\n"
+    )
     if selected:
         assert marker.read_text(encoding="utf-8") == (
             "plugins preset apply channels-full --offline\n"
         )
+
+
+@pytest.mark.parametrize("failed_help", ["--help", "plugins --help"])
+def test_c7_installer_does_not_ignore_cli_help_failure(tmp_path, failed_help):
+    content = _source("scripts/install.sh")
+    start = content.index("# Verify the CLI entry point exists")
+    end = content.index('info "QwenPaw installed successfully"', start)
+    cli = tmp_path / "bin/qwenpaw"
+    cli.parent.mkdir()
+    marker = tmp_path / "prepared"
+    cli.write_text(
+        "#!/bin/sh\n"
+        '[ "$*" != "$C7_FAILED_HELP" ] || exit 37\n'
+        'case "$*" in\n'
+        '  "--help") printf "  plugins\\n" ;;\n'
+        '  "plugins --help") printf "  prepare-upgrade\\n" ;;\n'
+        '  "plugins prepare-upgrade") touch "$C7_PREPARED" ;;\n'
+        "  *) exit 97 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    cli.chmod(0o755)
+    result = subprocess.run(
+        ["bash", "-ec", content[start:end]],
+        env={
+            **os.environ,
+            "EXTRAS": "",
+            "QWENPAW_VENV": str(tmp_path),
+            "C7_FAILED_HELP": failed_help,
+            "C7_PREPARED": str(marker),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 37, result.stdout + result.stderr
+    assert not marker.exists()
 
 
 def test_c7_desktop_resource_and_launcher_command_paths() -> None:

@@ -40,6 +40,7 @@ _STARTUP_ENVIRONMENT = (
             "TMP",
             "TMPDIR",
             "WINDIR",
+            "QWENPAW_DEPENDENCY_MAINTENANCE",
         },
     )
     | NETWORK_PROXY_ENVIRONMENT

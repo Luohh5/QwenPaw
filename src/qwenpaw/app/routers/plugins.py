@@ -19,9 +19,87 @@ from fastapi import APIRouter, HTTPException, Request, UploadFile, File
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from ...plugins.dependency_upgrade import (
+    DependencyUpgradeRequired,
+    dependency_upgrades,
+)
+from ...plugins.dependency_gate import SharedDependencyError
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/plugins", tags=["plugins"])
+
+
+def dependency_http_error(exc):
+    """Keep upgrade decisions machine-readable for every install client."""
+    if isinstance(exc, DependencyUpgradeRequired):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "DEPENDENCY_UPGRADE_REQUIRED",
+                "message": str(exc),
+                "operation": exc.operation,
+            },
+        )
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": exc.reason_code or "DEPENDENCY_PLAN_UNVERIFIED",
+            "message": str(exc),
+            "instructions": [
+                "Resolve the shared dependency requirements, then retry installation.",
+            ],
+        },
+    )
+
+
+def _upgrade_manager(request):
+    loader = getattr(request.app.state, "plugin_loader", None)
+    if loader is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Plugin loader is not ready yet.",
+        )
+    return dependency_upgrades(loader)
+
+
+@router.get("/dependency-upgrades/{operation_id}")
+async def dependency_upgrade_status(operation_id: str, request: Request):
+    try:
+        return await asyncio.to_thread(
+            _upgrade_manager(request).status,
+            operation_id,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/dependency-upgrades/{operation_id}/apply")
+async def apply_dependency_upgrade(operation_id: str, request: Request):
+    try:
+        return await _upgrade_manager(request).apply(operation_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (SharedDependencyError, DependencyUpgradeRequired) as exc:
+        raise dependency_http_error(exc) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "DEPENDENCY_UPGRADE_BLOCKED", "message": str(exc)},
+        ) from exc
+
+
+@router.delete("/dependency-upgrades/{operation_id}")
+async def cancel_dependency_upgrade(operation_id: str, request: Request):
+    try:
+        return await asyncio.to_thread(
+            _upgrade_manager(request).cancel,
+            operation_id,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def _log_safe(value: object) -> str:
@@ -226,7 +304,10 @@ async def _load_plugin_with_optional_force_reinstall(
         )
         del plugin_id
 
-    return await loader.load_plugin_from_path(
+    from ...plugins.dependency_upgrade import install_with_upgrade
+
+    return await install_with_upgrade(
+        loader,
         source_path=source_path,
         install_dir=get_plugins_dir(),
         force=force,
@@ -449,6 +530,8 @@ async def install_plugin(
         )
     except HTTPException:
         raise
+    except (DependencyUpgradeRequired, SharedDependencyError) as exc:
+        raise dependency_http_error(exc) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (FileNotFoundError, RuntimeError) as exc:
@@ -522,6 +605,8 @@ async def upload_plugin(
         )
     except HTTPException:
         raise
+    except (DependencyUpgradeRequired, SharedDependencyError) as exc:
+        raise dependency_http_error(exc) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (FileNotFoundError, RuntimeError) as exc:
@@ -692,6 +777,8 @@ async def repair_plugin_dependencies(plugin_id: str, request: Request):
         record = await loader.repair_dependencies(plugin_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (DependencyUpgradeRequired, SharedDependencyError) as exc:
+        raise dependency_http_error(exc) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:

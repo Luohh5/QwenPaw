@@ -254,6 +254,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             plugin_dirs: List of directories to search for plugins
         """
         self.plugin_dirs = [Path(d) for d in plugin_dirs]
+        if channel_runtime is not None:
+            from .dependency_maintenance import lease_environment
+
+            lease_environment(channel_runtime.dependency_paths)
         self.registry = PluginRegistry()
         if channel_runtime is not None:
             self.registry.configure_channel_runtime(channel_runtime)
@@ -587,9 +591,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         _ensure_plugin_site_on_path()
         requirements_file = source_path / "requirements.txt"
         from .execution.dependencies import repair_marker
+        from .dependency_maintenance import authorized
 
         if any(
-            repair_marker(path).exists()
+            repair_marker(path).exists() and not authorized(path)
             for path in sys.path
             if path and Path(path).is_dir()
         ):
@@ -820,6 +825,12 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 spec = replace(spec, dependency_paths=paths)
                 snapshot = (await process.audit(spec)).snapshot
                 usage.observe(lease, snapshot)
+            # A selected interpreter can expose package sites absent from the
+            # host's sys.path (including an active user site). Retain its real
+            # audited roots before the additive writer admits another audit.
+            from .dependency_maintenance import lease_environment
+
+            lease_environment(snapshot.dependency_sites or ())
             from .dependency_usage import current_admission_token
 
             targets = (
@@ -887,9 +898,29 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         """Build/stage wheels; the shared gate owns actual package writes."""
         import hashlib
         from packaging.utils import parse_wheel_filename
-        from .dependency_gate import WheelAddition, prepare_shared_dependencies
+        from .dependency_gate import (
+            SharedDependencyError,
+            WheelAddition,
+            prepare_shared_dependencies,
+        )
 
         from .dependency_usage import current_admission_token
+        from .execution.process import _settle
+
+        async def run(command):
+            task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._run_subprocess_with_streaming_log,
+                    command,
+                    timeout=300,
+                    plugin_id=plugin_id,
+                ),
+            )
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await _settle(task)
+                raise
 
         usage = self.registry.dependency_usage
         with tempfile.TemporaryDirectory(
@@ -897,13 +928,17 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         ) as temporary:
             staging = Path(temporary)
             constraints = staging / "constraints.txt"
-            constraints.write_text(
-                "".join(
-                    f"{name}=={row['version']}\n"
-                    for name, row in snapshot.distributions.items()
-                ),
-                encoding="utf-8",
-            )
+
+            def constrain(observed):
+                constraints.write_text(
+                    "".join(
+                        f"{name}=={row['version']}\n"
+                        for name, row in observed.distributions.items()
+                    ),
+                    encoding="utf-8",
+                )
+
+            constrain(snapshot)
             command = [
                 spec.python_executable,
                 "-I",
@@ -919,24 +954,37 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 "-r",
                 str(requirements_file),
             ]
-            from .execution.process import _settle
-
-            build = asyncio.create_task(
-                asyncio.to_thread(
-                    self._run_subprocess_with_streaming_log,
-                    command,
-                    timeout=300,
-                    plugin_id=plugin_id,
-                ),
-            )
-            try:
-                result = await asyncio.shield(build)
-            except asyncio.CancelledError:
-                await _settle(build)
-                raise
+            result = await run(command)
+            if result.returncode and result.stdout.strip() == (
+                f"{spec.python_executable}: No module named pip"
+            ):
+                # ensurepip uses bundled wheels, without upgrading installed
+                # packages. Only a missing installer authorizes this retry.
+                bootstrap = await run(
+                    [spec.python_executable, "-I", "-m", "ensurepip"],
+                )
+                if bootstrap.returncode:
+                    raise SharedDependencyError(
+                        GateDecision(
+                            False,
+                            False,
+                            reason="DEPENDENCY_INSTALLER_UNAVAILABLE",
+                            reason_code="DEPENDENCY_INSTALLER_UNAVAILABLE",
+                        ),
+                    )
+                snapshot = (await process.audit(spec)).snapshot
+                constrain(snapshot)
+                result = await run(command)
             if result.returncode:
-                raise RuntimeError(
-                    "DEPENDENCY_PLAN_UNVERIFIED: complete wheels required",
+                raise SharedDependencyError(
+                    GateDecision(
+                        False,
+                        False,
+                        reason=(
+                            "DEPENDENCY_PLAN_UNVERIFIED: complete wheels required"
+                        ),
+                        reason_code="DEPENDENCY_PLAN_UNVERIFIED",
+                    ),
                 )
             wheels = tuple(
                 WheelAddition(
@@ -3046,12 +3094,24 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 )
             else:
                 binding = self.backend_resolver.resolve(source_path, manifest)
-            await self.lifecycle.prepare_backend(
-                binding,
-                allow_install=True,
-                probe=True,
-                wheels=wheels,
-            )
+            from .dependency_gate import SharedDependencyError
+
+            try:
+                await self.lifecycle.prepare_backend(
+                    binding,
+                    allow_install=True,
+                    probe=True,
+                    wheels=wheels,
+                )
+            except SharedDependencyError as exc:
+                from .dependency_upgrade import stage_dependency_refusal
+
+                await stage_dependency_refusal(
+                    self,
+                    source_path,
+                    exc,
+                    force=True,
+                )
             from ..config.utils import load_config
             from .settings import is_plugin_enabled, runtime_config
 

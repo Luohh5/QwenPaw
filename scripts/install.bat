@@ -321,7 +321,7 @@ if exist "%QWENPAW_VENV%" (
     echo [qwenpaw] Creating Python %PYTHON_VERSION% environment...
 )
 
-uv venv "%QWENPAW_VENV%" --python %PYTHON_VERSION% --quiet --clear
+uv venv "%QWENPAW_VENV%" --python %PYTHON_VERSION% --quiet --clear --seed
 if errorlevel 1 (
     echo [qwenpaw] ERROR: Failed to create virtual environment
     exit /b 1
@@ -475,6 +475,28 @@ for %%E in (%ARG_EXTRAS:,= %) do (
 )
 if defined CHANNEL_PRESET_SELECTED (
     "%VENV_QWENPAW%" plugins preset apply channels-full --offline
+    if errorlevel 1 exit /b 1
+)
+set "PLUGIN_HELP_FILE=%TEMP%\qwenpaw-plugins-%RANDOM%.txt"
+set "PREPARE_CHANNELS=1"
+"%VENV_QWENPAW%" --help > "%PLUGIN_HELP_FILE%"
+if errorlevel 1 (
+    del "%PLUGIN_HELP_FILE%" >nul 2>&1
+    exit /b 1
+)
+findstr /R /C:"^  plugins " /C:"^  plugins$" "%PLUGIN_HELP_FILE%" >nul
+if errorlevel 1 goto :install_channels_ready
+"%VENV_QWENPAW%" plugins --help > "%PLUGIN_HELP_FILE%"
+if errorlevel 1 (
+    del "%PLUGIN_HELP_FILE%" >nul 2>&1
+    exit /b 1
+)
+findstr /C:"prepare-upgrade" "%PLUGIN_HELP_FILE%" >nul
+set "PREPARE_CHANNELS=%errorlevel%"
+:install_channels_ready
+del "%PLUGIN_HELP_FILE%" >nul 2>&1
+if "%PREPARE_CHANNELS%"=="0" (
+    "%VENV_QWENPAW%" plugins prepare-upgrade
     if errorlevel 1 exit /b 1
 )
 echo [qwenpaw] QwenPaw installed successfully

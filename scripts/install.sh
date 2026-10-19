@@ -144,7 +144,7 @@ else
     info "Creating Python $PYTHON_VERSION environment..."
 fi
 
-uv venv "$QWENPAW_VENV" --python "$PYTHON_VERSION" --quiet
+uv venv "$QWENPAW_VENV" --python "$PYTHON_VERSION" --quiet --seed
 
 # Verify the venv was created
 [ -x "$QWENPAW_VENV/bin/python" ] || die "Failed to create virtual environment"
@@ -285,6 +285,13 @@ case ",${NORMALIZED_EXTRAS// /}," in
         "$QWENPAW_VENV/bin/qwenpaw" plugins preset apply channels-full --offline
         ;;
 esac
+CLI_HELP="$("$QWENPAW_VENV/bin/qwenpaw" --help)"
+if printf '%s\n' "$CLI_HELP" | grep -Eq '^[[:space:]]+plugins([[:space:]]|$)'; then
+    PLUGIN_HELP="$("$QWENPAW_VENV/bin/qwenpaw" plugins --help)"
+    if [[ "$PLUGIN_HELP" == *prepare-upgrade* ]]; then
+        "$QWENPAW_VENV/bin/qwenpaw" plugins prepare-upgrade
+    fi
+fi
 info "QwenPaw installed successfully"
 
 # Check console availability (for PyPI installs, check the installed package)

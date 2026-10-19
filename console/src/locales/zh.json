@@ -5174,6 +5174,30 @@
     "details": "详细信息"
   },
   "pluginManager": {
+    "dependencyUpgrade": {
+      "title": "确认升级共享依赖",
+      "confirm": "升级并安装",
+      "progress": "正在升级共享依赖",
+      "changes": "共享依赖版本变更",
+      "affected": "受影响的插件实例",
+      "noInstances": "没有受影响的插件实例。",
+      "restart": "此次升级需要重启后端，重新连接后将继续安装插件。",
+      "background": "在后台跟踪",
+      "resume": "进度跟踪已中断。后端重新连接后，请重新打开插件管理查看安装结果。",
+      "invalid": "依赖升级响应与当前安装不匹配，请重新打开插件管理查看状态。",
+      "notStarted": "依赖升级尚未开始，请重新打开插件管理，查看计划并再次确认。",
+      "cancelFailed": "未能取消依赖升级，请重新打开插件管理查看状态。",
+      "failed": "共享依赖升级失败。",
+      "status": {
+        "needs_confirmation": "等待确认",
+        "preparing": "正在准备升级",
+        "applying": "正在应用升级",
+        "waiting_restart": "等待后端重启",
+        "succeeded": "插件安装完成",
+        "failed": "升级失败",
+        "cancelled": "已取消升级"
+      }
+    },
     "title": "插件管理",
     "description": "安装、管理和卸载插件，无需重启服务。",
     "installed": "已安装插件",

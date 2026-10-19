@@ -149,6 +149,17 @@ class PythonBackend:
             for path in dependency_sites(path for path in sys.path if path)
         )
 
+    @staticmethod
+    def dependency_install_target(_description, snapshot):
+        """Use one actual interpreter site, never overlay another provider."""
+        targets = [
+            Path(site)
+            for site in snapshot.dependency_sites or ()
+            if Path(site).name in {"site-packages", "dist-packages"}
+            and Path(site).is_relative_to(snapshot.prefix)
+        ]
+        return targets[0] if len(targets) == 1 else None
+
     async def prepare(
         self,
         description,
@@ -170,6 +181,10 @@ class PythonBackend:
                 or decision.unsupported
                 or (decision.missing and not decision.allow_install)
             ):
+                if decision.reason_code:
+                    from .dependency_gate import SharedDependencyError
+
+                    raise SharedDependencyError(decision)
                 raise RuntimeError(decision.reason)
         if probe:
             entry = description.payload

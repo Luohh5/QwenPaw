@@ -34,6 +34,10 @@ import styles from "../index.module.less";
 import { useAgentStore } from "../../../../stores/agentStore";
 import { openExternalLink } from "../../../../utils/openExternalLink";
 import { captureChannelSaveJob } from "./channelConfig";
+import {
+  resumePendingPluginInstalls,
+  runPluginInstall,
+} from "@/pages/Settings/PluginManager/dependencyUpgrade";
 
 const CHANNELS_WITH_ACCESS_CONTROL: ChannelKey[] = [
   "telegram",
@@ -229,6 +233,15 @@ export function ChannelDrawer({
   const currentLang = i18n.language?.startsWith("zh") ? "zh" : "en";
   const label = activeKey ? getChannelLabel(activeKey, t) : activeLabel;
   const { message } = useAppMessage();
+  useEffect(
+    () =>
+      resumePendingPluginInstalls(
+        t,
+        () => onRuntimeChange?.(),
+        (error) => message.error(error.message),
+      ),
+    [agentId, message, onRuntimeChange, t],
+  );
   const matrixAuthMethod = Form.useWatch("auth_method", form);
   const isMatrixPasswordAuth = matrixAuthMethod === "password";
   const feishuDomain = (Form.useWatch("domain", form) as string) || "feishu";
@@ -2127,7 +2140,11 @@ export function ChannelDrawer({
                 onClick={async () => {
                   setRepairing(true);
                   try {
-                    await channelApi.repairChannel(channelSchema.repair!);
+                    const result = await runPluginInstall(
+                      () => channelApi.repairChannel(channelSchema.repair!),
+                      t,
+                    );
+                    if (result === null) return;
                     await onRuntimeChange?.();
                   } catch (error) {
                     message.error(

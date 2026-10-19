@@ -373,6 +373,11 @@ class ChannelBackend:
             ),
         )
 
+    def dependency_install_target(self, description, _snapshot):
+        """The host-selected publication site, independent of platform SDK."""
+        settings = self.runtime_for(description)
+        return settings.dependency_install_target if settings else None
+
     def require_selection(self, manifest):
         if self.runtime_for(manifest) is None:
             raise ChannelRuntimeNotIntegratedError(

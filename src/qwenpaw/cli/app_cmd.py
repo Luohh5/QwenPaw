@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 
 import click
 import uvicorn
@@ -17,6 +18,7 @@ from ..utils.platform import warn_unelevated_sandbox
 from .windows_shutdown import install_shutdown_handlers
 
 logger = logging.getLogger(__name__)
+_dependency_restart = None
 
 
 def _format_bind_address(host: str, port: int) -> str:
@@ -171,6 +173,14 @@ def app_cmd(
     )
     _warn_if_auth_off_non_loopback_bind(host, port)
     install_shutdown_handlers()
+
+    # This is launcher-owned state, not request-supplied restart arguments.
+    global _dependency_restart  # pylint: disable=global-statement
+    if not reload:
+        _dependency_restart = {
+            "command": [sys.executable, *sys.orig_argv[1:]],
+            "cwd": os.getcwd(),
+        }
 
     uvicorn.run(
         "qwenpaw.app._app:app",

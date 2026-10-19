@@ -550,6 +550,15 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
                 plugin_dirs,
                 channel_runtime=channel_runtime,
             )
+            from ..cli.app_cmd import _dependency_restart
+
+            if _dependency_restart is not None:
+                import signal
+
+                plugin_loader.dependency_upgrade_restart = _dependency_restart
+                plugin_loader.dependency_upgrade_shutdown = (
+                    lambda: signal.raise_signal(signal.SIGINT)
+                )
             from .channels.management import ChannelManagementService
             from .channels.qrcode_sessions import ChannelQRCodeSessions
 

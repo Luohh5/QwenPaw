@@ -43,6 +43,7 @@ from qwenpaw.channel_protocol.models import (
     UNKNOWN_ACTOR_CAPABILITY,
     APPROVAL_RESOLUTION_CAPABILITY,
     TEXT_MERGE_CAPABILITY,
+    ApprovalCardParams,
     ApprovalResolutionParams,
     validate_content_part,
     DeliveryState,
@@ -65,6 +66,22 @@ _STATE_MAX_BYTES = 1024 * 1024
 _STATE_MAX_KEYS = 64
 _TEXT_MERGE_MAX_RESPONSES = 128
 _TEXT_MERGE_MAX_BYTES = 768 * 1024
+
+
+def _approval_card_params(metadata):
+    """Adapt host severity values to the validated approval wire contract."""
+    severity = metadata.get("severity", "medium")
+    if isinstance(severity, str):
+        severity = severity.lower()
+        if severity in {"info", "safe"}:
+            severity = "medium"
+    return ApprovalCardParams.from_mapping(
+        {
+            "request_id": metadata["approval_request_id"],
+            "tool_name": metadata.get("tool_name", "tool"),
+            "severity": severity,
+        },
+    ).to_mapping()
 
 
 @dataclass
@@ -1930,11 +1947,7 @@ class IsolatedChannelProxy(BaseChannel):
                 to_handle,
                 send_meta,
                 "message.create",
-                approval={
-                    "request_id": metadata["approval_request_id"],
-                    "tool_name": metadata.get("tool_name", "tool"),
-                    "severity": metadata.get("severity", "medium"),
-                },
+                approval=_approval_card_params(metadata),
                 content_parts=[{"type": "text", "text": body}],
             )
         else:

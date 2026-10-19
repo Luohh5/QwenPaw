@@ -233,7 +233,13 @@ def dependency_sites(sites, *, explicit=(), distributions=()):
 def _installed_metadata(sites):
     """Read metadata headers and invalid names without importing code."""
     # pylint: disable=protected-access
-    if any(repair_marker(site).exists() for site in sites):
+    from ..dependency_maintenance import authorized, check_admission
+
+    for site in sites:
+        check_admission(site)
+    if any(
+        repair_marker(site).exists() and not authorized(site) for site in sites
+    ):
         raise dependency_error("DEPENDENCY_REPAIR_REQUIRED")
     rows, invalid, observed = {}, {}, {}
     for distribution in metadata.distributions(path=list(sites)):

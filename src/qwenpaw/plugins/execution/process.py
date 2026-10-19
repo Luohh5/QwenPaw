@@ -542,9 +542,15 @@ class PluginProcess:
                 "TEMP",
                 "TMP",
                 "TMPDIR",
+                "QWENPAW_DEPENDENCY_MAINTENANCE",
             }
             or name in NETWORK_PROXY_ENVIRONMENT
         }
+        from ..dependency_maintenance import current_capability
+
+        capability = current_capability()
+        if capability:
+            environment["QWENPAW_DEPENDENCY_MAINTENANCE"] = capability
         options: dict[str, Any] = (
             {"start_new_session": True} if os.name != "nt" else {}
         )

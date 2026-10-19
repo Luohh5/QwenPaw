@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import os
+import runpy
 import shutil
 import subprocess
 import sys
@@ -17,11 +18,19 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from packaging.markers import default_environment
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
 ROOT = Path(__file__).resolve().parents[3]
-OFFICIAL_IDS = ("dingtalk", "feishu")
+OFFICIAL_ROWS = runpy.run_path(
+    str(ROOT / "src/qwenpaw/plugins/official_channel_catalog.py"),
+)["OFFICIAL_CHANNELS"]
+SOURCE_DIRS = {row["plugin_id"]: row["source_dir"] for row in OFFICIAL_ROWS}
+OFFICIAL_IDS = tuple(sorted(SOURCE_DIRS))
+# Azure Bot was public before extraction (#5849); bundling preserves that
+# existing publication policy. The other official sources remain private.
+PUBLIC_OFFICIAL_IDS = frozenset({"azure-bot"})
 EXCLUSIVE_SDKS = {
     "lark-oapi",
     "dingtalk-stream",
@@ -129,9 +138,17 @@ def _assert_official_bundle(wheel: Path, source: Path) -> dict:
             channel = item["plugin_id"]
             manifest = json.loads(
                 (
-                    source / "plugins" / "channel" / channel / "plugin.json"
+                    source
+                    / "plugins"
+                    / "channel"
+                    / SOURCE_DIRS[channel]
+                    / "plugin.json"
                 ).read_text(),
             )
+            if channel in PUBLIC_OFFICIAL_IDS:
+                assert manifest.get("publish", True) is True
+            else:
+                assert manifest["publish"] is False
             assert set(item) == {
                 "plugin_id",
                 "version",
@@ -153,7 +170,9 @@ def _assert_official_bundle(wheel: Path, source: Path) -> dict:
                     for name in plugin.namelist()
                     if not name.endswith("/")
                 }
-                source_dir = source / "plugins" / "channel" / channel
+                source_dir = (
+                    source / "plugins" / "channel" / SOURCE_DIRS[channel]
+                )
                 expected = {
                     f"{channel}/{path.relative_to(source_dir).as_posix()}"
                     for path in source_dir.rglob("*")
@@ -198,6 +217,7 @@ from importlib import resources
 
 stage = pathlib.Path(sys.argv[1]).resolve()
 installed = pathlib.Path(sys.argv[2]).resolve()
+public_officials = set(json.loads(sys.argv[4]))
 # -S avoids the current environment's editable .pth finder. Process only
 # the wheel under test, then expose dependency directories without their .pths.
 site.addsitedir(str(installed))
@@ -240,10 +260,12 @@ index = json.loads(root.joinpath("index.json").read_bytes())
 assert set(index) == {"schema_version", "host_version", "plugins"}
 assert index["schema_version"] == 1
 assert index["host_version"] == __version__
-assert [row["plugin_id"] for row in index["plugins"]] == ["dingtalk", "feishu"]
+from qwenpaw.plugins.official_channel_catalog import OFFICIAL_CHANNELS
+sources = {row["plugin_id"]: row["source_dir"] for row in OFFICIAL_CHANNELS}
+assert [row["plugin_id"] for row in index["plugins"]] == sorted(sources)
 for row in index["plugins"]:
     channel = row["plugin_id"]
-    original = stage / "plugins/channel" / channel
+    original = stage / "plugins/channel" / sources[channel]
     manifest = json.loads((original / "plugin.json").read_bytes())
     assert set(row) == {
         "plugin_id", "version", "filename", "sha256", "descriptor_sha256",
@@ -277,7 +299,10 @@ for row in index["plugins"]:
         }
         assert extracted == expected
         extracted_manifest = json.loads((source / "plugin.json").read_bytes())
-        assert extracted_manifest["publish"] is False
+        if channel in public_officials:
+            assert extracted_manifest.get("publish", True) is True
+        else:
+            assert extracted_manifest["publish"] is False
     assert not source.exists()
 print("C7_EDITABLE_SOURCES_OK")
 """
@@ -302,6 +327,7 @@ print("C7_EDITABLE_SOURCES_OK")
                     if Path(path).name in {"site-packages", "dist-packages"}
                 ],
             ),
+            json.dumps(sorted(PUBLIC_OFFICIAL_IDS)),
         ],
         cwd=tmp_path,
         env={
@@ -382,7 +408,11 @@ def test_c7_metadata_moves_exclusive_sdks_to_channels(
         str(Requirement(line.strip()))
         for channel in OFFICIAL_IDS
         for line in (
-            stage / "plugins" / "channel" / channel / "requirements.txt"
+            stage
+            / "plugins"
+            / "channel"
+            / SOURCE_DIRS[channel]
+            / "requirements.txt"
         )
         .read_text()
         .splitlines()
@@ -409,14 +439,34 @@ def test_c7_metadata_moves_exclusive_sdks_to_channels(
     }
     assert wheel_base.isdisjoint(EXCLUSIVE_SDKS)
     assert "channels" in metadata.get_all("Provides-Extra", [])
-    wheel_channels = {
-        str(item).split(";", 1)[0].strip()
-        for item in requires
-        if item.marker is not None
-        and item.marker.evaluate({"extra": "channels"})
-        and not item.marker.evaluate({"extra": ""})
-    }
-    assert wheel_channels == declared
+
+    def normalized(requirement):
+        return (
+            canonicalize_name(requirement.name),
+            tuple(sorted(requirement.extras)),
+            str(requirement.specifier),
+        )
+
+    for version in ("3.11", "3.12", "3.13"):
+        environment = {
+            **default_environment(),
+            "python_version": version,
+            "python_full_version": version + ".0",
+        }
+        wheel_channels = {
+            normalized(item)
+            for item in requires
+            if item.marker is not None
+            and item.marker.evaluate({**environment, "extra": "channels"})
+            and not item.marker.evaluate({**environment, "extra": ""})
+        }
+        active = {
+            normalized(item)
+            for value in declared
+            if (item := Requirement(value)).marker is None
+            or item.marker.evaluate(environment)
+        }
+        assert wheel_channels == active, version
 
 
 def test_c7_sdist_rebuilds_the_same_official_resources(
@@ -432,7 +482,9 @@ def test_c7_sdist_rebuilds_the_same_official_resources(
         )
         for channel in OFFICIAL_IDS:
             assert any(
-                name.endswith(f"/plugins/channel/{channel}/plugin.json")
+                name.endswith(
+                    f"/plugins/channel/{SOURCE_DIRS[channel]}/plugin.json",
+                )
                 for name in names
             )
         archive.extractall(tmp_path, filter="data")

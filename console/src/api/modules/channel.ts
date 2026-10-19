@@ -1,5 +1,6 @@
 import { request } from "../request";
 import type { ChannelConfig, SingleChannelConfig } from "../types";
+import { installPlugin, repairPluginDependencies } from "./plugin";
 
 export type ChannelRequestScope = { agentId: string; signal?: AbortSignal };
 export type ChannelAuthProvenance = {
@@ -73,22 +74,17 @@ export interface ChannelConflictResponse {
 export const channelApi = {
   repairChannel: (repair: NonNullable<ChannelSchema["repair"]>) => {
     const id = encodeURIComponent(repair.plugin_id);
-    if (repair.action === "install")
-      return request("/plugins/install", {
-        method: "POST",
-        body: JSON.stringify({ source: repair.source }),
-      });
-    return request(
-      `/plugins/${id}/${
-        repair.action === "enable" ? "enabled" : "repair-dependencies"
-      }`,
-      {
-        method: "POST",
-        ...(repair.action === "enable"
-          ? { body: JSON.stringify({ enabled: true }) }
-          : {}),
-      },
-    );
+    if (repair.action === "install") {
+      if (!repair.source)
+        return Promise.reject(new Error("Plugin install source is missing"));
+      return installPlugin(repair.source);
+    }
+    if (repair.action === "repair")
+      return repairPluginDependencies(repair.plugin_id);
+    return request(`/plugins/${id}/enabled`, {
+      method: "POST",
+      body: JSON.stringify({ enabled: true }),
+    });
   },
   listChannelTypes: (scope?: ChannelRequestScope) =>
     request<string[]>("/config/channels/types", requestScope(scope)),

@@ -5154,6 +5154,30 @@
     "details": "Details"
   },
   "pluginManager": {
+    "dependencyUpgrade": {
+      "title": "Confirm shared dependency upgrade",
+      "confirm": "Upgrade and install",
+      "progress": "Updating shared dependencies",
+      "changes": "Shared package changes",
+      "affected": "Affected plugin instances",
+      "noInstances": "No plugin instances are affected.",
+      "restart": "The backend must restart to complete this upgrade. Installation will continue after it reconnects.",
+      "background": "Track in background",
+      "resume": "Tracking was interrupted. Reopen Plugin Manager after the backend reconnects to check the installation.",
+      "invalid": "The dependency upgrade response does not match this installation. Reopen Plugin Manager to check its status.",
+      "notStarted": "The dependency upgrade has not started. Reopen Plugin Manager to review and confirm it again.",
+      "cancelFailed": "The upgrade could not be cancelled. Reopen Plugin Manager to check its status.",
+      "failed": "The shared dependency upgrade failed.",
+      "status": {
+        "needs_confirmation": "Waiting for confirmation",
+        "preparing": "Preparing the upgrade",
+        "applying": "Applying the upgrade",
+        "waiting_restart": "Waiting for the backend to restart",
+        "succeeded": "Installation completed",
+        "failed": "Upgrade failed",
+        "cancelled": "Upgrade cancelled"
+      }
+    },
     "title": "Plugin Manager",
     "description": "Install, manage, and remove plugins without restarting the service.",
     "installed": "Installed Plugins",

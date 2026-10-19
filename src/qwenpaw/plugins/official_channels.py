@@ -28,6 +28,7 @@ __all__ = [
     "provision_bundled_channels",
     "bundled_channel_source",
     "bundled_channel_description",
+    "prepare_channel_upgrade",
 ]
 
 
@@ -160,6 +161,114 @@ def bundled_channel_description(plugin_id: str):
         return describe_channel(source, manifest)
 
 
+def _persisted_channel_enabled(data, key):
+    channels = data.get("channels", {})
+    legacy_key = "weixin" if key == "wechat" else key
+    return (
+        channels.get(key, channels.get(legacy_key, {})).get("enabled") is True
+    )
+
+
+async def prepare_channel_upgrade():
+    """Prepare only persisted enabled channels during an explicit upgrade."""
+    from ..constant import EnvVarLoader
+    from ..config.utils import get_config_path, get_plugins_dir
+    from .lifecycle import UnloadMode
+    from .loader import PluginLoader
+    from .settings import is_plugin_enabled
+
+    path = get_config_path()
+    raw = (
+        json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    )
+    saved = [raw]
+    for profile in raw.get("agents", {}).get("profiles", {}).values():
+        workspace = profile.get("workspace_dir")
+        if workspace:
+            agent_path = Path(workspace).expanduser() / "agent.json"
+            if agent_path.is_file():
+                saved.append(
+                    json.loads(agent_path.read_text(encoding="utf-8")),
+                )
+    settings = raw.get("plugins", {})
+    removed = raw.get("channel_plugin_state", {}).get("uninstalled", [])
+    owners = official_channel_owners()
+    allowed = set(owners)
+    enabled = EnvVarLoader.get_str("QWENPAW_ENABLED_CHANNELS", "").strip()
+    disabled = EnvVarLoader.get_str("QWENPAW_DISABLED_CHANNELS", "")
+    if enabled:
+        allowed.intersection_update(key.strip() for key in enabled.split(","))
+    else:
+        allowed.difference_update(key.strip() for key in disabled.split(","))
+    selected = {
+        plugin_id: key
+        for key, plugin_id in owners.items()
+        if key in allowed
+        and plugin_id not in removed
+        and is_plugin_enabled(settings.get(plugin_id))
+        and any(_persisted_channel_enabled(data, key) for data in saved)
+    }
+    if not selected:
+        return {}
+    loader = PluginLoader(
+        [get_plugins_dir()],
+        channel_runtime=resolve_default_channel_runtime(),
+    )
+    errors = {}
+    try:
+        for plugin_id, key in sorted(selected.items()):
+            try:
+                source = loader.find_installed_plugin_dir(plugin_id)
+                if source is None:
+                    with bundled_channel_source(plugin_id) as bundled:
+                        record = await loader.seed_bundled_channel(
+                            bundled,
+                            settings.get(plugin_id),
+                        )
+                    source = record.source_path
+                async with loader.plugin_lifecycle(plugin_id):
+                    _, manifest = loader._read_source_manifest(source)
+                    compatible, _ = loader._check_version_compatibility(
+                        manifest,
+                    )
+                    if not compatible:
+                        errors[plugin_id] = "PLUGIN_VERSION_INCOMPATIBLE"
+                        continue
+                    binding = loader.backend_resolver.resolve(source, manifest)
+                    if (
+                        manifest.id != plugin_id
+                        or binding.description.payload.descriptor.channel_key
+                        != key
+                    ):
+                        errors[
+                            plugin_id
+                        ] = "OFFICIAL_CHANNEL_IDENTITY_MISMATCH"
+                        continue
+                    await loader.lifecycle.prepare_backend(
+                        binding,
+                        allow_install=True,
+                        probe=True,
+                    )
+            except Exception as exc:
+                # Child/SDK exception text can contain endpoint credentials.
+                decision = getattr(exc, "decision", None)
+                errors[plugin_id] = (
+                    getattr(exc, "reason_code", None)
+                    or getattr(decision, "reason_code", None)
+                    or type(exc).__name__
+                )
+    finally:
+        reports = await loader.lifecycle.unload_all(UnloadMode.SHUTDOWN)
+        for report in reports:
+            if (
+                not report.clean
+                or not report.quiescent
+                or report.needs_restart
+            ):
+                errors[report.plugin_id] = "CHANNEL_CLEANUP_INCOMPLETE"
+    return errors
+
+
 def initialize_channel_policy():
     """Capture legacy intent once from raw persisted files, never defaults."""
     from ..config.utils import get_config_path, mutate_config
@@ -217,8 +326,7 @@ def initialize_channel_policy():
                 continue
             plugin_id = owners[key]
             if plugin_id not in state.uninstalled and any(
-                data.get("channels", {}).get(key, {}).get("enabled") is True
-                for data in saved
+                _persisted_channel_enabled(data, key) for data in saved
             ):
                 pending.add(plugin_id)
         state.legacy_pending = sorted(pending - set(state.uninstalled))

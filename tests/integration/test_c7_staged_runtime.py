@@ -234,7 +234,7 @@ def test_c7_actual_wheel_stages_genuine_metadata_and_frozen_resources(
     site = manifest_path.parent / "site"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["schema_version"] == 1
-    assert manifest["preset"] == "channels-full"
+    assert manifest["preset"] == "light"
     assert (
         manifest["python_executable"]
         == "binaries/python-runtime/python/bin/python3"
@@ -274,7 +274,7 @@ def test_c7_actual_wheel_stages_genuine_metadata_and_frozen_resources(
         "QWENPAW_CHANNEL_DEPENDENCY_PATHS",
         json.dumps([str(site)]),
     )
-    monkeypatch.setenv("QWENPAW_CHANNEL_PRESET", "channels-full")
+    monkeypatch.setenv("QWENPAW_CHANNEL_PRESET", "light")
     settings = resolve_default_channel_runtime()
     assert settings.python_executable == str(child)
     assert settings.support_root == site
@@ -337,6 +337,8 @@ def test_c7_required_wheelhouse_pth_preserves_record_without_execution(
         path = native_site / relative
         if path.is_file():
             path.unlink()
+    # importlib.metadata still discovers an empty dist-info directory.
+    shutil.rmtree(native_site / Path(provider._path).name)
     wheelhouse = root / "wheelhouse"
     wheelhouse.mkdir()
     provider_wheel = _wheel_from_installed_provider("coloredlogs", wheelhouse)

@@ -241,6 +241,41 @@ class DependencyUsageRegistry:
         )
         self._revision += 1
 
+    def capture_admissions(self, leases):
+        """Retain exact token identity across custody snapshot pruning."""
+        return {
+            lease: self._bindings[lease][0]
+            for lease in leases
+            if lease in self._bindings
+        }
+
+    def rebase_stopped(self, leases, snapshot, admissions=()):
+        """Refine exact stopped admissions after an explicit transaction."""
+        restored = []
+        for lease in leases:
+            if lease in self._owners.leases():
+                raise ValueError("DEPENDENCY_LEASE_STILL_ACTIVE")
+            bound = self._bindings.pop(lease, None)
+            if bound is None and lease in admissions:
+                bound = (admissions[lease], None)
+            if bound is not None and bound[0] in self._declarations:
+                token = bound[0]
+                restored.append((token, self._declarations[token]))
+                self._declarations[token] = replace(
+                    self._declarations[token],
+                    snapshot=snapshot,
+                    environment=DependencyEnvironment.from_snapshot(snapshot),
+                )
+        self._revision += 1
+        return restored
+
+    def restore_rebased(self, declarations):
+        """Restore old evidence only after dependency rollback succeeded."""
+        for token, declaration in declarations:
+            if token in self._declarations:
+                self._declarations[token] = declaration
+        self._revision += 1
+
     def snapshot(
         self,
         environment=None,

@@ -641,6 +641,12 @@ def child_environment(root):
         site / "qwenpaw/plugins/execution",
         ignore=shutil.ignore_patterns("__pycache__"),
     )
+    # The trusted worker acquires its real environment lease before importing
+    # plugins. Retain that stdlib-only sibling with the copied runtime.
+    shutil.copyfile(
+        ROOT / "src/qwenpaw/plugins/dependency_maintenance.py",
+        site / "qwenpaw/plugins/dependency_maintenance.py",
+    )
     shutil.copytree(
         Path(packaging.__file__).parent,
         site / "packaging",
