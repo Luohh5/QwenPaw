@@ -449,6 +449,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         """
         with open(manifest_path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        from .sdk_version import validate_sdk
+
+        if isinstance(data, dict):
+            validate_sdk(data.get("sdk"), data.get("id"))
         return PluginManifest.from_dict(data)
 
     @staticmethod
@@ -512,6 +516,29 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         )
         if decision.unsupported:
             return decision
+        if decision.missing:
+            from ._sdk_dependencies import loaded_sdk_conflicts
+            from ..utils.io_utils import run_sync_io
+
+            conflicts = await run_sync_io(
+                loaded_sdk_conflicts,
+                source_path,
+                decision.missing,
+            )
+            if conflicts:
+                return GateDecision(
+                    allow_install=False,
+                    already_satisfied=False,
+                    missing=decision.missing,
+                    host_conflicts=conflicts,
+                    require_restart=True,
+                    reason=(
+                        f"Plugin '{plugin_id}' cannot safely replace "
+                        "distributions in this process "
+                        f"({', '.join(conflicts)}). "
+                        "Restart the backend to apply."
+                    ),
+                )
         if decision.already_satisfied or not decision.allow_install:
             return decision
         logger.info(
@@ -564,7 +591,19 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             # with fresh import caches before spending resources on pip.
             _ensure_plugin_site_on_path()
             importlib.invalidate_caches()
-            if not self._find_unsatisfied_dependencies(requirements_file):
+            missing = self._find_unsatisfied_dependencies(requirements_file)
+            from ._sdk_dependencies import loaded_sdk_conflicts
+
+            conflicts = loaded_sdk_conflicts(requirements_file.parent, missing)
+            if conflicts:
+                from .errors import SDKRestartRequiredError
+
+                raise SDKRestartRequiredError(
+                    f"Plugin '{plugin_id}' cannot safely replace "
+                    "distributions in this process "
+                    f"({', '.join(conflicts)}). Restart the backend to apply.",
+                )
+            if not missing:
                 logger.info(
                     "Plugin '%s' dependencies already satisfied by a "
                     "concurrent installer; skipping pip install",
@@ -705,6 +744,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 "dependencies": manifest.dependencies,
                 "qwenpaw_version": qv_dict,
                 "meta": manifest.meta,
+                "sdk": manifest.sdk,
             }
             await self._invoke_plugin_register(
                 plugin_id,
@@ -768,6 +808,11 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         instance = self.lifecycle.ensure_instance(plugin_id)
         instance.refuse_unquiescent_reregister()
         api.bind_instance(instance, loader=self)
+        if manifest_dict.get("sdk") is not None:
+            from .sdk import PluginContext
+
+            api = PluginContext(api)
+            instance.sdk_context = api
         self.registry.register_plugin_manifest(plugin_id, manifest_dict)
         instance.record_runtime(
             "plugin_manifest",
@@ -991,6 +1036,9 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
     ) -> PluginRecord:
         """Load a plugin; caller must hold :meth:`plugin_lifecycle`."""
         plugin_id = manifest.id
+        from .sdk_version import validate_sdk
+
+        validate_sdk(manifest.sdk, manifest.id)
         if not self.lifecycle.delegate.owns_commit(plugin_id):
             raise RuntimeError(
                 f"Plugin '{plugin_id}' commit is not owned by this process",
@@ -1045,6 +1093,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             allow_install=allow_install,
         )
         if decision.require_restart:
+            if manifest.sdk is not None:
+                from .errors import SDKRestartRequiredError
+
+                raise SDKRestartRequiredError(decision.reason)
             raise RuntimeError(decision.reason)
         if decision.unsupported or (
             decision.missing and not decision.allow_install
@@ -1412,6 +1464,24 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 "ask the administrator to install the requirements, "
                 "or use Docker for independently managed dependencies.",
             )
+        from ._sdk_dependencies import is_sdk_source, install_sdk_requirements
+
+        if is_sdk_source(requirements_file.parent):
+            python = _desktop_python() if _is_frozen() else sys.executable
+            if python is None:
+                raise RuntimeError(
+                    "The bundled dependency runtime is unavailable",
+                )
+            install_sdk_requirements(
+                requirements_file,
+                plugin_id,
+                python=str(python),
+                target=str(_plugin_site_dir()) if _is_frozen() else None,
+                run=self._run_subprocess_with_streaming_log,
+                find_uv=self._find_uv,
+            )
+            importlib.invalidate_caches()
+            return
         logger.info(
             f"Installing dependencies for plugin '{plugin_id}'...",
         )
@@ -1685,6 +1755,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     ok=False,
                     unchanged=True,
                     errors=[decision.reason],
+                    needs_restart=bool(
+                        incoming_manifest.sdk is not None
+                        and decision.require_restart,
+                    ),
                 )
             if decision.missing and not decision.allow_install:
                 return ReloadReport(
@@ -2321,6 +2395,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     manifest.id,
                 ),
             )
+            if decision.require_restart and manifest.sdk is not None:
+                from .errors import SDKRestartRequiredError
+
+                raise SDKRestartRequiredError(decision.reason)
             if (
                 decision.unsupported
                 or decision.require_restart
@@ -2416,6 +2494,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                         if report.errors
                         else f"Reload of '{plugin_id}' failed"
                     )
+                    if manifest.sdk is not None and report.needs_restart:
+                        from .errors import SDKRestartRequiredError
+
+                        raise SDKRestartRequiredError(detail)
                     raise RuntimeError(detail)
                 record = self._loaded_plugins[plugin_id]
                 if after_load is not None:
@@ -2790,6 +2872,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 allow_install=True,
             )
             if decision.require_restart:
+                if manifest.sdk is not None:
+                    from .errors import SDKRestartRequiredError
+
+                    raise SDKRestartRequiredError(decision.reason)
                 raise RuntimeError(decision.reason)
             from ..config.utils import load_config
             from .settings import is_plugin_enabled, runtime_config
@@ -3577,6 +3663,11 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         instance = self.lifecycle.ensure_instance(plugin_id)
         instance.refuse_unquiescent_reregister()
         api.bind_instance(instance, loader=self)
+        if manifest_dict.get("sdk") is not None:
+            from .sdk import PluginContext
+
+            api = PluginContext(api)
+            instance.sdk_context = api
         self.registry.register_plugin_manifest(plugin_id, manifest_dict)
         instance.record_runtime(
             "plugin_manifest",
@@ -4128,4 +4219,5 @@ def _manifest_as_dict(manifest: PluginManifest) -> Dict[str, Any]:
         "dependencies": manifest.dependencies,
         "qwenpaw_version": qv_dict,
         "meta": manifest.meta,
+        "sdk": manifest.sdk,
     }

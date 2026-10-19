@@ -45,6 +45,7 @@ from ..crons.manager import CronManager
 from ..crons.repo.json_repo import JsonJobRepository
 from ...config.config import load_agent_config
 from ...utils.logging import sanitize_log_value
+from ...plugins._events import observe_stream as _sdk_observe_stream
 
 if TYPE_CHECKING:
     from ...memory import MemoryBackendContext
@@ -411,6 +412,7 @@ class Workspace:
         """Inject the cross-workspace AppServiceManager reference."""
         self._app_services = app_services
 
+    @_sdk_observe_stream
     async def stream_query(
         self,
         request: Any,
@@ -447,20 +449,34 @@ class Workspace:
                 "user_id": getattr(request, "user_id", None),
                 "channel": getattr(request, "channel", None) or "console",
             }
-            async for item in self.harness_runtime.stream(
+            stream = self.harness_runtime.stream(
                 backend=backend,
                 request=request,
                 cwd=self.workspace_dir.resolve(),
                 settings=settings,
-            ):
-                yield item
+            )
+            try:
+                async for item in stream:
+                    yield item
+            finally:
+                from ...plugins._events import observing
+
+                if observing():
+                    await stream.aclose()
             return
 
         from ...runtime import Runtime
 
         rt = Runtime(workspace=self, app_services=self._app_services)
-        async for item in rt.run(request):
-            yield item
+        stream = rt.run(request)
+        try:
+            async for item in stream:
+                yield item
+        finally:
+            from ...plugins._events import observing
+
+            if observing():
+                await stream.aclose()
 
     def _register_services(  # pylint: disable=too-many-statements
         self,

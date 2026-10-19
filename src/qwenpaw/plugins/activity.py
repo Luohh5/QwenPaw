@@ -34,11 +34,13 @@ class PluginActivity:
         self.tasks = {}
         self.blocked = False
         self.mutator = None
+        self.cleanup_tasks = set()
+        self.cleanup_retries = {}
 
     @contextmanager
-    def invocation(self):
+    def invocation(self, *, cleanup=False):
         task = asyncio.current_task()
-        if self.blocked:
+        if self.blocked and not (cleanup and task in self.cleanup_tasks):
             raise PluginBusyError(
                 self.plugin_id,
                 len(self.tasks),
@@ -52,20 +54,48 @@ class PluginActivity:
             if not self.tasks[task]:
                 del self.tasks[task]
 
+    def retain_cleanup(self, task):
+        """Reserve only an already-admitted SDK request's terminal callback."""
+        self.cleanup_tasks.add(task)
+        task.add_done_callback(self.cleanup_tasks.discard)
+
+    async def retry_cleanup(self):
+        """Wait for lifecycle retry without cancelling live work."""
+        task = asyncio.current_task()
+        retry = asyncio.Event()
+        self.cleanup_retries[task] = retry
+        try:
+            await retry.wait()
+        except asyncio.CancelledError:
+            return True
+        finally:
+            self.cleanup_retries.pop(task, None)
+        return False
+
+    def _pending(self):
+        return {
+            task
+            for task in self.tasks.keys() | self.cleanup_tasks
+            if not task.done()
+        }
+
     @asynccontextmanager
     async def mutation(self, *, interrupt_tasks=False):
         current = asyncio.current_task()
         if self.mutator is current:
             yield
             return
-        pending = {task for task in self.tasks if not task.done()}
+        pending = self._pending()
         if current in pending:
             raise PluginBusyError(
                 self.plugin_id,
                 len(pending),
                 can_interrupt=False,
             )
-        if pending and not interrupt_tasks:
+        cleanup_only = pending <= (
+            self.cleanup_retries.keys() | self.cleanup_tasks
+        )
+        if pending and not interrupt_tasks and not cleanup_only:
             raise PluginBusyError(
                 self.plugin_id,
                 len(pending),
@@ -75,24 +105,44 @@ class PluginActivity:
         self.mutator = current
         try:
             if pending:
-                for task in pending:
-                    if not task.cancelling():
-                        task.cancel()
-                _, pending = await asyncio.wait(
-                    pending,
-                    timeout=INTERRUPT_TIMEOUT_SECONDS,
+                deadline = (
+                    asyncio.get_running_loop().time()
+                    + INTERRUPT_TIMEOUT_SECONDS
                 )
-                if pending:
-                    raise PluginBusyError(
-                        self.plugin_id,
-                        len(pending),
-                        can_interrupt=False,
+                for task in pending:
+                    retry = self.cleanup_retries.get(task)
+                    if retry is not None:
+                        retry.set()
+                    elif (
+                        task not in self.cleanup_tasks
+                        and not task.cancelling()
+                    ):
+                        task.cancel()
+                # A cancelled request may enqueue its terminal callback while
+                # draining. Keep the gate closed until those new owners finish.
+                while pending:
+                    _, remaining = await asyncio.wait(
+                        pending,
+                        timeout=max(
+                            0,
+                            deadline - asyncio.get_running_loop().time(),
+                        ),
                     )
+                    pending = remaining | self._pending()
+                    if (
+                        pending
+                        and asyncio.get_running_loop().time() >= deadline
+                    ):
+                        raise PluginBusyError(
+                            self.plugin_id,
+                            len(pending),
+                            can_interrupt=False,
+                        )
             yield
         finally:
             self.mutator = None
             # A timed-out/cancelled cleanup must not admit new work.
-            self.blocked = any(not task.done() for task in self.tasks)
+            self.blocked = bool(self._pending())
 
 
 @contextmanager
