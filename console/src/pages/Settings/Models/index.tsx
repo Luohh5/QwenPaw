@@ -1,8 +1,6 @@
 import { Cascade } from "@/components/interaction/Cascade";
 import { motion, useReducedMotion } from "motion/react";
-import { ModelChoice } from "../../Chat/ModelSelector/ModelChoice";
-import { providerApi } from "@/api/modules/provider";
-import { useAppMessage } from "@/hooks/useAppMessage";
+import { GlobalModelDefaults } from "./GlobalModelDefaults";
 import { AgentModelDefaults } from "./AgentModelDefaults";
 import {
   useCallback,
@@ -47,15 +45,6 @@ function ModelsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const { providers, activeModels, loading, error, warning, fetchAll } =
     useProviders();
-  const activeProvider = providers.find(
-    (provider) => provider.id === activeModels?.active_llm?.provider_id,
-  );
-  const activeHubModel =
-    activeProvider?.id === "hub-managed"
-      ? activeProvider.models.find(
-          (model) => model.id === activeModels?.active_llm?.model,
-        )
-      : undefined;
   const [addProviderOpen, setAddProviderOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
   const [modelsOpen, setModelsOpen] = useState(false);
@@ -75,7 +64,6 @@ function ModelsPage() {
     name: string;
     providers: ProviderInfo[];
   } | null>(null);
-  const { message } = useAppMessage();
   const [activeTab, setActiveTab] = useState<"cloud" | "local">(() => {
     const stored = localStorage.getItem("models_tab");
     return stored === "local" ? "local" : "cloud";
@@ -368,6 +356,11 @@ function ModelsPage() {
               />
             )}
             <div hidden={scopeTab !== "global"}>
+              <GlobalModelDefaults
+                activeModels={activeModels}
+                providers={providers}
+                onSaved={refreshProvidersSilently}
+              />
               {/* ---- Providers Section ---- */}
               <div className={styles.providersBlock}>
                 <div className={styles.sectionHeaderRow}>
@@ -376,29 +369,6 @@ function ModelsPage() {
                     className={styles.providersPageHeader}
                   />
                   <div className={styles.headerRight}>
-                    <div className={styles.globalModelRow}>
-                      <span>{t("models.defaultLlm")}</span>
-                      <ModelChoice
-                        value={activeModels?.active_llm}
-                        label={
-                          activeHubModel?.name ||
-                          activeModels?.active_llm?.model ||
-                          "—"
-                        }
-                        onChange={async (slot) => {
-                          try {
-                            await providerApi.setActiveLlm({
-                              ...slot,
-                              scope: "global",
-                            });
-                            await fetchAll(false);
-                          } catch (error) {
-                            message.error(String(error));
-                          }
-                        }}
-                      />
-                    </div>
-
                     {/* ---- Search ---- */}
                     <div className={styles.searchRow}>
                       <Input

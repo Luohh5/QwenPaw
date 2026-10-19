@@ -665,7 +665,8 @@ export default function Sidebar({
       <Tooltip
         key={entry.key}
         title={toolsMode === 2 ? null : entry.label}
-        placement="right"
+        placement="top"
+        trigger={["hover", "focus"]}
       >
         <button
           aria-label={typeof entry.label === "string" ? entry.label : undefined}
@@ -970,18 +971,28 @@ export default function Sidebar({
                         </motion.div>
                       ))}
 
-                      <button
-                        type="button"
-                        className={skin.moreSettings}
-                        data-press
-                        aria-label={t("nav.moreSettings", "More settings")}
-                        onClick={handleOpenSettings}
+                      <Tooltip
+                        title={
+                          toolsMode === 2
+                            ? null
+                            : t("nav.moreSettings", "More settings")
+                        }
+                        placement="top"
+                        trigger={["hover", "focus"]}
                       >
-                        <Settings size={18} />
-                        <span className={skin.navLabel}>
-                          {t("nav.moreSettings", "More settings")}
-                        </span>
-                      </button>
+                        <button
+                          type="button"
+                          className={skin.moreSettings}
+                          data-press
+                          aria-label={t("nav.moreSettings", "More settings")}
+                          onClick={handleOpenSettings}
+                        >
+                          <Settings size={18} />
+                          <span className={skin.navLabel}>
+                            {t("nav.moreSettings", "More settings")}
+                          </span>
+                        </button>
+                      </Tooltip>
                     </motion.div>
                   </motion.div>
                 )}

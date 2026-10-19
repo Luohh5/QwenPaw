@@ -345,16 +345,24 @@ describe("ModelsPage", () => {
     );
   });
 
-  it("renders the default LLM pill with the active model", () => {
+  it("renders the chat and decision model defaults", () => {
     setProviders(
       [makeProvider({ id: "openai", name: "OpenAI", api_key: "sk-x" })],
       {
         active_llm: { provider_id: "openai", model: "gpt-x" },
+        default_models: {
+          chat: { provider_id: "openai", model: "gpt-x" },
+          decision: null,
+        },
       },
     );
     renderWithProviders(<ModelsPage />, { initialEntries: ["/models"] });
-    expect(screen.getByText(/models\.defaultLlm/)).toBeInTheDocument();
-    expect(screen.getByText(/gpt-x/)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "models.defaultChatModel" }),
+    ).toHaveTextContent("OpenAI / gpt-x");
+    expect(
+      screen.getByRole("button", { name: "models.defaultDecisionModel" }),
+    ).toHaveTextContent("models.notSet");
   });
 
   it("groups configured cloud providers by provider_group", () => {
