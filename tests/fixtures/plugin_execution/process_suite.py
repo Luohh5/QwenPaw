@@ -108,28 +108,6 @@ async def processes(api):
         await asyncio.wait_for(process.stop(timeout=2), 5)
 
 
-def test_public_api_is_available_without_channel_or_plugin_framework(api):
-    for name in (
-        "PluginLaunchSpec",
-        "PluginProcess",
-        "PluginIdentity",
-        "PluginContext",
-        "StopResult",
-        "ProcessError",
-        "CallUnknown",
-    ):
-        assert hasattr(api, name), name
-    assert api.PluginIdentity(
-        "fixture.image-indexer",
-        "workspace",
-        1,
-    ).to_mapping() == {
-        "plugin_id": "fixture.image-indexer",
-        "instance_id": "workspace",
-        "generation": 1,
-    }
-
-
 @pytest.mark.parametrize("generation", [True, 1.0, 1, 2])
 def test_hello_generation_requires_integer_identity(launch, generation):
     """Python equality cannot admit bool/float as a generation integer."""

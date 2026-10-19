@@ -733,17 +733,19 @@ class IsolatedChannelProxy(BaseChannel):
             raise ValueError("HOST_STATE_CAPACITY")
         if path:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                dir=path.parent,
-                delete=False,
-            ) as output:
-                temporary = Path(output.name)
-                try:
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    dir=path.parent,
+                    delete=False,
+                ) as output:
+                    temporary = Path(output.name)
                     output.write(raw)
                     output.flush()
                     os.fsync(output.fileno())
-                    os.replace(temporary, path)
-                finally:
+                os.replace(temporary, path)
+            finally:
+                if temporary is not None:
                     temporary.unlink(missing_ok=True)
         self._state = updated
         return {"stored": True}

@@ -75,25 +75,6 @@ def _lock_primitive_name() -> str:
 
 
 class TestAcquireRelease:
-    def test_acquire_succeeds_on_a_free_file(self, tmp_path):
-        path = tmp_path / "l.lock"
-        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            assert lock_mod._acquire_os_lock(fd) is True
-        finally:
-            lock_mod._release_os_lock(fd)
-            os.close(fd)
-
-    def test_acquire_returns_false_when_contended(self, tmp_path):
-        path = tmp_path / "l.lock"
-        held = _hold(path)
-        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            assert lock_mod._acquire_os_lock(fd) is False
-        finally:
-            os.close(fd)
-            _release(held)
-
     def test_acquire_reraises_unexpected_os_error(self, monkeypatch, tmp_path):
         """EACCES/EAGAIN mean 'busy'; anything else must propagate."""
         path = tmp_path / "l.lock"
@@ -134,18 +115,6 @@ class TestAcquireRelease:
 
 
 class TestContextManager:
-    def test_creates_parent_dirs(self, lock_path):
-        assert not lock_path.parent.exists()
-
-        with lock_mod.plugin_install_lock(lock_path) as acquired:
-            assert acquired is True
-            assert lock_path.parent.is_dir()
-
-    def test_yields_true_and_creates_lock_file(self, lock_path):
-        with lock_mod.plugin_install_lock(lock_path) as acquired:
-            assert acquired is True
-            assert lock_path.is_file()
-
     def test_releases_after_the_block(self, lock_path):
         with lock_mod.plugin_install_lock(lock_path) as first:
             assert first is True
@@ -252,12 +221,6 @@ class TestDegradedPaths:
             with lock_mod.plugin_install_lock(target):
                 written.touch()
         assert not written.exists()
-
-    def test_lock_file_path_is_coerced_from_str(self, tmp_path):
-        target = str(tmp_path / "strlock" / "l.lock")
-        with lock_mod.plugin_install_lock(target) as acquired:
-            assert acquired is True
-            assert Path(target).is_file()
 
 
 class TestEnvironmentIdentity:

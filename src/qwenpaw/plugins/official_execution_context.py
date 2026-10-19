@@ -14,6 +14,7 @@ from .execution.bootstrap import validate_private_environment
 
 _PATH_FIELDS = {
     "imessage": ("db_path",),
+    "mqtt": ("tls_ca_certs", "tls_certfile", "tls_keyfile"),
     "wechat": ("bot_token_file",),
 }
 _QQ_ENVIRONMENT = ("QQ_API_BASE", "QQ_TOKEN_URL", "QQ_PORTAL_HOST")

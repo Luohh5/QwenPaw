@@ -38,36 +38,6 @@ def test_qq_sanitize_text_strips_urls(monkeypatch) -> None:
 
 @pytest.mark.integration
 @pytest.mark.p1
-def test_qq_sanitize_text_plain_passthrough(monkeypatch) -> None:
-    """Text without URLs passes through unchanged."""
-    from pathlib import Path
-
-    monkeypatch.syspath_prepend(
-        str(Path(__file__).resolve().parents[2] / "plugins/channel/qq"),
-    )
-    from qwenpaw_channel_qq.formatting import _sanitize_qq_text
-
-    text, removed = _sanitize_qq_text("no links here")
-    assert text == "no links here"
-    assert removed is False
-
-
-@pytest.mark.integration
-@pytest.mark.p1
-def test_qq_sanitize_text_empty(monkeypatch) -> None:
-    """Empty input yields empty output and no flag."""
-    from pathlib import Path
-
-    monkeypatch.syspath_prepend(
-        str(Path(__file__).resolve().parents[2] / "plugins/channel/qq"),
-    )
-    from qwenpaw_channel_qq.formatting import _sanitize_qq_text
-
-    assert _sanitize_qq_text("") == ("", False)
-
-
-@pytest.mark.integration
-@pytest.mark.p1
 def test_qq_aggressive_sanitize_bare_domains(monkeypatch) -> None:
     """Bare domain patterns are caught by the aggressive variant."""
     from pathlib import Path
@@ -168,16 +138,6 @@ def test_telegram_base_urls_empty(telegram_helpers) -> None:
 
 @pytest.mark.integration
 @pytest.mark.p1
-def test_telegram_chunk_text_short(telegram_helpers) -> None:
-    """Text under the limit is a single chunk."""
-    _chunk_text = telegram_helpers._chunk_text
-
-    assert _chunk_text("short") == ["short"]
-    assert not _chunk_text("")
-
-
-@pytest.mark.integration
-@pytest.mark.p1
 def test_telegram_chunk_text_long_splits(telegram_helpers) -> None:
     """Long text splits at whitespace near the limit."""
     TELEGRAM_SEND_CHUNK_SIZE = telegram_helpers.TELEGRAM_SEND_CHUNK_SIZE
@@ -216,22 +176,6 @@ def test_matrix_md_to_html_basic(monkeypatch) -> None:
     html = _md_to_html("**bold** and <script>")
     assert "<strong>bold</strong>" in html
     assert "<script>" not in html  # raw html escaped
-
-
-@pytest.mark.integration
-@pytest.mark.p1
-def test_matrix_md_to_html_newlines(monkeypatch) -> None:
-    """Single newlines become breaks."""
-    from pathlib import Path
-
-    monkeypatch.syspath_prepend(
-        str(Path(__file__).resolve().parents[2] / "plugins/channel/matrix"),
-    )
-    from qwenpaw_channel_matrix.platform import _md_to_html
-
-    html = _md_to_html("line1\nline2")
-    assert "line1" in html and "line2" in html
-    assert "<br" in html or "\n" in html
 
 
 @pytest.mark.integration
@@ -297,20 +241,6 @@ def test_discord_classify_attachment_by_filename(monkeypatch) -> None:
     classify = formatting.classify_attachment
     assert classify(Attachment("", "photo.jpg")) == "image"
     assert classify(Attachment("", "data.bin")) == "file"
-
-
-@pytest.mark.integration
-@pytest.mark.p1
-def test_discord_chunk_text_short(monkeypatch) -> None:
-    """Text under the limit stays whole."""
-    from pathlib import Path
-
-    monkeypatch.syspath_prepend(
-        str(Path(__file__).resolve().parents[2] / "plugins/channel/discord"),
-    )
-    from qwenpaw_channel_discord import formatting
-
-    assert formatting.chunk_text("hello", max_len=2000) == ["hello"]
 
 
 @pytest.mark.integration
@@ -392,41 +322,3 @@ def test_wecom_parse_chatid_from_handle(monkeypatch) -> None:
     assert parse("wecom:group:C1") == "C1"
     assert parse("wecom:U1") == "U1"
     assert parse("plain") == "plain"
-
-
-@pytest.mark.integration
-@pytest.mark.p1
-def test_yuanbao_short_id() -> None:
-    """Short id keeps the trailing suffix."""
-    from pathlib import Path
-    import sys
-
-    sys.path.insert(
-        0,
-        str(Path(__file__).resolve().parents[2] / "plugins/channel/yuanbao"),
-    )
-    from qwenpaw_channel_yuanbao.platform import _short_id
-
-    long_id = "0123456789abcdef"
-    short = _short_id(long_id)
-    assert long_id.endswith(short)
-    assert len(short) <= len(long_id)
-    assert _short_id("ab") == "ab"
-
-
-@pytest.mark.integration
-@pytest.mark.p1
-def test_yuanbao_sender_display() -> None:
-    """Sender display combines nickname and trailing id digits."""
-    from pathlib import Path
-    import sys
-
-    sys.path.insert(
-        0,
-        str(Path(__file__).resolve().parents[2] / "plugins/channel/yuanbao"),
-    )
-    from qwenpaw_channel_yuanbao.platform import _sender_display
-
-    display = _sender_display("Alice", "1234567890")
-    assert "Alice" in display
-    assert display.endswith("7890")

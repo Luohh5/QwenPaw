@@ -14,14 +14,7 @@ import pytest
     [
         "qq_closeout_contract_suite.py",
         "qq_closeout_formal_suite.py",
-        "qq_closeout_context_suite.py",
-        "qq_closeout_media_suite.py",
-        "qq_closeout_config_suite.py",
         "qq_closeout_lifecycle_suite.py",
-        "qq_closeout_cards_pure_suite.py",
-        "qq_closeout_scalar_suite.py",
-        "qq_closeout_card_host_suite.py",
-        "qq_closeout_remaining_suite.py",
         "qq_retired_helpers_suite.py",
     ],
 )

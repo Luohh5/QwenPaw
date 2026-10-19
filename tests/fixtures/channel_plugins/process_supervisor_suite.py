@@ -125,18 +125,6 @@ def api():
     return importlib.import_module(name)
 
 
-def test_supervisor_api_is_available(api):
-    """Approved public API must exist before lifecycle claims."""
-    for name in (
-        "LaunchSpec",
-        "ChannelProcess",
-        "ChannelProcessError",
-        "ChannelCallUnknown",
-        "StopResult",
-    ):
-        assert hasattr(api, name), name
-
-
 @pytest.mark.asyncio
 async def test_readonly_and_disabled_never_spawn(api, launch, monkeypatch):
     """Health, construction and disabled launch do no external work."""

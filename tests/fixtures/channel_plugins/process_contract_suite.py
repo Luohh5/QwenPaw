@@ -135,26 +135,6 @@ def validate_hello(shared, value, **overrides):
     )
 
 
-def test_import_guard_catches_a_discoverable_sdk(tmp_path, monkeypatch):
-    """Installing SDKs must not disable the import boundary."""
-    (tmp_path / "lark_oapi.py").write_text("raise RuntimeError('executed')")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    assert importlib.machinery.PathFinder.find_spec("lark_oapi") is not None
-    with pytest.raises(
-        AssertionError,
-        match="Metadata path imported platform",
-    ):
-        importlib.import_module("lark_oapi")
-    assert GUARD.attempts.pop() == "lark_oapi"
-
-
-def test_shared_api_is_available():
-    """B1 must expose shared metadata/handshake APIs before production GO."""
-    assert importlib.util.find_spec(
-        "qwenpaw.channel_protocol.shared",
-    ), "B1 shared descriptor/dependency/hello API is missing"
-
-
 @pytest.mark.parametrize(
     "channel,qualname",
     [

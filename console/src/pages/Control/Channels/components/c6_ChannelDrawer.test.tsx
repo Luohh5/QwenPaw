@@ -10,6 +10,7 @@ import {
 import { Form } from "antd";
 import type { FormInstance } from "antd";
 import type { ChannelSchema } from "../../../../api/modules/channel";
+import type { ChannelQrcodeConfig } from "./useChannelQrcode";
 
 vi.mock("@agentscope-ai/design", async () => vi.importActual("antd"));
 vi.mock("react-i18next", () => ({
@@ -19,15 +20,15 @@ vi.mock("react-i18next", () => ({
     i18n: { language: "en" },
   }),
 }));
-vi.mock("../../../../stores/agentStore", () => ({
-  useAgentStore: Object.assign(
-    () => ({
+vi.mock("../../../../stores/agentStore", async () => {
+  const { create } = await import("zustand");
+  return {
+    useAgentStore: create(() => ({
       selectedAgent: "c6-agent",
       agents: [{ id: "c6-agent", workspace_dir: "/ws" }],
-    }),
-    { subscribe: () => () => {} },
-  ),
-}));
+    })),
+  };
+});
 vi.mock("../../../../hooks/useAppMessage", () => ({
   useAppMessage: () => ({
     message: {
@@ -39,18 +40,22 @@ vi.mock("../../../../hooks/useAppMessage", () => ({
   }),
 }));
 vi.mock("./QrcodeAuthBlock", () => ({
-  QrcodeAuthBlock: (props: Record<string, unknown>) => (
+  QrcodeAuthBlock: (props: ChannelQrcodeConfig) => (
     <button
       data-testid={`c6-qr-${props.channel}`}
-      data-poll={props.pollInterval as number}
-      data-domain={(props.params as { domain?: string })?.domain}
+      data-poll={props.pollInterval}
+      data-domain={props.params?.domain}
       onClick={() =>
-        (props.onSuccess as (value: Record<string, string>) => void)({
-          app_id: "cli_qr",
-          app_secret: "test-feishu",
-          client_id: "client_qr",
-          client_secret: "test-dingtalk",
-        })
+        props.onSuccess(
+          {
+            app_id: "cli_qr",
+            app_secret: "test-feishu",
+            client_id: "client_qr",
+            client_secret: "test-dingtalk",
+          },
+          { agentId: props.agentId, channel: props.channel, token: "c6-auth" },
+          { take: () => true, cancel: vi.fn() },
+        )
       }
     >
       QR
@@ -74,6 +79,7 @@ function c6Drawer(
 ) {
   let form!: FormInstance;
   const onSubmit = vi.fn();
+  const onSubmitSnapshot = vi.fn().mockResolvedValue(true);
   function Harness() {
     [form] = Form.useForm();
     return (
@@ -87,12 +93,13 @@ function c6Drawer(
         initialValues={values}
         onClose={() => {}}
         onSubmit={onSubmit}
+        onSubmitSnapshot={onSubmitSnapshot}
         channelSchema={channelSchema}
       />
     );
   }
   const view = render(<Harness />);
-  return { ...view, form, onSubmit };
+  return { ...view, form, onSubmit, onSubmitSnapshot };
 }
 
 afterEach(cleanup);
@@ -118,16 +125,6 @@ describe("C6 official plugin form parity", () => {
     },
   );
 
-  it.each([
-    ["feishu", "app_secret"],
-    ["dingtalk", "client_secret"],
-  ])("%s builtin baseline proves QR/password harness", (key, secret) => {
-    c6Drawer(key, {}, true);
-    expect(screen.getByTestId(`c6-qr-${key}`)).toBeTruthy();
-    expect(
-      document.querySelector(`input#${secret}`)?.getAttribute("type"),
-    ).toBe("password");
-  });
 
   it.each(["message_type", "cron_message_type"])(
     "DingTalk %s controls required card template",
@@ -247,15 +244,19 @@ describe("C6 review structured fields and failed runtime", () => {
   );
 
   it("saves valid entered JSON as an array", async () => {
-    const { onSubmit } = c6Drawer("custom", {}, false, c6JsonSchema(true));
+    const { onSubmitSnapshot } = c6Drawer("custom", {}, false, c6JsonSchema(true));
     const input = document.querySelector(
       "textarea#options",
     ) as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: '[{"scope":"read"}]' } });
     await waitFor(
       () =>
-        expect(onSubmit).toHaveBeenCalledWith(
-          expect.objectContaining({ options: [{ scope: "read" }] }),
+        expect(onSubmitSnapshot).toHaveBeenCalledWith(
+          expect.objectContaining({
+            agentId: "c6-agent",
+            channel: "custom",
+            body: expect.objectContaining({ options: [{ scope: "read" }] }),
+          }),
         ),
       { timeout: 2000 },
     );

@@ -484,6 +484,7 @@ async def test_enabling_registered_channel_prepares_once(
         process,
         config,
         workspace_dir=workspace.workspace_dir,
+        defer_process_channels=True,
     )
     workspace.channel_manager.set_workspace(workspace)
     loader.registry.projector = WorkspaceProjector(

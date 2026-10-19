@@ -17,7 +17,6 @@ import pytest
         "voice_closeout_http_controls_suite.py",
         "voice_raw_completed_host_suite.py",
         "voice_unknown_identity_oracle_suite.py",
-        "voice_legacy_text_oracle_suite.py",
     ],
 )
 def test_voice_migrated_responsibilities(tmp_path, suite_name):

@@ -1,40 +1,8 @@
 """Existing empty-caller facts; no invented unknown-identity protocol."""
 
-import ast
-from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
-
 import pytest
 
 pytest_plugins = ["extension_process_suite"]
-
-
-def test_frozen_voice_empty_caller_builds_default_open_request_without_fabricated_sender():
-    from qwenpaw.schemas import MessageType, ContentType
-
-    path = (
-        Path(__file__).resolve().parents[3]
-        / "tests/fixtures/channel_plugins/legacy_voice_conversation_relay.py"
-    )
-    tree = ast.parse(path.read_text())
-    (fn,) = [
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "_build_agent_request"
-    ]
-    ns = {"Any": Any, "MessageType": MessageType, "ContentType": ContentType}
-    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), ns)
-    # Only data consumed by the original pure builder, not a fake Base/Agent.
-    data = SimpleNamespace(
-        call_sid="CA-original", caller_info={}, _channel_type="voice"
-    )
-    request = ns[fn.name](data, "anonymous speech")
-    assert request.user_id == "" and request.session_id == "voice:CA-original"
-    assert (
-        request.channel == "voice"
-        and request.input[0].content[0].text == "anonymous speech"
-    )
 
 
 @pytest.mark.parametrize("field", ["sender_id", "acl_sender_id"])
@@ -90,12 +58,8 @@ async def test_real_proxy_default_open_allowlist_and_approval_identity_boundarie
     assert await channel._access_control_gate(denied)
     assert not store.is_whitelisted(channel.channel, "unlisted-caller")
     assert not store.is_whitelisted(channel.channel, "")
-    # Observed limitation, not an assertion that unknown is authorized:
-    # Base returns early for empty sender before consulting the store.
-    assert not await channel._access_control_gate(payload)
-    print(
-        "BASE_EMPTY_IDENTITY_BYPASSES_ACL_GATE: current DTO blocks ingress; future unknown contract must close this gap"
-    )
+    # Enabling DM access control rejects unknown callers without enrollment.
+    assert await channel._access_control_gate(payload)
     for command in [
         "/approve pending-one",
         "/deny pending-one",

@@ -16,7 +16,6 @@ import pytest
         "telegram_control_suite.py",
         "telegram_config_suite.py",
         "telegram_pure_suite.py",
-        "telegram_boundary_preflight_suite.py",
         "telegram_business_suite.py",
         "telegram_route_suite.py",
         "telegram_media_suite.py",

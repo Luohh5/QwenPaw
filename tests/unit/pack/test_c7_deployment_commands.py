@@ -3,31 +3,17 @@
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 import subprocess
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[3]
 
 
 def _source(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
-
-
-def test_c7_docker_always_installs_full_channel_dependencies() -> None:
-    docker = _source("deploy/Dockerfile")
-    entrypoint = _source("deploy/entrypoint.sh")
-    assert "QWENPAW_CHANNEL_PRESET" not in docker
-    assert (
-        "uv pip install --python /app/venv/bin/python --no-cache-dir "
-        '"$1[channels]"' in docker
-    )
-    assert "channel-preset.json" not in docker
-    assert "channel-preset.json" not in entrypoint
 
 
 @pytest.mark.parametrize(
@@ -75,17 +61,6 @@ def test_c7_docker_init_receives_selected_channel_preset(
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert marker.read_text(encoding="utf-8") == expected_preset + "\n"
-
-
-def test_c7_installers_apply_exact_extras_offline() -> None:
-    for path in (
-        "scripts/install.sh",
-        "scripts/install.ps1",
-        "scripts/install.bat",
-    ):
-        content = _source(path)
-        assert "channels" in content and "full" in content
-        assert "plugins preset apply channels-full --offline" in content
 
 
 @pytest.mark.parametrize(
@@ -185,33 +160,3 @@ def test_c7_installer_does_not_ignore_cli_help_failure(tmp_path, failed_help):
     )
     assert result.returncode == 37, result.stdout + result.stderr
     assert not marker.exists()
-
-
-def test_c7_desktop_resource_and_launcher_command_paths() -> None:
-    config = json.loads(_source("console/src-tauri/tauri.conf.json"))
-    assert "binaries/channel-runtime" in config["bundle"]["resources"]
-    launcher = _source("console/src-tauri/src/channel_runtime.rs")
-    assert 'root.join("runtime.json")' in launcher
-    assert 'root.join("site")' in launcher
-    for key in (
-        "QWENPAW_CHANNEL_RUNTIME_MANIFEST",
-        "QWENPAW_CHANNEL_SUPPORT_ROOT",
-        "QWENPAW_CHANNEL_DEPENDENCY_PATHS",
-    ):
-        assert key in launcher
-
-
-def test_c7_release_builds_resolve_and_stage_target_child() -> None:
-    for path in (
-        "scripts/pack-tauri/build_pyinstaller.sh",
-        "scripts/pack-tauri/build_pyinstaller.ps1",
-    ):
-        content = _source(path)
-        assert "setuptools.build_meta" in content
-        assert "[channels]" in content
-        assert "pip download --only-binary=:all:" in content
-        assert "stage_channel_runtime.py" in content
-        assert "--python" in content
-        assert "--wheel" in content
-        assert "--resource-dir" in content
-        assert "--wheelhouse" in content

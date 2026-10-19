@@ -203,6 +203,7 @@ async def framework(tmp_path):
                 ws._config,
                 ws.on_last_dispatch,
                 workspace_dir=ws.workspace_dir,
+                defer_process_channels=True,
             )
             ws.channel_manager.set_workspace(ws)
             await ws.channel_manager.start_all()

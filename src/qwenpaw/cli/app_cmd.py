@@ -133,6 +133,9 @@ def app_cmd(
     hide_access_paths: tuple[str, ...],
 ) -> None:
     """Run QwenPaw FastAPI app."""
+    global _dependency_restart  # pylint: disable=global-statement
+    _dependency_restart = None
+
     # NOTE: the server intentionally runs UNPRIVILEGED. The Windows
     # restricted-token sandbox no longer requires the whole server to be
     # elevated (which PR #5931 forced via ShellExecuteW("runas"), breaking
@@ -175,8 +178,15 @@ def app_cmd(
     install_shutdown_handlers()
 
     # This is launcher-owned state, not request-supplied restart arguments.
-    global _dependency_restart  # pylint: disable=global-statement
-    if not reload:
+    # Supervisor supplies native process metadata and owns its child's restart.
+    if not reload and not any(
+        key in os.environ
+        for key in (
+            "SUPERVISOR_ENABLED",
+            "SUPERVISOR_PROCESS_NAME",
+            "SUPERVISOR_GROUP_NAME",
+        )
+    ):
         _dependency_restart = {
             "command": [sys.executable, *sys.orig_argv[1:]],
             "cwd": os.getcwd(),

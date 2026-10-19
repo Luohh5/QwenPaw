@@ -229,7 +229,7 @@ class WeChatPlatform:
                 "sender_id": sender,
                 "acl_sender_id": sender,
                 "session_id": session,
-                "user_id": "" if group else sender,
+                "user_id": session if group else sender,
                 "content_parts": parts,
                 "meta": {
                     "wechat_from_user_id": sender,

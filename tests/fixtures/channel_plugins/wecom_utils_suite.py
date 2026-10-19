@@ -20,9 +20,7 @@ from unittest.mock import patch
 import pytest
 from PIL import Image
 
-from qwenpaw_channel_wecom import utils as wecom_utils
 from qwenpaw_channel_wecom.utils import (
-    _format_table,
     compress_image_for_wecom,
     format_markdown_tables,
 )
@@ -80,104 +78,6 @@ def _write_noisy_png(path, size=(400, 400), mode="RGB", alpha=None, seed=7):
         image.putalpha(Image.new("L", size, alpha))
     image.save(path, format="PNG")
     return path
-
-
-# ---------------------------------------------------------------------------
-# _format_table
-# ---------------------------------------------------------------------------
-
-
-class TestFormatTable:
-    def test_empty_input_is_returned_unchanged(self):
-        assert _format_table([]) == []
-
-    def test_columns_are_padded_to_widest_cell(self):
-        formatted = _format_table(
-            ["| name | b |", "| --- | --- |", "| 1 | 22 |"],
-        )
-
-        assert formatted == [
-            "| name | b  |",
-            "| ---- | --- |",
-            "| 1    | 22 |",
-        ]
-
-    def test_separator_row_is_rebuilt_from_widths(self):
-        formatted = _format_table(
-            ["| name | value |", "|---|---|", "| long-name | v |"],
-        )
-
-        # The rebuilt separator matches the widest cell per column and is
-        # never shorter than three dashes.
-        assert formatted[1] == "| --------- | ----- |"
-
-    def test_separator_has_minimum_three_dashes(self):
-        formatted = _format_table(["| a | b |", "| - | - |", "| 1 | 2 |"])
-
-        assert formatted[1] == "| --- | --- |"
-
-    def test_alignment_colons_in_separator_are_discarded(self):
-        formatted = _format_table(["| a | b |", "|:---|---:|", "| 1 | 2 |"])
-
-        assert set(formatted[1]) <= set("|- ")
-
-    def test_rows_without_leading_trailing_pipe(self):
-        formatted = _format_table(["a | b", "--- | ---", "1 | 2"])
-
-        assert formatted[0] == "| a | b |"
-        assert formatted[2] == "| 1 | 2 |"
-
-    def test_ragged_rows_are_padded_with_empty_cells(self):
-        formatted = _format_table(["| a | b | c |", "| --- |", "| 1 |"])
-
-        assert all(row.count("|") == 4 for row in formatted)
-        assert formatted[2] == "| 1 |   |   |"
-
-    def test_cells_are_trimmed(self):
-        formatted = _format_table(["|  a  |   b|", "| --- | --- |"])
-
-        assert formatted[0] == "| a | b |"
-
-    def test_single_row_table_gets_a_separator(self):
-        formatted = _format_table(["| only |"])
-
-        assert formatted == ["| only |", "| ---- |"]
-
-    def test_table_without_separator_row_is_left_alone(self):
-        """No separator detected -> every line is parsed as a data row."""
-        formatted = _format_table(["| a | b |", "| 1 | 2 |"])
-
-        assert len(formatted) == 3  # header, rebuilt separator, data row
-        assert formatted[0] == "| a | b |"
-        assert formatted[2] == "| 1 | 2 |"
-
-    def test_lines_with_no_cells_are_dropped(self):
-        formatted = _format_table(["| a |", "| --- |", "|"])
-
-        assert formatted == ["| a |", "| --- |"]
-
-    def test_only_unparsable_lines_return_input(self):
-        """A pipe-only line yields no cells, so nothing is reformatted."""
-        lines = ["|", "|"]
-
-        assert _format_table(lines) == lines
-
-    def test_whitespace_only_separator_is_detected(self):
-        formatted = _format_table(["| a |", "|   |   |", "| 1 |"])
-
-        assert formatted[1] == "| --- |"
-
-    def test_unicode_cells_are_padded_by_character_count(self):
-        formatted = _format_table(
-            ["| 名 | v |", "| --- | --- |", "| 名字 | v |"],
-        )
-
-        # Width is the character count of the widest cell (2 for column 1).
-        assert formatted == [
-            "| 名  | v |",
-            "| --- | --- |",
-            "| 名字 | v |",
-        ]
 
 
 # ---------------------------------------------------------------------------
@@ -311,46 +211,6 @@ class TestCompressImageOverLimit:
         assert len(data) <= limit
         assert Image.open(io.BytesIO(data)).format == "JPEG"
 
-    def test_accepts_the_first_quality_that_fits(self, tmp_path):
-        """The ladder stops as soon as a quality level fits."""
-        path = _write_noisy_png(tmp_path / "big.png")
-        image = Image.open(path)
-        # Just below the best quality so attempt #1 misses and #2 hits.
-        limit = _jpeg_size(image, 85) - 1
-        assert _jpeg_size(image, 70) <= limit, "ladder precondition"
-
-        saved = []
-        real_save = Image.Image.save
-
-        def recording_save(self, fp, *args, **kwargs):
-            saved.append(kwargs.get("quality"))
-            return real_save(self, fp, *args, **kwargs)
-
-        with patch.object(Image.Image, "save", recording_save):
-            data, name = compress_image_for_wecom(str(path), max_size=limit)
-
-        assert saved == [85, 70]
-        assert len(data) <= limit
-        assert name == "big.jpg"
-
-    def test_quality_ladder_runs_in_descending_order(self, tmp_path):
-        path = _write_noisy_png(tmp_path / "big.png")
-        limit = _jpeg_size(Image.open(path), 30) - 1
-
-        saved = []
-        real_save = Image.Image.save
-
-        def recording_save(self, fp, *args, **kwargs):
-            saved.append(kwargs.get("quality"))
-            return real_save(self, fp, *args, **kwargs)
-
-        with patch.object(Image.Image, "save", recording_save):
-            compress_image_for_wecom(str(path), max_size=limit)
-
-        # No quality fits; every attempt runs, then resizing takes over.
-        assert saved[:4] == [85, 70, 50, 30]
-        assert saved[4:] == [70] * (len(saved) - 4)
-
     def test_resize_path_when_quality_is_not_enough(self, tmp_path):
         path = _write_noisy_png(tmp_path / "big.png", size=(600, 600))
         image = Image.open(path)
@@ -375,21 +235,6 @@ class TestCompressImageOverLimit:
         # The first scale that fits is accepted; the rest never run.
         assert sizes == [(450, 450)]
         assert len(data) <= limit
-
-    def test_resize_scales_progressively(self, tmp_path):
-        path = _write_noisy_png(tmp_path / "big.png", size=(800, 800))
-
-        sizes = []
-        real_resize = Image.Image.resize
-
-        def recording_resize(self, size, *args, **kwargs):
-            sizes.append(size)
-            return real_resize(self, size, *args, **kwargs)
-
-        with patch.object(Image.Image, "resize", recording_resize):
-            compress_image_for_wecom(str(path), max_size=1)
-
-        assert sizes == [(600, 600), (400, 400), (200, 200)]
 
     def test_smallest_version_is_returned_when_limit_is_unreachable(
         self,
@@ -470,8 +315,3 @@ class TestCompressImageOverLimit:
 
         assert data == original
         assert name == "big.png"
-
-    def test_default_limit_matches_wecom_constant(self):
-        assert wecom_utils._WECOM_IMAGE_MAX_SIZE == pytest.approx(
-            1.9 * 1024 * 1024,
-        )

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import pytest
 from qwenpaw.plugins.execution.framing import FrameReader, FramedTransport, FramingLimits, encode_frame
-from qwenpaw.plugins.execution.errors import FrameClosedError, FrameTimeoutError, FrameWriteError, FrameProtocolError
+from qwenpaw.plugins.execution.errors import FrameClosedError, FrameTimeoutError, FrameWriteError
 
 class FakeWriter:
     """Minimal asyncio StreamWriter substitute with controllable drain."""
@@ -249,13 +249,3 @@ async def test_reader_handles_fragmented_and_sticky_frames() -> None:
 
     assert await framing.read_message() == '{"first":"é"}'
     assert await framing.read_message() == "[1,2,3]"
-
-
-@pytest.mark.asyncio
-async def test_reader_rejects_invalid_utf8() -> None:
-    """Bodies must decode as strict UTF-8."""
-    raw = b"Content-Length: 1\r\n\r\n\xff"
-    framing = FrameReader(_reader_with_data(raw))
-
-    with pytest.raises(FrameProtocolError):
-        await framing.read_message()

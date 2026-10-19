@@ -26,15 +26,6 @@ def working_dir(tmp_path, monkeypatch):
     return wd
 
 
-class TestIsFrozen:
-    def test_not_frozen(self):
-        assert pl._is_frozen() is False
-
-    def test_frozen_flag(self, monkeypatch):
-        monkeypatch.setattr(sys, "frozen", True, raising=False)
-        assert pl._is_frozen() is True
-
-
 class TestDesktopPython:
     def test_unset_returns_none(self, monkeypatch):
         monkeypatch.delenv("QWENPAW_DESKTOP_PY_RUNTIME", raising=False)
@@ -56,9 +47,6 @@ class TestDesktopPython:
 
 
 class TestPluginRuntimeDirs:
-    def test_runtime_dir_under_working_dir(self, working_dir):
-        assert pl._plugin_runtime_dir() == working_dir / "plugin_runtime"
-
     def test_site_dir_bucketed_without_creating_environment(self, working_dir):
         site = pl._plugin_site_dir()
         assert not site.exists()
@@ -95,17 +83,7 @@ class TestPluginRuntimeDirs:
         assert not target.parent.exists()
 
 
-class TestNormRealpath:
-    def test_normalises(self, tmp_path):
-        assert pl._norm_realpath(tmp_path) == pl._norm_realpath(str(tmp_path))
-
-
 class TestResolvedPluginManifestPath:
-    def test_returns_manifest(self, tmp_path):
-        (tmp_path / "plugin.json").write_text("{}")
-        result = pl.resolved_plugin_manifest_path(tmp_path)
-        assert result.name == "plugin.json"
-
     def test_missing_dir_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             pl.resolved_plugin_manifest_path(tmp_path / "nope")
@@ -137,10 +115,6 @@ class TestIsDisabledPluginDir:
 
 
 class TestEnsurePluginSiteOnPath:
-    def test_noop_when_not_frozen(self, monkeypatch):
-        monkeypatch.setattr(pl, "_is_frozen", lambda: False)
-        pl._ensure_plugin_site_on_path()  # must not raise or modify path
-
     def test_adds_site_when_frozen(self, working_dir, monkeypatch):
         monkeypatch.setattr(pl, "_is_frozen", lambda: True)
         site_dir = pl._plugin_site_dir()

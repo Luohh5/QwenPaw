@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Isolated entry for six native WeCom approval/card effect controls."""
+"""Run MQTT TLS path regressions without global platform SDK mocks."""
 
 import os
 from pathlib import Path
@@ -7,13 +7,11 @@ import subprocess
 import sys
 
 
-def test_wecom_native_card_effects(tmp_path):
+def test_mqtt_tls_paths(tmp_path):
     suite = (
         Path(__file__).resolve().parents[3]
-        / "fixtures/channel_plugins/wecom_card_effect_closeout_suite.py"
+        / "fixtures/channel_plugins/mqtt_tls_paths_suite.py"
     )
-    for name in ("home", "work", "secret", "backup", "tmp"):
-        (tmp_path / name).mkdir()
     result = subprocess.run(
         [
             sys.executable,
@@ -26,16 +24,12 @@ def test_wecom_native_card_effects(tmp_path):
             str(suite.parent),
             str(suite),
             "-q",
-            "--tb=short",
         ],
         env={
             **os.environ,
             "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
-            "HOME": str(tmp_path / "home"),
-            "TMPDIR": str(tmp_path / "tmp"),
-            "TMP": str(tmp_path / "tmp"),
-            "TEMP": str(tmp_path / "tmp"),
-            "QWENPAW_WORKING_DIR": str(tmp_path / "work"),
+            "PIP_NO_INDEX": "1",
+            "QWENPAW_WORKING_DIR": str(tmp_path / "state"),
             "QWENPAW_SECRET_DIR": str(tmp_path / "secret"),
             "QWENPAW_BACKUP_DIR": str(tmp_path / "backup"),
         },

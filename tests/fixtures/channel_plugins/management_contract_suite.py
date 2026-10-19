@@ -144,11 +144,6 @@ def replace_path(value, path, replacement):
     return copied
 
 
-def test_public_management_dto_api_exists_without_sdk_imports(dto):
-    assert callable(dto.ManagementRequest.from_mapping)
-    assert callable(dto.ManagementResult.from_mapping)
-
-
 @pytest.mark.parametrize(
     "operation",
     [

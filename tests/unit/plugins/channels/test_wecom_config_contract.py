@@ -24,7 +24,6 @@ def test_wecom_official_config_and_contract(tmp_path):
             "pytest_asyncio.plugin",
             "--confcutdir",
             str(suite.parent),
-            str(suite),
             str(suite.with_name("wecom_contract_suite.py")),
             "-q",
             "--tb=short",

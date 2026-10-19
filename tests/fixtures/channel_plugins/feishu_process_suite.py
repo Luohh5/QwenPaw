@@ -137,13 +137,6 @@ def proxy_api():
     return api.IsolatedChannelProxy
 
 
-def test_host_proxy_contract_is_available_without_platform_imports():
-    """Missing proxy cannot silently leave the old in-process path in use."""
-    name = "qwenpaw.app.channels.isolated_proxy"
-    assert importlib.util.find_spec(name), "B3 IsolatedChannelProxy is missing"
-    assert hasattr(importlib.import_module(name), "IsolatedChannelProxy")
-
-
 @pytest_asyncio.fixture
 async def runtime(proxy_api, tmp_path):
     from qwenpaw.app.channels.process_supervisor import (

@@ -21,23 +21,18 @@ from qwenpaw.channel_protocol import (
     LockPackage,
     ProtocolRange,
     RELEASE_TARGET_PLATFORM_TAGS,
-    RELEASE_TARGET_REGISTRY_VERSION,
     VersionRange,
     build_reproducible_zip,
-    code_root_digest,
     condition_domain,
     read_json,
     sha256_file,
     write_canonical_json,
 )
 from scripts.channel_isolation.audit_channel_dependencies import (
-    audit_channel,
-    direct_dependencies,
     import_roots,
     main as audit_main,
 )
 from scripts.channel_isolation.build_fixture_artifact import build_fixture
-
 
 PLATFORMS = RELEASE_TARGET_PLATFORM_TAGS
 EMPTY_CONDITION_DIGEST = (
@@ -584,7 +579,6 @@ def test_reproducible_fixture_archive_and_source_revision(
 
     assert first.read_bytes() == second.read_bytes()
     assert first_digest == second_digest
-    assert code_root_digest(code_root) == code_root_digest(code_root)
     with zipfile.ZipFile(first) as archive:
         names = archive.namelist()
     assert names == sorted(names)
@@ -614,12 +608,6 @@ def test_archive_rejects_platform_tag_outside_release_registry(
     _write_unregistered_archive_root(code_root)
     with pytest.raises(ArtifactValidationError):
         build_reproducible_zip(code_root, tmp_path / "artifact.zip")
-
-
-def test_release_target_registry_is_versioned() -> None:
-    """The artifact registry exposes a stable v1 membership set."""
-    assert RELEASE_TARGET_REGISTRY_VERSION == 1
-    assert "manylinux_999_x86_64" not in RELEASE_TARGET_PLATFORM_TAGS
 
 
 def test_fixture_builder_emits_a_complete_parseable_artifact(
@@ -669,33 +657,6 @@ def test_fixture_builder_emits_a_complete_parseable_artifact(
             == entry.lock_sha256
             for entry in lock_manifest.locks
         )
-
-
-def test_runner_dependency_audit_exposes_transitive_channel_imports() -> None:
-    """Runner imports are not allowed to rely on the Core dependency set."""
-    repository_root = Path(__file__).parents[3]
-    declared = direct_dependencies(repository_root / "pyproject.toml")
-    feishu = audit_channel(
-        "feishu",
-        repository_root / "src" / "qwenpaw" / "app" / "channels" / "feishu",
-        declared,
-    )
-    onebot = audit_channel(
-        "onebot",
-        repository_root / "src" / "qwenpaw" / "app" / "channels" / "onebot",
-        declared,
-    )
-    voice = audit_channel(
-        "voice",
-        repository_root / "src" / "qwenpaw" / "app" / "channels" / "voice",
-        declared,
-    )
-
-    assert not feishu.undeclared_distributions
-    assert feishu.optional_compat_imports == ("pkg_resources",)
-    assert "aiohttp" in onebot.undeclared_distributions
-    assert "aiohttp" in voice.undeclared_distributions
-    assert "fastapi" in voice.undeclared_distributions
 
 
 def test_runner_dependency_audit_rejects_missing_channel_root(

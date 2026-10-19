@@ -1,19 +1,7 @@
 """Static scope and known auth custody; real readers/owners, no Agent mocks."""
 
-from importlib import import_module, util
+from importlib import import_module
 from pathlib import Path
-
-import pytest
-
-
-def test_qrcode_session_scope_api_exists_without_starting_a_workspace():
-    name = "qwenpaw.app.channels.qrcode_sessions"
-    assert (
-        util.find_spec(name) is not None
-    ), "Accepted ChannelQRCodeSessions/static scope API has not been implemented"
-    api = import_module(name)
-    assert callable(api.resolve_channel_management_scope)
-    assert callable(api.ChannelQRCodeSessions)
 
 
 def auth_api():

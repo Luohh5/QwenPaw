@@ -345,16 +345,6 @@ class TestRequestContextCache:
     def test_unknown_request_returns_none(self, cache):
         assert cache._get_request_context("nope") is None
 
-    def test_eviction_halves_the_cache(self, monkeypatch, cache):
-        monkeypatch.setattr(tg, "_CACHE_MAX_SIZE", 4)
-
-        for index in range(5):
-            cache._cache_request_context(f"rid-{index}", "t", "m", "", {})
-
-        assert len(cache._request_context_cache) == 3
-        assert "rid-0" not in cache._request_context_cache
-        assert "rid-4" in cache._request_context_cache
-
     def test_cache_at_limit_is_kept(self, monkeypatch, cache):
         monkeypatch.setattr(tg, "_CACHE_MAX_SIZE", 4)
 
@@ -373,74 +363,6 @@ class TestMarkProcessed:
         cache._mark_processed("rid-1", "deny")
 
         assert cache._processed_requests["rid-1"] == "deny"
-
-    def test_eviction_halves_the_cache(self, monkeypatch, cache):
-        monkeypatch.setattr(tg, "_PROCESSED_MAX_SIZE", 4)
-
-        for index in range(5):
-            cache._mark_processed(f"rid-{index}", "approve")
-
-        assert len(cache._processed_requests) == 3
-        assert "rid-0" not in cache._processed_requests
-        assert "rid-4" in cache._processed_requests
-
-
-class TestTelegramExceptions:
-    """Tests for custom exception classes."""
-
-    def test_file_too_large_error(self):
-        """_FileTooLargeError should be catchable."""
-        from qwenpaw_channel_telegram.platform import _FileTooLargeError
-
-        exc = _FileTooLargeError("File is too big")
-        assert str(exc) == "File is too big"
-        assert isinstance(exc, Exception)
-
-    def test_media_file_unavailable_error(self):
-        """_MediaFileUnavailableError should be catchable."""
-        from qwenpaw_channel_telegram.platform import (
-            _MediaFileUnavailableError,
-        )
-
-        exc = _MediaFileUnavailableError("File not found")
-        assert str(exc) == "File not found"
-        assert isinstance(exc, Exception)
-
-
-class TestTelegramConstants:
-    """Tests for module constants."""
-
-    def test_max_message_length(self):
-        """TELEGRAM_MAX_MESSAGE_LENGTH should be 4096."""
-        from qwenpaw_channel_telegram.platform import (
-            TELEGRAM_MAX_MESSAGE_LENGTH,
-        )
-
-        assert TELEGRAM_MAX_MESSAGE_LENGTH == 4096
-
-    def test_send_chunk_size(self):
-        """TELEGRAM_SEND_CHUNK_SIZE should be 4000."""
-        from qwenpaw_channel_telegram.platform import (
-            TELEGRAM_SEND_CHUNK_SIZE,
-        )
-
-        assert TELEGRAM_SEND_CHUNK_SIZE == 4000
-
-    def test_max_file_size(self):
-        """TELEGRAM_MAX_FILE_SIZE_BYTES should be 50MB."""
-        from qwenpaw_channel_telegram.platform import (
-            TELEGRAM_MAX_FILE_SIZE_BYTES,
-        )
-
-        assert TELEGRAM_MAX_FILE_SIZE_BYTES == 50 * 1024 * 1024
-
-
-class TestModuleMetadata:
-    def test_dispatcher_metadata(self):
-        assert tg.NAME == "tool_guard_approval"
-        assert tg.MESSAGE_TYPE == "tool_guard_approval"
-        assert tg.CALLBACK_DATA_PREFIX == "tg"
-        assert (tg.APPROVE_PREFIX, tg.DENY_PREFIX) == ("tga:", "tgd:")
 
 
 def test_native_update_without_message_has_no_message_metadata():

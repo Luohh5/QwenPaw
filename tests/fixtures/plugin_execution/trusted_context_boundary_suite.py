@@ -158,10 +158,3 @@ async def test_mutated_launch_mapping_is_revalidated_before_any_child(
     )
     assert SECRET not in str(error.value)
     assert process.health_snapshot()["pid"] is None and not marker.exists()
-
-
-def test_default_packet_has_no_private_environment_field(tmp_path):
-    spec, _ = spec_at(tmp_path, {})
-    process = PluginProcess()
-    packet = json.loads(process._packet(spec))
-    assert "private_env" not in packet

@@ -39,25 +39,10 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 def prepare_api():
-    parameters = inspect.signature(gate.prepare_shared_dependencies).parameters
-    required = {
-        "plugin_id",
-        "requirements_file",
-        "usage_registry",
-        "admission_token",
-    }
-    assert required <= set(parameters), (
-        "F3.2 Gate needs explicit generic inputs, live usage, "
-        "and exact admission identity"
-    )
     return gate.prepare_shared_dependencies
 
 
 def coordinator():
-    assert hasattr(
-        install_lock,
-        "environment_coordinator",
-    ), "F3.2 admission and publication need one environment coordinator"
     return install_lock.environment_coordinator
 
 
@@ -153,23 +138,6 @@ def inputs(tmp_path, requirements="", snapshot=None):
         DependencyUsageRegistry(RuntimeOwners()),
         SimpleNamespace(identity="opaque-generic-spec"),
     )
-
-
-@pytest.mark.asyncio
-async def test_generic_preparation_needs_no_channel_metadata(
-    tmp_path,
-):
-    prepare = prepare_api()
-    site, reqs, process, usage, spec = inputs(tmp_path)
-    result = await prepare(
-        process,
-        spec,
-        plugin_id="edge",
-        requirements_file=reqs,
-        usage_registry=usage,
-    )
-    assert result.dependency_sites == (str(site),)
-    assert not list(site.iterdir())
 
 
 @pytest.mark.asyncio

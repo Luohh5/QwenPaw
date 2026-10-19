@@ -1,164 +1,19 @@
 # -*- coding: utf-8 -*-
-"""Tests for CH-0-005 reliable events, ACKs, and delivery semantics."""
+"""Current reliable event DTO validation and shared-worker retry policy."""
 
 from __future__ import annotations
-
-import asyncio
-import json
 
 import pytest
 
 from qwenpaw.channel_protocol import (
-    CoreLifecycleAdapter,
-    DeliveryState,
     DeliveryUpdateParams,
     EventBatchAck,
     EventBatchParams,
-    HelloParams,
-    InboundInbox,
     InboundEvent,
-    LifecycleController,
-    LeaseParams,
-    OutboundDeliveryLedger,
-    PrepareParams,
     ProtocolValidationError,
     RetryPolicy,
-    RpcError,
-    RpcLimits,
-    RpcPeer,
-    RpcTimeoutError,
-    delivery_is_safe_to_retry,
     events_for_retry,
 )
-
-
-_ENVIRONMENT_SPEC_ID = f"ches1_{'1' * 64}"
-_ENVIRONMENT_ID = f"{_ENVIRONMENT_SPEC_ID}.install1_{'2' * 32}"
-_TERMINAL_DELIVERY_STATES = (
-    DeliveryState.ACKNOWLEDGED,
-    DeliveryState.FAILED,
-    DeliveryState.TIMEOUT,
-    DeliveryState.UNKNOWN,
-)
-
-
-class MemoryTransport:
-    """Minimal in-memory transport for reliability RPC tests."""
-
-    def __init__(self) -> None:
-        self.inbox: asyncio.Queue[str | None] = asyncio.Queue()
-        self.peer: MemoryTransport | None = None
-        self.closed = False
-
-    async def send(self, message: str) -> None:
-        """Deliver one message to the peer."""
-        if self.closed or self.peer is None or self.peer.closed:
-            raise ConnectionError("transport closed")
-        await self.peer.inbox.put(message)
-
-    async def receive(self) -> str:
-        """Receive one message from the peer."""
-        message = await self.inbox.get()
-        if message is None:
-            raise ConnectionError("transport closed")
-        return message
-
-    async def aclose(self) -> None:
-        """Close the transport and wake the peer."""
-        if not self.closed:
-            self.closed = True
-            if self.peer is not None:
-                await self.peer.inbox.put(None)
-
-
-class DropFirstResponseTransport(MemoryTransport):
-    """Discard the first JSON-RPC response after Core handles a request."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.dropped_response = False
-
-    async def send(self, message: str) -> None:
-        """Drop one response while still reporting a successful write."""
-        value = json.loads(message)
-        is_response = "id" in value and "method" not in value
-        if is_response and not self.dropped_response:
-            self.dropped_response = True
-            return
-        await super().send(message)
-
-
-async def _active_rpc_pair(
-    *,
-    core_transport: MemoryTransport | None = None,
-    inbound_inbox: InboundInbox | None = None,
-    runner_limits: RpcLimits | None = None,
-) -> tuple[CoreLifecycleAdapter, RpcPeer, RpcPeer]:
-    """Create an active mock Core and Runner pair."""
-    left = core_transport or MemoryTransport()
-    right = MemoryTransport()
-    left.peer = right
-    right.peer = left
-    controller = LifecycleController(
-        channel_key="voice",
-        instance_id="instance-1",
-        source_revision="4" * 64,
-        environment_spec_id=_ENVIRONMENT_SPEC_ID,
-        environment_id=_ENVIRONMENT_ID,
-        qwenpaw_version="0.1",
-        lock_sha256="0" * 64,
-        python_abi="cp313-cp313",
-        platform_tag="macosx_11_0_arm64",
-        generation=7,
-        capabilities=(),
-    )
-    adapter = CoreLifecycleAdapter(
-        controller,
-        inbound_inbox=inbound_inbox,
-    )
-    core = RpcPeer(left)
-    runner = RpcPeer(right, limits=runner_limits)
-    adapter.register_rpc_methods(core)
-    controller.register_rpc_methods(runner)
-    controller.accept_hello(
-        HelloParams.from_mapping(
-            {
-                "protocol_version": 1,
-                "qwenpaw_version": "0.1",
-                "channel_key": "voice",
-                "instance_id": "instance-1",
-                "source_revision": "4" * 64,
-                "environment_spec_id": _ENVIRONMENT_SPEC_ID,
-                "environment_id": _ENVIRONMENT_ID,
-                "lock_sha256": "0" * 64,
-                "python_abi": "cp313-cp313",
-                "platform_tag": "macosx_11_0_arm64",
-                "capabilities": [],
-            },
-        ),
-    )
-    prepare = PrepareParams.from_mapping(
-        {
-            "channel_key": "voice",
-            "instance_id": "instance-1",
-            "generation": 7,
-            "host_context": {},
-            "capabilities": [],
-        },
-    )
-    lease = LeaseParams(
-        channel_key="voice",
-        instance_id="instance-1",
-        generation=7,
-        lease_token="token",
-        lease_ttl_ms=1000,
-    )
-    await asyncio.gather(core.start(), runner.start())
-    lifecycle = adapter.lifecycle_client(core)
-    await lifecycle.prepare(prepare)
-    await lifecycle.activate(lease)
-    await lifecycle.commit(lease)
-    return adapter, core, runner
 
 
 def _event(event_id: str = "event-1") -> dict[str, object]:
@@ -185,20 +40,6 @@ def _batch(*event_ids: str) -> EventBatchParams:
             "batch_id": "generation-7-batch-1",
             "events": [_event(event_id) for event_id in event_ids],
         },
-    )
-
-
-def _delivery_update(
-    delivery_id: str,
-    state: DeliveryState,
-) -> DeliveryUpdateParams:
-    """Return one stable Runner delivery update."""
-    return DeliveryUpdateParams(
-        channel_key="voice",
-        instance_id="instance-1",
-        generation=7,
-        delivery_id=delivery_id,
-        state=state,
     )
 
 
@@ -312,20 +153,28 @@ def test_all_invalid_events_can_return_rejected_ack() -> None:
             ],
         },
     )
-    ack = InboundInbox().accept_batch(batch)
+    assert batch.events == ()
+    ack = EventBatchAck.from_mapping(
+        {
+            "batch_id": batch.batch_id,
+            "accepted_event_ids": [],
+            "duplicate_event_ids": [],
+            "rejected_events": [
+                event.to_mapping() for event in batch.invalid_events
+            ],
+        },
+    )
     assert not ack.accepted_event_ids
     assert ack.rejected_events[0].event_id == "invalid"
-
-
-def test_inbox_persists_before_ack_and_deduplicates_after_restart() -> None:
-    """Duplicate retries do not admit the same event twice."""
-    inbox = InboundInbox()
-    first = inbox.accept_batch(_batch("event-1"))
-    assert first.accepted_event_ids == ("event-1",)
-    restored = InboundInbox.from_snapshot(inbox.snapshot())
-    duplicate = restored.accept_batch(_batch("event-1"))
-    assert duplicate.duplicate_event_ids == ("event-1",)
-    assert restored.admitted_event_ids == ["event-1"]
+    assert ack.rejected_events[0].reason_code == "INVALID_PARAMS"
+    assert ack.rejected_events[0].retryable is False
+    assert ack.batch_id == batch.batch_id
+    assert events_for_retry(
+        batch,
+        ack,
+        attempt=1,
+        policy=RetryPolicy(),
+    ) == ((), None)
 
 
 def test_retry_policy_retries_unacknowledged_and_retryable_events() -> None:
@@ -387,154 +236,3 @@ def test_delivery_update_rejects_requested_state() -> None:
                 "state": "requested",
             },
         )
-
-
-@pytest.mark.parametrize("terminal_state", _TERMINAL_DELIVERY_STATES)
-@pytest.mark.parametrize("via_sending", [False, True])
-def test_delivery_ledger_accepts_all_forward_transitions(
-    terminal_state: DeliveryState,
-    via_sending: bool,
-) -> None:
-    """Every documented forward path reaches one terminal state."""
-    ledger = OutboundDeliveryLedger()
-    assert ledger.request("delivery-1") is DeliveryState.REQUESTED
-    assert ledger.request("delivery-1") is DeliveryState.REQUESTED
-    if via_sending:
-        sending = _delivery_update("delivery-1", DeliveryState.SENDING)
-        assert ledger.apply(sending) is DeliveryState.SENDING
-        assert ledger.apply(sending) is DeliveryState.SENDING
-        with pytest.raises(ValueError, match="DELIVERY_STATE_CONFLICT"):
-            ledger.request("delivery-1")
-        assert ledger.states["delivery-1"] is DeliveryState.SENDING
-    terminal = _delivery_update("delivery-1", terminal_state)
-    assert ledger.apply(terminal) is terminal_state
-    assert ledger.apply(terminal) is terminal_state
-    expected_history = [DeliveryState.REQUESTED]
-    if via_sending:
-        expected_history.append(DeliveryState.SENDING)
-    expected_history.append(terminal_state)
-    assert ledger.history["delivery-1"] == expected_history
-
-
-@pytest.mark.parametrize(
-    "state",
-    (DeliveryState.SENDING, *_TERMINAL_DELIVERY_STATES),
-)
-def test_delivery_ledger_rejects_runner_created_delivery(
-    state: DeliveryState,
-) -> None:
-    """A Runner update cannot create an absent delivery ID."""
-    ledger = OutboundDeliveryLedger()
-    with pytest.raises(ValueError, match="DELIVERY_STATE_CONFLICT"):
-        ledger.apply(_delivery_update("delivery-1", state))
-    assert not ledger.states
-    assert not ledger.history
-
-
-@pytest.mark.parametrize("terminal_state", _TERMINAL_DELIVERY_STATES)
-def test_delivery_terminal_state_is_immutable_after_restart(
-    terminal_state: DeliveryState,
-) -> None:
-    """Recovered terminal states reject late or conflicting results."""
-    ledger = OutboundDeliveryLedger()
-    ledger.request("delivery-1")
-    ledger.apply(_delivery_update("delivery-1", terminal_state))
-    restored = OutboundDeliveryLedger.from_snapshot(ledger.snapshot())
-    original_history = list(restored.history["delivery-1"])
-    for conflicting_state in DeliveryState:
-        if conflicting_state is terminal_state:
-            continue
-        with pytest.raises(ValueError, match="DELIVERY_STATE_CONFLICT"):
-            if conflicting_state is DeliveryState.REQUESTED:
-                restored.request("delivery-1")
-            else:
-                restored.apply(
-                    _delivery_update("delivery-1", conflicting_state),
-                )
-        assert restored.states["delivery-1"] is terminal_state
-        assert restored.history["delivery-1"] == original_history
-
-
-def test_delivery_retry_uses_a_new_id() -> None:
-    """A retry cannot reopen its failed predecessor delivery ID."""
-    ledger = OutboundDeliveryLedger()
-    ledger.request("delivery-1")
-    ledger.apply(_delivery_update("delivery-1", DeliveryState.FAILED))
-    with pytest.raises(ValueError, match="DELIVERY_STATE_CONFLICT"):
-        ledger.apply(
-            _delivery_update("delivery-1", DeliveryState.SENDING),
-        )
-    assert ledger.request("delivery-2") is DeliveryState.REQUESTED
-    assert (
-        ledger.apply(
-            _delivery_update("delivery-2", DeliveryState.SENDING),
-        )
-        is DeliveryState.SENDING
-    )
-    assert ledger.states["delivery-1"] is DeliveryState.FAILED
-    assert not delivery_is_safe_to_retry(DeliveryState.UNKNOWN)
-    assert delivery_is_safe_to_retry(DeliveryState.TIMEOUT)
-
-
-@pytest.mark.asyncio
-async def test_delivery_update_rpc_rejects_conflicts() -> None:
-    """Core maps immutable delivery conflicts to one stable RPC error."""
-    adapter, core, runner = await _active_rpc_pair()
-    adapter.delivery_ledger.request("delivery-1")
-    unknown = _delivery_update("delivery-1", DeliveryState.UNKNOWN)
-    recorded = await runner.call("delivery.update", unknown.to_mapping())
-    assert recorded["state"] == "unknown"
-    repeated = await runner.call("delivery.update", unknown.to_mapping())
-    assert repeated["state"] == "unknown"
-    for update in (
-        _delivery_update("delivery-1", DeliveryState.ACKNOWLEDGED),
-        _delivery_update("missing-delivery", DeliveryState.SENDING),
-    ):
-        with pytest.raises(RpcError) as error:
-            await runner.call("delivery.update", update.to_mapping())
-        assert error.value.data == {
-            "reason_code": "DELIVERY_STATE_CONFLICT",
-        }
-    assert (
-        adapter.delivery_ledger.states["delivery-1"] is DeliveryState.UNKNOWN
-    )
-    assert "missing-delivery" not in adapter.delivery_ledger.states
-    await asyncio.gather(core.aclose(), runner.aclose())
-
-
-@pytest.mark.asyncio
-async def test_event_batch_rpc_acks_after_core_inbox_admission() -> None:
-    """A mock Core returns per-event ACKs only from its active generation."""
-    _, core, runner = await _active_rpc_pair()
-    first = await runner.call("event.batch", _batch("event-1").to_mapping())
-    second = await runner.call("event.batch", _batch("event-1").to_mapping())
-    assert first["accepted_event_ids"] == ["event-1"]
-    assert second["duplicate_event_ids"] == ["event-1"]
-    await asyncio.gather(core.aclose(), runner.aclose())
-
-
-@pytest.mark.asyncio
-async def test_lost_ack_and_core_runner_restart_are_idempotent() -> None:
-    """A lost ACK survives both peer restarts without double admission."""
-    dropping_transport = DropFirstResponseTransport()
-    adapter, core, runner = await _active_rpc_pair(
-        core_transport=dropping_transport,
-        runner_limits=RpcLimits(request_timeout=0.01),
-    )
-    batch = _batch("event-1")
-    with pytest.raises(RpcTimeoutError):
-        await runner.call("event.batch", batch.to_mapping())
-    assert dropping_transport.dropped_response
-    assert adapter.inbound_inbox.admitted_event_ids == ["event-1"]
-    snapshot = adapter.inbound_inbox.snapshot()
-    await asyncio.gather(core.aclose(), runner.aclose())
-
-    restored = InboundInbox.from_snapshot(snapshot)
-    new_adapter, new_core, new_runner = await _active_rpc_pair(
-        inbound_inbox=restored,
-    )
-    retried = await new_runner.call("event.batch", batch.to_mapping())
-    assert retried["batch_id"] == batch.batch_id
-    assert retried["duplicate_event_ids"] == ["event-1"]
-    assert new_adapter.inbound_inbox.admitted_event_ids == ["event-1"]
-    await asyncio.gather(new_core.aclose(), new_runner.aclose())

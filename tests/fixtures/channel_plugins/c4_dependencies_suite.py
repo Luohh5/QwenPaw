@@ -16,6 +16,7 @@ import zipfile
 import pytest
 
 from process_supervisor_suite import alive, digest, eventually
+from qwenpaw.plugins.dependency_maintenance import lease_environment
 
 pytest_plugins = ["process_supervisor_suite"]
 
@@ -365,6 +366,7 @@ async def test_known_local_wheel_addition_then_satisfied_zero_wheel_read(
         requirements="c4-fixture-sdk==2.5\n",
         dependency_paths=(site,),
     )
+    lease_environment(spec.dependency_paths)
     addition = wheel(tmp_path)
     gate = gate_api()
     snapshot = await gate.prepare_shared_dependencies(
@@ -438,6 +440,7 @@ async def test_unsafe_addition_refused_without_site_mutation(
         requirements="c4-fixture-sdk==2.5\n",
         dependency_paths=(site,),
     )
+    lease_environment(spec.dependency_paths)
     with pytest.raises(RuntimeError):
         await gate_api().prepare_shared_dependencies(
             processes(),
@@ -468,6 +471,7 @@ async def test_held_environment_lock_means_zero_package_writes(
         requirements="c4-fixture-sdk==2.5\n",
         dependency_paths=(site,),
     )
+    lease_environment(spec.dependency_paths)
     addition = wheel(tmp_path)
     with lock.plugin_install_lock(lock.environment_install_lock_path(site)):
         with pytest.raises(RuntimeError):
@@ -509,6 +513,7 @@ from qwenpaw.plugins.dependency_gate import (
 )
 from qwenpaw.app.channels.process_supervisor import ChannelProcess, LaunchSpec
 from qwenpaw.plugins.dependency_usage import DependencyUsageRegistry
+from qwenpaw.plugins.dependency_maintenance import lease_environment
 from qwenpaw.plugins.ownership import RuntimeOwners
 
 
@@ -519,6 +524,7 @@ async def main():
     value["dependency_paths"] = tuple(
         Path(p) for p in value["dependency_paths"]
     )
+    lease_environment(value["dependency_paths"])
     process = ChannelProcess()
     result = await prepare_shared_dependencies(
         process,
@@ -603,6 +609,7 @@ async def test_interrupted_publication_retains_repair_blocker(
         requirements="c4-fixture-sdk==2.5\n",
         dependency_paths=(site,),
     )
+    lease_environment(spec.dependency_paths)
     addition = wheel(tmp_path)
     entered, release = threading.Event(), threading.Event()
 
@@ -781,6 +788,10 @@ async def test_installed_support_layout_preserves_sdk_metadata_in_same_site(
     site.mkdir()
     for relative in ("qwenpaw/plugins/execution", "qwenpaw/channel_protocol"):
         shutil.copytree(ROOT / "src" / relative, site / relative)
+    shutil.copyfile(
+        ROOT / "src/qwenpaw/plugins/dependency_maintenance.py",
+        site / "qwenpaw/plugins/dependency_maintenance.py",
+    )
     metadata(site)
     spec, marker = launch(
         requirements="c4-fixture-sdk==2.5\n",
@@ -854,6 +865,7 @@ async def test_valid_sdk_sized_wheel_exceeds_lark_real_record_profile(
         requirements="c4-fixture-sdk==2.5\n",
         dependency_paths=(site,),
     )
+    lease_environment(spec.dependency_paths)
     snapshot = await gate_api().prepare_shared_dependencies(
         processes(),
         spec,
@@ -1044,6 +1056,7 @@ async def test_conflicting_singleton_metadata_is_rejected(
             tmp_path,
             extra={"c4_fixture_sdk-2.5.dist-info/METADATA": raw},
         )
+        lease_environment(spec.dependency_paths)
         with pytest.raises(RuntimeError):
             await gate_api().prepare_shared_dependencies(
                 process,

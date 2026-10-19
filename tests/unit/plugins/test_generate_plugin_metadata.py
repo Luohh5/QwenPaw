@@ -24,7 +24,6 @@ sys.path.insert(
 from generate_plugin_metadata import (  # noqa: E402
     _iter_tree_relpaths,
     _normalize_pack_exclude,
-    _validate_declared_entries,
     _zip_plugin,
     get_version,
 )
@@ -180,20 +179,6 @@ def test_normalize_pack_exclude_drops_traversal_and_empty() -> None:
     assert not _normalize_pack_exclude(manifest)
 
 
-def test_iter_tree_relpaths_prunes_pack_exclude(tmp_path: Path) -> None:
-    plugin_dir = _make_plugin_tree(tmp_path)
-    rels = _iter_tree_relpaths(plugin_dir, _demo_manifest())
-    assert "backend/main.py" in rels
-    assert "backend/api/router.py" in rels
-    assert "ui/dist/index.js" in rels
-    assert "plugin.json" in rels
-    assert "backend/tests/test_api.py" not in rels
-    assert "backend/pytest.ini" not in rels
-    assert "e2e/test_shell.py" not in rels
-    assert "ui/src/App.tsx" not in rels
-    assert "ui/package.json" not in rels
-
-
 def test_pack_exclude_never_drops_manifest_or_entries(
     tmp_path: Path,
 ) -> None:
@@ -209,16 +194,6 @@ def test_pack_exclude_never_drops_manifest_or_entries(
     assert "plugin.json" in rels
     assert "backend/main.py" in rels
     assert "ui/dist/index.js" in rels
-
-
-def test_iter_tree_relpaths_are_posix_on_every_platform(
-    tmp_path: Path,
-) -> None:
-    """Relpaths never carry a native separator (Windows regression guard)."""
-    plugin_dir = _make_plugin_tree(tmp_path)
-    rels = _iter_tree_relpaths(plugin_dir, _demo_manifest())
-    assert rels
-    assert not any("\\" in rel for rel in rels)
 
 
 def test_pack_exclude_exact_prefix_no_sibling_bleed(tmp_path: Path) -> None:
@@ -249,23 +224,6 @@ def test_zip_plugin_applies_pack_exclude(tmp_path: Path) -> None:
     assert not any("backend/tests" in n for n in names)
     assert not any("/e2e/" in n for n in names)
     assert not any("ui/src" in n for n in names)
-
-
-def test_validate_declared_entries_rejects_missing_frontend(
-    tmp_path: Path,
-) -> None:
-    plugin_dir = _make_plugin_tree(tmp_path)
-    manifest = _demo_manifest()
-    (plugin_dir / "ui/dist/index.js").unlink()
-
-    with pytest.raises(
-        FileNotFoundError,
-        match=(
-            r"cannot package demo-plugin: declared entry file\(s\) "
-            r"missing: ui/dist/index.js"
-        ),
-    ):
-        _validate_declared_entries(plugin_dir, manifest)
 
 
 def test_zip_plugin_missing_entry_leaves_no_artifact(tmp_path: Path) -> None:

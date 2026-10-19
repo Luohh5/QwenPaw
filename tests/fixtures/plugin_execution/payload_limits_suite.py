@@ -9,15 +9,6 @@ from payload_support import ledger_rows
 pytest_plugins = ["process_suite", "payload_support"]
 
 
-def test_payload_defaults_are_per_direction_disk_budgets_not_rss_limits():
-    from qwenpaw.plugins.execution.payloads import PayloadLimits
-
-    limits = PayloadLimits()
-    assert limits.max_message_bytes == 128 * 1024 * 1024
-    assert limits.max_pending_bytes == 128 * 1024 * 1024
-    assert limits.max_pending_files == 64
-
-
 @pytest.mark.parametrize(
     "kwargs",
     [

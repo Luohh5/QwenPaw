@@ -792,9 +792,17 @@ def schedule_maintenance(manager, directory, operation):
     script = worker / "dependency_worker.py"
     command = [operation["worker_python"], "-I", "-S", str(script)]
     operation["instructions"] = [
-        "Stop this backend and its channel processes, then run: "
-        + shlex.join(command),
-        "The worker applies the retained plan and resumes installation; restart the backend after it finishes.",
+        "Stop this backend and its channel processes through their service manager, "
+        "and keep them stopped during maintenance. For Supervisor's app program: "
+        "supervisorctl -c /path/to/supervisord.conf stop app "
+        "(use your actual config and program name).",
+        "Then run the retained worker: " + shlex.join(command),
+        "The worker applies the retained plan and resumes installation. After success "
+        "or confirmed safe rollback, restart through the original launcher or service "
+        "manager. For Supervisor: supervisorctl -c /path/to/supervisord.conf start app.",
+        "If DEPENDENCY_REPAIR_REQUIRED is reported, keep the backend stopped and "
+        "recover using the same retained worker. Never edit operation.json or run "
+        "pip outside the retained transaction.",
     ]
     manager._save(directory, operation)
     if shutdown is not None and restart is not None:

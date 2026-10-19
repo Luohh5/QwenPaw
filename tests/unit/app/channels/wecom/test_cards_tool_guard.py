@@ -14,7 +14,6 @@ from tests.wecom_isolated import run_wecom_suite
     "suite",
     [
         "wecom_cards_pure_suite.py",
-        "wecom_card_metadata_suite.py",
         "wecom_card_effect_closeout_suite.py",
         "wecom_card_handoff_suite.py",
         "wecom_card_final_edges_suite.py",

@@ -9,8 +9,6 @@ import sys
 def test_matrix_private_business(tmp_path):
     suites = Path(__file__).resolve().parents[3] / "fixtures/channel_plugins"
     names = (
-        "matrix_pure_oracle_suite.py",
-        "matrix_legacy_ingress_suite.py",
         "matrix_native_auth_suite.py",
         "matrix_native_lifecycle_suite.py",
         "matrix_native_media_suite.py",

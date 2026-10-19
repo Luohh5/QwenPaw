@@ -1977,7 +1977,9 @@ export function ChannelDrawer({
         ? values
         : auth_method === "password"
         ? { ...rest, access_token: "" }
-        : { ...rest, password: "", encryption: false };
+        : auth_method === "token"
+        ? { ...rest, password: "", encryption: false }
+        : rest;
     const job = captureChannelSaveJob({
       agentId,
       channel: activeKey,
@@ -2191,9 +2193,8 @@ export function ChannelDrawer({
             <Switch disabled={activeKey === "console"} />
           </Form.Item>
 
-          {isBuiltin || activeKey === "feishu" || activeKey === "dingtalk"
-            ? renderKnownChannelFields(activeKey)
-            : renderCustomExtraFields(initialValues)}
+          {renderKnownChannelFields(activeKey) ??
+            (isBuiltin ? null : renderCustomExtraFields(initialValues))}
 
           <Collapse
             {...disclosureProps}

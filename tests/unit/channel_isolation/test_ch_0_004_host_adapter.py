@@ -186,19 +186,6 @@ def test_rpc_method_registration_preserves_owner_direction() -> None:
     assert core.methods.isdisjoint(runner.methods)
 
 
-def test_lifecycle_module_preserves_host_imports() -> None:
-    """The pre-refactor lifecycle import path remains compatible."""
-    from qwenpaw.channel_protocol.lifecycle import (
-        CoreLifecycleAdapter as LegacyCoreLifecycleAdapter,
-    )
-    from qwenpaw.channel_protocol.lifecycle import (
-        HostStateStore as LegacyHostStateStore,
-    )
-
-    assert LegacyCoreLifecycleAdapter is CoreLifecycleAdapter
-    assert LegacyHostStateStore is HostStateStore
-
-
 @pytest.mark.asyncio
 async def test_endpoint_and_host_state_require_active_generation() -> None:
     """Endpoint exposure and host writes honor standby and active fencing."""

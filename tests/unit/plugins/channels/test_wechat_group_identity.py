@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Isolated entry for media closeout."""
+"""Isolated entry for native WeChat group admission regressions."""
 
 import os
 from pathlib import Path
@@ -7,13 +7,11 @@ import subprocess
 import sys
 
 
-def test_wecom_media_closeout(tmp_path):
+def test_wechat_group_identity_contract(tmp_path):
     suite = (
         Path(__file__).resolve().parents[3]
-        / "fixtures/channel_plugins/wecom_media_closeout_suite.py"
+        / "fixtures/channel_plugins/wechat_group_identity_suite.py"
     )
-    for name in ("home", "work", "secret", "backup", "tmp"):
-        (tmp_path / name).mkdir()
     result = subprocess.run(
         [
             sys.executable,
@@ -26,15 +24,11 @@ def test_wecom_media_closeout(tmp_path):
             str(suite.parent),
             str(suite),
             "-q",
-            "--tb=short",
         ],
         env={
             **os.environ,
             "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
-            "HOME": str(tmp_path / "home"),
-            "TMPDIR": str(tmp_path / "tmp"),
-            "TMP": str(tmp_path / "tmp"),
-            "TEMP": str(tmp_path / "tmp"),
+            "PIP_NO_INDEX": "1",
             "QWENPAW_WORKING_DIR": str(tmp_path / "work"),
             "QWENPAW_SECRET_DIR": str(tmp_path / "secret"),
             "QWENPAW_BACKUP_DIR": str(tmp_path / "backup"),

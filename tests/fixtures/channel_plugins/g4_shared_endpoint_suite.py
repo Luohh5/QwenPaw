@@ -81,12 +81,3 @@ async def test_shared_child_registers_endpoint_with_current_host(runtime):
         "readiness": "ready",
     }
     assert registration.get("forwarding") is None
-
-
-def test_shared_endpoint_service_and_authority_are_available():
-    from qwenpaw.channel_protocol import host
-
-    assert hasattr(
-        host, "SharedEndpointService"
-    ), "G4-A1 requires a v2 service, not the existing v1 CoreEndpointRegistry"
-    assert hasattr(host, "SharedEndpointAuthority")

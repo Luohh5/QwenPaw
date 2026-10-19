@@ -164,6 +164,26 @@ def _validated_channel_config(name: str, values: dict):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+def _save_channel_updates(agent_id: str, updates: dict) -> ChannelConfig:
+    """Merge only requested channels into the latest persisted config."""
+    from ...config.config import mutate_agent_config
+
+    def apply_channels(candidate: Any) -> None:
+        current = candidate.channels.model_dump() if candidate.channels else {}
+        candidate.channels = ChannelConfig.model_validate(
+            {**current, **updates},
+        )
+
+    try:
+        saved = mutate_agent_config(agent_id, apply_channels)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=exc.errors(include_context=False),
+        ) from exc
+    return saved.channels
+
+
 _ALLOWED_ACP_TOOL_PARSE_MODES = {
     "call_title",
     "update_detail",
@@ -297,17 +317,17 @@ async def put_channels(
     ),
 ) -> ChannelConfig:
     """Update all channel configs."""
-    from ...config.config import save_agent_config
+    from ...config.config import load_agent_config
     from ..agent_context import get_agent_for_request
 
     agent = await get_agent_for_request(request)
-    current = (
-        agent.config.channels.model_dump() if agent.config.channels else {}
-    )
+    persisted = load_agent_config(agent.agent_id)
+    current = persisted.channels.model_dump() if persisted.channels else {}
     from ...plugins.channel_config import channel_config_dict
 
     incoming = channel_config_dict(channels_config)
     keys = getattr(channels_config, "model_fields_set", incoming.keys())
+    updates = {}
     disabled = []
     other_changes = []
     for key in keys:
@@ -316,23 +336,14 @@ async def put_channels(
             disabled.append(key)
         elif current.get(key) != value:
             other_changes.append(key)
-        current[key] = value
-    try:
-        channels_config = ChannelConfig.model_validate(current)
-    except ValidationError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=exc.errors(include_context=False),
-        ) from exc
+        updates[key] = value
     sessions = getattr(request.app.state, "channel_qrcode_sessions", None)
     async with AsyncExitStack() as stack:
         if sessions is not None and disabled:
             await stack.enter_async_context(
                 sessions.operation_guard(agent.agent_id, tuple(disabled)),
             )
-        candidate = agent.config.model_copy(deep=True)
-        candidate.channels = channels_config
-        save_agent_config(agent.agent_id, candidate)
+        saved_channels = _save_channel_updates(agent.agent_id, updates)
         if sessions is not None and other_changes:
             await stack.enter_async_context(
                 sessions.operation_guard(agent.agent_id, tuple(other_changes)),
@@ -341,7 +352,7 @@ async def put_channels(
     # Hot reload config (async, non-blocking)
     schedule_agent_reload(request, agent.agent_id)
 
-    return channels_config
+    return saved_channels
 
 
 # ── Channel health check & restart ─────────────────────────────────────────
@@ -799,8 +810,10 @@ async def put_channel(
         return channel_config
 
     agent = await get_agent_for_request(request)
+    persisted = load_agent_config(agent.agent_id)
+    current = persisted.channels.model_dump() if persisted.channels else {}
     available = get_configurable_channel_catalog(
-        agent.config.channels.model_dump() if agent.config.channels else (),
+        current,
     )
     if channel_name not in available:
         raise HTTPException(
@@ -812,22 +825,22 @@ async def put_channel(
         channel_name,
         single_channel_config,
     )
-    current = (
-        agent.config.channels.model_dump() if agent.config.channels else {}
-    )
     disabling = current.get(channel_name, {}).get(
         "enabled",
     ) and not channel_config.get("enabled")
     changed = current.get(channel_name) != channel_config
     sessions = getattr(request.app.state, "channel_qrcode_sessions", None)
-    current[channel_name] = channel_config
-    candidate = agent.config.model_copy(deep=True)
-    candidate.channels = ChannelConfig.model_validate(current)
     if sessions is not None and disabling:
         async with sessions.operation_guard(agent.agent_id, channel_name):
-            save_agent_config(agent.agent_id, candidate)
+            saved_channels = _save_channel_updates(
+                agent.agent_id,
+                {channel_name: channel_config},
+            )
     else:
-        save_agent_config(agent.agent_id, candidate)
+        saved_channels = _save_channel_updates(
+            agent.agent_id,
+            {channel_name: channel_config},
+        )
         if sessions is not None and changed:
             async with sessions.operation_guard(agent.agent_id, channel_name):
                 pass
@@ -835,7 +848,7 @@ async def put_channel(
     # Hot reload config (async, non-blocking)
     schedule_agent_reload(request, agent.agent_id)
 
-    return channel_config
+    return saved_channels.model_dump(mode="json")[channel_name]
 
 
 @router.get(

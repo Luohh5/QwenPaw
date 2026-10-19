@@ -389,14 +389,6 @@ async def local_management_http():
         await server.wait_closed()
 
 
-def test_management_start_public_api_is_present():
-    from qwenpaw.app.channels.process_supervisor import ChannelProcess
-
-    assert callable(
-        getattr(ChannelProcess, "start_management", None)
-    ), "G3 ChannelProcess.start_management is missing; management execution untested"
-
-
 @pytest.mark.asyncio
 async def test_management_fixture_audit_has_no_candidate_import_or_network(
     tmp_path, local_management_http

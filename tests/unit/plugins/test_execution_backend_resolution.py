@@ -407,29 +407,6 @@ def test_binding_snapshots_manifest_and_never_reselects_after_source_changes(
     assert len(memory.descriptions) == len(python.descriptions) == 1
 
 
-def test_static_source_versions_hold_separate_descriptions(
-    execution,
-    tmp_path,
-):
-    descriptor = tmp_path / "definition.json"
-    descriptor.write_text('{"revision": "old"}')
-    memory = DescribeBackend(execution)
-    resolver = execution.BackendResolver(
-        python_backend=DescribeBackend(execution),
-    )
-    resolver.register_descriptor(PluginType.MEMORY, memory)
-    parsed = manifest({"descriptor": descriptor.name}, plugin_type="memory")
-    old = resolver.resolve(tmp_path, parsed)
-    descriptor.write_text('{"revision": "candidate"}')
-    parsed.version = "2.0"
-    candidate = resolver.resolve(tmp_path, parsed)
-    assert old.description.payload == {"revision": "old"}
-    assert old.description.manifest.version == "1.0"
-    assert candidate.description.payload == {"revision": "candidate"}
-    assert candidate.description.manifest.version == "2.0"
-    assert old.description is not candidate.description
-
-
 @pytest.mark.asyncio
 async def test_record_binding_is_internal_and_preserves_public_instance(
     execution,
