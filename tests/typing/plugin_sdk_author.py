@@ -251,6 +251,10 @@ async def driver_contract(
     assert_type(context.session_scope, str)
     assert_type(context.credentials, DriverCredentialAccess)
     assert_type(context.credentials.aliases, tuple[str, ...])
+    assert_type(
+        await context.credentials.resolve_runtime("oauth"),
+        Mapping[str, JSONValue],
+    )
     assert_type(await context.subprocess_environment(), Mapping[str, str])
     credential = assert_type(
         await context.credentials.resolve("oauth"),

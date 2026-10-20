@@ -96,7 +96,7 @@
 | `DriverCallResult` | `content: tuple[ContentBlock, ...]`、`is_error: bool`、`structured_content: JSONValue`、JSON `metadata`；不返回 MCP SDK/AgentScope 类型 |
 | `DriverRequestContext` | 宿主提供的工作区实例、会话、用户、渠道身份、deadline、取消检查；插件不能修改身份或决定审批结果 |
 | `DriverCredential` | 本来源凭据的 `kind`、`revision: int`、只读 `public/secrets`；只交给受限来源上下文，不进入日志或 API 响应 |
-| `DriverCredentialAccess` | 只读 `aliases: tuple[str, ...]` 列出本来源声明的别名；`resolve(alias: str) -> Awaitable[DriverCredential]`；`update(alias, *, expected_revision, public, secrets) -> Awaitable[None]`；只允许本来源已声明别名 |
+| `DriverCredentialAccess` | 只读 `aliases: tuple[str, ...]` 列出本来源声明的别名；`resolve(alias: str) -> Awaitable[DriverCredential]` 读取原始版本化记录；`resolve_runtime(alias: str) -> Awaitable[Mapping[str, JSONValue]]` 按已声明种类惰性生成只读运行值（复用通用凭据 provider，不暴露引用）；`update(alias, *, expected_revision, public, secrets) -> Awaitable[None]`；只允许本来源已声明别名 |
 | `DriverContext` | `plugin_id/generation/workspace_id/workspace_instance_id/source_id/source_revision/session_scope`、`source: DriverSource`、`resources`、`logger`、`credentials`；`invalidate_capabilities() -> None` 仅标记本来源缓存失效；`subprocess_environment() -> Awaitable[Mapping[str, str]]` 按明确请求返回只读的用户持久化环境快照，不返回整个宿主进程环境 |
 | `DriverConnection` | `open() -> Awaitable[None]`；`discover(request: DriverRequestContext) -> Awaitable[tuple[DriverCapabilitySpec, ...]]`；`invoke(name: str, arguments: Mapping[str, JSONValue], request: DriverRequestContext) -> Awaitable[DriverCallResult]`；`close() -> Awaitable[None]` |
 | `DriverProtocolSpec` | `protocol: str`；`validate: Callable[[DriverSource], None]`；`create: Callable[[DriverContext, DriverSource], DriverConnection]` |
@@ -216,7 +216,7 @@
 - [x] **Step 2:** 写 `test_driver_calls_block_plugin_reload`、`test_partial_open_cancel_closes_every_created_connection`、`test_failed_close_retains_owner`、`test_old_revision_cannot_publish`。
 - [x] **Step 3:** 运行 `PYTHONPATH=src python -m pytest -q tests/unit/plugins/test_sdk_driver_lifecycle.py`，确认缺少桥接和清理能力导致失败。
 - [x] **Step 4:** 实现桥接、来源级资源账本、受限凭据能力和调用活动计数；修复并发初始化取消窗口。审批和白名单检查由宿主先执行，插件不能绕过。
-- [ ] **Step 5:** 重跑新测试及 `tests/unit/drivers/test_transient_scopes.py`，全部通过后提交；保留现有内部来源调用签名。
+- [x] **Step 5:** 重跑新测试及 `tests/unit/drivers/test_transient_scopes.py`，全部通过后提交；保留现有内部来源调用签名。
 
 ### Task 4 实现仅依赖 SDK 的 MCP 插件后端
 
@@ -224,10 +224,10 @@
 
 **Interfaces:** 消费 Task 2、3；manifest 声明 `sdk.version=1.1.0` 和 `drivers`，通过 `DriverProtocolSpec(protocol="mcp", ...)` 登记。资源在安装前不可自动发现。
 
-- [ ] **Step 1:** 把现有 stdio、SSE、streamable HTTP 的行为测试转为公开协议入口测试；固定超时、HTTP 协议兼容/回退、认证、重连、取消、白名单、名称转换和结构化结果。
-- [ ] **Step 2:** 运行 `PYTHONPATH=src python -m pytest -q tests/unit/plugins/mcp`，确认插件缺失或不符合契约导致失败。
-- [ ] **Step 3:** 迁移已有实现并适配公开 DTO，不顺便替换协议栈。移除内部导入；连接运行时与管理 HTTP 分文件，entry 仅登记协议和管理能力。
-- [ ] **Step 4:** 通过 Task 3 的宿主测试入口验证发现、策略、实际调用和关闭；保持原 capability ID、工具名称、内容块、错误和结构化结果。
+- [x] **Step 1:** 通过公开协议入口验证 stdio、SSE、streamable HTTP 的发现、治理与调用；同时迁移保留细粒度 transport 单元断言，固定超时、HTTP 协议兼容/回退、认证、重连、取消、白名单、名称转换和结构化结果。
+- [x] **Step 2:** 运行 `PYTHONPATH=src python -m pytest -q tests/unit/plugins/mcp`，确认插件缺失或不符合契约导致失败。
+- [x] **Step 3:** 迁移已有实现并适配公开 DTO，不顺便替换协议栈。移除内部导入；连接运行时与管理 HTTP 分文件，entry 仅登记协议和管理能力。
+- [x] **Step 4:** 通过 Task 3 的宿主测试入口验证发现、策略、实际调用和关闭；保持原 capability ID、工具名称、内容块、错误和结构化结果。
 - [ ] **Step 5:** 执行 `PYTHONPATH=src python -m qwenpaw.plugins.check plugins/protocol/mcp`；第三方 MCP 依赖允许，宿主内部依赖为零；测试通过后提交。
 
 ### Task 5 改造工作区为惰性 Driver 服务并按需保留两秒扫描

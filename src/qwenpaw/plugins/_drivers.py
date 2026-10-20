@@ -9,6 +9,7 @@ import re
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict
 from uuid import uuid4
+from weakref import WeakValueDictionary
 
 from .drivers import (
     DriverCallResult,
@@ -91,9 +92,23 @@ async def _environment(plugin, check):
 
 
 class CredentialAccess:
-    def __init__(self, card, store, check, guard, plugin):
+    def __init__(
+        self,
+        card,
+        store,
+        check,
+        guard,
+        plugin,
+        resources,
+        runtime_locks,
+        workspace_instance,
+    ):
         self._card, self._store, self._check = card, store, check
         self._guard, self._plugin = guard, plugin
+        self._resources = resources
+        self._runtime = {}
+        self._runtime_locks = runtime_locks
+        self._workspace_instance = workspace_instance
 
     @property
     def aliases(self):
@@ -127,6 +142,57 @@ class CredentialAccess:
             record.secrets,
         )
 
+    async def resolve_runtime(self, alias):
+        self._guard()
+        with self._plugin._admission():
+            try:
+                return await self._resolve_runtime(alias)
+            except SDKError:
+                raise
+            except Exception as exc:
+                raise SDKError(str(exc)) from exc
+
+    async def _resolve_runtime(self, alias):
+        ref = await self._ref(alias)
+        key = (self._workspace_instance, self._card.name, alias, ref)
+        lock = self._runtime_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            await self._check()
+            if self._card.credentials[alias].kind == "none":
+                return _freeze({})
+            record, revision = await self._store.get_versioned(ref)
+            if alias not in self._runtime:
+                from ..drivers.credentials.providers import build_provider
+
+                store = _RuntimeCredentialStore(
+                    self._store,
+                    ref,
+                    self._check,
+                )
+                provider = build_provider(
+                    self._card.credentials[alias],
+                    store,
+                )
+                self._resources._defer(
+                    provider.close,
+                    f"driver-credential:{alias}",
+                )
+                self._runtime[alias] = (provider, store, None)
+            provider, store, previous_revision = self._runtime[alias]
+            if revision != previous_revision:
+                provider.on_secrets_changed(dict(record.secrets))
+            store.revision = revision
+            try:
+                values = (await provider.resolve()).values
+                _, current_revision = await self._store.get_versioned(ref)
+                if current_revision != store.revision:
+                    raise SDKError("Credential revision is stale")
+            except Exception as exc:
+                raise SDKError(str(exc)) from exc
+            await self._check()
+            self._runtime[alias] = (provider, store, store.revision)
+            return _freeze(values)
+
     async def update(self, alias, *, expected_revision, public, secrets):
         self._guard()
         with self._plugin._admission():
@@ -153,6 +219,40 @@ class CredentialAccess:
         await self._check()
 
 
+class _RuntimeCredentialStore:
+    """Keep provider writes within the revision they observed."""
+
+    def __init__(self, store, ref, check):
+        self.store, self.ref, self.check = store, ref, check
+        self.revision = None
+
+    async def get(self, ref):
+        await self.check()
+        if ref != self.ref:
+            raise SDKAccessError("Credential is outside the declared alias")
+        record, self.revision = await self.store.get_versioned(ref)
+        await self.check()
+        return record
+
+    async def put(self, record):
+        await self.check()
+        if record.ref != self.ref:
+            raise SDKAccessError("Credential is outside the declared alias")
+        await self.store.compare_and_put(
+            record.ref,
+            expected_revision=self.revision,
+            public=record.public,
+            secrets=record.secrets,
+        )
+        current, self.revision = await self.store.get_versioned(record.ref)
+        if (
+            current.public != record.public
+            or current.secrets != record.secrets
+        ):
+            raise SDKError("Credential revision is stale")
+        await self.check()
+
+
 class ProtocolRegistration:
     """One generation owns all pending and published source resource scopes."""
 
@@ -161,6 +261,7 @@ class ProtocolRegistration:
         self.owner = plugin.resources.owner
         self.handlers = set()
         self.bindings = set()
+        self.credential_locks = WeakValueDictionary()
         self.revoked = False
 
     def guard(self):
@@ -360,6 +461,9 @@ class SDKDriverHandler(DriverHandler):
                     self.check,
                     self.guard,
                     plugin,
+                    self.scope,
+                    self.descriptor.credential_locks,
+                    _instance_id(self.workspace),
                 ),
                 self.session_scope,
                 self.invalidate,
@@ -413,26 +517,24 @@ class SDKDriverHandler(DriverHandler):
         with self.admission():
             await self.check()
             revision = self.metadata_revision
-            if self.capabilities is None:
-                specs = await self.connection.discover(
-                    self.request(request_context),
+            specs = await self.connection.discover(
+                self.request(request_context),
+            )
+            await self.check()
+            if revision != self.metadata_revision:
+                raise StaleContextError(
+                    "Driver metadata changed during discovery",
                 )
-                await self.check()
-                if revision != self.metadata_revision:
-                    raise StaleContextError(
-                        "Driver metadata changed during discovery",
-                    )
-                if any(
-                    not isinstance(spec, DriverCapabilitySpec)
-                    for spec in specs
-                ):
-                    raise SDKError(
-                        "Driver discovery must return "
-                        "DriverCapabilitySpec values",
-                    )
-                if len({spec.name for spec in specs}) != len(specs):
-                    raise SDKError("Driver capability names must be unique")
-                self.capabilities = tuple(specs)
+            if any(
+                not isinstance(spec, DriverCapabilitySpec) for spec in specs
+            ):
+                raise SDKError(
+                    "Driver discovery must return "
+                    "DriverCapabilitySpec values",
+                )
+            if len({spec.name for spec in specs}) != len(specs):
+                raise SDKError("Driver capability names must be unique")
+            self.capabilities = tuple(specs)
             whitelist = mcp_tool_whitelist(self.card.config.get("tools"))
             display = str(self.card.config.get("display_name") or "")
             namespace = re.sub(r"[^A-Za-z0-9_-]+", "_", display.strip())
@@ -446,6 +548,14 @@ class SDKDriverHandler(DriverHandler):
             result = []
             for spec in self.capabilities:
                 name = spec.name
+                description = spec.description
+                if not spec.tool_name and display and namespace != self.name:
+                    protocol_label = self.card.protocol.upper()
+                    description = (
+                        f"{description}\n\n"
+                        f"{protocol_label} server display name: {display}. "
+                        f"Stable {protocol_label} client key: {self.name}."
+                    ).strip()
                 tool = (
                     name
                     if re.fullmatch(r"[A-Za-z0-9_-]+", name)
@@ -468,7 +578,7 @@ class SDKDriverHandler(DriverHandler):
                         kind="tool",
                         action="invoke",
                         name=name,
-                        description=spec.description,
+                        description=description,
                         input_schema=_thaw(spec.input_schema),
                         output_schema=_thaw(spec.output_schema),
                         exposure=CapabilityExposure(
@@ -649,6 +759,9 @@ async def management_source(services, protocol, source_id):
                 check,
                 guard,
                 plugin,
+                scope,
+                descriptor.credential_locks,
+                _instance_id(workspace),
             ),
             _subprocess_environment=lambda: _environment(plugin, check),
         )

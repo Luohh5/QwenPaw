@@ -218,6 +218,12 @@ class DriverCredentialAccess(Protocol):
     async def resolve(self, alias: str) -> DriverCredential:
         ...
 
+    async def resolve_runtime(
+        self,
+        alias: str,
+    ) -> Mapping[str, JSONValue]:
+        """Materialize declared provider values without exposing its ref."""
+
     async def update(
         self,
         alias: str,
