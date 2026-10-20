@@ -2,17 +2,24 @@
 
 Status: **measurement and validation evidence complete within the scope below**.
 The broad source run and its focused repairs are recorded separately; there was
-no invented single all-green broad run. Final review and plan checkboxes remain
-with the coordinating reviewer. See the [design decisions](2026-10-20-mcp-plugin-decisions.md).
+no invented single all-green broad run. All code-review findings are resolved
+and the plan checklist is complete. Work remains on the local `codex/mcp-plugin`
+branch, without push or merge. See the [design decisions](2026-10-20-mcp-plugin-decisions.md).
 
 The Task 8 artifact hashes and thirty numeric samples below are historical
 pre-final-review evidence. A later consolidated fix corrects failed source
 replacement, embedded-text delivery and visible recovery diagnostics. Its
 affected verification passed 184 Python and 70 Console tests, followed by
 42 replacement/lifecycle tests after a final async sampling correction.
-Publication of the rebuilt artifacts and current-source unused-runtime checks
-is pending. The original measurements and their source hashes are preserved;
-they must not be represented as measurements of the revised source.
+The remaining live-retry gap was reproduced independently for enabled and
+disabled sources, then passed both focused cases and 61 affected tests;
+the [final amendment](2026-10-20-mcp-plugin-rereview-i3.md) records the exact
+commands, ownership checks and original failed review.
+The final reviewed source `773f1fc5b` now has rebuilt wheel/sdist acceptance,
+349 external SDK author tests, complete frontend SDK checks and a short
+current-source unused-runtime counter check, recorded separately below. The
+original measurements and source hashes remain historical and must not be
+represented as performance measurements of the revised source.
 
 ## Scope and environment
 
@@ -32,7 +39,196 @@ The baseline for the measured performance comparison is source commit
 `3cb75eecf`. Runtime and test authors are separate. No external account/model
 service is used by the local transport acceptance tests.
 
-## Distribution identity and resource scope
+## Final reviewed-source release: `773f1fc5b`
+
+The final source identity is `773f1fc5bb257c1416c832d861ac8c7032fcb38c`.
+The [initial review](2026-10-20-mcp-plugin-review.md),
+[scoped rereview](2026-10-20-mcp-plugin-rereview.md) and
+[residual retry-ordering rereview](2026-10-20-mcp-plugin-rereview-i3.md)
+record the findings and their resolution. The chronological
+[decisions](2026-10-20-mcp-plugin-decisions.md) distinguish the affected source
+regressions from earlier broad runs. The initial review covers `d8d7aa2e5`,
+the first scoped rereview covers `029011ac9` and retains its failed retry
+finding; the final narrow rereview covers `773f1fc5b` and closes that finding.
+
+| Current artifact | SHA256 |
+| --- | --- |
+| `qwenpaw-2.2.3b1-py3-none-any.whl` | `de09674b767dc321f82a2dc4af9ceabe14922a920fd26d4825d3c6e6b4ec223b` |
+| `qwenpaw-2.2.3b1.tar.gz` | `8758bad2a5e7165e2fe4f75e5c5efd0b6cd9e30cee513de44ae24d52bf4881b0` |
+
+These artifacts were built from a fresh Git archive of the final commit, with
+release-equivalent Console and website-doc staging inside that private snapshot.
+The earlier Task 8 wheel contained no full Console output; this release closes
+that packaging gap. Both archives contain all **1,745 Console files, 84 website
+Markdown documents and 13 optional MCP resources**, with bytes verified against
+the staged snapshot. The wheel has 3,402 members and sdist 3,693 members.
+The installed package has sole QwenPaw metadata and all `qwenpaw/` member bytes
+match the wheel. Independent acceptance also checks the final retry coordinator
+bytes in both archives against the reviewed source.
+
+Console inputs are identical between `029011ac9` and `773f1fc5b`
+(`git diff --exit-code 029011ac9 773f1fc5b -- console`, exit 0). The full
+production build was executed once in the former private snapshot using the
+existing declared `node_modules`, then reused. TypeScript and Vite passed;
+19,703 modules were transformed, Monaco CSS verified, 495 assets precompressed,
+and the initial-bundle check passed: 9.85 MiB raw / 2.55 MiB Brotli across 11
+initial assets. Vite retained mixed static/dynamic import and large-chunk
+warnings. This is build and packaged-byte evidence, not an actual browser test.
+
+| Final release gate | Actual result |
+| --- | --- |
+| Full Console production build | Exit 0; Vite build 34.21 s; compression and initial-bundle checks passed |
+| Wheel and sdist build, actual external wheel install | Both exit 0; no source install or network dependency download |
+| Existing distribution acceptance | 7 passed, no skips, 17.89 s |
+| Complete installed-wheel SDK script | All seven stages exit 0; 349 tests, 3 warnings, 367.84 s |
+| Packaged frontend SDK | NodeNext, bundler and runtime each exit 0 |
+| Current unused-runtime counters | Three current-only cells, N=1/10/50, zero measured MCP work and clean stops |
+
+The complete SDK gate copied 25 public author test modules, including the new
+`test_sdk_driver_replacement.py`, into an external `author_tests` package. All
+seven stages passed: installed import/version/byte binding, strict author
+mypy, exported author tests, template export, frontend export, template
+compliance and actual template load/call/reload/cross-workspace runtime. The
+349-case suite retains three upstream lark datetime, aibot websockets and
+websockets legacy deprecation warnings. Template compliance is SDK 1.1 with
+its declared SDK 1.0 template compatible; permission review remains not run,
+and its dynamic/uncalled/native behavior limitation remains visible. No broad
+source or Console tests were duplicated for this artifact refresh.
+
+### Final release commands and environment
+
+The following is the recorded command sequence. `REPO`, `RELEASE`, `BUILD_PY`
+and `PY` are task-specific path variables; the two Python environments use
+Python 3.13.10. `BUILD_PY` is the cached temporary build environment, while `PY`
+is a newly created venv with no system site packages. Its dependency-only mirror
+excludes all foreign QwenPaw package/metadata, editable entries and inherited
+`.pth`/`.egg-link` files; the single generated `.pth` points to that filtered
+mirror. Only the newly built wheel supplies QwenPaw. No global environment,
+real-user configuration or live source Console/docs output was changed.
+
+```sh
+REPO=/Users/luohh/Documents/Qwenpaw/QwenPaw-main_harness
+RELEASE=/private/tmp/qwenpaw-final-release
+BUILD_PY=/private/tmp/qwenpaw-mcp-checkenv/bin/python
+PY="$RELEASE/venv/bin/python"
+clean() {
+  env -i PATH=/Library/Frameworks/Python.framework/Versions/3.13/bin:/usr/bin:/bin:/opt/homebrew/bin \
+    QWENPAW_WORKING_DIR="$RELEASE/bootstrap-work" \
+    QWENPAW_SECRET_DIR="$RELEASE/bootstrap-secrets" \
+    XDG_CONFIG_HOME="$RELEASE/bootstrap-config" \
+    XDG_CACHE_HOME="$RELEASE/bootstrap-cache" \
+    PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring PYTHONNOUSERSITE=1 \
+    PIP_NO_INDEX=1 PIP_CACHE_DIR="$RELEASE/pip-cache" UV_NO_INDEX=1 \
+    npm_config_cache="$RELEASE/npm-cache" npm_config_userconfig="$RELEASE/npmrc" "$@"
+}
+cd "$REPO"
+clean git archive --format=tar --output="$RELEASE/source-029011ac9.tar" 029011ac9
+mkdir "$RELEASE/source-029011ac9"
+tar -xf "$RELEASE/source-029011ac9.tar" -C "$RELEASE/source-029011ac9"
+ln -s "$REPO/console/node_modules" "$RELEASE/source-029011ac9/console/node_modules"
+clean npm --prefix "$RELEASE/source-029011ac9/console" run build
+clean git diff --exit-code 029011ac9 773f1fc5b -- console
+clean git archive --format=tar --output="$RELEASE/source-773f1fc5b.tar" 773f1fc5b
+mkdir "$RELEASE/source-773f1fc5b"
+tar -xf "$RELEASE/source-773f1fc5b.tar" -C "$RELEASE/source-773f1fc5b"
+```
+
+Staging uses `shutil.copytree(..., dirs_exist_ok=True)` from the completed
+Console `dist` to the final snapshot's `src/qwenpaw/console`; each
+`website/public/docs/*.md` is copied with `shutil.copy2` into its
+`src/qwenpaw/docs`. This is the data staging in
+[the standard release script](../../../scripts/wheel_build.sh); its npm-install,
+global-tool-install and cleanup wrapper was not run. All destinations belong
+to the new isolated snapshot.
+
+```sh
+cd "$RELEASE/source-773f1fc5b"
+clean "$BUILD_PY" -m build --no-isolation --outdir "$RELEASE/dist"
+WHEEL="$RELEASE/dist/qwenpaw-2.2.3b1-py3-none-any.whl"
+SDIST="$RELEASE/dist/qwenpaw-2.2.3b1.tar.gz"
+clean "$PY" -I -m pip install --no-index --no-deps "$WHEEL"
+clean "$PY" -I -m zipfile -e "$WHEEL" "$RELEASE/unpacked"
+cd "$REPO"
+clean "$PY" scripts/check_plugin_sdk_artifacts.py \
+  --wheel "$WHEEL" --sdist "$SDIST" --python "$PY" \
+  --source-root "$REPO" --output "$RELEASE/sdk-check"
+clean "$PY" scripts/check_plugin_sdk_frontend.py \
+  --package "$RELEASE/unpacked/qwenpaw/plugins/frontend" \
+  --dependencies "$REPO/console/node_modules" --output "$RELEASE/frontend-check"
+```
+
+All outputs were new directories. The package build creates the wheel from its
+new sdist. The final source archive SHA256 is
+`222f7fd37c10ff58412f1ea4018381cc2ab467ecccdc5f8e2239018d051a1eef`.
+The install succeeded with a pip warning that the default macOS user-cache
+location was inaccessible and caching disabled; subsequent commands explicitly
+set the private `PIP_CACHE_DIR` shown above. No cache permission was widened.
+The earlier isolation incident remains documented below.
+
+Raw records are in `/private/tmp/qwenpaw-final-release`: `console-build.log`,
+`console-input-parity.log`, `build.log`, `install.log`, `final-source.json`,
+`final-artifacts.json`, `sdk-check.log`, `sdk-check/report.json` and its seven
+stage logs, plus `frontend-check/results.json`. Independent distribution and
+archive-identity records are `/private/tmp/final-fix-773-distribution.log` and
+`/private/tmp/final-fix-773-artifact-identity.log`. The artifact manifest has
+absolute `wheel`, `sdist`, `python`, `frontend_sdk` fields, the pinned source
+commit and the hashes above; it can be reconstructed without scratch metadata.
+
+The exact independent distribution invocation was:
+
+```sh
+.superpowers/sdd/2026-10-20-mcp-plugin/run-tests -c pyproject.toml \
+  tests/integration/test_mcp_plugin_distribution.py \
+  --mcp-plugin-artifacts /private/tmp/qwenpaw-final-release/final-artifacts.json
+```
+
+The scratch-independent `run_source` equivalent below preserves this runner's
+environment; pass the same test path and new manifest to it. The seven cases
+cover resource allowlist equality, actual installed-wheel wrong-byte rejection,
+wheel and frozen-layout unused/legacy cold children, and logical POSIX/Windows
+resource/interpreter paths. The local subprocess-inventory checks used the
+previously authorized narrow sandbox escalation. This is macOS execution and
+deterministic Windows-style path coverage, not native Windows execution.
+
+Final raw-output identities (SHA256):
+
+| Record | SHA256 |
+| --- | --- |
+| Console build (`console-build.log`) | `61c234a4de3941c18802550e540862c1211df7b72b31824c7fbced908ae5ac3f` |
+| Package build (`build.log`) | `f13922fe389cf6e4f68e4b297c05ff868f9b368d07833350283a44d7213b5df4` |
+| Actual wheel install (`install.log`) | `4bbe9198b7e45d53c162fdfb300daeb2a95ade6b00a505621d689d5106cf0b6e` |
+| Full SDK report (`sdk-check/report.json`) | `1e53adfe5a9f1052568de3ad50c20af73daeb30e1d56f06962548938ca88c7c5` |
+| SDK author test output (`sdk-check/public-author-tests.log`) | `51dc704698457ff0ba390f63d9032399373ba87d21ded536d2dcc710af358960` |
+| Frontend SDK results (`frontend-check/results.json`) | `d67565b7965b1c6a6738fa2138ba7345c31726bd271bee68f44da117fa781728` |
+
+### Current unused-runtime scope
+
+The [current counter evidence](2026-10-20-mcp-plugin-current-counters.json)
+retains all three raw rows, the complete handoff, exact commands/environment,
+source and driver hashes and original raw-file hashes. Only machine repository,
+private output and third-party-directory prefixes are replaced with documented
+placeholders. The original handoff SHA256 is
+`1d4d5c9324a463c5196b3672470bd221047a7dc2b5057d24f9b9c956592d277b`.
+
+At N=1, 10 and 50, current source has zero real managers, snapshots, card-file
+enumerations, dedicated tasks and project MCP imports, both after startup plus
+warmup and during the idle window; every stop leaves zero owned tasks. Each
+cell uses a fresh private bytecode-cache prefix with bytecode writes disabled,
+Python 3.13.10 and AgentScope 2.0.10. These are one replicate per count with
+requested 3.2-second observation and 0.1-second warmup, using actual Workspace
+Driver service descriptors. The retained incidental timings and RSS values
+are not performance estimates. There is no new CPU/RSS/startup comparison for
+`773f1fc5b`. The earlier six-cell `029011ac9` smoke and the original thirty
+numeric samples keep their historical source identities.
+
+Credential CAS evidence uses the same-process shared lock; independent
+multiprocess writers were not probed. The SDK deadline is optional and remains
+`None` in current production. Neither boundary was expanded during this change.
+Frozen acceptance remains an evaluated resource layout plus cold subprocesses,
+not a compiled native executable. OS/Python, permission-review and physical
+power-loss limits below still apply.
+
+## Historical Task 8 distribution identity and resource scope
 
 | Artifact | SHA256 |
 | --- | --- |
@@ -68,7 +264,7 @@ runs Python subprocesses; it is not a native PyInstaller executable build.**
 PyInstaller is unavailable in the current interpreter. Native bundling, signing,
 and each target platform's startup still require their release pipeline.
 
-## Executed gates
+## Historical Task 8 executed gates
 
 | Gate | Observed result |
 | --- | --- |
@@ -132,7 +328,7 @@ not a Windows native execution claim. The focused command is the distribution
 command below; raw results are `task8-fix1-path-red.log` and
 `task8-fix1-distribution-green.log`, and scoped hooks all passed.
 
-## Reproduction commands and retained result index
+## Historical reproduction commands and retained result index
 
 The following reproduces the recorded isolated source runner without depending
 on deleted planning scratch. Run from the repository root with the same local
@@ -251,7 +447,7 @@ Raw local logs remain under `/private/tmp`: `task8-final-python.log`,
 These temporary logs are diagnostic originals; the results, commands and linked
 test matrix here remain self-contained after planning scratch is removed.
 
-## Measured workspace-runtime overhead
+## Historical measured workspace-runtime overhead
 
 [The durable benchmark JSON](2026-10-20-mcp-plugin-benchmark.json) contains all
 30 complete raw sample objects, full precision summaries, original JSON SHA256s,
@@ -379,7 +575,7 @@ separate policy cases establish allow/deny/ask behavior.
 | Workspace/source/session identity and credentials cannot cross scope | [Driver lifecycle], [Runtime credentials], [Cold runtime] OAuth mismatch and authenticated workspace selection |
 | Existing allow/deny/ask policy remains enforced | [Driver lifecycle], [Public MCP driver], [Approval policy] |
 | Interrupted initialization, canceled RPC, replacement, close timeout retain custody | [Driver lifecycle], [Public MCP driver], [Transport stateful], [Transport ownership], [Lazy runtime] |
-| Public SDK imports only; test host uses production adapter/governance | External SDK 327-case run and strict author fixture; static compliance below |
+| Public SDK imports only; test host uses production adapter/governance | Final external SDK 349-case run and strict author fixture; historical 327-case run retained; static compliance below |
 | No scan for missing/disabled MCP; temporary source disable still monitored | [Watcher activation], [Lazy runtime], [Cold runtime], [benchmark data] |
 | Offline resource parity, old-user install, no unconditional desktop seed | [Distribution] exact spec mapping and actual wheel/frozen-layout cold starts; archive hashes above |
 

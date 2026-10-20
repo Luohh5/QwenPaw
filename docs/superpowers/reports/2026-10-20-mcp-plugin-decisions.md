@@ -90,3 +90,259 @@
 | 复审发现真实的重试恢复漏项后，增加一个限定范围的完成修正 | 用户要求全部 checklist 完成；不能因工作流的一轮修正上限就保留已证实的正常使用故障。保留首次复审失败记录，仅修正资格刷新后的活动工作区投影 | 增加一次定向修正和复核时间，不重新开展整分支审查 |
 
 用户指定保留当前开发分支，因此最终交付保留本地分支，不自动合并、push 或创建 PR。原生打包限制和实际测试平台范围必须随验证记录一起交付。
+
+## 按实施顺序保留的裁定原文
+
+以上表格列出决定、原因和判断错误的代价。以下按原始实施顺序保留包含裁定的日志行，包含同一阶段的上下文；测试结论以最终验证记录为准。
+
+### 1
+
+```text
+- Ruling: work in the current checkout and branch, not a new worktree — user explicitly requested this folder and named branch — wrong choice would require relocating uncommitted work.
+```
+
+### 2
+
+```text
+- Ruling: split every task into a test-author agent and a production-author agent; production waits for RED evidence — direct user requirement overrides a single-implementer skill template — wrong coordination could cause overlapping file edits, so roles have disjoint ownership.
+```
+
+### 3
+
+```text
+- Ruling: snapshot DTO names/fields are fixed in task-1-contract.md — the plan leaves exact snapshot shape open and independent authors need one contract — wrong shape costs a small adapter change before Task 6.
+```
+
+### 4
+
+```text
+- Ruling: default-looking AnySearch with only an opaque historical static:mcp/anysearch binding is needs_review — without decrypting secrets its history is ambiguous, so do not assume unused or auto-enable — wrong classification costs a manual install prompt for this narrow legacy case, but preserves all data. Confirmable env-backed default fixtures remain unused.
+```
+
+### 5
+
+```text
+- Ruling: inventory may contain valid non-MCP cards; ignore them and check duplicates within MCP only — classification must not force MCP installation for unrelated protocols — wrong filtering can require a follow-up migration check.
+```
+
+### 6
+
+```text
+- Ruling: registration ownership bridge may start in Task2 to test real duplicate/release behavior, with transport/governance in Task3 — avoids a fake public registration stub — wrong boundary costs a small internal move only.
+```
+
+### 7
+
+```text
+Task3 base34007fcdf. Ruling: public testhost open_driver accepts a raw JSON DriverCard mapping (name/protocol/endpoint/credentials/config/policy/enabled), optionalsession_scope selects transient vs persistent; fakeplugin only publicSDK — source setup needs persistedpolicy/credential declarations absent from runtime DriverSource — wrong choice costs an overload before SDKrelease.
+```
+
+### 8
+
+```text
+- Ruling: add readonly DriverCredentialAccess.aliases property — MCP implicit auth and bare legacysecretrefs require enumerating declaredaliases, which sourceDTO omits — wrong choice costs a small APIaddition before1.1release; no arbitrarycredentialrefs exposed. Missingproperty RED verified1fail0.25s beforeimplementationrelease.
+```
+
+### 9
+
+```text
+- Ruling: add explicit DriverContext.subprocess_environment() for readonly persistedconfiguredvars — originalstdio passes load_envs, replacingwithos.environ would expose morehostsecrets — wrong choice costs a narrow SDKmethod before1.1release; no implicitenvreads or arbitraryhostservices. Missingmethod RED verified1fail0.23s beforeimplementationrelease.
+```
+
+### 10
+
+```text
+Task4 preparation ruling (no implementation begun): retain detailed transport unit assertions by rehoming to plugin alongside public-host integration tests; requiring every low-level state-machine unit assertion to pass through broad host routing would erase useful regression granularity. Task5 removes old core transports after equivalent plugin coverage; final one maintainedimplementation. DriverCredentialAccess resolve raw records, therefore plugin must preserve OAuth refresh viaCAS, not assume host providers refresh rawtokens. Draft contract task-4-contract.md pins managementroute shapes for laterTask7 bridge.
+```
+
+### 11
+
+```text
+Task4 authors: /root/task4_tests tests-only; /root/task4_code production-only, waiting explicitindependentRED. Standardmodelhigh for migration/integration with contractfixed; no Task4host/SDK changes without ruling.
+```
+
+### 12
+
+```text
+Ruling: add finite DriverCredentialAccess.resolve_runtime(alias)->Awaitable[Mapping[str,JSONValue]], rawresolve remainsversionedrecord/CAS — existingAKSKprovider HMAC includesprivatecredentialref, so rawcredentials alonecannotpreservehistoricalbindings; reusegenericproviders alsoavoidsduplicatingOAuthrefresh inMCPplugin — wrongchoicecosts smallSDKmethodrework before1.1release. Readonlyderivedruntimevalues only, declaredalias/lifetimechecks, lazyownedprovidercleanup, no arbitraryrefs or implicitnetworkonrawresolve. Task4hostscope narrowlyextended plugins/drivers.py and _drivers.py, testauthorstrictfixture. IndependentmissingmethodREDpending, no methodimplementationbeforeRED. This supersedes priorrequirement that pluginreimplementgenericOAuthrefresh; pluginstillowns MCP OAuthnetworkmanagement.
+```
+
+### 13
+
+```text
+Ruling: hostcatalog mustdelegatediscover perrequest; protocolownsdiscoveryTTL10 ratherthanhostforevercache — independentpublicMCPtoolinventorytestafter+11seconds confirmedstale['echo'] (task-4-tests-ttl-cas.txt1fail1pass0.89) — wrongchoicecostsprotocol-localcaching work, avoidsSDKTTLfield/backgroundtimer. Rootreleasednarrow _drivers.pyfix preservingawaitguards/currentmetadata. CASactualMCPblockedrefresh vsnewerstorewriter alreadyPASS; correctedruntimeownershiptest2PASS0.68 aftermethodimplementation, priorfixture403 notclaimedfeatureRED.
+```
+
+### 14
+
+```text
+Ruling: change one ported cancelled-aclose assertion from dropped _http=None to retain exactHTTPclient untilsuccessfulretry, preservingallotherassertions — oldcleanupassertioncontradictsrequiredretryablecustody; newtestindependentlyreproducedlostclientbeforefix — wrongchoicecostsrevisitingclosecontract, retainsresourceinstead ofsilentlyorphaningit. KeepoldOAuth401fallback _implNoneassertionwhenstrictcleanupactuallysucceeds; authorfixedunnecessaryretention. Approvedinertplugins/protocol/__init__.py todisambiguateprojectpackagefromthirdparty mcp forpylint, noexecution/discoverypathchange.
+```
+
+### 15
+
+```text
+Ruling: preserve retryable custody of unfinishedRPCs instead ofportedabandon/removal — bindingno-leak/strictcleanup rule takesprecedenceoverinheritedtransportbehavior — wrongchoicecostssmallcleanup-ledgerrefactor, normalrequestcancellationmustremainbounded. Reviewernamedplan-mandatedconflictsettledbeforefix; no broadprotocolstackrewrite.
+```
+
+### 16
+
+```text
+Task5base764484a4c; contracttask-5-contract.md, brief/notesprepared. Ruling: explicitblankworkspace monitoringintent hasprivate request_monitoring(protocol) seam andlightweightpersistentworkspace metadata — avoidglobalpluginenablewatchingallemptyspaces whilepreservingintentthroughrestart — wrongchoicecosts smallmetadata-layoutmigration; nonewmandatoryuserpreference, pagevisitdoesnotrequestmonitoring.
+```
+
+### 17
+
+```text
+Task5additionalcompatREDrootverified: SDKbridgegovernance driver_errorinsteadlegacydriver_policy_denied (task-5-tests-progress.txt), whitelisttool_disabled+driver/toolmetadata (task-5-tests-rehome-unit.txt39pass2fail). Productionrestoresalllegacyresultcodesfrombaseline. Ruling: adaptdirectinternal .value dict assertions topublicDriverCallResult.structured_content whilepreservingallbusinessdata/cases — finiteSDKresultisrequired, internalwrappertypechanges — wrongchoicecostsassertionpathreworkonly, no publicAPIresponsedatachange.
+```
+
+### 18
+
+```text
+Ruling: reuseTask1fullfingerprints andrawagent.json/card evidence forconfiguredlegacyconversion/defaultfilter — hydratedMCPConfig/name+URLheuristicscanlosecustomdisabledAnySearchintent — wrongchoicecosts smallsharedclassifieradapter; onlyunusedexcludedfrommonitoring, needs_review evidencepreserved, conversiononlyconfigured+registeredMCP.
+```
+
+### 19
+
+```text
+Ruling: real MultiAgentManager publishesWorkspace AFTERstart/candidatepreparation, so deferredruntimeactivationmustawaitpostpublish/post-reload-commit genericfacade.activate_registered_protocols — strictactualobjectguardmustnotbeweakened — wrongchoicecosts narrow publicationhookorderingrework; noMCPspecialbranch/no candidateconnections beforecommit. ApprovedsourceMultiAgentManagerfileextension; independentactualpipelinecreation/reloadtests requested.
+```
+
+### 20
+
+```text
+Task5actualMultiAgentManagerinitial/reloadpublicationpipeline testhonestGREEN1pass1.03 aftersourcefix (task-5-tests-publication-red.txt provisionalfilename, notRED); newapp23pass6.71 reported. Productionlaterlifecycle70pass1failnewnamed-disabledcatalogexpectation ambiguous. Ruling: preserveManager semantics fornamed list_driver_capabilities disabled/inactive =>DriverNotFoundError, globalempty list_capabilities=>[]; neitherconstructsManager — existingconsumerresult/exceptioncompatibilitytakesprecedence — wrongchoicecostsoneexceptionpathrework; no reducingzero-resourceassertions. Testauthorupdatesnewcase accordingly.
+```
+
+### 21
+
+```text
+Task6 preparation only: brief/contract/notes ready. Ruling: preservegeneric successfuluninstall config-row-removalcompatibility byper-plugin durableuninstallintent sidecar underpluginroot, lifecycle-ownedatomicwrite andvalidatedID, ratherthanretainingconfigtombstonerow — wrongchoicecostsnarrowsidecarlayoutmigration, avoidsbreakingSDK1.0 legacyuninstallprobe; startupcannotclearintent, onlysuccessful explicitreinstall/enable. Task6notreleasedbeforeTask5cleanreview.
+```
+
+### 22
+
+```text
+Task6initialREDrootverified task-6-tests-red.txt6FAIL0.58 expectedmissinginventory/ensure(rawinactive+damaged,4unusedvariants,actualinstall+SDKcallfixture). Productionreleased. Pinnedprepare_startup_plugins(loader,workspace_manager,*,app=None,snapshot=None) adjacentapp/mcp_plugin_upgrade.py returnsimmutableUpgradeResult; inventory/ensurelazyentrypoints inoriginalpuremodule. Ruling: addoptionaltrailingMCPUsageSnapshot.config_path:str|None tohonorexplicitrawinventorycontextandfreshsettingschecks — wrongchoicecostssmallinternalDTOmigration, old3posargs/pureclassifierunchanged. Approvedgenericinstall_origin dictstaged.plugin-install-origin.json UUID/digest beforeexistingcopyrename +user_requested flag(defaultTrue,startupFalse), notnewcopyframework; settingsintenthelpersperID.
+```
+
+### 23
+
+```text
+Ruling: actual_lifespan'sgenericworkspace migration/load_configrepairprecedebackgroundpluginstartup; capture rawsnapshot beforethosemutations andcarryintohelper, mergefreshrawinventorywithoutlosinguncertainevidence, supportoldrootMCPwithoutprofiles — wrongchoicecostsnarrowbootstraporderingrework, avoidsdefaultinference/missinglegacyusage. MalformedROOTmuststopstartup safelybeforeauto-repairwrites; damagedworkspaceonlycontinuevalidsiblings. Norestore-by-overwriting/no broadunrelatedstartuprewrite. Bothauthorsnotified.
+```
+
+### 24
+
+```text
+Task6independentprogress-2 25PASS3FAIL3.70 task-6-tests-progress-2.txt verified: two lateupsert/refresh sharedresolverResourceError inactiveSDKcontext, sourcefixactivatesdynamicallyregisteredplugin beforeexplicitruntime; startupregisteronlypreserved. Third reallegacyconverter dropsMCPClientConfig.tools. Ruling: narrowmcp_legacy_config.py conversionfix isrequired despitepreexistingbug becauseupgradeguaranteepreserveswhitelists; retain[]denyall/Noneunrestricted/nonempty semantics, no testexpectationweakening — wrongchoicecostssmalllegacyconversionfieldmigration. Bothauthorsnotified, independenttestauthorcovers3variants.
+```
+
+### 25
+
+```text
+Task6ruling: genericstartup_blocked_plugins set inload_allapprovedforoff/review/failure/uncommittedownedtarget, notblanketunusedexplicitpreinstalledplugin. ExistingdeliberateinstalledenabledMCPwith0sources mustretainregistration/frontendreadiness onrestart, realmanager/watcher0; no configautoenablewrites — wrongchoicecostssmallstartupselectionrefinementandwouldotherwiseforceusersre-enableeachrestart. Independentactualinstall/restartRED1FAIL1PASS1.19 task-6-tests-intent-marker.txt rootverified andnarrowproductionfixreleased; finalcompletedmarkercommit-interruption controlalreadyPASS. Existingnever-installeddefaultunused0installer/gate testsunchanged.
+```
+
+### 26
+
+```text
+Task6orphanindependentRED1FAIL1.12 task-6-tests-orphan-red.txt verified actualsettingscommitfault→ownedtarget/origin→deleteglobalmarker→restartincorrectlyunchanged+loaded. Rootreleasedorphanonly, sourcefix2GREEN1.28(withexplicituseremptypositive) task-6-code-orphan-green.txt verified. Ruling: origin-present/globalrecord-missing isneeds_review, notusercode; no mutation/autoload — wrongchoicecostsmanualrecordrecoveryforrareexternalmetadataloss, preservesuncertainownership.
+```
+
+### 27
+
+```text
+Task6explicitreinstallintegrationruling: cleargenericstartupblockbeforeexplicitloadactivation, restoreonfailedcommit (notafteractivation), so retainedenabledsourcesreopenwithoutmanualrefresh — wrongchoicecostsnarrowactivationrollbackorderingadjustment. IndependentextendedactualuninstallcaseRED1FAIL1.18 task-6-tests-reinstall-red.txt rootverified; producerreleasedafterRED, orphanalreadyfixed. Current34upgradecases(33+orphan; reinstallcaseextended), nofurtherexpansionwithoutnewrealissue.
+```
+
+### 28
+
+```text
+Task6fixround1ruling: approve singleprotocol-neutralin-target.plugin-install-commit.json receipt(schema/pluginid/randomcommit/digestactualcode) writtenatomicallyonlyaftersuccessfulexplicitcommit/after_load, beforeuninstallintentclear; autoFalse neverwriteswitness. Validcode-boundreceiptmayretirestale pendingautotxnwithoutenabled/configrewrite; offintentstillwins, orphanwithoutreceipt/invalidreceipt/changedcodefailclosed. SurvivesCLI/freshloader; nocoordinatorin-memorycallbackonly/noMCPIDinloader/no2-fileframework. Wrongchoicecostsgenericreceiptlayout/reconciliationrework; samefilesystemtrustmodelasexistingorigin, singlefileavoidsextraatomicboundary. SourceauthorreleasedminimalproposalafterindependentRED; testfrontierbehaviorunchanged, source/testauthorsseparate.
+```
+
+### 29
+
+```text
+Ruling: interpret Task7 savedconfiguration query no-connection guarantee as READ/metadata paths includinginactiveworkspaces; unavailablepluginwrites persistwithoutconnection, explicitavailableplugincreate/enable/edit retain normalapply/reload — preserve userexperience and distinguish passivepageview from activeuse — wrongchoicecosts narrowwritepathrework. Correctedoverbroad initialcontract reads/saves wording beforeimplementation; bothauthorsnotified.
+```
+
+### 30
+
+```text
+Task7initialRED rootverified5API failures0.97 (inactiveget_agent startup insteadmetadata/stable503),3Console failures+8oldpass1.33(staleworkspace data/error/loading). Productionreleased. Ruling: approve architecturetask-7-architecture.md GETstate/explicitPOSTtrustedlocalinstall + existinggenericlifecycle; meaningfulpublicroute.wrap ownspluginmanagementadmissionandtoolbarwhilecorekeepsonecopyforms/shell — avoidsduplicatingallUI andsatisfiespublicSDKmount — wrongchoicecosts movingmanagementUIlaterifscopeinsufficient. PrivatefreshPawAppdispatch+boundedroutinggrantapproved,no publicSDKextension/no retainedlivecontexts. Ruling: revokedcredentialaliasmayremainbutbothaccess/refreshtokenscleared, statusunauthorized; oldrepresentation-onlyassertionsadapt. Callbackfailurestateconsumed,replayrejected despiteoldkeep-sessiontest — bindingexpiry/replaysecurityandTask4publiccontract — wrongchoicecostsrequiringnewauthorizationstartafterexchangefailure. Exactbusinesserrorassertionspreserved.
+```
+
+### 31
+
+```text
+Task7endpointcorrectionrulingbeforeimplementation: GET /api/mcp-plugin, POST /api/mcp-plugin/install separaterouter because /mcp/{client_key:path} accepts plugin and plugin/install — preserveexistingkeycontracts — wrongchoicecostsnarrownewendpointmigration. Bothauthorsnotified, addlegacykeycollisioncase. Architecturefileoriginalproposalretainedasproposal, coordinationcontractauthoritative.
+```
+
+### 32
+
+```text
+Task7independent61PASS2FAIL actualOAuthconservation runprogress3 rootverified: missingmeta.updated_at; maskedrawstoreexception. Ruling: hostatomicCASupdate stampsupdated_at preservingothermetadata, noSDKmetaAPI/no secondwrite, allowstore.pyextension — oldOAuthmetadataresponsibilitybelongshostnow — wrongchoicecostsgenericCASmetadatacontractrework. Ruling: do NOTrestore rawcredentialstoreexceptionpopuptext, Task4safeerrorboundarypreventssecrets/refs; adaptonlydetailassertiontosafealiaserror, all400/nooverwrite/errorpage/stateassertionsintact plussecretnegative — wrongchoicecostsmoreexplicitdiagnosticmappinglater, notsecretleak. Bothauthorsnotified.
+```
+
+### 33
+
+```text
+Task7affectedPython289PASS1FAIL20.0 rootread: Task4OAuthrefresh exactmetaequalitynowgetsintendedupdated_at. Approvedonlytimestampbound+preservedallothermeta expectationadaptation bytestauthor; no sourceeditstests. Ruling: legacyGETOAuthstatus ispassive savedcredentialquery aswell, pluginavailable+inactiveworkspace mustmetadataread withoutget_agent; unavailableplugin503 retained. SmallhostcredentialpresentationpermittedlikeMCPconfigadapter, businessnetwork/start/callback/revokepluginowned — wrongchoicecostsreadonlypresentationrefactor, avoids passiveconnection. Testauthorrequestedactualinactive/registeredpluginRED beforestatusedit.
+```
+
+### 34
+
+```text
+Task8releasedaftercleanTask7review; no newruntimeinterfaces. Ruling: performance frontier realWorkspace lifecycle with driver-relateddescriptors only (baselinebothmanager/watcher,finalfacade) toisolatenoMCPworkspacecostunderidenticaldeps; reportasMCPworkspace-runtime NOTwholeapp memory/CPUclaim — wrongchoicecostsbroaderbenchmarklater, avoidsmodel/channelnetworknoise. Rootbaseline5keyfileshashesverified56be andsavedmanifest; no samplesyet.
+```
+
+### 35
+
+```text
+Task8externalSDKactual5FAIL322PASS5warnings344.17 rawrootread. All5exportedtransitivefixtures hardcodedparents[3]/src→ModuleNotFoundError; testauthorapprovedcurrentboundqwenpaworigin+solemetadatawithNARROWproject-onlymirror, activeabsolute3rdpartydistributionrootsfiltered/deduped/stdlib+qwenpaw/.pth/finderexcluded andWindowscopyfallback, allbyte/no-mutation/restartassertionspreserved. Sourcebroadalreadyrunningoldcollectioncanfinish; new5sourcefocusedafterfix. Ruling: mandatorySDKreleasegateONEcorrectedfullscriptfreshoutputwithnewguardafter5fixturefix, becauseinitialgatefailedandguardchangedandremainingexportstagesneedactualendtoendrc0; notrepeatpassedunchangedgatescosmetically — wrongchoicecostsextra~6mintoolruntime, ensuresactualreleasecommandcomplete. Sourceprior4tailcontinuationPASSdiagnosticonly. Registerinheritedp1markinpublicisolatedpytestconfig, notblanketsuppression; inheritedthirdpartydeprecationsfinaltriage.
+```
+
+### 36
+
+```text
+RootfoundCONCRETEbenchmarkcacheasymmetryafter12/30: src/qwenpaw950existing.pyc vsbaseline0; timerstartsBEFOREqwenpawimport, -Bdoesnotdisablecachereads. Ruling: invalidatecurrent12cache-asymmetricrows (preservepreflight) andrestart30uniformfreshperchild PYTHONPYCACHEPREFIX undertempROOT/-B, assertrecordpolicy — startupandRSS/CPUcannotbeattributedsolelyMCPunderunequalcacheconditions — wrongchoicecosts~12minextrawaitbutpreventsfalseperformanceclaims. Userinformed; testauthorrequestedstopownedjobsgracefully/smoke/restart,noproductionorbroadsuiterepeats. Functionalmanager/scan0proofunaffected, no numericconclusionpublished. FinalbenchOnlyremainingmatrixactivitybesidesscopedTask8+finalreviews/docs/checkmarks.
+```
+
+### 37
+
+```text
+Task8 matched-run owner verified 8/30 complete, each sample>=60s, fresh prefix nonexistent, stop tasks empty; final0Manager/snapshots/directenumerations/tasks/projectMCPimports. Counts_after_start are actually startup+3sec warmup totals; publish that precise label. Owner current benchmark Black/flake8/mypy/Pylint10 all0 /private/tmp/task8-benchmark-cache-hooks.log. Root durable rulings report and final-review handoff prepared, no review dispatched early.
+```
+
+### 38
+
+```text
+Ruling: publish all30 measurements in durable normalized JSON via docs author, retaining every metric/counter/environment/sourcehash/replicate plus original rawJSON SHA256; strip only user/temp absolute path prefixes, keep exact originals in /private/tmp, no redundant binary tarball — durable reviewable evidence without machine paths or duplicate archive — wrongchoicecosts later needing the originals for byte-for-byte forensic comparison after temp cleanup, while metric parity remains verifiable now. Test author owns scratch handoff; root verifies normalized parity before acceptance.
+```
+
+### 39
+
+```text
+Ruling: accept repeated read-only startup classification forunusedusers andcorrectspecwording, do notaddunusedcompletionmarker — lateruserconfigurationstillrequiresfreshinventoryandmarkeraddsstate/writeswithoutremovingperiodicwork — wrongchoicecostsstartupinventoryI/O ratherthanpersistentmarkerbookkeeping; allunusedManager/scans/task0andtworestarts remainbinding. M2docs-onlyrootfix, authorsinformed.
+```
+
+### 40
+
+```text
+Ruling: committedoldsource may stay callable only against exact accepted replacement snapshot with unchanged effectiveenabled/protocol/credentials/policy/tools; candidatefreshnessseparatefromcommittedidentity, no unknownrawedits/policyrevocation bypass andno persistedrollback — preparesafelywhilepreservinghostauthority — wrongchoicecosts internalrevision/snapshotguardrework; changedauthorityremainsfailclosed evenifcandidatefails. I2genericconsumerfile.textadditiveapproved, DTOunchanged. I3additivefiniteupgrade/workspacestatusschemaapprovedunderexistinglock; safeactivewarningcode mustnotfalselyclaimruntimefailed; sourceknowsregister-onlyloadednotactive. Tests/M1ownertestagent; allcoveringPython/Console tests bytestauthor, productionhooks/Consoleformatbycodeauthor, releaseartifactrefreshrootafterfreeze.
+```
+
+### 41
+
+```text
+Ruling: preserve numeric30samples as PRE-final-review measuredsource withoriginalSHA, neverrewritecurrentidentity; usepostfix1/10/50shortcounter-only actualdescriptorchecks forcurrentzero-workguarantee, no another30numericsforactive-replacementfix — unusedpathsneverconstructManager, historicalCPU/RSS/startupalreadybounded/no materialclaim — wrongchoicecostslackofnew30roundlatestpatchnumericperformance, requiresfullrebenchifwanted; documentsexplicitqualification. CurrentwheelmustberebuiltandfullSDK/frontendactualnewartifactgatesbecausepackagedruntimebyteschanged; old327+oldwheelhistorypreserved.
+```
+
+### 42
+
+```text
+Ruling: complete this realload-bearingresidual with narrowlyscopedI3 amendment andfocusedfollowup, despite SDD final one-fix-wave cap — higher-prioritydeveloperpersistenceanduserexplicitallchecklistscomplete prohibitparkingknownunfixednormalretrybehavior whenminimalpathisconcrete — wrongchoicecostsextratargetedfix/reviewtime, not anotherbroadbranchreview; preserveoriginalverdict/evidence anddo notpretendfirstwavefullyaddressedI3. OtherI1/I2/M1/M2/verificationsnotreopened. NewwheelwaitsfinalPythonstable.
+```

@@ -4,7 +4,7 @@
 
 **Goal:** 将 MCP 实现为可选官方插件，并增加公开 `DriverProtocolSpec` SDK，使已有 MCP 用户升级后保留配置和功能，未使用 MCP 的用户升级后不自动安装或启用插件。
 
-**Architecture:** 保留协议中立的 Driver 存储、策略、审批和能力分发，改为按需创建运行时。MCP 插件通过公开协议接口提供连接、发现、调用和关闭；宿主负责工作区、来源和调用的归属。配置监测保留现有两秒扫描，仅在插件启用且工作区需要监测时运行；前端保留原入口和初始界面，由用户在页面内安装插件。通过一次性使用情况判定决定升级时是否安装插件，避免把默认配置误判为用户使用。
+**Architecture:** 保留协议中立的 Driver 存储、策略、审批和能力分发，改为按需创建运行时。MCP 插件通过公开协议接口提供连接、发现、调用和关闭；宿主负责工作区、来源和调用的归属。配置监测保留现有两秒扫描，仅在插件启用且工作区需要监测时运行；前端保留原入口和初始界面，由用户在页面内安装插件。通过只读使用情况判定决定升级时是否安装插件，避免把默认配置误判为用户使用。
 
 **Tech Stack:** Python、现有插件 SDK、Driver runtime、MCP Python SDK、现有两秒配置轮询、FastAPI 兼容路由、React/TypeScript、pytest。
 
@@ -286,57 +286,61 @@
 
 ## 必须通过的验收矩阵
 
-所有下列项目在本次实施完成前保持未勾选。只读配置中的秘密以受控测试值比较，日志中不得输出明文。
+以下项目已按[验证记录](../reports/2026-10-20-mcp-plugin-validation.md)逐条核对。只读配置中的秘密以受控测试值比较，日志中不输出明文。平台、物理断电与原生打包的实测范围见该记录。
 
 ### 已有 MCP 用户升级
 
-- [ ] 旧 `mcp.clients` 尚未转换为 DriverCard：升级后一次性转换，原服务和工具可调用。
-- [ ] 已迁移为 DriverCard：不重复转换、不复活已删除客户端、不重置旧迁移水位。
-- [ ] 混合 stdio/SSE/streamable HTTP、多工作区同名服务：全部配置保留，互不串用。
-- [ ] `command/args/cwd/env/url/headers/timeout`、显示名、凭据引用、OAuth、策略、白名单逐项保真；`tools=[]` 仍表示全部禁止，不能变成无限制。
-- [ ] 原启用来源正常连接、发现、调用和重连；原停用来源不连接。
-- [ ] 自定义但全部停用：配置可管理、无需重新输入，连接数为零。
-- [ ] 插件启用且工作区仍需监测：保持两秒扫描；来源暂时停用期间不建立连接，手工编辑启用后下一轮扫描正常生效。
-- [ ] 显式禁用/卸载插件后升级或重启：不恢复安装和启用；数据保留。
-- [ ] 断电/退出后继续升级：无半安装、无重复注册、无秘密泄漏。
-- [ ] 禁用再启用和插件更新：配置继续可用，失败更新保持可恢复状态。
+- [x] 旧 `mcp.clients` 尚未转换为 DriverCard：升级后一次性转换，原服务和工具可调用。
+- [x] 已迁移为 DriverCard：不重复转换、不复活已删除客户端、不重置旧迁移水位。
+- [x] 混合 stdio/SSE/streamable HTTP、多工作区同名服务：全部配置保留，互不串用。
+- [x] `command/args/cwd/env/url/headers/timeout`、显示名、凭据引用、OAuth、策略、白名单逐项保真；`tools=[]` 仍表示全部禁止，不能变成无限制。
+- [x] 原启用来源正常连接、发现、调用和重连；原停用来源不连接。
+- [x] 自定义但全部停用：配置可管理、无需重新输入，连接数为零。
+- [x] 插件启用且工作区仍需监测：保持两秒扫描；来源暂时停用期间不建立连接，手工编辑启用后下一轮扫描正常生效。
+- [x] 显式禁用/卸载插件后升级或重启：不恢复安装和启用；数据保留。
+- [x] 升级中断/退出后继续升级：无半安装、无重复注册、无秘密泄漏（复制、配置及记录阶段故障注入；未进行物理断电测试）。
+- [x] 禁用再启用和插件更新：配置继续可用，失败更新保持可恢复状态。
 
 ### 未使用 MCP 用户升级
 
-- [ ] 从无 MCP 字段、旧默认禁用 AnySearch、默认迁移卡片三种起点分别升级，均不安装、不启用。
-- [ ] `get_plugins_dir()/qwenpaw-mcp` 不存在；插件 discover/load 列表中无 `qwenpaw-mcp`。
-- [ ] 未调用插件安装器、DependencyGate、pip/uv、OAuth 或任何 MCP 外部连接。
-- [ ] 核心未加载本项目 MCP handler/transport；上游可能已加载的 `mcp.*` 另行记录，不混淆归因。
-- [ ] 真正的 DriverManager 实例数为零；MCP 连接、子进程、专用周期任务和周期 snapshot 次数为零。
-- [ ] 重启两次结果一致；迁移判定不因系统默认数据出现而反复改成安装。
-- [ ] 用户随后主动安装并配置 MCP：无需修改核心或重新创建工作区即可使用。
-- [ ] 原 MCP 导航入口和初始界面仍可见；进入页面不会自动安装或启动运行时，点击安装后可在同一页面继续配置和使用。
+- [x] 从无 MCP 字段、旧默认禁用 AnySearch、默认迁移卡片三种起点分别升级，均不安装、不启用。
+- [x] `get_plugins_dir()/qwenpaw-mcp` 不存在；插件 discover/load 列表中无 `qwenpaw-mcp`。
+- [x] 未调用插件安装器、DependencyGate、pip/uv、OAuth 或任何 MCP 外部连接。
+- [x] 核心未加载本项目 MCP handler/transport；上游可能已加载的 `mcp.*` 另行记录，不混淆归因。
+- [x] 真正的 DriverManager 实例数为零；MCP 连接、子进程、专用周期任务和周期 snapshot 次数为零。
+- [x] 重启两次结果一致；迁移判定不因系统默认数据出现而反复改成安装。
+- [x] 用户随后主动安装并配置 MCP：无需修改核心或重新创建工作区即可使用。
+- [x] 原 MCP 导航入口和初始界面仍可见；进入页面不会自动安装或启动运行时，点击安装后可在同一页面继续配置和使用。
 
 ### 前端入口与初始界面
 
-- [ ] 插件未安装、未启用或安装失败时，原 MCP 入口、路由和初始界面均保留。
-- [ ] 未安装时可在初始界面选择安装；已安装未启用时可在同一页面启用，失败时可重试。
-- [ ] 启用后在原 `/mcp` 页面提供管理能力；禁用或卸载后返回初始界面，不移除导航入口。
-- [ ] 未安装时不加载插件 bundle；现有其他 backend 的 discovery 入口不受影响。
+- [x] 插件未安装、未启用或安装失败时，原 MCP 入口、路由和初始界面均保留。
+- [x] 未安装时可在初始界面选择安装；已安装未启用时可在同一页面启用，失败时可重试。
+- [x] 启用后在原 `/mcp` 页面提供管理能力；禁用或卸载后返回初始界面，不移除导航入口。
+- [x] 未安装时不加载插件 bundle；现有其他 backend 的 discovery 入口不受影响。
 
 ### SDK 与资源安全
 
-- [ ] SDK 1.0 插件仍可加载；要求 `drivers` 的插件在旧 SDK 上于导入 entry 前明确拒绝。
-- [ ] fake 非 MCP 协议也能只靠 `DriverProtocolSpec` 完成发现和调用，证明接口没有硬编码 MCP。
-- [ ] 来源、凭据和身份跨工作区/来源越权被拒绝；策略 allow/deny/ask 与既有行为一致。
-- [ ] 初始化中断、在途调用取消、工作区替换和关闭超时后无失去归属的任务、连接或进程。
-- [ ] SDK 静态检查无内部导入；测试宿主与生产走相同 adapter 和治理路径。
-- [ ] 保留现有两秒扫描机制：未安装/未启用 MCP 插件时无扫描，需要监测的工作区继续扫描，暂时停用来源时可以只监测而不连接。
+- [x] SDK 1.0 插件仍可加载；要求 `drivers` 的插件在旧 SDK 上于导入 entry 前明确拒绝。
+- [x] fake 非 MCP 协议也能只靠 `DriverProtocolSpec` 完成发现和调用，证明接口没有硬编码 MCP。
+- [x] 来源、凭据和身份跨工作区/来源越权被拒绝；策略 allow/deny/ask 与既有行为一致。
+- [x] 初始化中断、在途调用取消、工作区替换和关闭超时后无失去归属的任务、连接或进程。
+- [x] SDK 静态检查无内部导入；测试宿主与生产走相同 adapter 和治理路径。
+- [x] 保留现有两秒扫描机制：未安装/未启用 MCP 插件时无扫描，需要监测的工作区继续扫描，暂时停用来源时可以只监测而不连接。
 
 ## 最终检查与交付记录
 
-- [ ] 逐条核对 Global Constraints、Review Focus 和用户矩阵，记录实际命令及输出。
-- [ ] 在与项目要求一致的 Python/依赖环境运行；不能以另一个 checkout 或 AgentScope 版本的结果代替。
-- [ ] 运行 `PYTHONPATH=src python -m pytest -q tests/unit/plugins tests/unit/drivers`，以及本方案新增 app 测试与集成测试。
-- [ ] 运行 `npm --prefix console run test:run -- src/plugins src/pages/Agent/MCP` 及 `npm --prefix console run format:check`，记录输出。
-- [ ] 运行 `scripts/check_plugin_sdk_artifacts.py`，传入本次构建的 `--wheel`、`--sdist`、已安装该 wheel 的外部 `--python`、`--source-root` 和仓库外新建的 `--output`；不能用源码安装结果替代 wheel 验证。
-- [ ] 运行 `scripts/check_plugin_sdk_frontend.py`，以本次 wheel 解包出的 SDK 为 `--package`、已有声明依赖目录为 `--dependencies`、新的隔离目录为 `--output`，核对发布类型和独立作者用法。
-- [ ] 对 SDK 类型、协议生命周期、升级判定、前端 API 和发行资源做一次整体复核。
-- [ ] 交付 MCP 插件、SDK 1.1 文档、升级 fixture/测试、性能对比及已知限制；本期没有 Agent Mail/ACP 插件化改动。
+- [x] 逐条核对 Global Constraints、Review Focus 和用户矩阵，记录实际命令及输出。
+- [x] 在与项目要求一致的 Python/依赖环境运行；不能以另一个 checkout 或 AgentScope 版本的结果代替。
+- [x] 运行 `PYTHONPATH=src python -m pytest -q tests/unit/plugins tests/unit/drivers`，以及本方案新增 app 测试与集成测试。
+- [x] 运行 `npm --prefix console run test:run -- src/plugins src/pages/Agent/MCP` 及 `npm --prefix console run format:check`，记录输出。
+- [x] 运行 `scripts/check_plugin_sdk_artifacts.py`，传入本次构建的 `--wheel`、`--sdist`、已安装该 wheel 的外部 `--python`、`--source-root` 和仓库外新建的 `--output`；不能用源码安装结果替代 wheel 验证。
+- [x] 运行 `scripts/check_plugin_sdk_frontend.py`，以本次 wheel 解包出的 SDK 为 `--package`、已有声明依赖目录为 `--dependencies`、新的隔离目录为 `--output`，核对发布类型和独立作者用法。
+- [x] 对 SDK 类型、协议生命周期、升级判定、前端 API 和发行资源做一次整体复核。
+- [x] 交付 MCP 插件、SDK 1.1 文档、升级 fixture/测试、性能对比及已知限制；本期没有 Agent Mail/ACP 插件化改动。
 
 计划检查只能证明文档完整；所有实现、测试和发布 checklist 必须以实际结果勾选，不能因本方案写完而视为已完成。
+
+最终运行时代码为 `773f1fc5b`。全部代码审查发现已解决，见[初审](../reports/2026-10-20-mcp-plugin-review.md)、[首次复审](../reports/2026-10-20-mcp-plugin-rereview.md)及[恢复修正复审](../reports/2026-10-20-mcp-plugin-rereview-i3.md)。最终 wheel 的 SDK 检查七阶段通过，349 项独立作者测试通过；发行资源与冷启动 7 项通过。源码广泛回归的初次 fixture/环境失败及全部受影响用例的修正结果按实际批次记录，不合成为一次全绿运行。
+
+原有三十条性能样本保留终审前源码身份；最终代码另以 1、10、50 工作区验证未使用 MCP 时零 Manager、零扫描与零相关任务。当前仅保留本地 `codex/mcp-plugin` 分支，push 目标为 `origin`（`Luohh5/QwenPaw`）；未推送或合并。所有裁定及判断错误的代价见[决策记录](../reports/2026-10-20-mcp-plugin-decisions.md)。
