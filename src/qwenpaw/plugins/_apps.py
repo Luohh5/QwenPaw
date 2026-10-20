@@ -185,6 +185,12 @@ class Services:  # pylint: disable=protected-access
                 "App call has ended; enter for_workspace() for a new call",
             )
 
+    def driver_source(self, protocol, source_id):
+        from ._drivers import management_source
+
+        self.guard()
+        return management_source(self, protocol, source_id)
+
     async def workspaces(self):
         self.guard()
         return await self._configured_workspaces()

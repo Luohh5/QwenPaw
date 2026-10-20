@@ -1,3 +1,6 @@
+# -*- coding: utf-8 -*-
+# This production adapter intentionally accesses the services under test.
+# pylint: disable=protected-access
 """Author-facing integration host using the production loader and lifecycle.
 
 This host owns process-wide plugin registries. Use one host per process; run
@@ -11,6 +14,8 @@ import sys
 import inspect
 from types import SimpleNamespace
 from typing import AsyncGenerator, Sequence, Mapping, Any
+from pathlib import Path
+from dataclasses import dataclass
 from .sdk import PluginContext
 from .messages import Message
 from .apps import ChatRequest
@@ -27,12 +32,8 @@ from .results import (
     ReloadResult,
     ConfigUpdateResult,
 )
-from pathlib import Path
-from dataclasses import dataclass
-
 from .errors import SDKError
 from .tools import ToolResult, ToolEvent
-from .messages import Attachment, ContentBlock
 from ._testing_http import TestHttpResponse, TestConnection
 
 _ACTIVE_HOST = None
@@ -43,7 +44,9 @@ class TestFault:
 
     def __init__(self, loader, point, message, times):
         if point not in {"before_commit", "post_commit_cleanup"}:
-            raise SDKError("Fault point must be before_commit or post_commit_cleanup")
+            raise SDKError(
+                "Fault point must be before_commit or post_commit_cleanup",
+            )
         if times < 1:
             raise SDKError("Fault injection times must be positive")
         self.point, self.message, self.hits = point, message, 0
@@ -84,7 +87,7 @@ class TestApproval:
 
 
 class TestModel:
-    """A model built through the production formatter, usage and retry wrappers."""
+    """A model using production formatting, usage and retry wrappers."""
 
     def __init__(self, model, workspace, workspace_id):
         self._model, self._workspace = model, workspace
@@ -118,7 +121,8 @@ class TestModel:
             await stream.aclose()
 
 
-class PluginTestHost:
+# The public harness exercises each SDK service through the real host.
+class PluginTestHost:  # pylint: disable=too-many-public-methods
     def __init__(
         self,
         root: Path,
@@ -188,7 +192,11 @@ class PluginTestHost:
                 ):
                     if value.is_absolute() and value.is_relative_to(original):
                         self._restore.append((module, name, value))
-                        setattr(module, name, replacement / value.relative_to(original))
+                        setattr(
+                            module,
+                            name,
+                            replacement / value.relative_to(original),
+                        )
                         break
         for module, name, value in (
             (constant, "WORKING_DIR", self.root),
@@ -207,7 +215,8 @@ class PluginTestHost:
             setattr(module, name, value)
         self._loader = PluginLoader([self.root / "plugins"])
         self._workspace_manager = SimpleNamespace(
-            agents=self._workspaces, _bootstrap_kwargs={}
+            agents=self._workspaces,
+            _bootstrap_kwargs={},
         )
         self._loader.registry.set_workspace_manager(self._workspace_manager)
         self._workspace_manager.get_agent = self._workspace
@@ -226,7 +235,7 @@ class PluginTestHost:
         await self.close()
 
     async def close(self) -> None:
-        """Retry cleanup after a failed close; ownership stays until it succeeds."""
+        """Retry failed cleanup, retaining ownership until it succeeds."""
         from .lifecycle import UnloadMode
 
         if _ACTIVE_HOST is not self:
@@ -240,12 +249,16 @@ class PluginTestHost:
             # Native channel producers still persist their completion after
             # leaving the SDK invocation. Keep this host's environment until
             # that workspace-owned tail finishes; do not cancel its I/O.
-            tasks = await workspace.task_tracker.snapshot_active_tasks(owner=workspace)
+            tasks = await workspace.task_tracker.snapshot_active_tasks(
+                owner=workspace,
+            )
             if not await workspace.task_tracker.wait_tasks_done(
-                list(tasks.values()), timeout=5
+                list(tasks.values()),
+                timeout=5,
             ):
                 raise SDKError(
-                    f"Workspace {workspace_id!r} task completion has not stopped; retry close()"
+                    f"Workspace {workspace_id!r} task completion "
+                    "has not stopped; retry close()",
                 )
             if "memory_manager" in workspace._service_manager.services:
                 await self.stop_memory(workspace_id=workspace_id)
@@ -284,7 +297,9 @@ class PluginTestHost:
                     relative = value.relative_to(self.root)
                     replacement = self._old_roots[0] / relative
                     if relative.parts[:1] == ("secrets",):
-                        replacement = self._old_roots[1] / Path(*relative.parts[1:])
+                        replacement = self._old_roots[1] / Path(
+                            *relative.parts[1:],
+                        )
                     setattr(module, name, replacement)
         for module, name, value in reversed(self._restore):
             setattr(module, name, value)
@@ -294,17 +309,30 @@ class PluginTestHost:
             os.environ["QWENPAW_WORKING_DIR"] = self._old_environment
         _ACTIVE_HOST = None
 
-    async def load(self, path: Path, config: dict | None = None) -> PluginContext:
+    async def load(
+        self,
+        path: Path,
+        config: dict | None = None,
+    ) -> PluginContext:
         _, manifest = self._loader.read_source_manifest(Path(path))
-        record = await self._loader.lifecycle.load(manifest, Path(path), config)
+        record = await self._loader.lifecycle.load(
+            manifest,
+            Path(path),
+            config,
+        )
         if record.status != "active":
             raise SDKError(
-                "; ".join(record.diagnostics) or f"Plugin load failed: {record.status}"
+                "; ".join(record.diagnostics)
+                or f"Plugin load failed: {record.status}",
             )
         return self.context(manifest.id)
 
     def inject_failure(
-        self, point: str, *, message="SDK test injected failure", times=1
+        self,
+        point: str,
+        *,
+        message="SDK test injected failure",
+        times=1,
     ) -> TestFault:
         return TestFault(self._loader, point, message, times)
 
@@ -317,7 +345,6 @@ class PluginTestHost:
         interrupt_tasks: bool = False,
     ) -> InstallResult:
         """Copy/install/activate through the real recovery transaction."""
-        from .results import InstallResult
 
         try:
             record = await self._loader.load_plugin_from_path(
@@ -337,7 +364,9 @@ class PluginTestHost:
             raise SDKError(str(exc)) from exc
         instance = self._loader.lifecycle.get_instance(record.manifest.id)
         diagnostics = tuple(
-            dict.fromkeys([*record.diagnostics, *getattr(instance, "diagnostics", ())])
+            dict.fromkeys(
+                [*record.diagnostics, *getattr(instance, "diagnostics", ())],
+            ),
         )
         return InstallResult(
             record.manifest.id,
@@ -348,12 +377,16 @@ class PluginTestHost:
         )
 
     async def set_enabled(
-        self, plugin_id: str, enabled: bool, *, interrupt_tasks: bool = False
+        self,
+        plugin_id: str,
+        enabled: bool,
+        *,
+        interrupt_tasks: bool = False,
     ) -> EnableResult:
-        from .results import EnableResult
-
         report = await self._loader.lifecycle.set_enabled(
-            plugin_id, enabled, interrupt_tasks=interrupt_tasks
+            plugin_id,
+            enabled,
+            interrupt_tasks=interrupt_tasks,
         )
         if hasattr(report, "quiescent"):
             return EnableResult(
@@ -372,9 +405,12 @@ class PluginTestHost:
         )
 
     async def uninstall(
-        self, plugin_id: str, *, interrupt_tasks: bool = False
+        self,
+        plugin_id: str,
+        *,
+        interrupt_tasks: bool = False,
     ) -> UnloadResult:
-        """Delete only installed copies owned by this host's plugins directory."""
+        """Delete only installed copies in this host's plugins directory."""
         async with self._loader.plugin_lifecycle(plugin_id):
             record = self._loader.get_loaded_plugin(plugin_id)
             destination = self.root / "plugins"
@@ -393,14 +429,17 @@ class PluginTestHost:
                     None,
                 )
             if destination.resolve() != destination or (
-                source is not None and Path(source).resolve().parent != destination
+                source is not None
+                and Path(source).resolve().parent != destination
             ):
                 raise SDKError(
                     "Cannot uninstall an external plugin source; use unload() "
-                    "or install() a copy into this host first"
+                    "or install() a copy into this host first",
                 )
             return await self._unload(
-                plugin_id, uninstall=True, interrupt_tasks=interrupt_tasks
+                plugin_id,
+                uninstall=True,
+                interrupt_tasks=interrupt_tasks,
             )
 
     def _workspace_path(self, workspace_id):
@@ -413,10 +452,17 @@ class PluginTestHost:
             raise SDKError("Invalid workspace ID")
         relative = Path(self._workspace_dirs.get(workspace_id, workspace_id))
         path = (base / relative).resolve()
-        if relative.is_absolute() or not path.is_relative_to(base) or path == base:
+        if (
+            relative.is_absolute()
+            or not path.is_relative_to(base)
+            or path == base
+        ):
             raise SDKError("Workspace directory must be inside the test host")
         for other in self._workspaces.values():
-            if other.agent_id != workspace_id and other.workspace_dir.resolve() == path:
+            if (
+                other.agent_id != workspace_id
+                and other.workspace_dir.resolve() == path
+            ):
                 raise SDKError("Workspace IDs must have distinct directories")
         return path
 
@@ -430,7 +476,8 @@ class PluginTestHost:
 
             config = load_config()
             config.agents.profiles[workspace_id] = AgentProfileRef(
-                id=workspace_id, workspace_dir=str(path)
+                id=workspace_id,
+                workspace_dir=str(path),
             )
             save_config(config)
             workspace = Workspace(workspace_id, str(path))
@@ -440,15 +487,15 @@ class PluginTestHost:
             from ..app.chats.session import SafeJSONSession
 
             workspace._service_manager.services["chat_manager"] = ChatManager(
-                repo=JsonChatRepository(path / "chats.json")
+                repo=JsonChatRepository(path / "chats.json"),
             )
             workspace._service_manager.services["session"] = SafeJSONSession(
-                save_dir=str(path / "sessions")
+                save_dir=str(path / "sessions"),
             )
             from ..hooks.session import SessionLoadHook, SessionSaveHook
 
             workspace.bootstrap_plugins(
-                builtin_hook_clses=[SessionLoadHook, SessionSaveHook]
+                builtin_hook_clses=[SessionLoadHook, SessionSaveHook],
             )
             self._workspaces[workspace_id] = workspace
             from ..governance.resource_governor import ResourceGovernor
@@ -463,21 +510,24 @@ class PluginTestHost:
                         "*(**)",
                         GovernanceAction.ALLOW,
                         reason="PluginTestHost explicit test policy",
-                    )
+                    ),
                 )
                 for tool_name, action in self._tool_policy.items():
-                    policy_name = DEFAULT_REGISTRY.python_to_policy_name(tool_name)
+                    policy_name = DEFAULT_REGISTRY.python_to_policy_name(
+                        tool_name,
+                    )
                     governor.add_rule(
                         GovernanceRule(
                             f"{policy_name}(**)",
                             GovernanceAction(action),
                             reason="PluginTestHost explicit policy override",
-                        )
+                        ),
                     )
 
             await run_sync_io(configure_policy)
             for func in self._workspace_manager._bootstrap_kwargs.get(
-                "builtin_tool_funcs", []
+                "builtin_tool_funcs",
+                [],
             ):
                 workspace.plugins.tool_registry.register(func._tool_descriptor)
             for hook in self._loader.registry.get_workspace_created_hooks():
@@ -486,7 +536,7 @@ class PluginTestHost:
                         "workspace": workspace,
                         "agent_id": workspace_id,
                         "workspace_dir": str(path),
-                    }
+                    },
                 )
                 if inspect.isawaitable(result):
                     await result
@@ -519,9 +569,16 @@ class PluginTestHost:
     ) -> Message | None:
         from ._messages import from_host
 
-        context = await self._request_context(workspace_id, session_id, messages)
-        result = await context.workspace.plugins.slash_command_registry.dispatch(
-            text, context
+        context = await self._request_context(
+            workspace_id,
+            session_id,
+            messages,
+        )
+        result = (
+            await context.workspace.plugins.slash_command_registry.dispatch(
+                text,
+                context,
+            )
         )
         return from_host(result) if result is not None else None
 
@@ -535,16 +592,29 @@ class PluginTestHost:
     ) -> HookResult:
         from ..runtime.phases import Phase
         from ._messages import from_host
-        from .hooks import HookResult, ContextInjection
+        from .hooks import ContextInjection
 
-        context = await self._request_context(workspace_id, session_id, messages)
-        initial_messages = tuple(from_host(message) for message in context.input_msgs)
-        result = await context.workspace.plugins.hook_registry.run(
-            Phase(phase), context
+        context = await self._request_context(
+            workspace_id,
+            session_id,
+            messages,
         )
-        final_messages = tuple(from_host(message) for message in context.input_msgs)
+        initial_messages = tuple(
+            from_host(message) for message in context.input_msgs
+        )
+        result = await context.workspace.plugins.hook_registry.run(
+            Phase(phase),
+            context,
+        )
+        final_messages = tuple(
+            from_host(message) for message in context.input_msgs
+        )
         return HookResult(
-            "reply" if result.action.value == "short_circuit" else result.action.value,
+            (
+                "reply"
+                if result.action.value == "short_circuit"
+                else result.action.value
+            ),
             from_host(result.payload) if result.payload is not None else None,
             final_messages if final_messages != initial_messages else None,
             tuple(
@@ -554,15 +624,27 @@ class PluginTestHost:
         )
 
     async def build_prompt(
-        self, *, workspace_id="test", session_id="test", messages=()
+        self,
+        *,
+        workspace_id="test",
+        session_id="test",
+        messages=(),
     ) -> str:
-        context = await self._request_context(workspace_id, session_id, messages)
+        context = await self._request_context(
+            workspace_id,
+            session_id,
+            messages,
+        )
         return await context.workspace.plugins.prompt_manager.build(context)
 
     async def start_channel(
-        self, name: str, settings: dict | None = None, *, workspace_id: str = "test"
+        self,
+        name: str,
+        settings: dict | None = None,
+        *,
+        workspace_id: str = "test",
     ) -> None:
-        """Start the real queue; None reuses saved settings, {} replaces them."""
+        """Start the real queue; None reuses settings, {} replaces them."""
         from ..app.channels.manager import ChannelManager
         from ..config.config import load_agent_config, save_agent_config
         from ..utils.io_utils import run_sync_io
@@ -573,7 +655,9 @@ class PluginTestHost:
         def save():
             config = load_agent_config(workspace_id)
             values = (
-                getattr(config.channels, name, {}) if settings is None else settings
+                getattr(config.channels, name, {})
+                if settings is None
+                else settings
             )
             if hasattr(values, "model_dump"):
                 values = values.model_dump()
@@ -590,12 +674,17 @@ class PluginTestHost:
             manager.set_workspace(workspace)
             workspace._service_manager.services["channel_manager"] = manager
             await manager.start_all()
-        registration = self._loader.registry.get_registered_channels().get(name)
+        registration = self._loader.registry.get_registered_channels().get(
+            name,
+        )
         if registration is None:
             raise SDKError("Channel has no active plugin registration")
         try:
             await self._loader.registry.projector.project_one(
-                workspace, "channel", name, registration.plugin_id
+                workspace,
+                "channel",
+                name,
+                registration.plugin_id,
             )
             # A deliberate manager stop retains the projector's declaration.
             # Re-enter the real idempotent start primitive with current config;
@@ -607,7 +696,11 @@ class PluginTestHost:
             raise SDKError(str(exc)) from exc
 
     async def receive_channel(
-        self, name: str, message: ChannelMessage, *, workspace_id: str = "test"
+        self,
+        name: str,
+        message: ChannelMessage,
+        *,
+        workspace_id: str = "test",
     ) -> None:
         workspace = await self._workspace(workspace_id)
         manager = workspace.channel_manager
@@ -616,7 +709,12 @@ class PluginTestHost:
             raise SDKError("SDK channel is not running")
         channel._sdk_context.receive(message)
 
-    async def stop_channel(self, name: str, *, workspace_id: str = "test") -> None:
+    async def stop_channel(
+        self,
+        name: str,
+        *,
+        workspace_id: str = "test",
+    ) -> None:
         workspace = await self._workspace(workspace_id)
         if workspace.channel_manager is None:
             return
@@ -625,15 +723,22 @@ class PluginTestHost:
             raise SDKError(receipt.detail)
 
     async def set_channel_access(
-        self, name: str, user_id: str, allowed: bool, *, workspace_id: str = "test"
+        self,
+        name: str,
+        user_id: str,
+        allowed: bool,
+        *,
+        workspace_id: str = "test",
     ) -> None:
-        """Change the real workspace ACL, using the platform sender identity."""
+        """Change the workspace ACL using the platform sender identity."""
         from ..app.channels.access_control import get_access_control_store
         from ..utils.io_utils import run_sync_io
 
         workspace = await self._workspace(workspace_id)
         if type(allowed) is not bool or not user_id:
-            raise SDKError("Channel access requires a sender and boolean decision")
+            raise SDKError(
+                "Channel access requires a sender and boolean decision",
+            )
         store = get_access_control_store(workspace.workspace_dir)
         await run_sync_io(
             store.add_to_whitelist if allowed else store.add_to_blacklist,
@@ -665,18 +770,25 @@ class PluginTestHost:
         )
 
     async def health_channel(
-        self, name: str, *, workspace_id: str = "test"
+        self,
+        name: str,
+        *,
+        workspace_id: str = "test",
     ) -> ChannelHealth:
-        from .channels import ChannelHealth
-
         workspace = await self._workspace(workspace_id)
         if workspace.channel_manager is None:
             raise SDKError("Channel manager is not running")
         value = await workspace.channel_manager.get_channel_health(name)
         return ChannelHealth(value["status"], value.get("detail", ""))
 
-    async def configure_tool(self, name: str, settings: dict, *, workspace_id="test"):
-        """Persist declared tool settings through the normal agent.json writer."""
+    async def configure_tool(
+        self,
+        name: str,
+        settings: dict,
+        *,
+        workspace_id="test",
+    ):
+        """Persist tool settings through the normal agent.json writer."""
         from ..config.config import (
             load_agent_config,
             save_agent_config,
@@ -694,7 +806,8 @@ class PluginTestHost:
         def save():
             config = load_agent_config(workspace_id)
             entry = config.tools.builtin_tools.setdefault(
-                name, BuiltinToolConfig(name=name)
+                name,
+                BuiltinToolConfig(name=name),
             )
             entry.config = dict(settings)
             save_agent_config(workspace_id, config)
@@ -706,9 +819,17 @@ class PluginTestHost:
         return tuple(mode.name for mode in workspace.plugins.modes)
 
     async def active_modes(
-        self, *, workspace_id="test", session_id="test", messages=()
+        self,
+        *,
+        workspace_id="test",
+        session_id="test",
+        messages=(),
     ) -> tuple[str, ...]:
-        context = await self._request_context(workspace_id, session_id, messages)
+        context = await self._request_context(
+            workspace_id,
+            session_id,
+            messages,
+        )
         return tuple(
             mode.name
             for mode in context.workspace.plugins.modes
@@ -726,29 +847,47 @@ class PluginTestHost:
     ):
         if event not in {"turn_start", "reset"}:
             raise SDKError("Mode events are turn_start or reset")
-        context = await self._request_context(workspace_id, session_id, messages)
+        context = await self._request_context(
+            workspace_id,
+            session_id,
+            messages,
+        )
         mode = next(
-            (mode for mode in context.workspace.plugins.modes if mode.name == name),
+            (
+                mode
+                for mode in context.workspace.plugins.modes
+                if mode.name == name
+            ),
             None,
         )
         if mode is None:
             raise SDKError(f"Unknown mode: {name}")
         callback = (
-            mode.on_turn_start if event == "turn_start" else mode.on_conversation_reset
+            mode.on_turn_start
+            if event == "turn_start"
+            else mode.on_conversation_reset
         )
         await callback(context)
 
     async def available_tools(
-        self, *, workspace_id="test", session_id="test", messages=(), allowed=()
+        self,
+        *,
+        workspace_id="test",
+        session_id="test",
+        messages=(),
+        allowed=(),
     ) -> tuple[str, ...]:
         workspace = await self._workspace(workspace_id)
         active = await self.active_modes(
-            workspace_id=workspace_id, session_id=session_id, messages=messages
+            workspace_id=workspace_id,
+            session_id=session_id,
+            messages=messages,
         )
         return tuple(
             desc.name
             for desc in workspace.plugins.tool_registry.filter(
-                active_modes=set(active), allowed=set(allowed)
+                active_modes=set(active),
+                allowed=set(allowed),
             )
         )
 
@@ -762,7 +901,7 @@ class PluginTestHost:
                 str(path.relative_to(root))
                 for path in root.rglob("*")
                 if path.is_file()
-            )
+            ),
         )
 
     async def read_skill(self, name: str, *, workspace_id="test") -> str:
@@ -776,12 +915,21 @@ class PluginTestHost:
         return path.read_text(encoding="utf-8")
 
     async def search_market(
-        self, key: str, query: str, *, page: int = 1, limit: int = 10
+        self,
+        key: str,
+        query: str,
+        *,
+        page: int = 1,
+        limit: int = 10,
     ) -> SearchPage:
         from ..market.service import search_market
-        from .markets import SearchPage, MarketResult
+        from .markets import MarketResult
 
-        results, errors, pagination = await search_market(query, {key: page}, limit)
+        results, errors, pagination = await search_market(
+            query,
+            {key: page},
+            limit,
+        )
         if errors:
             raise SDKError("; ".join(error.message for error in errors))
         if key not in pagination:
@@ -804,7 +952,13 @@ class PluginTestHost:
         )
 
     async def install_market_skill(
-        self, key: str, url: str, *, workspace_id="test", version="", enable=False
+        self,
+        key: str,
+        url: str,
+        *,
+        workspace_id="test",
+        version="",
+        enable=False,
     ) -> str:
         from ..agents.skill_system.hub import install_skill_from_hub
 
@@ -819,7 +973,12 @@ class PluginTestHost:
         return result.name
 
     async def configure_provider(
-        self, provider_id: str, *, api_key="", base_url=None, options=None
+        self,
+        provider_id: str,
+        *,
+        api_key="",
+        base_url=None,
+        options=None,
     ):
         from ..providers.provider_manager import ProviderManager
 
@@ -829,12 +988,17 @@ class PluginTestHost:
         if options is not None:
             values["generate_kwargs"] = options
         if not await ProviderManager.get_instance().update_provider_async(
-            provider_id, values
+            provider_id,
+            values,
         ):
             raise SDKError(f"Unknown provider: {provider_id}")
 
     async def configure_chat_model(
-        self, provider_id: str, model_id: str, *, workspace_id="test"
+        self,
+        provider_id: str,
+        model_id: str,
+        *,
+        workspace_id="test",
     ):
         from ..config.config import load_agent_config, save_agent_config
         from ..providers.provider_manager import ModelSlotConfig
@@ -845,7 +1009,8 @@ class PluginTestHost:
         def configure():
             profile = load_agent_config(workspace_id)
             profile.active_model = ModelSlotConfig(
-                provider_id=provider_id, model=model_id
+                provider_id=provider_id,
+                model=model_id,
             )
             save_agent_config(workspace_id, profile)
             return profile
@@ -853,7 +1018,11 @@ class PluginTestHost:
         workspace._config = await run_sync_io(configure)
 
     async def create_model(
-        self, provider_id: str, model_id: str, *, workspace_id="test"
+        self,
+        provider_id: str,
+        model_id: str,
+        *,
+        workspace_id="test",
     ) -> TestModel:
         from ..agents.model_factory import create_model_and_formatter_async
         from ..providers.provider_manager import ModelSlotConfig
@@ -862,14 +1031,14 @@ class PluginTestHost:
         model, _formatter = await create_model_and_formatter_async(
             agent_id=workspace_id,
             model_slot_override=ModelSlotConfig(
-                provider_id=provider_id, model=model_id
+                provider_id=provider_id,
+                model=model_id,
             ),
         )
         return TestModel(model, workspace.workspace_dir, workspace_id)
 
     async def discover_models(self, provider_id: str) -> tuple[ModelInfo, ...]:
         from ..providers.provider_manager import ProviderManager
-        from .providers import ModelInfo
 
         provider = ProviderManager.get_instance().get_provider(provider_id)
         if provider is None:
@@ -887,7 +1056,134 @@ class PluginTestHost:
             for item in await provider.fetch_models()
         )
 
-    async def start_memory(self, backend_id: str, *, workspace_id="test", config=None):
+    async def _driver_manager(self, workspace_id):
+        from ..drivers.manager import DriverManager
+        from ..drivers.credentials.store import AsyncCredentialStore
+        from ..app.approvals.driver_gate import QwenPawDriverApprovalGate
+        from ._drivers import attach_driver_protocols
+
+        workspace = await self._workspace(workspace_id)
+        services = workspace._service_manager.services
+        manager = services.get("driver_manager")
+        if manager is None:
+            manager = DriverManager(
+                workspace.workspace_dir / "drivers",
+                AsyncCredentialStore(
+                    workspace.workspace_dir / "credentials.yaml",
+                ),
+                approval_gate=QwenPawDriverApprovalGate(),
+            )
+            services["driver_manager"] = manager
+        attach_driver_protocols(manager, self._loader.registry, workspace)
+        return manager
+
+    async def open_driver(
+        self,
+        source,
+        *,
+        workspace_id="test",
+        session_scope="",
+    ):
+        from ..drivers.contracts import DriverCard
+        from .drivers import _freeze, _thaw
+
+        try:
+            card = DriverCard(**_thaw(_freeze(source)))
+            manager = await self._driver_manager(workspace_id)
+            if session_scope:
+                await manager.replace_transient_drivers(session_scope, [card])
+            else:
+                await manager.register_driver(card)
+        except Exception as exc:
+            raise SDKError(str(exc)) from exc
+
+    async def list_driver_capabilities(
+        self,
+        source_id,
+        *,
+        workspace_id="test",
+        session_scope="",
+    ):
+        from ..drivers.constants import DRIVER_SCOPE_CONTEXT_KEY
+        from .drivers import _freeze
+        from dataclasses import asdict
+
+        try:
+            manager = await self._driver_manager(workspace_id)
+            capabilities = await manager.list_driver_capabilities(
+                source_id,
+                request_context={DRIVER_SCOPE_CONTEXT_KEY: session_scope},
+            )
+            return tuple(_freeze(asdict(value)) for value in capabilities)
+        except Exception as exc:
+            raise SDKError(str(exc)) from exc
+
+    async def call_driver(
+        self,
+        source_id,
+        name,
+        arguments,
+        *,
+        workspace_id="test",
+        session_scope="",
+        session_id="test",
+        user_id="test",
+        channel="console",
+    ):
+        from ..drivers.capabilities import (
+            DriverInvocation,
+            format_capability_id,
+        )
+        from ..drivers.constants import DRIVER_SCOPE_CONTEXT_KEY
+
+        manager = await self._driver_manager(workspace_id)
+        try:
+            handler = manager._get_handler(source_id)
+            result = await manager.invoke_capability(
+                DriverInvocation(
+                    format_capability_id(
+                        handler.card.protocol,
+                        source_id,
+                        "tool",
+                        "invoke",
+                        name,
+                    ),
+                    dict(arguments),
+                    {
+                        "agent_id": workspace_id,
+                        "session_id": session_id,
+                        "user_id": user_id,
+                        "channel": channel,
+                        DRIVER_SCOPE_CONTEXT_KEY: session_scope,
+                    },
+                ),
+            )
+            if not result.ok:
+                raise SDKError(result.message)
+            return result.value
+        except Exception as exc:
+            raise SDKError(str(exc)) from exc
+
+    async def close_driver(
+        self,
+        source_id,
+        *,
+        workspace_id="test",
+        session_scope="",
+    ):
+        try:
+            manager = await self._driver_manager(workspace_id)
+            await manager.close_driver(source_id, session_scope=session_scope)
+        except Exception as exc:
+            raise SDKError(str(exc)) from exc
+
+    async def start_memory(
+        self,
+        backend_id: str,
+        *,
+        workspace_id="test",
+        config=None,
+    ):
         """Select and construct memory via Workspace's real ServiceManager."""
         from ..config.config import load_agent_config, save_agent_config
         from ..utils.io_utils import run_sync_io
@@ -895,12 +1191,16 @@ class PluginTestHost:
         workspace = await self._workspace(workspace_id)
         manager = workspace._service_manager
         if "memory_manager" in manager.services:
-            raise SDKError("Stop the workspace's memory service before replacing it")
+            raise SDKError(
+                "Stop the workspace's memory service before replacing it",
+            )
 
         def configure():
             profile = load_agent_config(workspace_id)
             profile.running.memory_manager_backend = backend_id
-            profile.running.memory_backend_configs[backend_id] = dict(config or {})
+            profile.running.memory_backend_configs[backend_id] = dict(
+                config or {},
+            )
             save_agent_config(workspace_id, profile)
             return profile
 
@@ -918,7 +1218,8 @@ class PluginTestHost:
         manager = workspace._service_manager
         try:
             await manager._stop_service(
-                manager.descriptors["memory_manager"], final=True
+                manager.descriptors["memory_manager"],
+                final=True,
             )
         except RuntimeError as exc:
             raise SDKError(str(exc)) from exc
@@ -933,7 +1234,11 @@ class PluginTestHost:
         workspace._config = await run_sync_io(deselect)
 
     async def search_memory(
-        self, query: str, *, workspace_id="test", max_results=5
+        self,
+        query: str,
+        *,
+        workspace_id="test",
+        max_results=5,
     ) -> ToolResult:
         from ._messages import _from_block
 
@@ -955,7 +1260,9 @@ class PluginTestHost:
         service = workspace._service_manager.services.get("memory_manager")
         if service is None:
             raise SDKError("Memory service is not started")
-        return await service.auto_memory([to_host(message) for message in messages])
+        return await service.auto_memory(
+            [to_host(message) for message in messages],
+        )
 
     async def submit_memory(self, messages, *, workspace_id="test") -> str:
         from ._messages import to_host
@@ -964,13 +1271,15 @@ class PluginTestHost:
         service = workspace._service_manager.services.get("memory_manager")
         if service is None:
             raise SDKError("Memory service is not started")
-        return service.submit_auto_memory([to_host(message) for message in messages])
+        return service.submit_auto_memory(
+            [to_host(message) for message in messages],
+        )
 
     async def memory_tasks(
-        self, *, workspace_id: str = "test"
+        self,
+        *,
+        workspace_id: str = "test",
     ) -> tuple[MemoryTask, ...]:
-        from .memory import MemoryTask
-
         workspace = await self._workspace(workspace_id)
         service = workspace._service_manager.services.get("memory_manager")
         return (
@@ -995,21 +1304,24 @@ class PluginTestHost:
         session_id: str = "test",
         user_id: str = "test",
     ) -> AsyncGenerator[ChatEvent, None]:
-        """Run the production Runtime, including registered command/hook routes."""
+        """Run production Runtime with registered command and hook routes."""
         from ..schemas import AgentRequest
         from ._events import chat_event, _observing
 
         workspace = await self._workspace(workspace_id)
-        from .apps import ChatRequest
 
         public = (
             text
             if isinstance(text, ChatRequest)
             else ChatRequest(text, session_id=session_id)
         )
-        text = f"/{public.skill} {public.text}" if public.skill else public.text
+        text = (
+            f"/{public.skill} {public.text}" if public.skill else public.text
+        )
         request = AgentRequest(
-            input=[{"role": "user", "content": [{"type": "text", "text": text}]}],
+            input=[
+                {"role": "user", "content": [{"type": "text", "text": text}]},
+            ],
             session_id=public.session_id or session_id,
             user_id=user_id,
             channel="console",
@@ -1046,7 +1358,6 @@ class PluginTestHost:
         json=None,
     ) -> TestConnection:
         """Open an unbuffered ASGI response; use async with and chunks()."""
-        from ._testing_http import TestConnection
 
         if json is not None:
             import json as codec
@@ -1064,10 +1375,13 @@ class PluginTestHost:
         )
 
     def websocket(
-        self, path: str, *, workspace_id="test", user_id="test", headers=None
+        self,
+        path: str,
+        *,
+        workspace_id="test",
+        user_id="test",
+        headers=None,
     ) -> TestConnection:
-        from ._testing_http import TestConnection
-
         return TestConnection(
             self,
             "GET",
@@ -1078,9 +1392,12 @@ class PluginTestHost:
             websocket=True,
         )
 
-    async def request(self, method: str, path: str, **kwargs) -> TestHttpResponse:
-        from ._testing_http import TestHttpResponse
-
+    async def request(
+        self,
+        method: str,
+        path: str,
+        **kwargs,
+    ) -> TestHttpResponse:
         async with self.open_http(method, path, **kwargs) as stream:
             body = b"".join([chunk async for chunk in stream.chunks()])
             return TestHttpResponse(stream.status, stream.headers, body)
@@ -1117,12 +1434,15 @@ class PluginTestHost:
 
         context = self._tool_context(name)
         if DEFAULT_REGISTRY.get_owner(name) != context.plugin_id:
-            raise SDKError(f"Tool {name!r} has no active governance registration")
+            raise SDKError(
+                f"Tool {name!r} has no active governance registration",
+            )
         workspace = self._workspace_path(workspace_id)
         governor = self._governors.get(workspace_id)
         if governor is None:
             governor = ResourceGovernor(
-                str(workspace), governance_dir=str(self.root / "governance")
+                str(workspace),
+                governance_dir=str(self.root / "governance"),
             )
             governor.start()
             governor.policy.user_rules.insert(
@@ -1150,12 +1470,16 @@ class PluginTestHost:
         tool = PolicyGuardedTool(
             invoke,
             governor=governor,
-            request_context={"agent_id": workspace_id, "session_id": session_id},
+            request_context={
+                "agent_id": workspace_id,
+                "session_id": session_id,
+            },
         )
         decision = await tool.check_permissions(arguments)
         if decision.behavior is not PermissionBehavior.ALLOW:
             raise SDKError(f"Tool invocation denied: {decision.message}")
-        normalized = await tool(**arguments)
+        # PolicyGuardedTool supplies its callable adapter dynamically.
+        normalized = await tool(**arguments)  # pylint: disable=not-callable
         try:
             while True:
                 workspace_token = current_workspace_dir.set(workspace)
@@ -1180,7 +1504,10 @@ class PluginTestHost:
         session_id: str = "test",
     ) -> AsyncGenerator[ToolEvent, None]:
         chunks = self._tool_chunks(
-            name, arguments, workspace_id=workspace_id, session_id=session_id
+            name,
+            arguments,
+            workspace_id=workspace_id,
+            session_id=session_id,
         )
         try:
             async for chunk in chunks:
@@ -1189,11 +1516,17 @@ class PluginTestHost:
                 if chunk.is_last:
                     yield ToolEvent("end")
                     continue
-                metadata, previews, kind, is_error, block_metadata = (
-                    _take_tool_metadata(chunk.metadata, chunk.content)
-                )
+                (
+                    metadata,
+                    previews,
+                    kind,
+                    is_error,
+                    block_metadata,
+                ) = _take_tool_metadata(chunk.metadata, chunk.content)
                 if kind is None:
-                    raise SDKError("Tool returned an invalid SDK result envelope")
+                    raise SDKError(
+                        "Tool returned an invalid SDK result envelope",
+                    )
                 content = tuple(
                     _from_block(block, previews, block_metadata, str(index))
                     for index, block in enumerate(chunk.content)
@@ -1203,19 +1536,32 @@ class PluginTestHost:
                     if kind == "result"
                     else None
                 )
-                yield ToolEvent(kind, tuple(content) if kind == "delta" else (), result)
+                yield ToolEvent(
+                    kind,
+                    tuple(content) if kind == "delta" else (),
+                    result,
+                )
         finally:
             await chunks.aclose()
 
-    async def approval_requests(self, session_id: str = "test") -> list[TestApproval]:
+    async def approval_requests(
+        self,
+        session_id: str = "test",
+    ) -> list[TestApproval]:
         from ..app.approvals import get_approval_service
         from ..governance.tool_registry import DEFAULT_REGISTRY
 
-        pending = await get_approval_service().list_pending_by_session(session_id)
+        pending = await get_approval_service().list_pending_by_session(
+            session_id,
+        )
         names = {
             DEFAULT_REGISTRY.python_to_policy_name(name): name
             for instance in self._loader.lifecycle._instances.values()
-            for name in getattr(getattr(instance, "sdk_context", None), "_tools", {})
+            for name in getattr(
+                getattr(instance, "sdk_context", None),
+                "_tools",
+                {},
+            )
         }
         return [
             TestApproval(
@@ -1228,7 +1574,12 @@ class PluginTestHost:
             for item in pending
         ]
 
-    async def resolve_approval(self, request_id: str, *, approved: bool) -> bool:
+    async def resolve_approval(
+        self,
+        request_id: str,
+        *,
+        approved: bool,
+    ) -> bool:
         from ..app.approvals import get_approval_service
         from ..app.approvals.service import ApprovalActor
         from ..security.tool_guard.approval import ApprovalDecision
@@ -1251,7 +1602,12 @@ class PluginTestHost:
         )
         return resolved is not None
 
-    async def call_tool(self, name: str, arguments: dict, **context) -> ToolResult:
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict,
+        **context,
+    ) -> ToolResult:
         from agentscope.tool import ToolResponse
         from ._messages import _from_block, _take_tool_metadata
 
@@ -1263,7 +1619,8 @@ class PluginTestHost:
         finally:
             await chunks.aclose()
         metadata, previews, kind, error, block_metadata = _take_tool_metadata(
-            response.metadata, response.content
+            response.metadata,
+            response.content,
         )
         if kind != "end":
             raise SDKError("Tool returned no terminal SDK result envelope")
@@ -1284,8 +1641,6 @@ class PluginTestHost:
         new_source: Path | None = None,
         config: dict | None = None,
     ) -> ReloadResult:
-        from .results import ReloadResult
-
         report = await self._loader.lifecycle.reload(
             plugin_id,
             new_source=new_source,
@@ -1302,12 +1657,16 @@ class PluginTestHost:
         )
 
     async def update_config(
-        self, plugin_id: str, config: dict, *, interrupt_tasks: bool = False
+        self,
+        plugin_id: str,
+        config: dict,
+        *,
+        interrupt_tasks: bool = False,
     ) -> ConfigUpdateResult:
-        from .results import ConfigUpdateResult
-
         report = await self._loader.lifecycle.update_config(
-            plugin_id, config, interrupt_tasks=interrupt_tasks
+            plugin_id,
+            config,
+            interrupt_tasks=interrupt_tasks,
         )
         return ConfigUpdateResult(
             report.plugin_id,
@@ -1322,16 +1681,19 @@ class PluginTestHost:
         )
 
     async def unload(
-        self, plugin_id: str, *, interrupt_tasks: bool = False
+        self,
+        plugin_id: str,
+        *,
+        interrupt_tasks: bool = False,
     ) -> UnloadResult:
         return await self._unload(
-            plugin_id, uninstall=False, interrupt_tasks=interrupt_tasks
+            plugin_id,
+            uninstall=False,
+            interrupt_tasks=interrupt_tasks,
         )
 
     async def _unload(self, plugin_id, *, uninstall, interrupt_tasks):
         from .lifecycle import UnloadMode
-
-        from .results import UnloadResult
 
         report = await self._loader.lifecycle.unload(
             plugin_id,

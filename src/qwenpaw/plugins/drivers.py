@@ -7,7 +7,7 @@ import asyncio
 import math
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Callable, Mapping, Protocol, TYPE_CHECKING
+from typing import Awaitable, Callable, Mapping, Protocol, TYPE_CHECKING
 
 from .events import JSONValue
 from .messages import Attachment, ContentBlock
@@ -211,6 +211,10 @@ class DriverCredential:
 
 
 class DriverCredentialAccess(Protocol):
+    @property
+    def aliases(self) -> tuple[str, ...]:
+        ...
+
     async def resolve(self, alias: str) -> DriverCredential:
         ...
 
@@ -255,6 +259,23 @@ class DriverContext:
         )
         if not isinstance(self.source, DriverSource):
             raise TypeError("Driver context requires a public DriverSource")
+
+    _subprocess_environment: (
+        Callable[[], Awaitable[Mapping[str, str]]] | None
+    ) = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    async def subprocess_environment(self) -> Mapping[str, str]:
+        if self._subprocess_environment is None:
+            from .errors import SDKError
+
+            raise SDKError(
+                "Subprocess environment is unavailable in this context",
+            )
+        return await self._subprocess_environment()
 
     def invalidate_capabilities(self) -> None:
         self._invalidate_capabilities()

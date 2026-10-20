@@ -96,8 +96,8 @@
 | `DriverCallResult` | `content: tuple[ContentBlock, ...]`、`is_error: bool`、`structured_content: JSONValue`、JSON `metadata`；不返回 MCP SDK/AgentScope 类型 |
 | `DriverRequestContext` | 宿主提供的工作区实例、会话、用户、渠道身份、deadline、取消检查；插件不能修改身份或决定审批结果 |
 | `DriverCredential` | 本来源凭据的 `kind`、`revision: int`、只读 `public/secrets`；只交给受限来源上下文，不进入日志或 API 响应 |
-| `DriverCredentialAccess` | `resolve(alias: str) -> Awaitable[DriverCredential]`；`update(alias, *, expected_revision, public, secrets) -> Awaitable[None]`；只允许本来源已声明别名 |
-| `DriverContext` | `plugin_id/generation/workspace_id/workspace_instance_id/source_id/source_revision/session_scope`、`source: DriverSource`、`resources`、`logger`、`credentials`；`invalidate_capabilities() -> None` 仅标记本来源缓存失效 |
+| `DriverCredentialAccess` | 只读 `aliases: tuple[str, ...]` 列出本来源声明的别名；`resolve(alias: str) -> Awaitable[DriverCredential]`；`update(alias, *, expected_revision, public, secrets) -> Awaitable[None]`；只允许本来源已声明别名 |
+| `DriverContext` | `plugin_id/generation/workspace_id/workspace_instance_id/source_id/source_revision/session_scope`、`source: DriverSource`、`resources`、`logger`、`credentials`；`invalidate_capabilities() -> None` 仅标记本来源缓存失效；`subprocess_environment() -> Awaitable[Mapping[str, str]]` 按明确请求返回只读的用户持久化环境快照，不返回整个宿主进程环境 |
 | `DriverConnection` | `open() -> Awaitable[None]`；`discover(request: DriverRequestContext) -> Awaitable[tuple[DriverCapabilitySpec, ...]]`；`invoke(name: str, arguments: Mapping[str, JSONValue], request: DriverRequestContext) -> Awaitable[DriverCallResult]`；`close() -> Awaitable[None]` |
 | `DriverProtocolSpec` | `protocol: str`；`validate: Callable[[DriverSource], None]`；`create: Callable[[DriverContext, DriverSource], DriverConnection]` |
 | `PluginContext.register_driver_protocol(spec: DriverProtocolSpec) -> Registration` | 登记协议描述及撤销操作；同名协议由其他插件占用时明确失败；注册阶段不连接、不扫描工作区 |
@@ -202,9 +202,9 @@
 
 - [x] **Step 1:** 写公开导入、嵌套只读快照、JSON/schema 校验、重复协议拒绝和旧 SDK 插件兼容测试；`test_driver_plugin_rejects_internal_imports` 必须拒绝内部 Manager 导入。
 - [x] **Step 2:** 运行 `PYTHONPATH=src python -m pytest -q tests/unit/plugins/test_sdk_driver_contract.py`，确认新接口相关用例失败。
-- [ ] **Step 3:** 实现 DTO/Protocol 和登记接口；同步 PUBLIC_API、API_EXPORTS、版本、capability、类型样例。公开模块顶层不能导入 MCP 或宿主运行时。
-- [ ] **Step 4:** 重跑测试；用独立进程仅导入 `qwenpaw.plugins.drivers`，核对没有新增自有 MCP handler/transport 导入。
-- [ ] **Step 5:** 更新公开 API 清单与对应检查，独立提交。本任务不包含实际 MCP 连接。
+- [x] **Step 3:** 实现 DTO/Protocol 和登记接口；同步 PUBLIC_API、API_EXPORTS、版本、capability、类型样例。公开模块顶层不能导入 MCP 或宿主运行时。
+- [x] **Step 4:** 重跑测试；用独立进程仅导入 `qwenpaw.plugins.drivers`，核对没有新增自有 MCP handler/transport 导入。
+- [x] **Step 5:** 更新公开 API 清单与对应检查，独立提交。本任务不包含实际 MCP 连接。
 
 ### Task 3 将协议回调接入宿主治理与生命周期
 
@@ -212,10 +212,10 @@
 
 **Interfaces:** 消费 Task 2；内部桥将 `DriverConnection` 转成现有 Driver 能力，提供经鉴权的 `AppContext.driver_source()` 管理作用域。测试宿主增加 `open_driver(source, *, workspace_id)`、`list_driver_capabilities(source_id, *, workspace_id)`、`call_driver(source_id, name, arguments, *, workspace_id)`、`close_driver(source_id, *, workspace_id)` 四个测试入口，沿生产策略和桥接路径执行，不直接调用插件业务函数。
 
-- [ ] **Step 1:** 使用只依赖公开 SDK 的 fake 协议写 red tests：发现/调用/结果转换、allow/deny/ask、凭据别名越权拒绝、同名来源的双工作区隔离；管理作用域读取停用来源不创建连接，跨插件/会话来源访问被拒绝。
-- [ ] **Step 2:** 写 `test_driver_calls_block_plugin_reload`、`test_partial_open_cancel_closes_every_created_connection`、`test_failed_close_retains_owner`、`test_old_revision_cannot_publish`。
-- [ ] **Step 3:** 运行 `PYTHONPATH=src python -m pytest -q tests/unit/plugins/test_sdk_driver_lifecycle.py`，确认缺少桥接和清理能力导致失败。
-- [ ] **Step 4:** 实现桥接、来源级资源账本、受限凭据能力和调用活动计数；修复并发初始化取消窗口。审批和白名单检查由宿主先执行，插件不能绕过。
+- [x] **Step 1:** 使用只依赖公开 SDK 的 fake 协议写 red tests：发现/调用/结果转换、allow/deny/ask、凭据别名越权拒绝、同名来源的双工作区隔离；管理作用域读取停用来源不创建连接，跨插件/会话来源访问被拒绝。
+- [x] **Step 2:** 写 `test_driver_calls_block_plugin_reload`、`test_partial_open_cancel_closes_every_created_connection`、`test_failed_close_retains_owner`、`test_old_revision_cannot_publish`。
+- [x] **Step 3:** 运行 `PYTHONPATH=src python -m pytest -q tests/unit/plugins/test_sdk_driver_lifecycle.py`，确认缺少桥接和清理能力导致失败。
+- [x] **Step 4:** 实现桥接、来源级资源账本、受限凭据能力和调用活动计数；修复并发初始化取消窗口。审批和白名单检查由宿主先执行，插件不能绕过。
 - [ ] **Step 5:** 重跑新测试及 `tests/unit/drivers/test_transient_scopes.py`，全部通过后提交；保留现有内部来源调用签名。
 
 ### Task 4 实现仅依赖 SDK 的 MCP 插件后端
