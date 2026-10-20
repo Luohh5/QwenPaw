@@ -1,28 +1,15 @@
 """SDK-free legacy configuration and real Loader inherited contracts."""
 
-import importlib
 import sys
 
 import pytest
-import pytest_asyncio
 
 from extension_sample import ROOT
 from telegram_support import fault_runtime, runtime, telegram, telegram_sdk
 
 sys.path.insert(0, str(ROOT))
-ChannelContractTest = importlib.import_module(
-    "tests.contract.channels"
-).ChannelContractTest
 
 
-class TestTelegramProxyContract(ChannelContractTest):
-    def create_instance(self):
-        raise AssertionError("Use the real production Loader fixture")
-
-    @pytest_asyncio.fixture
-    async def instance(self, runtime, telegram_sdk):
-        rt = await telegram(runtime, telegram_sdk)
-        return rt.channel
 
 
 def test_environment_reads_exact_names_flags_raw_values_and_csv():

@@ -31,6 +31,7 @@ from .identifiers import (
     validate_python_abi,
 )
 from .models import IdentityParams, _capabilities, _string
+from .models import _identity_from_fields
 from .requirements import canonicalize_requirements
 
 SHARED_PROTOCOL_VERSION = 2
@@ -410,12 +411,7 @@ class SharedHelloParams(IdentityParams):
             raise ProtocolValidationError("dependency_mode must be shared")
         environment = _marker_environment(data["marker_environment"])
         try:
-            identity = IdentityParams.from_mapping(
-                {
-                    key: data[key]
-                    for key in ("channel_key", "instance_id", "generation")
-                },
-            )
+            identity = _identity_from_fields(data)
             source_revision = validate_digest(data["source_revision"])
             python_abi = validate_python_abi(data["python_abi"])
             platform_tag = validate_platform_tag(

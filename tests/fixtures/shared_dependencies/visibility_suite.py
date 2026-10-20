@@ -6,6 +6,7 @@ import importlib
 from importlib import metadata
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import site
@@ -943,3 +944,30 @@ async def test_paired_workers_measure_readable_unused_roots_without_imports(
         json.dumps(measurements, indent=2) + "\n",
     )
     print("SHARED_DEPENDENCY_MEMORY=" + json.dumps(measurements))
+
+
+def test_live_readers_survives_removed_candidate_and_keeps_locked_reader(
+    tmp_path, monkeypatch,
+):
+    from qwenpaw.plugins import dependency_maintenance as maintenance
+
+    site = tmp_path / "site"
+    site.mkdir()
+    readers = tmp_path / ".site.dependencies-readers"
+    live = readers / f"{os.getpid()}-live.lease"
+    stale = readers / "999999-stale.lease"
+    original_glob = Path.glob
+
+    def enumerate_then_remove(directory, pattern):
+        paths = list(original_glob(directory, pattern))
+        if directory == readers and pattern == "*.lease":
+            stale.unlink()
+            paths.sort(key=lambda path: path != stale)
+        return iter(paths)
+
+    with maintenance.file_lock(live):
+        stale.write_bytes(b"\0")
+        monkeypatch.setattr(Path, "glob", enumerate_then_remove)
+        assert maintenance.live_readers((site,)) == [
+            {"pid": os.getpid(), "site": str(site)},
+        ]

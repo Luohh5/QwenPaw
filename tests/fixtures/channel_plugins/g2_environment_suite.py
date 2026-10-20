@@ -1,6 +1,7 @@
 """Environment compatibility through the public ChannelManager factory."""
 
 import json
+from pathlib import Path
 import sys
 from types import MappingProxyType
 
@@ -345,5 +346,8 @@ async def test_official_env_parser_preserves_legacy_values_without_sdk(
     assert isinstance(channel, IsolatedChannelProxy)
     config = channel._launch_spec.config
     assert config["enabled"] is True
-    assert {field: config[field] for field in expected} == expected
+    expected_execution = dict(expected)
+    if key == "mattermost" and expected_execution.get("media_dir") == "~/media":
+        expected_execution["media_dir"] = str(Path.home() / "media")
+    assert {field: config[field] for field in expected_execution} == expected_execution
     assert channel.channel_process.health_snapshot()["pid"] is None

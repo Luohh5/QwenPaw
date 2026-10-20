@@ -197,7 +197,10 @@ def live_readers(sites, ignore_pid=None):
     for root in sites:
         directory = _readers_dir(root)
         for path in directory.glob("*.lease") if directory.is_dir() else ():
-            descriptor = os.open(path, os.O_RDWR)
+            try:
+                descriptor = os.open(path, os.O_RDWR)
+            except FileNotFoundError:
+                continue
             try:
                 if _try_lock(descriptor):
                     path.unlink(missing_ok=True)

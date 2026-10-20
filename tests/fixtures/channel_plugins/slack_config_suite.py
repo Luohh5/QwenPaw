@@ -2,7 +2,6 @@
 moves."""
 
 import json
-import importlib
 import sys
 from types import SimpleNamespace as NS
 
@@ -13,9 +12,6 @@ from g2_legacy_configuration_suite import proxy_for
 from slack_suite import forbid_host_sdk
 
 sys.path.insert(0, str(ROOT))
-ChannelContractTest = importlib.import_module(
-    "tests.contract.channels"
-).ChannelContractTest
 
 
 def static_proxy(config=None, **options):
@@ -32,9 +28,6 @@ def static_proxy(config=None, **options):
     )
 
 
-class TestSlackHostContract(ChannelContractTest):
-    def create_instance(self):
-        return static_proxy()
 
 
 def test_original_init_and_contract_credential_projection():

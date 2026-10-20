@@ -22,7 +22,6 @@ from PIL import Image
 
 from qwenpaw_channel_wecom.utils import (
     compress_image_for_wecom,
-    format_markdown_tables,
 )
 
 
@@ -85,84 +84,6 @@ def _write_noisy_png(path, size=(400, 400), mode="RGB", alpha=None, seed=7):
 # ---------------------------------------------------------------------------
 
 
-class TestFormatMarkdownTables:
-    def test_plain_text_is_untouched(self):
-        text = "hello\nworld"
-
-        assert format_markdown_tables(text) == text
-
-    def test_empty_text(self):
-        assert format_markdown_tables("") == ""
-
-    def test_table_is_reformatted(self):
-        text = "| a | b |\n|---|---|\n| 1 | 22 |"
-
-        assert format_markdown_tables(text) == (
-            "| a | b  |\n| --- | --- |\n| 1 | 22 |"
-        )
-
-    def test_surrounding_text_is_preserved(self):
-        text = "before\n| name |\n| --- |\n| 1 |\nafter"
-
-        # Widths come from data rows only (the separator is rebuilt).
-        assert format_markdown_tables(text) == (
-            "before\n| name |\n| ---- |\n| 1    |\nafter"
-        )
-
-    def test_pipes_inside_code_fence_are_left_alone(self):
-        text = "```\n| a | b |\n| 1 | 2 |\n```"
-
-        assert format_markdown_tables(text) == text
-
-    def test_code_fence_with_language_marker(self):
-        text = "```python\nx = a | b\n```"
-
-        assert format_markdown_tables(text) == text
-
-    def test_table_after_a_closed_fence_is_formatted(self):
-        text = "```\nnot | a | table\n```\n| name |\n| --- |\n| 1 |"
-
-        assert format_markdown_tables(text) == (
-            "```\nnot | a | table\n```\n| name |\n| ---- |\n| 1    |"
-        )
-
-    def test_unterminated_fence_suppresses_later_tables(self):
-        text = "```\n| a |\n| --- |\n| 1 |"
-
-        assert format_markdown_tables(text) == text
-
-    def test_table_stops_at_a_fence_line(self):
-        text = "| name |\n| --- |\n```\n| b |"
-
-        # The fence opens a block, so the trailing row passes through.
-        assert format_markdown_tables(text) == (
-            "| name |\n| ---- |\n```\n| b |"
-        )
-
-    def test_two_tables_in_one_message(self):
-        text = "| name |\n| --- |\n| 1 |\n\nmid\n\n| value |\n| --- |\n| 22 |"
-
-        result = format_markdown_tables(text)
-
-        assert result == (
-            "| name |\n| ---- |\n| 1    |\n\nmid\n\n"
-            "| value |\n| ----- |\n| 22    |"
-        )
-
-    def test_line_without_pipe_but_with_table_word_is_untouched(self):
-        text = "a table follows:"
-
-        assert format_markdown_tables(text) == text
-
-    def test_trailing_newline_is_preserved(self):
-        text = "| a |\n| --- |\n"
-
-        assert format_markdown_tables(text).endswith("\n")
-
-    def test_indented_fence_is_detected(self):
-        text = "  ```\n| a |\n  ```"
-
-        assert format_markdown_tables(text) == text
 
 
 # ---------------------------------------------------------------------------

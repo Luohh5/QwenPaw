@@ -57,10 +57,6 @@ class SIPDriver(SharedResponseDriver):
         self._connected = connected
         await self._context.set_platform_state(state)
 
-    def _check_connection(self, generation):
-        if self._stopping or generation != self._connection_generation:
-            raise RuntimeError("STALE_CONNECTION_CALLBACK")
-
     def _require_connected(self):
         if (
             self._stopping

@@ -8,8 +8,8 @@ import importlib
 import json
 import os
 
-from qwenpaw.channel_protocol import FramedTransport
-from qwenpaw.channel_protocol.runner_bootstrap import (
+from qwenpaw.plugins.execution.framing import FramedTransport
+from qwenpaw.plugins.execution.bootstrap import (
     _capture_protocol_output,
     _open_protocol_transport,
     _redirect_ordinary_output,

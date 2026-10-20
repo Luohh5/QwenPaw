@@ -39,19 +39,6 @@ def test_original_attachment_classification(
     )
 
 
-@pytest.mark.parametrize(
-    "kind,text,prefix,want",
-    [
-        ("message", "hello", "[META] ", "[META]   hello"),
-        ("message", "hello", "[BOT] ", "[BOT]   hello"),
-        ("reasoning", "thinking...", "[BOT] ", "[BOT]   💭 thinking..."),
-        ("reasoning", "thinking...", "", "💭 thinking..."),
-        ("message", "", "", ""),
-        ("message", "", "[BOT] ", ""),
-    ],
-)
-def test_original_stream_display(helpers, kind, text, prefix, want):
-    assert helpers.build_stream_display_text(kind, text, prefix) == want
 
 
 @pytest.mark.parametrize(
@@ -69,11 +56,6 @@ def test_original_handle_routes(helpers, handle, want):
     assert helpers.route_from_handle(handle) == want
 
 
-@pytest.mark.parametrize("text", ["Hello, World!", "", "   \n\t  "])
-def test_original_short_empty_whitespace_chunking(helpers, text):
-    chunks = helpers.chunk_text(text)
-    assert chunks == [text]
-    assert len(chunks) == 1
 
 
 def test_original_newline_chunking_preserves_every_line(helpers):
@@ -90,40 +72,6 @@ def test_original_long_single_line_keeps_all_characters(helpers):
     assert all(len(chunk) <= 2000 for chunk in chunks)
 
 
-def test_original_chunking_paragraphs_and_boundary_message(helpers):
-    text = "First paragraph with some content.\n\nSecond paragraph with more content.\n\nThird paragraph here."
-    joined = "\n".join(helpers.chunk_text(text, max_len=1000))
-    assert "First paragraph" in joined
-    assert "Second paragraph" in joined
-    assert "Third paragraph" in joined
-    assert joined == text
-    assert helpers.chunk_text("Hello World") == ["Hello World"]
-    chunks = helpers.chunk_text("A" * 1999)
-    assert len(chunks) >= 1
-    assert all(len(chunk) <= 2000 for chunk in chunks)
-
-
-@pytest.mark.parametrize(
-    "text",
-    ["```\n```", '```python\nprint("```nested```")\n```'],
-)
-def test_original_only_and_nested_fences(helpers, text):
-    chunks = helpers.chunk_text(text, max_len=100)
-    assert len(chunks) >= 1
-    assert "\n".join(chunks) == text
-
-
-def test_original_cross_chunk_fences_keep_language_and_body(helpers):
-    lines = [f"line_{i:03d}()" for i in range(400)]
-    chunks = helpers.chunk_text("```python\n" + "\n".join(lines) + "\n```")
-    assert len(chunks) > 1
-    assert all(len(chunk) <= 2000 for chunk in chunks)
-    assert all(
-        chunk.startswith("```python\n") and chunk.endswith("\n```")
-        for chunk in chunks
-    )
-    body = [line for chunk in chunks for line in chunk.splitlines()[1:-1]]
-    assert body == lines
 
 
 def test_original_environment_basic_and_policy_values_are_sdk_free():

@@ -762,6 +762,10 @@ class PluginProcess:
         deadline = asyncio.get_running_loop().time() + budget
         if self._stop_task is None or self._stop_task.done():
             self._stop_task = asyncio.create_task(self._stop(budget))
+        elif self._state == "residual":
+            self._stop_task = asyncio.create_task(
+                self._stop(budget, previous=self._stop_task),
+            )
         wait = asyncio.create_task(self._wait_stop(self._stop_task, deadline))
         try:
             return await asyncio.shield(wait)
@@ -799,7 +803,13 @@ class PluginProcess:
             tuple(residual) or ("STOP_PENDING",),
         )
 
-    async def _stop(self, budget: float) -> StopResult:
+    async def _stop(self, budget: float, *, previous=None) -> StopResult:
+        if previous is not None:
+            deadline = asyncio.get_running_loop().time() + budget
+            result = await asyncio.shield(previous)
+            budget = deadline - asyncio.get_running_loop().time()
+            if result.exited or budget <= 0:
+                return result
         self._state = "stopping"
         if self._start_task is not None and not self._start_task.done():
             self._start_task.cancel()

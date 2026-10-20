@@ -357,10 +357,6 @@ class DingTalkDriver(SharedResponseDriver):
             self._platform = None
         await self._context.set_platform_state("disconnected")
 
-    def _check_connection(self, generation):
-        if self._stopping or generation != self._connection_generation:
-            raise RuntimeError("STALE_CONNECTION_CALLBACK")
-
     def _require_connected(self):
         if not self._connected or self._platform is None:
             raise ValueError("NOT_CONNECTED")

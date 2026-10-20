@@ -2,11 +2,9 @@
 """ApprovalService display severities cross the real shared worker boundary."""
 
 import asyncio
-from contextvars import ContextVar
 from copy import deepcopy
 import json
 import os
-from types import SimpleNamespace
 
 import pytest
 
@@ -23,121 +21,6 @@ from dingtalk_process_suite import (
 )
 
 
-@pytest.fixture
-def capture_proxy(proxy_api):
-    """Capture card construction; worker tests below prove real delivery."""
-    from qwenpaw.channel_protocol.models import ApprovalCardParams
-
-    class CaptureProxy(proxy_api):
-        def __new__(cls):
-            return object.__new__(cls)
-
-        def __init__(self):
-            self._response_context = ContextVar("approval-test-response", default=None)
-            self.operations = []
-
-        async def _send_operation(self, to_handle, meta, operation, **fields):
-            self.operations.append(deepcopy(fields))
-            ApprovalCardParams.from_mapping(fields["approval"])
-
-    return CaptureProxy()
-
-
-async def send_approval_event(channel, severity_fields):
-    from qwenpaw.schemas import Message, TextContent
-
-    event = Message(
-        content=[TextContent(text="Diagnostic approval body")],
-        metadata={
-            "metadata": {
-                "message_type": "tool_guard_approval",
-                "approval_request_id": "approval-display-1",
-                "tool_name": "diagnostic-tool",
-                **severity_fields,
-            }
-        },
-    )
-    original = deepcopy(event.model_dump())
-    meta = {"session_id": "diagnostic-session", "payload": {"severity": "HIGH"}}
-    original_meta = deepcopy(meta)
-    try:
-        await channel.on_event_message_completed(
-            SimpleNamespace(),
-            "diagnostic-handle",
-            event,
-            meta,
-        )
-    finally:
-        assert event.model_dump() == original
-        assert meta == original_meta
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "value,expected",
-    [
-        ("LOW", "low"),
-        ("low", "low"),
-        ("MEDIUM", "medium"),
-        ("medium", "medium"),
-        ("HIGH", "high"),
-        ("high", "high"),
-        ("CRITICAL", "critical"),
-        ("critical", "critical"),
-        ("HiGh", "high"),
-        ("INFO", "medium"),
-        ("info", "medium"),
-        ("SAFE", "medium"),
-        ("safe", "medium"),
-    ],
-)
-async def test_public_approval_event_maps_display_severity(
-    capture_proxy, value, expected
-):
-    await send_approval_event(capture_proxy, {"severity": value})
-    assert capture_proxy.operations == [
-        {
-            "approval": {
-                "request_id": "approval-display-1",
-                "tool_name": "diagnostic-tool",
-                "severity": expected,
-            },
-            "content_parts": [{"type": "text", "text": "Diagnostic approval body"}],
-        }
-    ]
-
-
-@pytest.mark.asyncio
-async def test_public_approval_event_retains_absent_severity_default(capture_proxy):
-    await send_approval_event(capture_proxy, {})
-    assert capture_proxy.operations[0]["approval"]["severity"] == "medium"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("value", ["UNKNOWN", "", "   ", None, 7])
-async def test_public_approval_event_rejects_invalid_severity(capture_proxy, value):
-    from qwenpaw.channel_protocol.errors import ProtocolValidationError
-
-    with pytest.raises(ProtocolValidationError):
-        await send_approval_event(capture_proxy, {"severity": value})
-    assert capture_proxy.operations == []
-
-
-@pytest.mark.parametrize(
-    "value", ["LOW", "MEDIUM", "HIGH", "CRITICAL", "INFO", "SAFE", "info", "safe"]
-)
-def test_wire_approval_severity_remains_closed_and_canonical(value):
-    from qwenpaw.channel_protocol.errors import ProtocolValidationError
-    from qwenpaw.channel_protocol.models import ApprovalCardParams
-
-    with pytest.raises(ProtocolValidationError, match="unsupported approval severity"):
-        ApprovalCardParams.from_mapping(
-            {
-                "request_id": "approval-wire-1",
-                "tool_name": "diagnostic-tool",
-                "severity": value,
-            }
-        )
 
 
 @pytest.mark.asyncio

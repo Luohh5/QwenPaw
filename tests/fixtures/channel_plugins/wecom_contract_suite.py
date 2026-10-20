@@ -1,6 +1,5 @@
 """Original inherited assertions through the actual bundled official factory."""  # noqa: E501
 
-import importlib
 import json
 from pathlib import Path
 import sys
@@ -9,9 +8,6 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
-ChannelContractTest = importlib.import_module(
-    "tests.contract.channels"
-).ChannelContractTest
 
 
 @pytest.fixture
@@ -44,14 +40,3 @@ def official_wecom_proxy(tmp_path):
             )
 
         yield construct
-
-
-class TestWeComProxyContract(ChannelContractTest):
-    @pytest.fixture(autouse=True)
-    def official_factory(self, official_wecom_proxy):
-        self._construct = official_wecom_proxy
-
-    def create_instance(self):
-        return self._construct(
-            dict(enabled=False, bot_id="test_bot_id", secret="test_secret")
-        )

@@ -64,18 +64,8 @@ class IMessageDriver(SharedResponseDriver):
             raise ValueError("NOT_CONNECTED")
         return self._platform
 
-    def _check_connection(self, generation):
-        if self._stopping or generation != self._connection_generation:
-            raise RuntimeError("STALE_CONNECTION_CALLBACK")
-
     async def stop(self):
-        self._stopping = True
-        self._connected = False
-        self._connection_generation += 1
-        if self._platform is not None:
-            await self._platform.stop()
-            self._platform = None
-        await self._context.set_platform_state("disconnected")
+        await self._stop_platform()
 
     def response_policy(self, response_handle):
         # iMessage prefixes parts without the generic two-space separator,

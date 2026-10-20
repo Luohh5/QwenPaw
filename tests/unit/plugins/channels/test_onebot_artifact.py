@@ -1,40 +1,19 @@
 # -*- coding: utf-8 -*-
 """Bounded isolated wrapper for private OneBot artifact contracts."""
-import os
-from pathlib import Path
-import subprocess
-import sys
+
+from tests.isolated_pytest import run_isolated_pytest
 
 
 def test_onebot_artifact_contracts(tmp_path):
-    suite = (
-        Path(__file__).resolve().parents[3]
-        / "fixtures/channel_plugins/onebot_artifact_suite.py"
-    )
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            "-m",
-            "pytest",
-            "-p",
-            "pytest_asyncio.plugin",
-            "--confcutdir",
-            str(suite.parent),
-            str(suite),
-            "-q",
-        ],
+    run_isolated_pytest(
+        "onebot_artifact_suite.py",
         env={
-            **os.environ,
             "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
             "QWENPAW_RUNTIME_ID": "onebot-artifact-test",
             "QWENPAW_WORKING_DIR": str(tmp_path / "host"),
             "QWENPAW_SECRET_DIR": str(tmp_path / "secrets"),
             "QWENPAW_BACKUP_DIR": str(tmp_path / "backups"),
         },
-        capture_output=True,
-        text=True,
-        check=False,
         timeout=60,
+        asyncio_plugin=True,
     )
-    assert result.returncode == 0, result.stdout + result.stderr

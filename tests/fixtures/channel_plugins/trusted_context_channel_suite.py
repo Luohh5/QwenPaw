@@ -2,6 +2,7 @@
 import asyncio
 from copy import deepcopy
 from dataclasses import replace
+from importlib.metadata import PackageNotFoundError, distribution
 import json
 import os
 from pathlib import Path
@@ -66,6 +67,13 @@ async def test_normal_sip_factory_projects_host_key_into_real_child_asr(
         ("pyVoIP", "1.6.0"),
         ("dashscope-realtime", "0.1.0"),
     ]:
+        # Keep real installed metadata; duplicate test dist-info is ambiguous.
+        try:
+            distribution(name)
+        except PackageNotFoundError:
+            pass
+        else:
+            continue
         metadata = site / (
             name.replace("-", "_") + "-" + version + ".dist-info"
         )

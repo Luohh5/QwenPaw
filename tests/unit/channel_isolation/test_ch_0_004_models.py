@@ -9,10 +9,8 @@ from qwenpaw.channel_protocol import (
     ApprovalSeverity,
     EndpointParams,
     HelloParams,
-    HostContext,
     HostStateParams,
     InboundEvent,
-    LeaseParams,
     DeliveryState,
     OutboundResult,
     PROTOCOL_VERSION,
@@ -27,13 +25,8 @@ from qwenpaw.channel_protocol import (
     SendParams,
     OutboundOperation,
     StreamType,
-    VoiceEventKind,
-    VoiceSetup,
-    VoiceStatusCallback,
     parse_rpc_message,
     validate_content_part,
-    voice_event_from_setup,
-    voice_event_from_status_callback,
 )
 from tests.unit.channel_isolation._ch_0_004_support import _hello
 
@@ -130,24 +123,6 @@ def test_hello_requires_closed_protocol_and_source_identity() -> None:
         invalid = {**mapping, "source_revision": invalid_source}
         with pytest.raises(ProtocolValidationError):
             HelloParams.from_mapping(invalid)
-
-
-def test_host_context_requires_cross_platform_absolute_media_path() -> None:
-    """The media work directory is absolute on POSIX and Windows forms."""
-    assert (
-        HostContext.from_mapping(
-            {"media_work_dir": "/tmp/media"},
-        ).media_work_dir
-        == "/tmp/media"
-    )
-    assert (
-        HostContext.from_mapping(
-            {"media_work_dir": r"C:\\media"},
-        ).media_work_dir
-        == r"C:\\media"
-    )
-    with pytest.raises(ProtocolValidationError):
-        HostContext.from_mapping({"media_work_dir": "relative/media"})
 
 
 def test_media_locator_and_send_schema_are_closed() -> None:
@@ -404,17 +379,6 @@ def test_outbound_operation_field_combinations_are_strict(
         )
 
 
-def test_secret_handle_is_opaque_bounded_and_redacted() -> None:
-    """The wire model validates but never interprets an opaque handle."""
-    context = HostContext.from_mapping({"secret_handle": "fixture-handle"})
-    assert context.to_mapping()["secret_handle"] == "fixture-handle"
-    assert "fixture-handle" not in repr(context)
-    with pytest.raises(ProtocolValidationError):
-        HostContext.from_mapping({"secret_handle": "bad\nhandle"})
-    with pytest.raises(ProtocolValidationError):
-        HostContext.from_mapping({"secret_handle": "x" * 257})
-
-
 def test_endpoint_rejects_unauthenticated_external_binding() -> None:
     """A non-loopback endpoint cannot be committed without auth."""
     with pytest.raises(ProtocolValidationError) as exc_info:
@@ -475,59 +439,9 @@ def test_endpoint_loopback_is_not_external() -> None:
     assert endpoint.bound_externally is False
 
 
-def test_voice_setup_and_terminal_callback_build_stable_events() -> None:
-    """ConversationRelay fields map to stable protocol event DTOs."""
-    setup = VoiceSetup.from_mapping(
-        {
-            "type": "setup",
-            "callSid": "CA123",
-            "from": "+1",
-            "to": "+2",
-            "AccountSid": "AC123",
-            "Direction": "inbound",
-        },
-    )
-    started = voice_event_from_setup(
-        setup,
-        event_id="event-1",
-        channel_key="voice",
-        instance_id="instance-1",
-        generation=7,
-        connection_id="connection-1",
-        session_binding="binding-1",
-    )
-    assert started.event_kind is VoiceEventKind.CALL_STARTED
-    callback = VoiceStatusCallback.from_mapping(
-        {
-            "CallSid": "CA123",
-            "CallStatus": "completed",
-            "AccountSid": "AC123",
-            "Direction": "inbound",
-            "From": "+1",
-            "To": "+2",
-        },
-    )
-    closed = voice_event_from_status_callback(
-        callback,
-        event_id="event-2",
-        channel_key="voice",
-        instance_id="instance-1",
-        generation=7,
-        connection_id="connection-1",
-        session_binding="binding-1",
-        sequence=2,
-    )
-    assert closed.event_kind is VoiceEventKind.CALL_CLOSED
-    assert closed.payload == {"status": "completed"}
-
-
-def test_host_state_key_is_relative_and_lease_has_positive_ttl() -> None:
-    """Host state stays instance-scoped and lease TTL cannot be disabled."""
+def test_host_state_key_is_relative() -> None:
+    """Host state stays instance-scoped and rejects path traversal."""
     params = HostStateParams.from_mapping({**_identity(), "key": "checkpoint"})
     assert params.key == "checkpoint"
     with pytest.raises(ProtocolValidationError):
         HostStateParams.from_mapping({**_identity(), "key": "../escape"})
-    lease = LeaseParams.from_mapping(
-        {**_identity(), "lease_token": "opaque", "lease_ttl_ms": 1000},
-    )
-    assert lease.lease_ttl_ms == 1000

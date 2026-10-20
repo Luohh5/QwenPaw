@@ -53,6 +53,19 @@ def _closed(
         )
 
 
+def _rpc_object(value: object, allowed: set[str]) -> dict[str, Any]:
+    """Validate the shared JSON-RPC object prefix."""
+    data = _object(value)
+    _closed(data, allowed)
+    if data.get("jsonrpc") != JSONRPC_VERSION:
+        raise _error(
+            "jsonrpc must be '2.0'",
+            path=("jsonrpc",),
+            reason_code="PROTOCOL_MISMATCH",
+        )
+    return data
+
+
 def _string(
     value: object,
     name: str,
@@ -168,14 +181,7 @@ class RpcRequest:
     @classmethod
     def from_mapping(cls, value: object) -> "RpcRequest":
         """Validate a request envelope."""
-        data = _object(value)
-        _closed(data, {"jsonrpc", "id", "method", "params"})
-        if data.get("jsonrpc") != JSONRPC_VERSION:
-            raise _error(
-                "jsonrpc must be '2.0'",
-                path=("jsonrpc",),
-                reason_code="PROTOCOL_MISMATCH",
-            )
+        data = _rpc_object(value, {"jsonrpc", "id", "method", "params"})
         if "id" not in data:
             raise _error(
                 "request must contain id",
@@ -212,14 +218,7 @@ class RpcNotification:
     @classmethod
     def from_mapping(cls, value: object) -> "RpcNotification":
         """Validate a notification envelope."""
-        data = _object(value)
-        _closed(data, {"jsonrpc", "method", "params"})
-        if data.get("jsonrpc") != JSONRPC_VERSION:
-            raise _error(
-                "jsonrpc must be '2.0'",
-                path=("jsonrpc",),
-                reason_code="PROTOCOL_MISMATCH",
-            )
+        data = _rpc_object(value, {"jsonrpc", "method", "params"})
         method = _string(data.get("method"), "method")
         params = data.get("params")
         if params is not None and not isinstance(params, (Mapping, list)):
@@ -257,14 +256,7 @@ class RpcResponse:
     @classmethod
     def from_mapping(cls, value: object) -> "RpcResponse":
         """Validate a response envelope."""
-        data = _object(value)
-        _closed(data, {"jsonrpc", "id", "result", "error"})
-        if data.get("jsonrpc") != JSONRPC_VERSION:
-            raise _error(
-                "jsonrpc must be '2.0'",
-                path=("jsonrpc",),
-                reason_code="PROTOCOL_MISMATCH",
-            )
+        data = _rpc_object(value, {"jsonrpc", "id", "result", "error"})
         if "id" not in data:
             raise _error("response must contain id", path=("id",))
         has_result = "result" in data

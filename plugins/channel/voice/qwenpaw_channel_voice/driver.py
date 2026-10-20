@@ -129,10 +129,6 @@ class VoiceDriver(SharedResponseDriver):
             raise ValueError("NOT_CONNECTED")
         return self._platform
 
-    def _check_connection(self, generation):
-        if self._stopping or generation != self._connection_generation:
-            raise RuntimeError("STALE_CONNECTION_CALLBACK")
-
     async def stop(self):
         self._stopping = True
         self._connected = False

@@ -20,7 +20,6 @@ on:
       - 'tests/unit/channels/test_voice.py'
       - 'tests/unit/channels/test_wecom.py'
       - 'tests/contract/channels/test_feishu_contract.py'
-      - 'tests/contract/channels/test_voice_contract.py'
       - 'tests/integration/test_voice.py'
       - 'pyproject.toml'
       - '.github/workflows/channel-isolation-g0.yml'
@@ -46,7 +45,6 @@ on:
       - 'tests/unit/channels/test_voice.py'
       - 'tests/unit/channels/test_wecom.py'
       - 'tests/contract/channels/test_feishu_contract.py'
-      - 'tests/contract/channels/test_voice_contract.py'
       - 'tests/integration/test_voice.py'
       - 'pyproject.toml'
       - '.github/workflows/channel-isolation-g0.yml'
@@ -117,7 +115,6 @@ jobs:
             tests/unit/channels/test_onebot_channel.py \
             tests/unit/channels/test_voice.py \
             tests/contract/channels/test_feishu_contract.py \
-            tests/contract/channels/test_voice_contract.py \
             tests/integration/test_voice.py \
             --junitxml="test-results/g0-${{ matrix.evidence-key }}.xml"
 

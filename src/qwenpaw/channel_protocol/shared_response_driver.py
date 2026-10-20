@@ -78,6 +78,19 @@ class SharedResponseDriver:
         self._core_batch_timeout_total = 0
         self._core_batch_retry_total = 0
 
+    async def _stop_platform(self):
+        self._stopping = True
+        self._connected = False
+        self._connection_generation += 1
+        if self._platform is not None:
+            await self._platform.stop()
+            self._platform = None
+        await self._context.set_platform_state("disconnected")
+
+    def _check_connection(self, generation):
+        if self._stopping or generation != self._connection_generation:
+            raise RuntimeError("STALE_CONNECTION_CALLBACK")
+
     def diagnostics(self) -> dict[str, int]:
         """Return a detached snapshot of this Driver's Core admission counts."""
         return {

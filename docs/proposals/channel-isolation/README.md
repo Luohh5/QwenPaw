@@ -17,17 +17,25 @@ Core 注册器只保留 Console。源码存在不代表各渠道均已验收；�
 本目录的 [DESIGN](DESIGN.md)、[实施计划](IMPLEMENTATION_WORK_PLAN.md)、
 [Core/Runner 边界](CH-0-001_CORE_RUNNER_BOUNDARY.md)和
 [Chat 提示词](CODEX_CHAT_PROMPTS.md)保留为原方案的设计与验收记录。
-其旧独立依赖环境路线不再是当前接入要求；公共协议和尚未迁移渠道的原型仍有用途。
+其旧独立依赖环境和 lease Controller 路线不再是当前接入要求；当前共享协议与回复生命周期继续使用。
 
 本次清理退役以下专用实现及其独占测试：
 
 - `src/qwenpaw/app/channels/env_manager.py`：CH-1-002 独立 venv 选择与验证。
 - `src/qwenpaw/app/channels/environment_installer.py`：CH-1-003 独立 venv 安装。
 - `tests/unit/channel_isolation/test_ch_1_002.py`、`test_ch_1_003.py`。
+- CH-1-001 独立渠道 release/lock/archive 模型、构建器、旧 Core 依赖扫描工具及其
+  fixture/测试；当前安装与升级使用公共插件依赖 Gate。`artifacts.py` 继续保留
+  `code_root_digest`，供当前 ChannelAdapter 与管理操作验证源码 revision。
+- 旧 `LifecycleController`、Core 生命周期适配器、独立 `runner_bootstrap.py` 与其专用
+  outbound 状态机；当前渠道通过公共执行组件和 `shared_worker.py` 启动。
+- 无当前调用方的 v1 descriptor、独立环境身份与旧控制/语音 DTO；保留当前共享
+  descriptor、消息 DTO、重试策略及已发布的 v1 hello 兼容契约。
 
-保留 `channel_protocol` 中当前 worker、Driver 和旧原型使用的协议、消息、可靠投递、
-回复生命周期、artifact 与 descriptor 模型；混合模块不按旧方案名称整文件删除。
-OneBot/Voice Runner 原型及动态 bootstrap fixture 继续作为后续迁移参考，
+保留 `channel_protocol` 中当前 worker、Driver 使用的协议、消息、可靠投递、回复生命周期、
+源码摘要与 descriptor 模型，以及当前共享进程授权的 endpoint 注册与路由边界。
+旧 bootstrap 测试中仍覆盖公共管道传输和输出隔离的用例转向公共执行组件；
+OneBot/Voice 历史测试入口现已转向当前插件 Driver 与共享宿主的生命周期回归，
 `legacy_isolated_proxy` / `legacy_contract` 继续支持现有兼容路径。
 已完成原功能对照和接入验收的渠道逐项移除旧 Core 实现；尚未收口的旧实现仅作
 迁移参考，不恢复为注册入口。`BaseChannel` 和 `ChannelManager` 继续承担宿主职责。

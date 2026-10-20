@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import ipaddress
 import json
-import ntpath
-import posixpath
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Mapping
@@ -40,7 +38,6 @@ APPROVAL_RESOLUTION_CAPABILITY = "send.approval_resolution.v1"
 TEXT_MERGE_CAPABILITY = "channel.text_merge.v1"
 PROTOCOL_VERSION = 1
 MAX_METHOD_LENGTH = 128
-MAX_SECRET_HANDLE_LENGTH = 256
 MAX_RESPONSE_HANDLE_LENGTH = 512
 
 
@@ -101,30 +98,6 @@ def _boolean(
     return value
 
 
-def _number(
-    value: object,
-    name: str,
-    *,
-    path: tuple[str | int, ...] = (),
-    minimum: int | float | None = None,
-) -> int | float:
-    """Require a finite JSON number."""
-    import math
-
-    if (
-        not isinstance(value, (int, float))
-        or isinstance(value, bool)
-        or not math.isfinite(value)
-    ):
-        raise _error(f"{name} must be a finite number", path=path + (name,))
-    if minimum is not None and value < minimum:
-        raise _error(
-            f"{name} must be at least {minimum}",
-            path=path + (name,),
-        )
-    return value
-
-
 def _list(
     value: object,
     name: str,
@@ -135,17 +108,6 @@ def _list(
     if not isinstance(value, list):
         raise _error(f"{name} must be an array", path=path + (name,))
     return value
-
-
-def _absolute_path(value: object, name: str) -> str:
-    """Require an absolute POSIX or Windows path."""
-    result = _string(value, name)
-    if not (posixpath.isabs(result) or ntpath.isabs(result)):
-        raise _error(
-            f"{name} must be an absolute path",
-            path=(name,),
-        )
-    return result
 
 
 def _optional_integer(
@@ -279,68 +241,6 @@ def _capabilities(value: object) -> tuple[str, ...]:
 
 
 @dataclass(frozen=True)
-class HostContext:
-    """Core-owned host context passed during prepare."""
-
-    media_work_dir: str | None = None
-    config_snapshot: Mapping[str, Any] = field(default_factory=dict)
-    secret_handle: str | None = field(default=None, repr=False)
-
-    def to_mapping(self) -> dict[str, Any]:
-        """Encode host context without secret values."""
-        result: dict[str, Any] = {
-            "config_snapshot": dict(self.config_snapshot),
-        }
-        if self.media_work_dir is not None:
-            result["media_work_dir"] = self.media_work_dir
-        if self.secret_handle is not None:
-            result["secret_handle"] = self.secret_handle
-        return result
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "HostContext":
-        """Validate host context and absolute media path."""
-        data = _object(value, path=("host_context",))
-        _closed(
-            data,
-            {"media_work_dir", "config_snapshot", "secret_handle"},
-            path=("host_context",),
-        )
-        media_work_dir = None
-        if "media_work_dir" in data and data["media_work_dir"] is not None:
-            media_work_dir = _absolute_path(
-                data["media_work_dir"],
-                "media_work_dir",
-            )
-        config_snapshot = data.get("config_snapshot", {})
-        if not isinstance(config_snapshot, Mapping):
-            raise _error(
-                "config_snapshot must be an object",
-                path=("config_snapshot",),
-            )
-        secret_handle = _optional_string(data, "secret_handle")
-        if secret_handle is not None:
-            if len(secret_handle) > MAX_SECRET_HANDLE_LENGTH:
-                raise _error(
-                    "secret_handle exceeds the maximum length",
-                    path=("secret_handle",),
-                )
-            if any(
-                ord(character) < 32 or ord(character) == 127
-                for character in secret_handle
-            ):
-                raise _error(
-                    "secret_handle must not contain control characters",
-                    path=("secret_handle",),
-                )
-        return cls(
-            media_work_dir=media_work_dir,
-            config_snapshot=dict(config_snapshot),
-            secret_handle=secret_handle,
-        )
-
-
-@dataclass(frozen=True)
 class IdentityParams:
     """Common instance and generation identity for control methods."""
 
@@ -374,6 +274,16 @@ class IdentityParams:
         )
 
 
+_IDENTITY_FIELDS = ("channel_key", "instance_id", "generation")
+
+
+def _identity_from_fields(data: Mapping[str, Any]) -> IdentityParams:
+    """Validate the identity subset of a containing DTO."""
+    return IdentityParams.from_mapping(
+        {name: data[name] for name in _IDENTITY_FIELDS},
+    )
+
+
 class ResponsePrepareKind(StrEnum):
     """Internal reply preparation intent, independent of streaming."""
 
@@ -398,96 +308,6 @@ class ResponsePrepareOperation(IdentityParams):
 
 
 @dataclass(frozen=True)
-class PrepareParams(IdentityParams):
-    """Prepare a candidate Runner for a generation."""
-
-    host_context: HostContext = field(default_factory=HostContext)
-    capabilities: tuple[str, ...] = ()
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "PrepareParams":
-        """Validate prepare parameters."""
-        data = _object(value)
-        _closed(
-            data,
-            {
-                "channel_key",
-                "instance_id",
-                "generation",
-                "host_context",
-                "capabilities",
-            },
-        )
-        identity = IdentityParams.from_mapping(
-            {
-                key: data[key]
-                for key in ("channel_key", "instance_id", "generation")
-            },
-        )
-        return cls(
-            **identity.__dict__,
-            host_context=HostContext.from_mapping(
-                data.get("host_context", {}),
-            ),
-            capabilities=_capabilities(data.get("capabilities", [])),
-        )
-
-    def to_mapping(self) -> dict[str, Any]:
-        """Encode prepare parameters."""
-        return {
-            **super().to_mapping(),
-            "host_context": self.host_context.to_mapping(),
-            "capabilities": list(self.capabilities),
-        }
-
-
-@dataclass(frozen=True)
-class LeaseParams(IdentityParams):
-    """Activate or renew a generation lease."""
-
-    lease_token: str
-    lease_ttl_ms: int
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "LeaseParams":
-        """Validate lease parameters."""
-        data = _object(value)
-        _closed(
-            data,
-            {
-                "channel_key",
-                "instance_id",
-                "generation",
-                "lease_token",
-                "lease_ttl_ms",
-            },
-        )
-        identity = IdentityParams.from_mapping(
-            {
-                key: data[key]
-                for key in ("channel_key", "instance_id", "generation")
-            },
-        )
-        return cls(
-            **identity.__dict__,
-            lease_token=_string(data.get("lease_token"), "lease_token"),
-            lease_ttl_ms=_integer(
-                data.get("lease_ttl_ms"),
-                "lease_ttl_ms",
-                minimum=1,
-            ),
-        )
-
-    def to_mapping(self) -> dict[str, Any]:
-        """Encode lease parameters."""
-        return {
-            **super().to_mapping(),
-            "lease_token": self.lease_token,
-            "lease_ttl_ms": self.lease_ttl_ms,
-        }
-
-
-@dataclass(frozen=True)
 class EndpointParams(IdentityParams):
     """Runner-owned ingress endpoint registration DTO."""
 
@@ -506,9 +326,7 @@ class EndpointParams(IdentityParams):
         """Validate an endpoint registration/update DTO."""
         data = _object(value)
         allowed = {
-            "channel_key",
-            "instance_id",
-            "generation",
+            *_IDENTITY_FIELDS,
             "protocol",
             "host",
             "port",
@@ -520,12 +338,7 @@ class EndpointParams(IdentityParams):
             "quiescing",
         }
         _closed(data, allowed)
-        identity = IdentityParams.from_mapping(
-            {
-                key: data[key]
-                for key in ("channel_key", "instance_id", "generation")
-            },
-        )
+        identity = _identity_from_fields(data)
         protocol = _string(data.get("protocol"), "protocol")
         host = _string(data.get("host"), "host")
         port = _integer(data.get("port"), "port", minimum=0)
@@ -770,9 +583,7 @@ class InboundEvent:
             {
                 "event_id",
                 "event_kind",
-                "channel_key",
-                "instance_id",
-                "generation",
+                *_IDENTITY_FIELDS,
                 "conversation",
                 "sender_id",
                 "acl_sender_id",
@@ -887,14 +698,7 @@ class EventBatchParams:
         for item in raw_events:
             raw_item = item if isinstance(item, Mapping) else {}
             item_identity = IdentityParams.from_mapping(
-                {
-                    key: raw_item.get(key)
-                    for key in (
-                        "channel_key",
-                        "instance_id",
-                        "generation",
-                    )
-                },
+                {key: raw_item.get(key) for key in _IDENTITY_FIELDS},
             )
             if identity is None:
                 identity = item_identity
@@ -1142,21 +946,14 @@ class DeliveryUpdateParams(IdentityParams):
         _closed(
             data,
             {
-                "channel_key",
-                "instance_id",
-                "generation",
+                *_IDENTITY_FIELDS,
                 "delivery_id",
                 "state",
                 "reason_code",
                 "retryable",
             },
         )
-        identity = IdentityParams.from_mapping(
-            {
-                key: data[key]
-                for key in ("channel_key", "instance_id", "generation")
-            },
-        )
+        identity = _identity_from_fields(data)
         state_value = _string(data.get("state"), "state")
         try:
             state = DeliveryState(state_value)
@@ -1534,9 +1331,7 @@ class SendParams(IdentityParams):
         _closed(
             data,
             {
-                "channel_key",
-                "instance_id",
-                "generation",
+                *_IDENTITY_FIELDS,
                 "delivery_id",
                 "to_handle",
                 "operation",
@@ -1551,12 +1346,7 @@ class SendParams(IdentityParams):
                 "raw_completed_text_sources",
             },
         )
-        identity = IdentityParams.from_mapping(
-            {
-                key: data[key]
-                for key in ("channel_key", "instance_id", "generation")
-            },
-        )
+        identity = _identity_from_fields(data)
         operation = _parse_outbound_operation(data)
         source = None
         if data.get("content_source") is not None:
@@ -1693,21 +1483,14 @@ class ReactionParams(IdentityParams):
         _closed(
             data,
             {
-                "channel_key",
-                "instance_id",
-                "generation",
+                *_IDENTITY_FIELDS,
                 "delivery_id",
                 "to_handle",
                 "target_delivery_id",
                 "reaction",
             },
         )
-        identity = IdentityParams.from_mapping(
-            {
-                key: data[key]
-                for key in ("channel_key", "instance_id", "generation")
-            },
-        )
+        identity = _identity_from_fields(data)
         reaction = _string(data.get("reaction"), "reaction")
         if reaction != "completed":
             raise _error(
@@ -1736,102 +1519,6 @@ class ReactionParams(IdentityParams):
         }
 
 
-class VoiceEventKind(StrEnum):
-    """Stable Voice event kinds crossing the process boundary."""
-
-    CALL_STARTED = "call.started"
-    MESSAGE_QUERY = "message.query"
-    CALL_INTERRUPTED = "call.interrupted"
-    DTMF = "dtmf"
-    CALL_CLOSED = "call.closed"
-
-
-@dataclass(frozen=True)
-class VoiceEvent:
-    """Stable Voice event DTO extracted from ConversationRelay messages."""
-
-    event_id: str
-    event_kind: VoiceEventKind
-    channel_key: str
-    instance_id: str
-    generation: int
-    connection_id: str
-    sequence: int
-    session_binding: str
-    platform_session_id: str
-    payload: Mapping[str, Any] = field(default_factory=dict)
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "VoiceEvent":
-        """Validate a Voice event DTO."""
-        data = _object(value)
-        _closed(
-            data,
-            {
-                "event_id",
-                "event_kind",
-                "channel_key",
-                "instance_id",
-                "generation",
-                "connection_id",
-                "sequence",
-                "session_binding",
-                "platform_session_id",
-                "payload",
-            },
-        )
-        payload = data.get("payload", {})
-        if not isinstance(payload, Mapping):
-            raise _error("payload must be an object", path=("payload",))
-        event_kind_value = _string(data.get("event_kind"), "event_kind")
-        try:
-            event_kind = VoiceEventKind(event_kind_value)
-        except ValueError as exc:
-            raise _error(
-                "unsupported Voice event kind",
-                path=("event_kind",),
-            ) from exc
-        return cls(
-            event_id=_string(data.get("event_id"), "event_id"),
-            event_kind=event_kind,
-            channel_key=validate_channel_key(
-                _string(data.get("channel_key"), "channel_key"),
-            ),
-            instance_id=_string(data.get("instance_id"), "instance_id"),
-            generation=_integer(
-                data.get("generation"),
-                "generation",
-                minimum=1,
-            ),
-            connection_id=_string(data.get("connection_id"), "connection_id"),
-            sequence=_integer(data.get("sequence"), "sequence", minimum=1),
-            session_binding=_string(
-                data.get("session_binding"),
-                "session_binding",
-            ),
-            platform_session_id=_string(
-                data.get("platform_session_id"),
-                "platform_session_id",
-            ),
-            payload=dict(payload),
-        )
-
-    def to_mapping(self) -> dict[str, Any]:
-        """Encode Voice event DTO."""
-        return {
-            "event_id": self.event_id,
-            "event_kind": self.event_kind.value,
-            "channel_key": self.channel_key,
-            "instance_id": self.instance_id,
-            "generation": self.generation,
-            "connection_id": self.connection_id,
-            "sequence": self.sequence,
-            "session_binding": self.session_binding,
-            "platform_session_id": self.platform_session_id,
-            "payload": dict(self.payload),
-        }
-
-
 class ResponseOutcome(StrEnum):
     """Stable terminal outcomes for one request-scoped response."""
 
@@ -1854,9 +1541,7 @@ class ResponseFinishParams(IdentityParams):
         _closed(
             data,
             {
-                "channel_key",
-                "instance_id",
-                "generation",
+                *_IDENTITY_FIELDS,
                 "response_handle",
                 "outcome",
             },
@@ -1936,43 +1621,6 @@ class ResponseFinishResult:
 
 
 @dataclass(frozen=True)
-class QuiesceParams(IdentityParams):
-    """Stop new work and drain a bounded amount of existing work."""
-
-    drain_timeout_ms: int
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "QuiesceParams":
-        """Validate quiesce parameters."""
-        data = _object(value)
-        _closed(
-            data,
-            {"channel_key", "instance_id", "generation", "drain_timeout_ms"},
-        )
-        identity = IdentityParams.from_mapping(
-            {
-                key: data[key]
-                for key in ("channel_key", "instance_id", "generation")
-            },
-        )
-        return cls(
-            **identity.__dict__,
-            drain_timeout_ms=_integer(
-                data.get("drain_timeout_ms"),
-                "drain_timeout_ms",
-                minimum=0,
-            ),
-        )
-
-    def to_mapping(self) -> dict[str, Any]:
-        """Encode quiesce parameters."""
-        return {
-            **super().to_mapping(),
-            "drain_timeout_ms": self.drain_timeout_ms,
-        }
-
-
-@dataclass(frozen=True)
 class HostStateParams(IdentityParams):
     """Identify a versioned, instance-scoped host state key."""
 
@@ -1987,20 +1635,13 @@ class HostStateParams(IdentityParams):
         _closed(
             data,
             {
-                "channel_key",
-                "instance_id",
-                "generation",
+                *_IDENTITY_FIELDS,
                 "key",
                 "schema_version",
                 "value",
             },
         )
-        identity = IdentityParams.from_mapping(
-            {
-                key: data[key]
-                for key in ("channel_key", "instance_id", "generation")
-            },
-        )
+        identity = _identity_from_fields(data)
         key = _string(data.get("key"), "key")
         if "/" in key or "\\" in key or key.startswith("."):
             raise _error(
@@ -2031,144 +1672,9 @@ class HostStateParams(IdentityParams):
         return result
 
 
-@dataclass(frozen=True)
-class VoiceSetup:
-    """ConversationRelay setup message fields needed by the protocol."""
-
-    platform_session_id: str
-    from_number: str
-    to_number: str
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "VoiceSetup":
-        """Validate a ConversationRelay setup message."""
-        data = _object(value)
-        if data.get("type") != "setup":
-            raise _error(
-                "setup message must have type 'setup'",
-                path=("type",),
-            )
-        return cls(
-            platform_session_id=_string(data.get("callSid"), "callSid"),
-            from_number=_string(data.get("from", ""), "from", non_empty=False),
-            to_number=_string(data.get("to", ""), "to", non_empty=False),
-        )
-
-
-_VOICE_TERMINAL_STATUSES = frozenset(
-    {"completed", "busy", "no-answer", "canceled", "failed"},
-)
-
-
-@dataclass(frozen=True)
-class VoiceStatusCallback:
-    """Idempotent status callback fields for closing a Voice session."""
-
-    platform_session_id: str
-    status: str
-
-    @property
-    def is_terminal(self) -> bool:
-        """Return whether the callback closes the platform session."""
-        return self.status in _VOICE_TERMINAL_STATUSES
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "VoiceStatusCallback":
-        """Validate a Twilio status callback form mapping."""
-        data = _object(value)
-        return cls(
-            platform_session_id=_string(data.get("CallSid"), "CallSid"),
-            status=_string(data.get("CallStatus"), "CallStatus"),
-        )
-
-
-def voice_event_from_setup(
-    setup: VoiceSetup,
-    *,
-    event_id: str,
-    channel_key: str,
-    instance_id: str,
-    generation: int,
-    connection_id: str,
-    session_binding: str,
-    sequence: int = 1,
-) -> VoiceEvent:
-    """Build the first stable Voice event from a setup message."""
-    return VoiceEvent(
-        event_id=event_id,
-        event_kind=VoiceEventKind.CALL_STARTED,
-        channel_key=validate_channel_key(channel_key),
-        instance_id=instance_id,
-        generation=generation,
-        connection_id=connection_id,
-        sequence=sequence,
-        session_binding=session_binding,
-        platform_session_id=setup.platform_session_id,
-        payload={
-            "from": setup.from_number,
-            "to": setup.to_number,
-        },
-    )
-
-
-def voice_event_from_status_callback(
-    callback: VoiceStatusCallback,
-    *,
-    event_id: str,
-    channel_key: str,
-    instance_id: str,
-    generation: int,
-    connection_id: str,
-    session_binding: str,
-    sequence: int,
-) -> VoiceEvent:
-    """Build an idempotent close event from a terminal callback."""
-    if not callback.is_terminal:
-        raise _error(
-            "status callback is not terminal",
-            reason_code="TEMPORARY_UNAVAILABLE",
-        )
-    return VoiceEvent(
-        event_id=event_id,
-        event_kind=VoiceEventKind.CALL_CLOSED,
-        channel_key=validate_channel_key(channel_key),
-        instance_id=instance_id,
-        generation=generation,
-        connection_id=connection_id,
-        sequence=sequence,
-        session_binding=session_binding,
-        platform_session_id=callback.platform_session_id,
-        payload={"status": callback.status},
-    )
-
-
-@dataclass(frozen=True)
-class GenerationStatus:
-    """Read-only lifecycle status returned by a Runner."""
-
-    state: str
-    generation: int
-    lease_expires_at_ms: int | None = None
-    consuming: bool = False
-
-    def to_mapping(self) -> dict[str, Any]:
-        """Encode status data."""
-        return {
-            "state": self.state,
-            "generation": self.generation,
-            "lease_expires_at_ms": self.lease_expires_at_ms,
-            "consuming": self.consuming,
-        }
-
-
 METHOD_SCHEMAS: dict[str, type[Any]] = {
     "channel.management.execute": ManagementRequest,
-    "channel.prepare": PrepareParams,
     "runner.hello": HelloParams,
-    "channel.activate": LeaseParams,
-    "channel.commit": LeaseParams,
-    "channel.lease_renew": LeaseParams,
-    "channel.quiesce": QuiesceParams,
     "channel.health": IdentityParams,
     "channel.generation_status": IdentityParams,
     "channel.stop": IdentityParams,

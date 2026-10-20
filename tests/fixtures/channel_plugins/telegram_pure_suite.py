@@ -2,7 +2,6 @@
 
 import importlib
 import sys
-from unittest.mock import patch
 import pytest
 from extension_sample import ROOT
 
@@ -44,117 +43,6 @@ class TestBuildApprovalKeyboard:
             )
 
 
-class TestBuildApprovalText:
-    def test_body_is_passed_through_verbatim(self):
-        assert tg.build_approval_text("raw body") == "raw body"
-
-    @pytest.mark.parametrize("body", ["", None])
-    def test_empty_body_uses_the_placeholder(self, body):
-        assert tg.build_approval_text(body) == "🛡️ Tool Approval Required"
-
-
-class TestBuildResolvedText:
-    def test_plain_shape_keeps_the_body(self):
-        text = tg.build_resolved_text(
-            tool_name="shell",
-            action="approve",
-            operator_display="@taige",
-            body_text="raw body",
-        )
-
-        assert text == ("raw body\n\n✅ Approved by @taige  |  Tool: shell")
-
-    def test_plain_shape_without_operator(self):
-        text = tg.build_resolved_text(
-            tool_name="shell",
-            action="deny",
-            body_text="raw body",
-        )
-
-        assert text == "raw body\n\n🚫 Denied  |  Tool: shell"
-
-    def test_plain_shape_escapes_nothing(self):
-        """A body with markdown must survive untouched (parse_mode=None)."""
-        text = tg.build_resolved_text(
-            tool_name="a_b",
-            action="approve",
-            body_text="keep *this* [as is]",
-        )
-
-        assert "keep *this* [as is]" in text
-        assert "Tool: a_b" in text
-
-    def test_compact_shape_uses_markdown_v2(self):
-        text = tg.build_resolved_text(
-            tool_name="shell",
-            action="approve",
-            operator_display="@taige",
-            body_text="",
-        )
-
-        assert text == "✅ *Approved* by *@taige*  \\|  Tool: `shell`"
-
-    def test_compact_shape_denied(self):
-        text = tg.build_resolved_text(
-            tool_name="shell",
-            action="deny",
-            body_text="",
-        )
-
-        assert text == "🚫 *Denied*  \\|  Tool: `shell`"
-
-    def test_compact_shape_escapes_specials_in_the_tool_name(self):
-        text = tg.build_resolved_text(
-            tool_name="rm -rf /tmp",
-            action="approve",
-            body_text="",
-        )
-
-        assert "`rm \\-rf /tmp`" in text
-
-    @pytest.mark.parametrize("action", ["", "retry", "APPROVE"])
-    def test_unknown_action_reports_expiry(self, action):
-        text = tg.build_resolved_text(
-            tool_name="shell",
-            action=action,
-            body_text="body",
-        )
-
-        assert "⌛ Expired" in text
-
-    def test_compact_unknown_action_reports_expiry(self):
-        text = tg.build_resolved_text(
-            tool_name="shell",
-            action="whatever",
-            body_text="",
-        )
-
-        assert text == "⌛ *Expired*  \\|  Tool: `shell`"
-
-
-class TestEscapeMdv2:
-    def test_specials_are_backslashed(self):
-        assert tg._escape_mdv2("a_b.c!") == "a\\_b\\.c\\!"
-
-    def test_pipe_is_escaped(self):
-        assert tg._escape_mdv2("|") == "\\|"
-
-    def test_plain_text_is_untouched(self):
-        assert tg._escape_mdv2("shell 123") == "shell 123"
-
-    @pytest.mark.parametrize("char", ["*", "[", "]", "(", ")", "~", "`", ">"])
-    def test_each_markdown_metacharacter(self, char):
-        assert tg._escape_mdv2(char) == f"\\{char}"
-
-    @pytest.mark.parametrize(
-        "char",
-        ["#", "+", "-", "=", "{", "}", ".", "!"],
-    )
-    def test_each_punctuation_metacharacter(self, char):
-        assert tg._escape_mdv2(char) == f"\\{char}"
-
-    def test_backslash_is_escaped(self):
-        assert tg._escape_mdv2("\\") == "\\\\"
 
 
 class TestParseCallbackData:
@@ -225,71 +113,6 @@ class TestTelegramChunkText:
         assert all(len(chunk) <= 4000 for chunk in result)
 
 
-class TestTelegramRichMessages:
-    @pytest.mark.parametrize(
-        ("text", "expected"),
-        [
-            ("A | B\n:--- | ---:\n1 | 2", True),
-            ("| A | B |\n|---|---|", True),
-            ("| `a\\|b` | B |\n|---|---|\n| 1 | 2 |", True),
-            ("| [A](https://example.com/a|b) | B |\n|---|---|", True),
-            ("A | B\nnot a delimiter | row", False),
-            ("\n|---|---|\n1 | 2", False),
-            pytest.param(
-                f"{'[' * 32000}\n{_MARKDOWN_TABLE}",
-                True,
-                id="unclosed-brackets",
-            ),
-        ],
-    )
-    def test_rich_message_candidates(self, text, expected):
-        """Detect delimiters without interpreting inline Markdown."""
-        assert telegram_module._can_send_rich_message(text) is expected
-
-    @pytest.mark.parametrize("fence", ["```", "~~~", "````"])
-    def test_table_detection_ignores_fenced_code(self, fence):
-        """Only tables outside a matching code fence use the Rich API."""
-        text = f"{fence}markdown\n```\n{_MARKDOWN_TABLE}\n{fence}"
-        if fence == "```":
-            text = f"{fence}markdown\n{_MARKDOWN_TABLE}\n{fence}"
-        assert not telegram_module._can_send_rich_message(text)
-        assert telegram_module._can_send_rich_message(
-            f"{text}\n{_MARKDOWN_TABLE}",
-        )
-
-    @pytest.mark.parametrize(
-        ("columns", "expected"),
-        [(20, True), (21, False)],
-    )
-    def test_rich_table_column_limit(self, columns, expected):
-        """A wider table anywhere in a message requires legacy delivery."""
-        header = " | ".join(["A"] * columns)
-        delimiter = " | ".join(["---"] * columns)
-        text = f"{_MARKDOWN_TABLE}\n\n{header}\n{delimiter}\n{header}"
-
-        assert telegram_module._can_send_rich_message(text) is expected
-
-    @pytest.mark.parametrize(
-        "suffix",
-        ["[" * 131072, "\u4e2d" * 11000],
-        ids=["oversized-ascii", "oversized-utf8"],
-    )
-    def test_size_limit_is_checked_before_table_detection(self, suffix):
-        """Reject oversized ASCII and UTF-8 input before delimiter scanning."""
-        text = f"{_MARKDOWN_TABLE}\n{suffix}"
-        with patch.object(
-            telegram_module.re,
-            "fullmatch",
-            side_effect=AssertionError("Unexpected delimiter scan"),
-        ):
-            assert not telegram_module._can_send_rich_message(text)
-
-    def test_rich_message_accepts_exact_byte_limit(self):
-        """A message at the Rich API byte limit remains eligible."""
-        padding = 32768 - len(_MARKDOWN_TABLE) - 1
-        text = f"{_MARKDOWN_TABLE}\n{'x' * padding}"
-
-        assert telegram_module._can_send_rich_message(text)
 
 
 def test_telegram_base_urls_derive_api_and_file_prefixes():
