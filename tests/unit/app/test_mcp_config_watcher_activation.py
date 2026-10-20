@@ -339,3 +339,63 @@ async def test_other_protocol_poll_never_scans_disabled_mcp(
         assert [
             item.driver_name for item in await runtime.list_capabilities()
         ] == ["other"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["enable", "add", "config"])
+async def test_activation_keeps_edits_between_load_and_watcher_baseline(
+    tmp_path,
+    poll_clock,
+    monkeypatch,
+    change,
+):
+    import os
+    from qwenpaw.drivers.storage import card_path, dump_card
+    from qwenpaw.plugins.testing import PluginTestHost
+    from .test_lazy_driver_runtime import (
+        PLUGIN_ID,
+        card,
+        events,
+        fake_plugin,
+        start_runtime,
+    )
+
+    async with PluginTestHost(tmp_path / "host") as host:
+        await host.install(fake_plugin(tmp_path))
+        host.test_event_storage = host.context(PLUGIN_ID).storage
+        workspace = await host._workspace("test")
+        cards_dir = workspace.workspace_dir / "drivers"
+        path = card_path(cards_dir, "same", protocol="mcp")
+        dump_card(card(enabled=change == "config", label="before"), path)
+        updated = card("added" if change == "add" else "same", label="after")
+        target = card_path(cards_dir, updated.name, protocol="mcp")
+        original = AsyncDriverCardStore.load_path
+        edited = False
+
+        async def read_then_edit(self, source_path):
+            nonlocal edited
+            observed = await original(self, source_path)
+            if not edited and source_path == path:
+                edited = True
+                # Keep the exact old read while a manual writer publishes the
+                # newer card before the activation path starts its watcher.
+                dump_card(updated, target)
+                os.utime(target, (2000000001, 2000000001))
+            return observed
+
+        monkeypatch.setattr(AsyncDriverCardStore, "load_path", read_then_edit)
+        runtime = await start_runtime(workspace)
+        try:
+            assert edited
+            assert runtime.watcher is not None
+            await poll_clock.tick()
+            capabilities = await runtime.list_capabilities()
+            assert [item.driver_name for item in capabilities] == [
+                updated.name,
+            ]
+            assert events(host, "opened") == [
+                ["opened", updated.name, "after"],
+            ]
+            assert poll_clock.intervals == [2.0, 2.0]
+        finally:
+            await asyncio.wait_for(runtime.shutdown_all(), 3)

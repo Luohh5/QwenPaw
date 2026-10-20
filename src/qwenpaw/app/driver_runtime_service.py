@@ -223,13 +223,7 @@ class LazyDriverService:  # pylint: disable=too-many-public-methods
         )
         return decision.status != "unused"
 
-    async def activate_protocol(self, protocol):
-        self._guard()
-        self._inactive.discard(protocol)
-        if not self._available(protocol):
-            return
-        if protocol == "mcp":
-            await self._migrate_legacy_config()
+    async def _configured_cards(self, protocol):
         paths = await self.card_store.list_paths(protocols={protocol})
         cards = []
         for path in paths:
@@ -244,10 +238,25 @@ class LazyDriverService:  # pylint: disable=too-many-public-methods
                 continue
             if card.protocol == protocol and self._configured(card):
                 cards.append(card)
-        if cards:
+        return cards
+
+    async def activate_protocol(self, protocol):
+        self._guard()
+        self._inactive.discard(protocol)
+        if not self._available(protocol):
+            return
+        if protocol == "mcp":
+            await self._migrate_legacy_config()
+        if protocol not in self._monitoring and await self._configured_cards(
+            protocol,
+        ):
             self._monitoring.add(protocol)
-        # Snapshot first so edits arriving during open remain observable.
+        # Establish the baseline before reading the sources to activate. A
+        # write during intent discovery must not be acknowledged without apply.
         await self._reconcile_watcher()
+        if protocol not in self._monitoring:
+            return
+        cards = await self._configured_cards(protocol)
         for card in cards:
             if card.enabled:
                 try:
