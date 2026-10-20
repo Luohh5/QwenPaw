@@ -178,10 +178,7 @@ class ProtocolRegistration:
         errors = []
         for handler in tuple(self.handlers):
             try:
-                await handler.manager.close_driver(
-                    handler.name,
-                    session_scope=handler.session_scope,
-                )
+                await handler.manager._close_owned_handlers((handler,))
             except Exception as exc:
                 errors.append(str(exc))
         if errors:

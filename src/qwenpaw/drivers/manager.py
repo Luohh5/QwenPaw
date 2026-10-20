@@ -74,6 +74,7 @@ class DriverManager:  # pylint: disable=too-many-public-methods
         self._cleanup_handler_ids: set[int] = set()
         self._lock = asyncio.Lock()
         self._revisions: dict[str, int] = {}
+        self._scope_revisions: dict[str, int] = {}
         self._owned: set[DriverHandler] = set()
         self._failed_cleanup: set[DriverHandler] = set()
         self._pending: dict[DriverHandler, asyncio.Task] = {}
@@ -338,6 +339,7 @@ class DriverManager:  # pylint: disable=too-many-public-methods
                         f"Transient Driver name already exists: {name}",
                     )
             revisions = {card.name: self._reserve(card.name) for card in cards}
+            scope_revision = self._invalidate_scope(scope_id)
         epoch = self._epoch
         built: dict[str, DriverHandler] = {}
         try:
@@ -354,9 +356,13 @@ class DriverManager:  # pylint: disable=too-many-public-methods
         old_handlers: list[DriverHandler] = []
         try:
             async with self._lock:
-                if epoch != self._epoch or any(
-                    not self.source_is_current(name, revision)
-                    for name, revision in revisions.items()
+                if (
+                    epoch != self._epoch
+                    or self._scope_revisions.get(scope_id) != scope_revision
+                    or any(
+                        not self.source_is_current(name, revision)
+                        for name, revision in revisions.items()
+                    )
                 ):
                     raise RuntimeError(
                         "Transient Driver source revision is stale",
@@ -392,6 +398,16 @@ class DriverManager:  # pylint: disable=too-many-public-methods
                     self._scope_handlers[scope_id] = set(built)
                 else:
                     self._scope_handlers.pop(scope_id, None)
+                # Superseded pending transactions also belong to this scope.
+                # Their exact handlers are retired without touching other
+                # scopes' same-name publications or reservations.
+                old_handlers.extend(
+                    handler
+                    for handler in self._owned
+                    if getattr(handler, "_session_scope", "") == scope_id
+                    and handler not in built.values()
+                    and handler not in old_handlers
+                )
         except BaseException:
             await self._shutdown_handlers(built.values())
             raise
@@ -399,32 +415,46 @@ class DriverManager:  # pylint: disable=too-many-public-methods
         self._schedule_handler_cleanup(old_handlers)
 
     async def remove_transient_drivers(self, scope_id: str) -> None:
-        """Unpublish a scope and wait for its managed handler cleanup."""
+        """Unpublish only this scope's exact owners and drain their cleanup."""
         async with self._lock:
-            names = self._scope_handlers.pop(scope_id, set())
-            names |= {
-                handler.name
+            self._invalidate_scope(scope_id)
+            handlers = [
+                handler
                 for handler in self._owned
                 if getattr(handler, "_session_scope", "") == scope_id
-            }
-            for name in names:
-                self._invalidate(name)
-            handlers = []
-            for name in names:
-                handler = self._handlers.pop(name, None)
-                self._handler_scopes.pop(name, None)
-                if handler is not None:
-                    handlers.append(handler)
-        handlers.extend(
-            handler
-            for handler in self._owned
-            if getattr(handler, "_session_scope", "") == scope_id
-            and handler not in handlers
-        )
+            ]
+            self._unpublish_owned_handlers(handlers)
+            self._scope_handlers.pop(scope_id, None)
         await self._stop_pending(handlers)
         cleanup_task = self._schedule_handler_cleanup(handlers)
         if cleanup_task is not None:
             await asyncio.shield(cleanup_task)
+
+    def _invalidate_scope(self, scope_id):
+        revision = self._scope_revisions.get(scope_id, 0) + 1
+        self._scope_revisions[scope_id] = revision
+        return revision
+
+    def _unpublish_owned_handlers(self, handlers):
+        """Revoke exact owners under the lock; preserve successors."""
+        for handler in handlers:
+            name = handler.name
+            if self._handlers.get(name) is handler:
+                self._handlers.pop(name)
+                scope_id = self._handler_scopes.pop(name, "")
+                self._scope_handlers.get(scope_id, set()).discard(name)
+            # Private lifecycle metadata is assigned by this manager.
+            # pylint: disable-next=protected-access
+            if self.source_is_current(name, handler._source_revision):
+                self._invalidate(name)
+
+    async def _close_owned_handlers(self, handlers):
+        """Descriptor custody release, separate from user close-by-source."""
+        async with self._lock:
+            owned = [handler for handler in handlers if handler in self._owned]
+            self._unpublish_owned_handlers(owned)
+        await self._stop_pending(owned)
+        await self._shutdown_handlers(owned)
 
     async def shutdown_all(self) -> None:
         """Revoke pending work and retain failed stops for explicit retry."""
@@ -660,6 +690,8 @@ class DriverManager:  # pylint: disable=too-many-public-methods
         # Private binding shared with the SDK source adapter.
         # pylint: disable-next=protected-access
         handler._session_scope = session_scope
+        # pylint: disable-next=protected-access
+        handler._source_revision = revision
         self._owned.add(handler)
         self._pending[handler] = asyncio.current_task()
         try:
@@ -770,10 +802,12 @@ class DriverManager:  # pylint: disable=too-many-public-methods
             return None
         ids = {id(handler) for handler in retired}
         self._cleanup_handler_ids.update(ids)
-        task = asyncio.create_task(
-            self._shutdown_handlers(retired),
-            name="driver-handler-cleanup",
-        )
+
+        async def cleanup():
+            await self._stop_pending(retired)
+            await self._shutdown_handlers(retired)
+
+        task = asyncio.create_task(cleanup(), name="driver-handler-cleanup")
         self._cleanup_tasks.add(task)
         task.add_done_callback(
             lambda done: self._finish_handler_cleanup(done, ids),

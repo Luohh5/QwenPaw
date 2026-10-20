@@ -18,6 +18,8 @@ from qwenpaw.plugins import SDKError
 from qwenpaw.plugins.testing import PluginTestHost
 
 from ..plugins.test_sdk_driver_lifecycle import (
+    PLUGIN_ID,
+    SOURCE,
     card,
     driver_plugin,
     events,
@@ -190,3 +192,43 @@ async def test_agentscope_adapter_converts_public_driver_result(
         assert attachments[0].source.media_type == "image/png"
         assert attachments[0].name == "picture"
         assert len(events(context, "invoke")) == 1
+
+
+async def test_retired_protocol_failed_close_preserves_new_protocol_owner(
+    tmp_path,
+):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    source_a, source_b = driver_plugin(first), driver_plugin(second)
+    (source_b / "main.py").write_text(
+        SOURCE.replace(
+            "author-driver",
+            "driver-b",
+        ).replace("driver-manage", "driver-manage-b"),
+    )
+    manifest_path = source_b / "plugin.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["id"] = "driver-lifecycle-b"
+    manifest_path.write_text(json.dumps(manifest))
+    async with PluginTestHost(tmp_path / "host") as host:
+        await host.load(source_a, config={"directory": str(tmp_path)})
+        context_b = await host.load(
+            source_b,
+            config={"directory": str(tmp_path)},
+        )
+        await host.open_driver(card(config={"fail_close": True}))
+        try:
+            with pytest.raises(SDKError, match="(?i)close|cleanup"):
+                await host.open_driver(card(protocol="driver-b"))
+            assert len(events(context_b, "opened")) == 1
+            assert not events(context_b, "closed")
+            before = await host.call_driver("same", "echo", {})
+            assert before.content[0].text == "echo:echo"
+            await asyncio.wait_for(host.unload(PLUGIN_ID), 5)
+            assert not events(context_b, "closed")
+            after = await host.call_driver("same", "echo", {})
+            assert after.content[0].text == "echo:echo"
+            assert len(events(context_b, "invoke")) == 2
+        finally:
+            (tmp_path / "allow-close").touch()

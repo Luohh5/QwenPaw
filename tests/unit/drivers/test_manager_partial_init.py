@@ -189,3 +189,97 @@ async def test_transient_scope_removal_revokes_pending_initialization(
             with suppress(asyncio.CancelledError, RuntimeError):
                 await pending
         await manager.shutdown_all()
+
+
+@pytest.mark.parametrize("new_scope", ["", "scope-b"])
+async def test_removing_pending_scope_preserves_new_owner_same_source_id(
+    setup_manager,
+    new_scope,
+):
+    manager, created, closed, _, slow_ready, release = setup_manager
+    pending = asyncio.create_task(
+        manager.replace_transient_drivers(
+            "scope-a",
+            [card("same", wait=True, label="old-a")],
+        ),
+    )
+    context = {DRIVER_SCOPE_CONTEXT_KEY: new_scope}
+    try:
+        await asyncio.wait_for(slow_ready.wait(), 2)
+        newer = card("same", label="new-owner")
+        if new_scope:
+            await manager.replace_transient_drivers(new_scope, [newer])
+        else:
+            await manager.register_driver(newer)
+        assert (
+            await manager.list_driver_capabilities(
+                "same",
+                request_context=context,
+            )
+            == []
+        )
+        await manager.remove_transient_drivers("scope-a")
+        assert ("same", "old-a") in closed
+        assert ("same", "new-owner") not in closed
+        assert (
+            await manager.list_driver_capabilities(
+                "same",
+                request_context=context,
+            )
+            == []
+        )
+        assert created == [("same", "old-a"), ("same", "new-owner")]
+    finally:
+        release.set()
+        if not pending.done():
+            pending.cancel()
+        with suppress(asyncio.CancelledError, RuntimeError):
+            await pending
+        await manager.shutdown_all()
+
+
+@pytest.mark.parametrize("new_name", ["", "replacement"])
+async def test_completed_scope_replacement_revokes_older_pending_membership(
+    setup_manager,
+    new_name,
+):
+    manager, _, closed, _, slow_ready, release = setup_manager
+    pending = asyncio.create_task(
+        manager.replace_transient_drivers(
+            "scope",
+            [card("same", wait=True, label="old-pending")],
+        ),
+    )
+    context = {DRIVER_SCOPE_CONTEXT_KEY: "scope"}
+    try:
+        await asyncio.wait_for(slow_ready.wait(), 2)
+        latest = [card(new_name, label="latest")] if new_name else []
+        await asyncio.wait_for(
+            manager.replace_transient_drivers("scope", latest),
+            2,
+        )
+        release.set()
+        with suppress(asyncio.CancelledError, RuntimeError):
+            await asyncio.wait_for(pending, 2)
+        with pytest.raises(DriverNotFoundError):
+            await manager.list_driver_capabilities(
+                "same",
+                request_context=context,
+            )
+        assert ("same", "old-pending") in closed
+        if new_name:
+            assert (new_name, "latest") not in closed
+            assert (
+                await manager.list_driver_capabilities(
+                    new_name,
+                    request_context=context,
+                )
+                == []
+            )
+    finally:
+        release.set()
+        if not pending.done():
+            pending.cancel()
+        with suppress(asyncio.CancelledError, RuntimeError):
+            await asyncio.wait_for(pending, 2)
+        await asyncio.wait_for(manager.shutdown_all(), 2)
