@@ -385,3 +385,206 @@ async def test_oauth_status_reads_inactive_workspace_without_starting_it(
         start.assert_not_awaited()
         assert not host._workspaces
         assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("operation", ["create", "enable", "update"])
+async def test_available_plugin_write_activates_inactive_workspace(
+    tmp_path,
+    monkeypatch,
+    operation,
+):
+    """Explicit writes cross the real workspace/service-factory boundary.
+
+    PluginTestHost intentionally starts no driver facade on workspace creation;
+    its manager's lazy boundary therefore uses the production Task5 factory.
+    Only the external MCP client endpoint is substituted.
+    """
+    import asyncio
+
+    from qwenpaw.app.workspace.service_factories import create_driver_service
+    from qwenpaw.config.config import AgentProfileRef
+    from qwenpaw.plugins.testing import PluginTestHost
+    from mcp.types import CallToolResult
+    from tests.unit.plugins.mcp.fixtures import PLUGIN, Peer
+
+    peer = Peer()
+    peer.install(monkeypatch)
+    peer.result = CallToolResult(
+        content=[],
+        structuredContent={"echo": {"message": "actual route write"}},
+    )
+
+    async with PluginTestHost(tmp_path / "host") as host:
+        await host.install(PLUGIN)
+        host._http_app.state.plugin_loader = host._loader
+        host._http_app.include_router(mcp.router, prefix="/api")
+        directory = host.root / "workspaces/inactive-write"
+        config = utils.load_config()
+        config.agents.profiles["inactive-write"] = AgentProfileRef(
+            id="inactive-write",
+            workspace_dir=str(directory),
+        )
+        utils.save_config(config)
+        _seed_available_write_case(directory, operation)
+        activated, published = [], []
+
+        async def activate_workspace(agent_id):
+            workspace = await host._workspace(agent_id)
+            activated.append(workspace)
+            if workspace.driver_manager is None:
+
+                def publish(service):
+                    published.append(service)
+                    workspace._service_manager.services[
+                        "driver_manager"
+                    ] = service
+
+                await create_driver_service(workspace, None, publish)
+            return workspace
+
+        monkeypatch.setattr(
+            host._workspace_manager,
+            "get_agent",
+            activate_workspace,
+        )
+        headers = {"X-Agent-Id": "inactive-write"}
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=host._http_app),
+                base_url="http://testserver",
+            ) as client:
+                assert (
+                    await client.get("/api/mcp", headers=headers)
+                ).status_code == 200
+                assert not host._workspaces
+                assert not activated
+                assert not peer.opens
+                if operation == "create":
+                    response = await client.post(
+                        "/api/mcp",
+                        headers=headers,
+                        json={
+                            "client_key": "retained",
+                            "client": {
+                                "name": "Retained",
+                                "transport": "stdio",
+                                "command": "synthetic-mcp",
+                                "enabled": True,
+                            },
+                        },
+                    )
+                    assert response.status_code == 201, response.text
+                elif operation == "enable":
+                    response = await client.patch(
+                        "/api/mcp/toggle/retained",
+                        headers=headers,
+                    )
+                    assert response.status_code == 200, response.text
+                else:
+                    response = await client.put(
+                        "/api/mcp/retained",
+                        headers=headers,
+                        json={"command": "updated-mcp", "enabled": True},
+                    )
+                    assert response.status_code == 200, response.text
+                assert activated, (
+                    "Available-plugin explicit write never resolved "
+                    "the real workspace"
+                )
+                workspace = host._workspaces["inactive-write"]
+                assert activated == [workspace]
+                assert published == [workspace.driver_manager]
+                await _assert_active_mcp_client(
+                    client,
+                    headers,
+                    workspace,
+                    peer,
+                    operation,
+                )
+        finally:
+            for service in published:
+                await asyncio.wait_for(service.shutdown_all(), 3)
+
+
+def _seed_available_write_case(directory, operation):
+    if operation == "create":
+        return
+    path = seed_card(directory, enabled=operation == "update")
+    saved = load_card(path)
+    saved.config["tools"] = ["echo"]
+    saved.policy.default_effect = "allow"
+    dump_card(saved, path)
+
+
+async def _assert_active_mcp_client(
+    client,
+    headers,
+    workspace,
+    peer,
+    operation,
+):
+    import asyncio
+    from qwenpaw.drivers.capabilities import DriverInvocation
+
+    runtime = workspace.driver_manager
+    expected_command = {
+        "create": "synthetic-mcp",
+        "enable": "offline-command",
+        "update": "updated-mcp",
+    }[operation]
+    async with asyncio.timeout(3):
+        while not (
+            peer.opens
+            and peer.opens[-1][1].command == expected_command
+            and any(
+                row.status == "active"
+                for row in await runtime.list_drivers(protocol="mcp")
+            )
+        ):
+            await asyncio.sleep(0.005)
+    assert runtime.manager is not None
+    assert runtime.watcher is not None
+    tools = await client.get(
+        "/api/mcp/tools/retained",
+        headers=headers,
+    )
+    assert tools.status_code == 200, tools.text
+    assert "echo" in [tool["name"] for tool in tools.json()]
+    policy = await client.put(
+        "/api/mcp/policy/retained",
+        headers=headers,
+        json={
+            "default_effect": "allow",
+            "client_overrides": [],
+            "tool_defaults": [],
+            "tool_overrides": [],
+            "unmanaged_rules_count": 0,
+        },
+    )
+    assert policy.status_code == 200, policy.text
+    capability = next(
+        item
+        for item in await runtime.list_driver_capabilities(
+            "retained",
+        )
+        if item.name == "echo"
+    )
+    result = await runtime.invoke_capability(
+        DriverInvocation(
+            capability_id=capability.capability_id,
+            payload={"message": "actual route write"},
+            request_context={
+                "channel": "console",
+                "user_id": "alice",
+            },
+        ),
+    )
+    assert result.ok, result.message
+    assert result.value.structured_content == {
+        "echo": {"message": "actual route write"},
+    }
+    assert peer.calls == [
+        ("echo", {"message": "actual route write"}),
+    ]
+    if operation == "update":
+        assert peer.opens[-1][1].command == "updated-mcp"

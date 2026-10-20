@@ -24,6 +24,7 @@ const registration = sdk.route.wrap(pluginId, "core.mcp", (Inner) => {
       requests.current = controller;
       setAdmitted("");
       setError("");
+      setBusy(false);
       sdk.host
         .fetch(
           `/qwenpaw-mcp/management?agent_id=${encodeURIComponent(agent.id)}`,

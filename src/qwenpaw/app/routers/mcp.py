@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Body, Path, Request
+from fastapi import APIRouter, Body, HTTPException, Path, Request
 from pydantic import BaseModel, Field
 
 from ..mcp.config_service import (
@@ -46,8 +46,16 @@ def _mcp_service(agent: Any) -> MCPConfigService:
 
 
 async def _agent_for_request(request: Request) -> Any:
-    from ..mcp.plugin_service import configuration_workspace
+    from ..agent_context import get_agent_for_request
+    from ..mcp.plugin_service import configuration_workspace, require_runtime
 
+    if request.method != "GET":
+        try:
+            require_runtime(request)
+        except HTTPException:
+            pass
+        else:
+            return await get_agent_for_request(request)
     return await configuration_workspace(request)
 
 

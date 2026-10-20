@@ -25,6 +25,27 @@ const mocks = vi.hoisted(() => ({
   t: (key: string, options?: { defaultValue?: string }) =>
     options?.defaultValue ?? key,
 }));
+vi.mock("@agentscope-ai/design", async (original) => ({
+  ...(await original<typeof import("@agentscope-ai/design")>()),
+  // The global design test shim omits Select; keep the retained form valid.
+  Select: ({
+    value,
+    options = [],
+    onChange,
+  }: {
+    value?: string;
+    options?: Array<{ value: string; label: string }>;
+    onChange?: (value: string) => void;
+  }) => (
+    <select value={value} onChange={(event) => onChange?.(event.target.value)}>
+      {options.map((option) => (
+        <option key={option.value} value={option.value}>
+          {option.label}
+        </option>
+      ))}
+    </select>
+  ),
+}));
 vi.mock("../../../api/request", () => ({ request: mocks.request }));
 vi.mock("../../../plugins/usePluginLoader", () => ({
   reloadFrontendPlugin: mocks.reload,
@@ -294,3 +315,52 @@ it("startup and explicit reload leave exactly one meaningful management wrapper"
   ).toHaveLength(1);
   expect(mocks.fetch).toHaveBeenCalledTimes(1);
 });
+
+it.each(["Disable", "Uninstall"])(
+  "canceled pending %s releases busy controls after workspace readmission",
+  async (action) => {
+    lifecycle = active;
+    const implementation = mocks.fetch.getMockImplementation()!;
+    let resolve!: (value: Response) => void;
+    let mutationSignal: AbortSignal | undefined;
+    mocks.fetch.mockImplementation((path, init) => {
+      if (init?.method === "POST" || init?.method === "DELETE") {
+        mutationSignal = init.signal;
+        return new Promise<Response>((done) => {
+          resolve = done;
+        });
+      }
+      return implementation(path, init);
+    });
+    mountActualPlugin();
+    const view = render(<CurrentRoute />);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Saved server action" }),
+      ).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: action }));
+    expect(screen.getByRole("button", { name: "Disable" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Uninstall" })).toBeDisabled();
+    mocks.agent.selectedAgent = "two";
+    view.rerender(<CurrentRoute />);
+    expect(mutationSignal?.aborted).toBe(true);
+    await waitFor(() =>
+      expect(mocks.fetch).toHaveBeenCalledWith(
+        "/qwenpaw-mcp/management?agent_id=two",
+        expect.anything(),
+      ),
+    );
+    await act(async () => resolve(Response.json({ ok: true })));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Saved server action" }),
+      ).toBeEnabled(),
+    );
+    expect(screen.getByRole("button", { name: "Disable" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Uninstall" })).toBeEnabled();
+    expect(
+      screen.getByRole("region", { name: "MCP plugin management" }),
+    ).toBeInTheDocument();
+  },
+);
