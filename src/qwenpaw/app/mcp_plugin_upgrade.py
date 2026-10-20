@@ -271,7 +271,9 @@ class MCPPluginCoordinator:
                     config_path=self.config_path,
                     plugins_dir=self.loader.plugin_dirs[0],
                 )
-                self.latest_result = await self._ensure_owned(snapshot)
+                result = await self._ensure_owned(snapshot)
+                await self._reconcile_live_workspaces()
+                self.latest_result = result
                 return record
             except Exception:
                 self.latest_result = MCPPluginUpgradeResult(
@@ -280,6 +282,31 @@ class MCPPluginCoordinator:
                     ("offline_upgrade_failed_check_dependencies_and_storage",),
                 )
                 raise
+
+    async def _reconcile_live_workspaces(self):
+        """Reconcile existing facades without starting agents."""
+        _, off = await asyncio.to_thread(self._current_settings)
+        if off:
+            return
+        manager = self.loader.registry.get_workspace_manager()
+        workspaces = getattr(
+            manager,
+            "agents",
+            getattr(manager, "workspaces", {}),
+        )
+        for workspace in tuple(workspaces.values()):
+            if not self.eligible(workspace.agent_id, "mcp"):
+                continue
+            service = getattr(workspace, "driver_manager", None)
+            if not hasattr(service, "activate_protocol") or getattr(
+                service,
+                "_stopped",
+                False,
+            ):
+                continue
+            # The facade rechecks exact workspace identity before activation
+            # and retains cleanup ownership if retirement races this call.
+            await service.activate_protocol("mcp")
 
     async def ensure_protocol(self, protocol):
         if protocol != "mcp":
