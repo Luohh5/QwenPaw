@@ -5,6 +5,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import re
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict
@@ -35,6 +36,16 @@ from ..drivers.capabilities import (
     mcp_tool_whitelist,
 )
 from ..drivers.contracts import PolicyTarget, validate_card
+
+logger = logging.getLogger(__name__)
+
+
+def _credential_error(alias, operation, error):
+    logger.warning(
+        f"Could not {operation} Driver credential alias '{alias}' "
+        f"({type(error).__name__})",
+    )
+    return SDKError(f"Could not {operation} credential alias '{alias}'")
 
 
 def _source(card):
@@ -133,7 +144,7 @@ class CredentialAccess:
         try:
             record, revision = await self._store.get_versioned(ref)
         except Exception as exc:
-            raise SDKError(str(exc)) from exc
+            raise _credential_error(alias, "resolve", exc) from None
         await self._check()
         return DriverCredential(
             record.kind,
@@ -147,10 +158,14 @@ class CredentialAccess:
         with self._plugin._admission():
             try:
                 return await self._resolve_runtime(alias)
-            except SDKError:
+            except (SDKAccessError, StaleContextError):
                 raise
             except Exception as exc:
-                raise SDKError(str(exc)) from exc
+                raise _credential_error(
+                    alias,
+                    "resolve runtime",
+                    exc,
+                ) from None
 
     async def _resolve_runtime(self, alias):
         ref = await self._ref(alias)
@@ -182,13 +197,10 @@ class CredentialAccess:
             if revision != previous_revision:
                 provider.on_secrets_changed(dict(record.secrets))
             store.revision = revision
-            try:
-                values = (await provider.resolve()).values
-                _, current_revision = await self._store.get_versioned(ref)
-                if current_revision != store.revision:
-                    raise SDKError("Credential revision is stale")
-            except Exception as exc:
-                raise SDKError(str(exc)) from exc
+            values = (await provider.resolve()).values
+            _, current_revision = await self._store.get_versioned(ref)
+            if current_revision != store.revision:
+                raise SDKError("Credential revision is stale")
             await self._check()
             self._runtime[alias] = (provider, store, store.revision)
             return _freeze(values)
@@ -215,7 +227,7 @@ class CredentialAccess:
                 secrets=_thaw(_freeze(secrets)),
             )
         except Exception as exc:
-            raise SDKError(str(exc)) from exc
+            raise _credential_error(alias, "update", exc) from None
         await self._check()
 
 

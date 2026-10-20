@@ -85,6 +85,9 @@ class Peer:
         self.initialize_gate = None
         self.exit_started = asyncio.Event()
         self.exit_gate = None
+        self.rpc_started = asyncio.Event()
+        self.rpc_gate = None
+        self.rpc_tasks = []
 
     def install(self, monkeypatch):
         import mcp
@@ -142,6 +145,14 @@ class Peer:
 
             async def call_tool(self, name, arguments, **_):
                 peer.calls.append((name, arguments))
+                if peer.rpc_gate is not None:
+                    peer.rpc_tasks.append(asyncio.current_task())
+                    peer.rpc_started.set()
+                    while not peer.rpc_gate.is_set():
+                        try:
+                            await peer.rpc_gate.wait()
+                        except asyncio.CancelledError:
+                            continue
                 return peer.result
 
         monkeypatch.setattr(mcp, "ClientSession", Session)

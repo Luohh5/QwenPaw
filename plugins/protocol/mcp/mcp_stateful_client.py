@@ -186,6 +186,7 @@ class _MCPClientMixin:
     _ready_event: asyncio.Event
     _session_closed: asyncio.Event
     _rpc_tasks: set[asyncio.Task]
+    _rpc_cleanup_tasks: set[asyncio.Task]
     _lifecycle_task: asyncio.Task | None
 
     # Exponential backoff & circuit breaker state
@@ -621,7 +622,12 @@ class _MCPClientMixin:
             self._lifecycle_task.done()
         )
 
-        if not self.is_connected and not has_task:
+        if (
+            not self.is_connected
+            and not has_task
+            and not self._rpc_cleanup_tasks
+            and not self._rpc_tasks
+        ):
             if not ignore_errors:
                 raise RuntimeError(
                     f"MCP client '{self.name}' is not connected. "
@@ -639,6 +645,11 @@ class _MCPClientMixin:
                         f"MCP client '{self.name}' lifecycle cleanup "
                         "is pending",
                     )
+            await self._drain_session_rpcs()
+            if self._rpc_cleanup_tasks:
+                raise RuntimeError(
+                    f"MCP client '{self.name}' RPC cleanup is pending",
+                )
         except Exception as e:
             if not ignore_errors:
                 raise
@@ -653,6 +664,11 @@ class _MCPClientMixin:
             if task is not None:
                 await asyncio.gather(task, return_exceptions=True)
                 self._clear_lifecycle_state(task)
+            await self._drain_session_rpcs()
+            if self._rpc_cleanup_tasks:
+                raise RuntimeError(
+                    f"MCP client '{self.name}' RPC cleanup is pending",
+                )
             return
         await self.close(ignore_errors=False)
 
@@ -703,10 +719,17 @@ class _MCPClientMixin:
             task.cancel()
             task.add_done_callback(_discard_task_result)
             self._rpc_tasks.discard(task)
+            if not task.done() and task not in self._rpc_cleanup_tasks:
+                self._rpc_cleanup_tasks.add(task)
+                task.add_done_callback(self._rpc_cleanup_tasks.discard)
 
     async def _drain_session_rpcs(self) -> None:
         await asyncio.sleep(0)
-        pending = [t for t in tuple(self._rpc_tasks) if not t.done()]
+        pending = [
+            task
+            for task in self._rpc_tasks | self._rpc_cleanup_tasks
+            if not task.done()
+        ]
         if not pending:
             return
         for task in pending:
@@ -717,6 +740,7 @@ class _MCPClientMixin:
         )
         for task in done:
             _discard_task_result(task)
+            self._rpc_cleanup_tasks.discard(task)
         if leftover:
             self._abandon_session_rpcs(list(leftover))
 
@@ -953,6 +977,7 @@ class StdIOStatefulClient(_MCPClientMixin):
         self._stop_event = asyncio.Event()
         self._session_closed = asyncio.Event()
         self._rpc_tasks: set[asyncio.Task] = set()
+        self._rpc_cleanup_tasks: set[asyncio.Task] = set()
         self._oauth_required = False
 
         # Exponential backoff & circuit breaker
@@ -1056,6 +1081,7 @@ class HttpStatefulClient(_MCPClientMixin):
         self._stop_event = asyncio.Event()
         self._session_closed = asyncio.Event()
         self._rpc_tasks: set[asyncio.Task] = set()
+        self._rpc_cleanup_tasks: set[asyncio.Task] = set()
         self._oauth_required = False
 
         # Exponential backoff & circuit breaker

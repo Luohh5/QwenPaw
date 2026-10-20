@@ -537,3 +537,62 @@ async def test_stateful_reaper_retains_public_host_custody_until_exit(
             peer.exit_gate.set()
             if loaded:
                 await host.unload(PLUGIN_ID)
+
+
+async def test_cancelled_rpc_retains_public_host_owner_until_rpc_finishes(
+    tmp_path,
+    monkeypatch,
+):
+    import sys
+
+    peer = Peer()
+    peer.rpc_gate = asyncio.Event()
+    peer.install(monkeypatch)
+    loaded = True
+    caller = None
+    async with PluginTestHost(tmp_path / "host") as host:
+        await host.load(PLUGIN)
+        transport = sys.modules["plugin_qwenpaw_mcp.mcp_stateful_client"]
+        monkeypatch.setattr(transport, "_SESSION_RPC_DRAIN_TIMEOUT", 0.01)
+        monkeypatch.setattr(transport, "_LIFECYCLE_JOIN_TIMEOUT", 0.03)
+        try:
+            await host.open_driver(card())
+            caller = asyncio.create_task(host.call_driver("same", "echo", {}))
+            await asyncio.wait_for(peer.rpc_started.wait(), 1)
+            caller.cancel()
+            # Normal request cancellation must stay bounded even if its
+            # underlying thirdparty RPC suppresses cancellation indefinitely.
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(caller, 1)
+            assert peer.rpc_tasks and not peer.rpc_tasks[0].done()
+            close_returned = False
+            try:
+                await asyncio.wait_for(host.close_driver("same"), 1)
+                close_returned = True
+            except SDKError:
+                pass
+            report = await asyncio.wait_for(host.unload(PLUGIN_ID), 1)
+            loaded = not report.quiescent
+            assert not peer.rpc_tasks[0].done()
+            assert not close_returned, "Strict close lost the unfinished RPC"
+            assert not report.quiescent, "Unload lost the unfinished RPC owner"
+            peer.rpc_gate.set()
+            await asyncio.wait_for(asyncio.gather(*peer.rpc_tasks), 1)
+            report = await asyncio.wait_for(host.unload(PLUGIN_ID), 1)
+            loaded = not report.quiescent
+            assert report.quiescent
+            host.assert_quiescent(PLUGIN_ID)
+        finally:
+            peer.rpc_gate.set()
+            if caller is not None and not caller.done():
+                caller.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(caller, return_exceptions=True),
+                    1,
+                )
+            await asyncio.wait_for(
+                asyncio.gather(*peer.rpc_tasks, return_exceptions=True),
+                1,
+            )
+            if loaded:
+                await host.unload(PLUGIN_ID)

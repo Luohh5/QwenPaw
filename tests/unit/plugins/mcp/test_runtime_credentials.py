@@ -6,6 +6,7 @@
 import inspect
 
 import httpx
+import pytest
 
 from qwenpaw.plugins.drivers import DriverCredentialAccess
 from qwenpaw.plugins.testing import PluginTestHost
@@ -35,6 +36,10 @@ class Plugin:
                 async with ctx.driver_source("mcp", "same") as driver:
                     saved[:] = [driver.credentials]
                     alias = data.get("alias", "oauth")
+                    if data.get("runtime_only"):
+                        values = await driver.credentials.resolve_runtime(
+                            alias)
+                        return {"values": dict(values)}
                     raw = await driver.credentials.resolve(alias)
                     if data.get("update"):
                         await driver.credentials.update(alias,
@@ -360,3 +365,54 @@ async def test_concurrent_runtime_refresh_for_same_source_is_single_exchange(
                 asyncio.gather(*tasks, return_exceptions=True),
                 2,
             )
+
+
+@pytest.mark.parametrize(
+    "failure,runtime_only",
+    [
+        ("expired-auth-code", True),
+        ("missing-record", True),
+        ("missing-record", False),
+    ],
+)
+async def test_credential_errors_do_not_expose_private_storage_reference(
+    tmp_path,
+    failure,
+    runtime_only,
+):
+    root = tmp_path / "host"
+    opaque_ref = "opaque-internal-storage-ref-5818b60e-synthetic"
+    async with PluginTestHost(root) as host:
+        await host.load(make_plugin(tmp_path, SOURCE, ["apps", "drivers"]))
+        if failure == "expired-auth-code":
+            await seed_record(
+                root,
+                ref=opaque_ref,
+                public={"expires_at": 1},
+                secrets={"access_token": "expired-synthetic"},
+            )
+        seed_card(
+            root,
+            card(
+                enabled=False,
+                credentials={
+                    "oauth": {
+                        "kind": "oauth2_auth_code",
+                        "ref": opaque_ref,
+                    },
+                },
+            ),
+        )
+        response = await host.request(
+            "POST",
+            "/api/runtime-credential-test/resolve",
+            json={"runtime_only": runtime_only},
+        )
+        assert response.status == 403, response.text
+        assert response.json()["error"]
+        assert opaque_ref not in response.text
+        assert "expired-synthetic" not in response.text
+        assert all(
+            "driver_manager" not in workspace._service_manager.services
+            for workspace in host._workspaces.values()
+        )
