@@ -210,13 +210,15 @@ ClientConnection.close = _g2_faulting_ws_close
 
 def official_zip_source(directory, key, **_ignored):
     """Build and authenticate the actual private official ZIP before Loader."""
+    from qwenpaw.__version__ import __version__
+
     spec = importlib.util.spec_from_file_location(
         "g2_bundle_builder", ROOT / "scripts/pack/generate_plugin_metadata.py"
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     bundle = Path(directory).parent / "official-bundle"
-    module.build_official_channel_bundle(ROOT, bundle, host_version="2.2.2b4")
+    module.build_official_channel_bundle(ROOT, bundle, host_version=__version__)
     from qwenpaw.plugins import official_channels
 
     original = official_channels._resource_root

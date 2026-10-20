@@ -6,7 +6,7 @@ import importlib.abc
 import os
 from pathlib import Path
 import sys
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import pytest
 
@@ -321,7 +321,7 @@ async def test_malicious_getfile_cannot_copy_outside_workspace(
     rt = await telegram(runtime, telegram_sdk)
     outside = tmp_path / "host-secret.png"
     outside.write_bytes(b"host private bytes")
-    profile = telegram_sdk.work / TOKEN / "file.json"
+    profile = telegram_sdk.work / quote(TOKEN, safe="") / "file.json"
     profile.write_text(json.dumps({"file_path": str(outside)}))
     push(
         telegram_sdk.work,
@@ -360,7 +360,7 @@ async def test_native_download_suffix_precedence_and_recursive_directory(
     import json
 
     rt = await telegram(runtime, telegram_sdk)
-    (telegram_sdk.work / TOKEN / "file.json").write_text(
+    (telegram_sdk.work / quote(TOKEN, safe="") / "file.json").write_text(
         json.dumps({"file_path": file_path})
     )
     push(

@@ -11,15 +11,25 @@ on:
       - 'src/qwenpaw/app/channels/feishu/**'
       - 'src/qwenpaw/app/channels/onebot/**'
       - 'src/qwenpaw/app/channels/voice/**'
+      - 'plugins/channel/telegram/**'
+      - 'plugins/channel/feishu/**'
+      - 'src/qwenpaw/plugins/channel_adapter.py'
+      - 'src/qwenpaw/app/channels/isolated_proxy.py'
+      - 'tests/fixtures/channel_plugins/telegram_*.py'
+      - 'tests/fixtures/channel_plugins/g2_fault_runtime.py'
+      - 'tests/fixtures/channel_plugins/g2_lifecycle_suite.py'
+      - 'tests/fixtures/channel_plugins/c6_artifacts.py'
+      - 'tests/isolated_pytest.py'
+      - 'tests/contract/channels/__init__.py'
       - 'tests/fixtures/channel_isolation/**'
       - 'tests/unit/channel_isolation/**'
       - 'tests/unit/app/channels/test_manager_batch_acl.py'
       - 'tests/unit/channels/test_feishu.py'
       - 'tests/unit/channels/test_onebot_channel.py'
-      - 'tests/unit/channels/test_telegram.py'
+      - 'tests/unit/plugins/channels/test_telegram_plugin.py'
       - 'tests/unit/channels/test_voice.py'
       - 'tests/unit/channels/test_wecom.py'
-      - 'tests/contract/channels/test_feishu_contract.py'
+      - 'tests/contract/plugin_channels/test_c7_feishu_contract.py'
       - 'tests/integration/test_voice.py'
       - 'pyproject.toml'
       - '.github/workflows/channel-isolation-g0.yml'
@@ -36,15 +46,25 @@ on:
       - 'src/qwenpaw/app/channels/feishu/**'
       - 'src/qwenpaw/app/channels/onebot/**'
       - 'src/qwenpaw/app/channels/voice/**'
+      - 'plugins/channel/telegram/**'
+      - 'plugins/channel/feishu/**'
+      - 'src/qwenpaw/plugins/channel_adapter.py'
+      - 'src/qwenpaw/app/channels/isolated_proxy.py'
+      - 'tests/fixtures/channel_plugins/telegram_*.py'
+      - 'tests/fixtures/channel_plugins/g2_fault_runtime.py'
+      - 'tests/fixtures/channel_plugins/g2_lifecycle_suite.py'
+      - 'tests/fixtures/channel_plugins/c6_artifacts.py'
+      - 'tests/isolated_pytest.py'
+      - 'tests/contract/channels/__init__.py'
       - 'tests/fixtures/channel_isolation/**'
       - 'tests/unit/channel_isolation/**'
       - 'tests/unit/app/channels/test_manager_batch_acl.py'
       - 'tests/unit/channels/test_feishu.py'
       - 'tests/unit/channels/test_onebot_channel.py'
-      - 'tests/unit/channels/test_telegram.py'
+      - 'tests/unit/plugins/channels/test_telegram_plugin.py'
       - 'tests/unit/channels/test_voice.py'
       - 'tests/unit/channels/test_wecom.py'
-      - 'tests/contract/channels/test_feishu_contract.py'
+      - 'tests/contract/plugin_channels/test_c7_feishu_contract.py'
       - 'tests/integration/test_voice.py'
       - 'pyproject.toml'
       - '.github/workflows/channel-isolation-g0.yml'
@@ -109,12 +129,12 @@ jobs:
           pytest -q \
             tests/unit/channel_isolation \
             tests/unit/app/channels/test_manager_batch_acl.py \
-            tests/unit/channels/test_telegram.py \
+            tests/unit/plugins/channels/test_telegram_plugin.py \
             tests/unit/channels/test_wecom.py \
             tests/unit/channels/test_feishu.py \
             tests/unit/channels/test_onebot_channel.py \
             tests/unit/channels/test_voice.py \
-            tests/contract/channels/test_feishu_contract.py \
+            tests/contract/plugin_channels/test_c7_feishu_contract.py \
             tests/integration/test_voice.py \
             --junitxml="test-results/g0-${{ matrix.evidence-key }}.xml"
 

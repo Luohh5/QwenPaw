@@ -542,10 +542,15 @@ class PluginProcess:
                 "TEMP",
                 "TMP",
                 "TMPDIR",
+                "SSL_CERT_FILE",
                 "QWENPAW_DEPENDENCY_MAINTENANCE",
             }
             or name in NETWORK_PROXY_ENVIRONMENT
         }
+        if ca_file := environment.get("SSL_CERT_FILE"):
+            environment["SSL_CERT_FILE"] = str(Path(ca_file).absolute())
+        if os.name == "nt":
+            environment["USERPROFILE"] = str(Path.home().resolve())
         from ..dependency_maintenance import current_capability
 
         capability = current_capability()

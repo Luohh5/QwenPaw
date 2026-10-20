@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import shutil
 from types import SimpleNamespace as NS
+from urllib.parse import quote
 
 import pytest
 
@@ -17,7 +18,7 @@ TOKEN = "123:local-A"
 
 
 def rows(work, kind=None, *, token=TOKEN):
-    path = Path(work) / token / "ledger.jsonl"
+    path = Path(work) / quote(token, safe="") / "ledger.jsonl"
     values = (
         [json.loads(line) for line in path.read_text().splitlines()]
         if path.exists()
@@ -27,13 +28,13 @@ def rows(work, kind=None, *, token=TOKEN):
 
 
 def set_mode(work, value, *, token=TOKEN):
-    path = Path(work) / token
+    path = Path(work) / quote(token, safe="")
     path.mkdir(parents=True, exist_ok=True)
     (path / "mode").write_text(value)
 
 
 def push(work, ident=1, *, token=TOKEN, callback="message", **fields):
-    path = Path(work) / token
+    path = Path(work) / quote(token, safe="")
     path.mkdir(parents=True, exist_ok=True)
     event = {
         "message_id": ident,

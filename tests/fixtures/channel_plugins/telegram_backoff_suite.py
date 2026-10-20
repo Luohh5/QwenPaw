@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from urllib.parse import quote
 
 import pytest
 
@@ -20,7 +21,7 @@ from telegram_support import (
 async def test_conflict_cycles_cap_at_effective_timeout_plus_one_ok_resets(
     runtime, telegram_sdk
 ):
-    directory = telegram_sdk.work / TOKEN
+    directory = telegram_sdk.work / quote(TOKEN, safe="")
     directory.mkdir(parents=True, exist_ok=True)
     script = directory / "poll-script.json"
     script.write_text(json.dumps([{"code": 409}] * 5))

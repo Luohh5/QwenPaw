@@ -1,6 +1,7 @@
 """Native PTB retries, effective timeout, cleanup offset and owned teardown."""
 
 import asyncio
+from urllib.parse import quote
 
 import psutil
 import pytest
@@ -244,7 +245,7 @@ async def test_conflict_network_cycles_reset_each_other(runtime, telegram_sdk):
     import json
     from telegram_support import TOKEN
 
-    directory = telegram_sdk.work / TOKEN
+    directory = telegram_sdk.work / quote(TOKEN, safe="")
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "poll-script.json").write_text(
         json.dumps(

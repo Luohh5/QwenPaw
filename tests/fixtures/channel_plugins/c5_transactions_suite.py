@@ -119,9 +119,17 @@ async def test_bad_candidate_is_probed_before_any_old_teardown(
     (candidate / "requirements.txt").write_text("c5-transaction-sdk==1.0\n")
     local = wheelhouse(tmp_path / "candidate-wheelhouse")
 
-    def local_download(command, **_kwargs):
-        assert "download" in command and "install" not in command
-        staging = Path(command[command.index("--dest") + 1])
+    def local_wheel(command, **_kwargs):
+        assert command[1:5] == ["-I", "-m", "pip", "wheel"]
+        assert not {"install", "download", "--dest", "--target"}.intersection(
+            command,
+        )
+        staging = Path(command[command.index("--wheel-dir") + 1])
+        assert staging != transaction.site
+        assert Path(command[command.index("--constraint") + 1]).is_file()
+        assert Path(command[command.index("-r") + 1]).read_text() == (
+            "c5-transaction-sdk==1.0\n"
+        )
         for path in local.glob("*.whl"):
             shutil.copyfile(path, staging / path.name)
         return NS(returncode=0)
@@ -129,7 +137,7 @@ async def test_bad_candidate_is_probed_before_any_old_teardown(
     monkeypatch.setattr(
         transaction.loader,
         "_run_subprocess_with_streaming_log",
-        local_download,
+        local_wheel,
     )
     report = await transaction.loader.lifecycle.reload(
         KEY,
@@ -680,9 +688,18 @@ async def test_existing_http_entrypoints_acquire_validated_local_wheels(
         },
     )
 
-    def local_download(command, *, timeout, plugin_id):
+    def local_wheel(command, *, timeout, plugin_id):
         assert plugin_id == KEY
-        assert "download" in command and "install" not in command
+        assert command[1:5] == ["-I", "-m", "pip", "wheel"]
+        assert not {"install", "download", "--dest", "--target"}.intersection(
+            command,
+        )
+        staging = Path(command[command.index("--wheel-dir") + 1])
+        assert staging != transaction.site
+        assert Path(command[command.index("--constraint") + 1]).is_file()
+        assert Path(command[command.index("-r") + 1]).read_text() == (
+            "c5-transaction-sdk==1.0\n"
+        )
         return subprocess.run(
             [*command, "--no-index", "--find-links", str(local)],
             capture_output=True,
@@ -694,7 +711,7 @@ async def test_existing_http_entrypoints_acquire_validated_local_wheels(
     monkeypatch.setattr(
         transaction.loader,
         "_run_subprocess_with_streaming_log",
-        local_download,
+        local_wheel,
     )
     if operation == "repair":
         persist_plugin_settings(

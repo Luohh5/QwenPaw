@@ -6,7 +6,7 @@ import importlib.abc
 import os
 from pathlib import Path
 import sys
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import pytest
 
@@ -208,7 +208,7 @@ async def test_service_replayed_stable_update_reaches_sdk_but_executes_once(
     rt = await telegram(runtime, telegram_sdk)
     original = push(telegram_sdk.work, 17, text="once only")
     await eventually(lambda: len(rt.ws.requests) == 1)
-    (telegram_sdk.work / TOKEN / "replay.json").write_text(
+    (telegram_sdk.work / quote(TOKEN, safe="") / "replay.json").write_text(
         json.dumps([original])
     )
     await eventually(

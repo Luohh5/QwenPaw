@@ -2,9 +2,11 @@
 
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
+import sysconfig
 import tempfile
 from types import SimpleNamespace
 import venv
@@ -16,13 +18,17 @@ import pytest
 
 @pytest.fixture(scope="session")
 def fault_runtime():
-    root = Path(
-        tempfile.mkdtemp(prefix="qwenpaw-g2-sdk-fault-", dir="/private/tmp")
-    )
+    root = Path(tempfile.mkdtemp(prefix="qwenpaw-g2-sdk-fault-")).resolve()
     try:
-        venv.EnvBuilder(with_pip=False, symlinks=True).create(root)
-        python = root / "bin/python"
-        site = next((root / "lib").glob("python*/site-packages"))
+        builder = venv.EnvBuilder(with_pip=False, symlinks=os.name == "posix")
+        context = builder.ensure_directories(str(root))
+        builder.create(root)
+        python = Path(context.env_exec_cmd)
+        site = Path(
+            sysconfig.get_path(
+                "purelib", scheme="venv", vars={"base": str(root)}
+            )
+        )
         pending = [
             "packaging",
             "jsonschema",

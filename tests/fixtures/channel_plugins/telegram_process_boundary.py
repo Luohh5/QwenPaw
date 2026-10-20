@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import re
 import time
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 import httpx
 from email.parser import BytesParser
 from email.policy import default as email_policy
@@ -24,7 +24,7 @@ REQUEST_SEQUENCE = 0
 
 
 def directory(token):
-    path = Path(WORK) / token
+    path = Path(WORK) / quote(token, safe="")
     path.mkdir(parents=True, exist_ok=True)
     return path
 

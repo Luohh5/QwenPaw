@@ -263,12 +263,13 @@ def test_real_file_url_helper_preserves_original_return_contracts(
     code = """
 import asyncio,json,sys
 from pathlib import Path
+from urllib.parse import quote
 sys.path[:0]=sys.argv[1:4]
 from telegram import Bot, File
 from telegram.error import TelegramError
 from qwenpaw_channel_telegram.platform import _resolve_telegram_file_url
 site=Path(sys.argv[1])
-work=Path((site/'telegram-test-work').read_text())/'123:local-A'
+work=Path((site/'telegram-test-work').read_text())/quote('123:local-A',safe='')
 work.mkdir(exist_ok=True)
 class PureFileResult:
     # Explicit pure-helper dependency boundary, not native getFile behavior.
