@@ -10,7 +10,7 @@
 
 **Spec:** 本文的[设计与验收约定](#设计与验收约定)是后续任务共同遵守的设计契约。
 
-基线：`codex/mcp-plugin`，`56be46ddf`。本文件中的步骤和 checklist 均为待实施项。
+基线：`codex/mcp-plugin`，`56be46ddf`。实施进度以各项勾选和实际验证记录为准。
 
 ## Global Constraints
 
@@ -188,11 +188,11 @@
 
 **Interfaces:** 产出 `classify_mcp_usage(snapshot: MCPUsageSnapshot) -> MCPUsageDecision`。`MCPUsageSnapshot` 包含工作区原始配置/卡片快照、默认版本指纹及显式插件状态；`MCPUsageDecision` 包含 `unused/configured/explicit_off/needs_review`、工作区决策和不含秘密的原因。
 
-- [ ] **Step 1:** 写 `test_pristine_and_migrated_defaults_are_unused`：无配置、旧默认 AnySearch、迁移后的默认卡片、仅迁移水位四类均为 `unused`；默认指纹不能吞掉定制差异。
-- [ ] **Step 2:** 写 `test_custom_disabled_sources_are_preserved`、`test_explicit_off_wins`、`test_inventory_includes_inactive_workspaces`、`test_invalid_snapshot_requires_review`，固定对应判定，断言不导入 transport、不修改文件。
-- [ ] **Step 3:** 运行 `PYTHONPATH=src python -m pytest -q tests/unit/app/test_mcp_plugin_classification.py`，确认因缺少判定接口而失败。
-- [ ] **Step 4:** 实现纯判定及版本 fixture。原始配置读取不得通过默认填充后的 `MCPConfig` 来猜测用户操作；只有规范化默认指纹一致才可排除。
-- [ ] **Step 5:** 重跑同一命令，全部通过；检查没有真实凭据进入 fixture 或原因字段，单独提交本任务。
+- [x] **Step 1:** 写 `test_pristine_and_migrated_defaults_are_unused`：无配置、旧默认 AnySearch、迁移后的默认卡片、仅迁移水位四类均为 `unused`；默认指纹不能吞掉定制差异。
+- [x] **Step 2:** 写 `test_custom_disabled_sources_are_preserved`、`test_explicit_off_wins`、`test_inventory_includes_inactive_workspaces`、`test_invalid_snapshot_requires_review`，固定对应判定，断言不导入 transport、不修改文件。
+- [x] **Step 3:** 运行 `PYTHONPATH=src python -m pytest -q tests/unit/app/test_mcp_plugin_classification.py`，确认因缺少判定接口而失败。
+- [x] **Step 4:** 实现纯判定及版本 fixture。原始配置读取不得通过默认填充后的 `MCPConfig` 来猜测用户操作；只有规范化默认指纹一致才可排除。
+- [x] **Step 5:** 重跑同一命令，全部通过；检查没有真实凭据进入 fixture 或原因字段，单独提交本任务。
 
 ### Task 2 发布 DriverProtocolSpec SDK 契约
 
