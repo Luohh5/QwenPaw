@@ -149,14 +149,38 @@ def _binding(value: Any, credentials: Mapping | None) -> bool:
     if credentials is None or not isinstance(value, Mapping):
         return False
     if value.get("source") == "literal":
-        return isinstance(value.get("value"), str)
+        return value.get("value") is None or isinstance(value["value"], str)
     return (
         value.get("source") == "credential"
         and _text(value.get("credential"))
         and value["credential"] in credentials
         and _text(value.get("field"))
-        and isinstance(value.get("format", "{value}"), str)
+        and (value.get("format") is None or isinstance(value["format"], str))
     )
+
+
+def _bindings(value: Any, credentials: Mapping | None) -> bool:
+    if value is None and credentials is not None:
+        return True
+    if not isinstance(value, Mapping):
+        return False
+    if credentials is not None and (
+        "public" in value or "secret_refs" in value
+    ):
+        return all(
+            section is None
+            or (
+                isinstance(section, Mapping)
+                and all(
+                    _text(k) and isinstance(v, str) for k, v in section.items()
+                )
+            )
+            for section in (
+                value.get("public", {}),
+                value.get("secret_refs", {}),
+            )
+        )
+    return all(_text(k) and _binding(v, credentials) for k, v in value.items())
 
 
 def _endpoint(
@@ -177,14 +201,7 @@ def _endpoint(
     return (
         _strings(value.get("args", []))
         and isinstance(value.get("cwd", ""), str)
-        and all(
-            isinstance(section, Mapping)
-            and all(
-                _text(k) and _binding(v, credentials)
-                for k, v in section.items()
-            )
-            for section in bindings
-        )
+        and all(_bindings(section, credentials) for section in bindings)
         and (
             timeout is None or (type(timeout) in (int, float) and timeout > 0)
         )
@@ -238,6 +255,26 @@ def _client(value: Any) -> dict[str, Any] | None:
     return result
 
 
+def _policy_selectors(target: Mapping, principal: Mapping) -> bool:
+    return (
+        target.get("kind", "*") in ("tool", "*")
+        and _text(target.get("name", "*"))
+        and all(
+            isinstance(principal.get(key, "*"), str)
+            for key in (
+                "source_type",
+                "source_value",
+                "subject_type",
+                "subject_value",
+            )
+        )
+        and not (
+            principal.get("subject_type", "*").strip().lower() == "user"
+            and not principal.get("subject_value", "*").strip()
+        )
+    )
+
+
 def _policy(value: Any) -> dict[str, Any] | None:
     if isinstance(value, list):
         value = {"default_effect": "deny", "rules": value}
@@ -255,9 +292,10 @@ def _policy(value: Any) -> dict[str, Any] | None:
             return None
         target = rule.get("target", {})
         principal = rule.get("principal", {})
-        if not isinstance(target, Mapping) or not isinstance(
-            principal,
-            Mapping,
+        if (
+            not isinstance(target, Mapping)
+            or not isinstance(principal, Mapping)
+            or not _policy_selectors(target, principal)
         ):
             return None
         normalized.append(

@@ -525,3 +525,67 @@ def test_valid_endpoint_extension_is_preserved_as_configuration():
     assert result.status == "configured"
     assert result.workspace_statuses == {"main": "configured"}
     assert data == original
+
+
+@pytest.mark.parametrize("section", ("headers", "env"))
+def test_legacy_structured_bindings_remain_configured(section):
+    data = {"cards": load_default(2)["cards"]}
+    card = data["cards"][0]
+    card["credentials"] = {}
+    binding = {"public": {"X-Mode": "legacy"}, "secret_refs": {}}
+    if section == "headers":
+        card["endpoint"]["headers"] = binding
+    else:
+        card["endpoint"] = {
+            "transport": "stdio",
+            "command": "local-mcp",
+            "args": [],
+            "env": binding,
+        }
+    original = deepcopy(data)
+    result = classify(data)
+    assert result.status == "configured"
+    assert result.workspace_statuses == {"main": "configured"}
+    assert data == original
+
+
+def test_unsupported_policy_target_kind_requires_review():
+    data = {"cards": load_default(2)["cards"]}
+    rule = data["cards"][0]["policy"]["rules"][0]
+    rule["target"]["kind"] = "unsupported-policy-kind"
+    original = deepcopy(data)
+    result = classify(data)
+    assert result.status == "needs_review"
+    assert result.workspace_statuses == {"main": "needs_review"}
+    assert data == original
+
+
+@pytest.mark.parametrize("subject_value", ("", "   "))
+def test_user_principal_requires_nonempty_subject_value(subject_value):
+    data = {"cards": load_default(2)["cards"]}
+    principal = data["cards"][0]["policy"]["rules"][0]["principal"]
+    principal["subject_type"] = "user"
+    principal["subject_value"] = subject_value
+    original = deepcopy(data)
+    result = classify(data)
+    assert result.status == "needs_review"
+    assert result.workspace_statuses == {"main": "needs_review"}
+    assert data == original
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("literal-value-none", "credential-format-none"),
+)
+def test_nullable_existing_value_source_fields_remain_configured(case):
+    data = {"cards": load_default(2)["cards"]}
+    headers = data["cards"][0]["endpoint"]["headers"]
+    if case == "literal-value-none":
+        headers["X-Optional"] = {"source": "literal", "value": None}
+    else:
+        headers["Authorization"]["format"] = None
+    original = deepcopy(data)
+    result = classify(data)
+    assert result.status == "configured"
+    assert result.workspace_statuses == {"main": "configured"}
+    assert data == original
