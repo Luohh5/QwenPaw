@@ -200,8 +200,8 @@
 
 **Interfaces:** 产出设计第 4 节全部公开类型与 `PluginContext.register_driver_protocol()`，SDK `1.1.0` 与 capability `drivers`。
 
-- [ ] **Step 1:** 写公开导入、嵌套只读快照、JSON/schema 校验、重复协议拒绝和旧 SDK 插件兼容测试；`test_driver_plugin_rejects_internal_imports` 必须拒绝内部 Manager 导入。
-- [ ] **Step 2:** 运行 `PYTHONPATH=src python -m pytest -q tests/unit/plugins/test_sdk_driver_contract.py`，确认新接口相关用例失败。
+- [x] **Step 1:** 写公开导入、嵌套只读快照、JSON/schema 校验、重复协议拒绝和旧 SDK 插件兼容测试；`test_driver_plugin_rejects_internal_imports` 必须拒绝内部 Manager 导入。
+- [x] **Step 2:** 运行 `PYTHONPATH=src python -m pytest -q tests/unit/plugins/test_sdk_driver_contract.py`，确认新接口相关用例失败。
 - [ ] **Step 3:** 实现 DTO/Protocol 和登记接口；同步 PUBLIC_API、API_EXPORTS、版本、capability、类型样例。公开模块顶层不能导入 MCP 或宿主运行时。
 - [ ] **Step 4:** 重跑测试；用独立进程仅导入 `qwenpaw.plugins.drivers`，核对没有新增自有 MCP handler/transport 导入。
 - [ ] **Step 5:** 更新公开 API 清单与对应检查，独立提交。本任务不包含实际 MCP 连接。

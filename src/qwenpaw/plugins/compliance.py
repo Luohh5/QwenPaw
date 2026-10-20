@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Explicit SDK dependency checks. Static inspection never imports a plugin."""
 
 import ast
@@ -5,6 +6,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 
@@ -25,6 +27,17 @@ PUBLIC_API = MappingProxyType(
             "PluginBusyError",
         ),
         "qwenpaw.plugins.logging": ("PluginLogger",),
+        "qwenpaw.plugins.drivers": (
+            "DriverSource",
+            "DriverCapabilitySpec",
+            "DriverCallResult",
+            "DriverRequestContext",
+            "DriverCredential",
+            "DriverCredentialAccess",
+            "DriverContext",
+            "DriverConnection",
+            "DriverProtocolSpec",
+        ),
         "qwenpaw.plugins.models": ("ModelService",),
         "qwenpaw.plugins.messages": ("Message", "ContentBlock", "Attachment"),
         "qwenpaw.plugins.tools": (
@@ -34,9 +47,21 @@ PUBLIC_API = MappingProxyType(
             "ToolEvent",
             "ConfigField",
         ),
-        "qwenpaw.plugins.resources": ("ResourceOwner", "Registration", "ResourceScope"),
-        "qwenpaw.plugins.storage": ("PluginStorage", "MediaStore", "PluginConfig"),
-        "qwenpaw.plugins.commands": ("CommandSpec", "CommandContext", "CommandResult"),
+        "qwenpaw.plugins.resources": (
+            "ResourceOwner",
+            "Registration",
+            "ResourceScope",
+        ),
+        "qwenpaw.plugins.storage": (
+            "PluginStorage",
+            "MediaStore",
+            "PluginConfig",
+        ),
+        "qwenpaw.plugins.commands": (
+            "CommandSpec",
+            "CommandContext",
+            "CommandResult",
+        ),
         "qwenpaw.plugins.hooks": (
             "HookPhase",
             "HookSpec",
@@ -138,7 +163,7 @@ PUBLIC_API = MappingProxyType(
             "check_plugin",
         ),
         "qwenpaw.pawapp": ("PawApp",),
-    }
+    },
 )
 
 
@@ -154,6 +179,7 @@ API_EXPORTS = tuple(
     APIExport(
         module,
         symbol,
+        since="1.1.0" if module == "qwenpaw.plugins.drivers" else "1.0.0",
         stability="compatibility" if module == "qwenpaw.pawapp" else "stable",
     )
     for module, symbols in PUBLIC_API.items()
@@ -200,6 +226,9 @@ def check_plugin(directory: str | Path) -> CheckReport:
     Third-party imports are dependencies, not SDK violations. Dynamic code is
     reported as unverified; this is an author aid, never a security sandbox.
     """
+    # Keep the static rules together to share per-source alias state.
+    # pylint: disable=too-many-branches,too-many-statements
+    # pylint: disable=too-many-nested-blocks
     directory = Path(directory).resolve()
     findings, dependencies, uncovered = [], set(), set()
     digest = hashlib.sha256()
@@ -211,7 +240,9 @@ def check_plugin(directory: str | Path) -> CheckReport:
         ):
             continue
         if file.is_symlink():
-            digest.update(str(file.relative_to(directory)).encode() + b"\0symlink\0")
+            digest.update(
+                str(file.relative_to(directory)).encode() + b"\0symlink\0",
+            )
             digest.update(str(file.readlink()).encode() + b"\0")
             findings.append(
                 CheckFinding(
@@ -219,7 +250,7 @@ def check_plugin(directory: str | Path) -> CheckReport:
                     1,
                     "external-source",
                     "Package symlinks require explicit review",
-                )
+                ),
             )
             continue
         if not file.is_file():
@@ -228,7 +259,7 @@ def check_plugin(directory: str | Path) -> CheckReport:
             sources.append(file)
         digest.update(str(file.relative_to(directory)).encode() + b"\0")
         with file.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            for chunk in iter(partial(stream.read, 1024 * 1024), b""):
                 digest.update(chunk)
         digest.update(b"\0")
     manifest = {}
@@ -245,22 +276,35 @@ def check_plugin(directory: str | Path) -> CheckReport:
 
         validate_sdk(manifest.get("sdk"), manifest["id"])
         compatibility = (
-            "compatible" if manifest.get("sdk") is not None else "legacy-not-sdk"
+            "compatible"
+            if manifest.get("sdk") is not None
+            else "legacy-not-sdk"
         )
         if compatibility == "legacy-not-sdk":
             uncovered.add(
-                "Manifest does not opt in to the SDK; legacy behavior was not migrated or disabled"
+                "Manifest does not opt in to the SDK; "
+                "legacy behavior was not migrated or disabled",
             )
         entry = (manifest.get("entry") or {}).get("backend") or manifest.get(
-            "entry_point"
+            "entry_point",
         )
         if entry and not (directory / entry).is_file():
             raise ValueError("Declared backend entry does not exist")
-    except (OSError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
-        findings.append(CheckFinding("plugin.json", 1, "invalid-input", str(exc)))
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        AttributeError,
+        RuntimeError,
+    ) as exc:
+        findings.append(
+            CheckFinding("plugin.json", 1, "invalid-input", str(exc)),
+        )
     if not isinstance(manifest, dict):
         manifest = {}
-    declaration = manifest.get("sdk") if isinstance(manifest.get("sdk"), dict) else {}
+    declaration = (
+        manifest.get("sdk") if isinstance(manifest.get("sdk"), dict) else {}
+    )
 
     for path in sources:
         if path.is_symlink() or not path.resolve().is_relative_to(directory):
@@ -270,7 +314,7 @@ def check_plugin(directory: str | Path) -> CheckReport:
                     1,
                     "external-source",
                     "Source escapes the plugin directory",
-                )
+                ),
             )
             continue
         relative = str(path.relative_to(directory))
@@ -278,22 +322,32 @@ def check_plugin(directory: str | Path) -> CheckReport:
             tree = ast.parse(path.read_text(), filename=relative)
         except (SyntaxError, UnicodeError) as exc:
             findings.append(
-                CheckFinding(relative, getattr(exc, "lineno", 1), "syntax", str(exc))
+                CheckFinding(
+                    relative,
+                    getattr(exc, "lineno", 1),
+                    "syntax",
+                    str(exc),
+                ),
             )
             continue
         aliases = {}
 
-        def reject(node, code, message):
-            findings.append(CheckFinding(relative, node.lineno, code, message))
+        def reject(node, code, message, _relative=relative):
+            findings.append(
+                CheckFinding(_relative, node.lineno, code, message),
+            )
 
-        def dependency(node, module, symbol=None):
+        def dependency(node, module, symbol=None, _reject=reject):
             dependencies.add(module + ("." + symbol if symbol else ""))
             if module == "qwenpaw" or module.startswith("qwenpaw."):
                 full_module = module + "." + symbol if symbol else module
                 if full_module in PUBLIC_API:
                     return full_module
-                if module not in PUBLIC_API or symbol not in PUBLIC_API[module]:
-                    reject(
+                if (
+                    module not in PUBLIC_API
+                    or symbol not in PUBLIC_API[module]
+                ):
+                    _reject(
                         node,
                         "private-import",
                         f"Not a public SDK dependency: {full_module}",
@@ -311,15 +365,20 @@ def check_plugin(directory: str | Path) -> CheckReport:
             elif isinstance(node, ast.ImportFrom) and not node.level:
                 for item in node.names:
                     aliases[item.asname or item.name] = dependency(
-                        node, node.module or "", item.name
+                        node,
+                        node.module or "",
+                        item.name,
                     )
 
-        def qualified(node):
-            if isinstance(node, ast.Name):
-                return aliases.get(node.id, node.id)
-            if isinstance(node, ast.Attribute):
-                return qualified(node.value) + "." + node.attr
-            return ""
+        def qualified(node, _lookup=aliases.get):
+            parts = []
+            while isinstance(node, ast.Attribute):
+                parts.append(node.attr)
+                node = node.value
+            base = (
+                _lookup(node.id, node.id) if isinstance(node, ast.Name) else ""
+            )
+            return ".".join((base, *reversed(parts)))
 
         contexts = {"ctx", "context", "call", "api"}
         for node in ast.walk(tree):
@@ -328,19 +387,24 @@ def check_plugin(directory: str | Path) -> CheckReport:
                 if node.name == "register" and len(arguments) > 1:
                     contexts.add(arguments[1].arg)
                 for argument in arguments:
-                    if argument.annotation and qualified(argument.annotation).endswith(
-                        "Context"
-                    ):
+                    if argument.annotation and qualified(
+                        argument.annotation,
+                    ).endswith("Context"):
                         contexts.add(argument.arg)
-        # Fixed point handles simple aliases without relying on author spelling.
+        # Follow aliases without relying on author spelling.
         for _ in range(len(tuple(ast.walk(tree)))):
             before = (len(contexts), dict(aliases))
             for node in ast.walk(tree):
                 if isinstance(node, (ast.Assign, ast.AnnAssign)):
                     targets = (
-                        node.targets if isinstance(node, ast.Assign) else [node.target]
+                        node.targets
+                        if isinstance(node, ast.Assign)
+                        else [node.target]
                     )
-                    if isinstance(node.value, ast.Name) and node.value.id in contexts:
+                    if (
+                        isinstance(node.value, ast.Name)
+                        and node.value.id in contexts
+                    ):
                         contexts.update(
                             target.id
                             for target in targets
@@ -349,7 +413,10 @@ def check_plugin(directory: str | Path) -> CheckReport:
                     if isinstance(node.value, (ast.Name, ast.Attribute)):
                         resolved = qualified(node.value)
                         for target in targets:
-                            if isinstance(target, ast.Name) and "." in resolved:
+                            if (
+                                isinstance(target, ast.Name)
+                                and "." in resolved
+                            ):
                                 aliases[target.id] = resolved
             if (len(contexts), aliases) == before:
                 break
@@ -363,22 +430,35 @@ def check_plugin(directory: str | Path) -> CheckReport:
                     and member not in PUBLIC_API[parent]
                     and name not in PUBLIC_API
                 ):
-                    reject(node, "private-symbol", f"Not a public SDK symbol: {name}")
+                    reject(
+                        node,
+                        "private-symbol",
+                        f"Not a public SDK symbol: {name}",
+                    )
                 if (
                     node.attr.startswith("_")
                     and isinstance(node.value, ast.Name)
                     and node.value.id in contexts
                 ):
                     reject(
-                        node, "private-context", f"Private context member: {node.attr}"
+                        node,
+                        "private-context",
+                        f"Private context member: {node.attr}",
                     )
                 if name.startswith("qwenpaw.") and any(
                     part.startswith("_") for part in name.split(".")
                 ):
-                    reject(node, "private-member", f"Private SDK member: {name}")
+                    reject(
+                        node,
+                        "private-member",
+                        f"Private SDK member: {name}",
+                    )
                 if isinstance(node.ctx, ast.Store) and (
                     name.startswith("qwenpaw.")
-                    or (isinstance(node.value, ast.Name) and node.value.id in contexts)
+                    or (
+                        isinstance(node.value, ast.Name)
+                        and node.value.id in contexts
+                    )
                 ):
                     reject(
                         node,
@@ -391,7 +471,8 @@ def check_plugin(directory: str | Path) -> CheckReport:
                     and node.value.id not in contexts | {"self", "cls"}
                 ):
                     uncovered.add(
-                        f"{relative}:{node.lineno}: private attribute on unclassified object {node.value.id}"
+                        f"{relative}:{node.lineno}: private attribute on "
+                        f"unclassified object {node.value.id}",
                     )
             elif isinstance(node, ast.Call):
                 name = qualified(node.func)
@@ -410,14 +491,16 @@ def check_plugin(directory: str | Path) -> CheckReport:
                             "unmanaged-resource",
                             f"Use ResourceScope or prove ownership for {name}",
                             "warning",
-                        )
+                        ),
                     )
                     uncovered.add(
-                        f"{relative}:{node.lineno}: unmanaged resource ownership"
+                        f"{relative}:{node.lineno}: "
+                        "unmanaged resource ownership",
                     )
                 if name in {"importlib.import_module", "__import__"}:
                     uncovered.add(
-                        f"{relative}:{node.lineno}: dynamic import result/member access"
+                        f"{relative}:{node.lineno}: "
+                        "dynamic import result/member access",
                     )
                     if (
                         node.args
@@ -426,7 +509,9 @@ def check_plugin(directory: str | Path) -> CheckReport:
                     ):
                         dependency(node, node.args[0].value)
                     else:
-                        uncovered.add(f"{relative}:{node.lineno}: dynamic import")
+                        uncovered.add(
+                            f"{relative}:{node.lineno}: dynamic import",
+                        )
                 elif name in {
                     "eval",
                     "exec",
@@ -444,11 +529,15 @@ def check_plugin(directory: str | Path) -> CheckReport:
                         and node.args[1].value.startswith("_")
                     ):
                         target = node.args[0]
-                        if isinstance(target, ast.Name) and target.id in contexts:
+                        if (
+                            isinstance(target, ast.Name)
+                            and target.id in contexts
+                        ):
                             reject(
                                 node,
                                 "private-context",
-                                f"Private context member: {node.args[1].value}",
+                                "Private context member: "
+                                f"{node.args[1].value}",
                             )
     from .sdk_version import SDK_VERSION
 
@@ -476,10 +565,15 @@ def check_plugin(directory: str | Path) -> CheckReport:
             (
                 prefix + "permissions",
                 json.dumps(
-                    container["permissions"], ensure_ascii=False, sort_keys=True
+                    container["permissions"],
+                    ensure_ascii=False,
+                    sort_keys=True,
                 ),
             )
-            for prefix, container in (("", manifest), ("meta.", manifest.get("meta")))
+            for prefix, container in (
+                ("", manifest),
+                ("meta.", manifest.get("meta")),
+            )
             if isinstance(container, dict) and "permissions" in container
         ),
     )

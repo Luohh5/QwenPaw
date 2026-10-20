@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """PawApp declarations and scoped services available to app authors."""
 
 from dataclasses import dataclass, field
@@ -10,15 +11,17 @@ from typing import (
     Callable,
     Mapping,
     TYPE_CHECKING,
+    TypeAlias,
     Union,
 )
+
+from .events import ChatEvent, StreamMessage, ApprovalSnapshot
+from .tools import ToolContext
 
 if TYPE_CHECKING:
     from .sdk import PluginContext
     from .resources import Registration
-
-from .events import ChatEvent, StreamMessage, ApprovalSnapshot
-from .tools import ToolContext
+    from .drivers import DriverContext
 
 JSONBody = Union[
     None,
@@ -47,7 +50,9 @@ class ChatReply:
     @property
     def text(self) -> str:
         # Prefer completed messages so streamed deltas are not counted twice.
-        messages = [message for event in self.events for message in event.output]
+        messages = [
+            message for event in self.events for message in event.output
+        ]
         if messages:
             return "".join(
                 block.text
@@ -146,29 +151,42 @@ class AppContext(ToolContext):
     channel: str = "console"
     _services: Any = field(default=None, repr=False, compare=False)
 
+    def driver_source(
+        self,
+        protocol: str,
+        source_id: str,
+    ) -> AbstractAsyncContextManager["DriverContext"]:
+        """Open an authenticated management scope for this plugin's source."""
+        return self._services.driver_source(protocol, source_id)
+
     async def workspaces(self) -> tuple[WorkspaceSummary, ...]:
         """Configured console workspaces, without host paths or credentials."""
         return await self._services.workspaces()
 
     def for_workspace(
-        self, workspace_id: str
+        self,
+        workspace_id: str,
     ) -> AbstractAsyncContextManager["AppContext"]:
-        """Open a fresh owned call with the same app and authenticated identity.
+        """Open a fresh owned call with the app and authenticated identity.
 
-        Only configured, enabled targets are accepted. A plugin-owned background
-        task may retain this identity delegation; each entry rechecks availability
-        and derives cancellation and resources from the task entering the scope.
+        Only configured, enabled targets are accepted. A plugin-owned
+        background task may retain this identity delegation; each entry
+        rechecks availability and derives cancellation and resources from
+        the task entering the scope.
         """
         return self._services.for_workspace(workspace_id)
 
     def chat_stream(
-        self, request: ChatRequest | str
+        self,
+        request: ChatRequest | str,
     ) -> AsyncGenerator[ChatEvent, None]:
         return self._services.chat_stream(request)
 
     async def chat(self, request: ChatRequest | str) -> ChatReply:
         stream = self.chat_stream(request)
         try:
+            # tuple() cannot consume an async generator directly.
+            # pylint: disable-next=consider-using-generator
             return ChatReply(tuple([event async for event in stream]))
         finally:
             await stream.aclose()
@@ -191,7 +209,10 @@ class AppContext(ToolContext):
     async def delete_session(self, chat_id: str) -> bool:
         return await self._services.delete_session(chat_id)
 
-    async def history(self, session_id: str | None = None) -> tuple[StreamMessage, ...]:
+    async def history(
+        self,
+        session_id: str | None = None,
+    ) -> tuple[StreamMessage, ...]:
         return await self._services.history(session_id)
 
     async def start_task(self, request: ChatRequest | str) -> TaskSnapshot:
@@ -201,7 +222,7 @@ class AppContext(ToolContext):
         return await self._services.task(run_id)
 
     def task_stream(self, run_id: str) -> AsyncGenerator[TaskSnapshot, None]:
-        """Current status and changes until terminal; disconnect leaves the run alive."""
+        """Stream until terminal; disconnect leaves the run alive."""
         return self._services.task_stream(run_id)
 
     async def cancel_task(self, run_id: str, *, timeout=5.0) -> CancelResult:
@@ -211,20 +232,38 @@ class AppContext(ToolContext):
         return await self._services.approvals(session_id)
 
     async def resolve_approval(
-        self, request_id: str, *, approved: bool, scope="exact"
+        self,
+        request_id: str,
+        *,
+        approved: bool,
+        scope="exact",
     ) -> bool:
-        return await self._services.resolve_approval(request_id, approved, scope)
+        return await self._services.resolve_approval(
+            request_id,
+            approved,
+            scope,
+        )
 
     async def request_approval(
-        self, name: str, *, session_id: str, summary="", timeout=300.0
+        self,
+        name: str,
+        *,
+        session_id: str,
+        summary="",
+        timeout=300.0,
     ) -> bool:
-        return await self._services.request_approval(name, session_id, summary, timeout)
+        return await self._services.request_approval(
+            name,
+            session_id,
+            summary,
+            timeout,
+        )
 
     async def notify(self, message: str, *, title="", level="info") -> None:
         await self._services.notify(message, title, level)
 
 
-RouteResult = (
+RouteResult: TypeAlias = (
     JSONBody
     | HttpResponse
     | StreamingResponse
@@ -234,7 +273,10 @@ RouteResult = (
     | ChatReply
     | ApprovalSnapshot
 )
-RouteHandler = Callable[[AppContext, HttpRequest], RouteResult | Awaitable[RouteResult]]
+RouteHandler = Callable[
+    [AppContext, HttpRequest],
+    RouteResult | Awaitable[RouteResult],
+]
 WebSocketHandler = Callable[[AppContext, "WebSocket"], Awaitable[None]]
 
 
@@ -248,7 +290,10 @@ class PawApp:
         self._standard = False
 
     def route(
-        self, path: str, *, methods: tuple[str, ...] = ("GET",)
+        self,
+        path: str,
+        *,
+        methods: tuple[str, ...] = ("GET",),
     ) -> Callable[[RouteHandler], RouteHandler]:
         """Decorate handler(AppContext, HttpRequest), sync or async."""
 
@@ -258,7 +303,10 @@ class PawApp:
 
         return register
 
-    def websocket(self, path: str) -> Callable[[WebSocketHandler], WebSocketHandler]:
+    def websocket(
+        self,
+        path: str,
+    ) -> Callable[[WebSocketHandler], WebSocketHandler]:
         """Decorate async handler(AppContext, WebSocket)."""
 
         def register(handler):
@@ -276,7 +324,7 @@ class PawApp:
 
 
 class WebSocket:
-    """Owned connection wrapper; host websocket objects never leave the adapter."""
+    """Owned connection wrapper that retains host websocket objects."""
 
     def __init__(self, connection):
         self._connection = connection
