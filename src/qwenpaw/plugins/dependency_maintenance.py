@@ -202,9 +202,8 @@ def live_readers(sites, ignore_pid=None):
             except FileNotFoundError:
                 continue
             try:
-                if _try_lock(descriptor):
-                    path.unlink(missing_ok=True)
-                else:
+                stale = _try_lock(descriptor)
+                if not stale:
                     try:
                         # Filename identity avoids reading a Windows-locked
                         # byte range; the OS lock supplies liveness evidence.
@@ -218,6 +217,13 @@ def live_readers(sites, ignore_pid=None):
                         readers.append(value)
             finally:
                 os.close(descriptor)
+            if stale:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    # Another scanner may still hold the verified-stale file.
+                    if getattr(exc, "winerror", None) not in {32, 33}:
+                        raise
     return readers
 
 

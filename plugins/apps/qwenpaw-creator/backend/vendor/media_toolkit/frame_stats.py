@@ -26,6 +26,7 @@ process group (the upstream script only ever ran in a foreground shell).
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -122,7 +123,9 @@ def _run_signalstats(
     input_args: list[str],
     video_filter: str,
 ) -> dict[str, float]:
-    meta = Path(tempfile.mkstemp(suffix=".txt")[1])
+    descriptor, filename = tempfile.mkstemp(suffix=".txt")
+    os.close(descriptor)
+    meta = Path(filename)
     try:
         try:
             subprocess.run(

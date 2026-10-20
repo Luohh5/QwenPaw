@@ -340,14 +340,37 @@ def test_catalog_is_inactive_owner_checked_and_identity_guarded(
     assert registry.unregister_channel("feishu")
 
 
-@pytest.mark.parametrize("key", ["console", "slack"])
-def test_other_builtin_static_keys_are_rejected(tmp_path, registry, key):
+def test_other_builtin_static_keys_are_rejected(tmp_path, registry):
     from qwenpaw.app.channels.registry import BUILTIN_CHANNEL_KEYS
 
+    key = "console"
     assert key in BUILTIN_CHANNEL_KEYS
     source, manifest = candidate(tmp_path, key)
     with pytest.raises(ValueError):
         registry.register_channel_descriptor(key, describe(source, manifest))
+
+
+def test_official_slack_rejects_wrong_owner_and_accepts_rightful_owner(
+    tmp_path,
+    registry,
+):
+    source, manifest = candidate(tmp_path, "other")
+    descriptor = source / "channel.json"
+    payload = json.loads(descriptor.read_text())
+    payload["channel_key"] = "slack"
+    descriptor.write_text(json.dumps(payload))
+    with pytest.raises(
+        ValueError,
+        match="Channel 'slack' owner 'slack' conflicts with plugin 'other'",
+    ):
+        describe(source, manifest)
+    assert registry.get_channel_catalog_entry("slack") is None
+
+    source, manifest = candidate(tmp_path, "slack")
+    description = describe(source, manifest)
+    row = registry.register_channel_descriptor("slack", description)
+    assert row.plugin_id == "slack" and row.description_record is description
+    assert registry.get_channel_catalog_entry("slack") is row
 
 
 @pytest.mark.asyncio
