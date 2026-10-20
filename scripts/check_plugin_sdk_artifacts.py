@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Verify built artifacts using an already wheel-installed external interpreter.
 
 The caller installs the wheel and test dependencies in an isolated venv first.
@@ -28,6 +29,8 @@ INTERNAL = {
 
 
 def main():
+    # Keep the ordered, independently logged release stages together.
+    # pylint: disable=too-many-statements
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wheel", type=Path, required=True)
     parser.add_argument("--sdist", type=Path, required=True)
@@ -37,7 +40,9 @@ def main():
     args = parser.parse_args()
     root, source = args.output.resolve(), args.source_root.resolve()
     assert not root.exists(), "Author output must be a new directory"
-    assert not root.is_relative_to(source), "Author check must run outside the checkout"
+    assert not root.is_relative_to(
+        source,
+    ), "Author check must run outside the checkout"
     root.mkdir(parents=True)
     interpreter = str(args.python.absolute())
     report = {"artifacts": {}, "steps": [], "tests": []}
@@ -52,7 +57,9 @@ def main():
     for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONDONTWRITEBYTECODE"):
         env.pop(name, None)
     env.update(
-        PATH=str(args.python.absolute().parent) + os.pathsep + env.get("PATH", ""),
+        PATH=str(args.python.absolute().parent)
+        + os.pathsep
+        + env.get("PATH", ""),
         QWENPAW_WORKING_DIR=str(root / "runtime/working"),
         QWENPAW_SECRET_DIR=str(root / "runtime/secrets"),
         XDG_CACHE_HOME=str(root / "runtime/cache"),
@@ -69,11 +76,14 @@ def main():
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=600,
+            check=False,
         )
         (root / (name + ".log")).write_text(result.stdout)
         report["steps"].append({"name": name, "returncode": result.returncode})
         (root / "report.json").write_text(json.dumps(report, indent=2))
-        assert result.returncode == 0, f"{name} failed; see {root / (name + '.log')}"
+        assert (
+            result.returncode == 0
+        ), f"{name} failed; see {root / (name + '.log')}"
         return result.stdout
 
     for artifact in (args.wheel.resolve(), args.sdist.resolve()):
@@ -93,17 +103,45 @@ def main():
             "files": len(names),
         }
     import_check = f"""
-import importlib.metadata, json, shutil, sys
+import hashlib, importlib.metadata, json, shutil, sys, zipfile
+from email.parser import BytesParser
 from pathlib import Path
 import qwenpaw
 location = Path(qwenpaw.__file__).resolve()
 assert "site-packages" in location.parts, location
 assert not location.is_relative_to(Path({str(source)!r})), location
+distributions = [
+    dist for dist in importlib.metadata.distributions()
+    if dist.metadata["Name"].lower().replace("_", "-") == "qwenpaw"
+]
+assert len(distributions) == 1, "Expected sole installed qwenpaw metadata"
+with zipfile.ZipFile({str(args.wheel.resolve())!r}) as archive:
+    metadata = next(
+        name for name in archive.namelist()
+        if name.endswith(".dist-info/METADATA")
+    )
+    expected = BytesParser().parsebytes(archive.read(metadata))["Version"]
+    assert distributions[0].version == expected, "Installed wheel version mismatch"
+    for name in archive.namelist():
+        if name.startswith("qwenpaw/") and not name.endswith("/"):
+            installed = location.parent.parent / name
+            assert installed.is_file(), f"Missing installed wheel file: {{name}}"
+            assert hashlib.sha256(installed.read_bytes()).digest() == hashlib.sha256(
+                archive.read(name)
+            ).digest(), f"Installed wheel bytes mismatch: {{name}}"
 uv = Path(shutil.which("uv") or "missing").absolute()
 assert uv.parent == Path(sys.executable).absolute().parent, uv
-print(json.dumps({{"import_path":str(location), "uv":str(uv), "versions":{{name:importlib.metadata.version(name) for name in ("qwenpaw", "agentscope", "fastapi", "pytest", "uv")}}}}))
+versions = {{
+    name: importlib.metadata.version(name)
+    for name in ("qwenpaw", "agentscope", "fastapi", "pytest", "uv")
+}}
+print(json.dumps({{
+    "import_path": str(location), "uv": str(uv), "versions": versions,
+}}))
 """
-    report["environment"] = json.loads(run("installed-import", "-c", import_check))
+    report["environment"] = json.loads(
+        run("installed-import", "-c", import_check),
+    )
     typing_source = source / "tests/typing/plugin_sdk_author.py"
     shutil.copy2(typing_source, root / typing_source.name)
     run(
@@ -123,7 +161,11 @@ print(json.dumps({{"import_path":str(location), "uv":str(uv), "versions":{{name:
             shutil.copy2(file, suite)
             report["tests"].append(file.name)
     assert report["tests"], "No public author tests found in build snapshot"
-    (root / "pytest.ini").write_text("[pytest]\nasyncio_mode = auto\n")
+    (root / "pytest.ini").write_text(
+        "[pytest]\nasyncio_mode = auto\n"
+        "markers =\n"
+        "    p1: supported feature contracts\n",
+    )
     run(
         "public-author-tests",
         "-m",
@@ -134,10 +176,26 @@ print(json.dumps({{"import_path":str(location), "uv":str(uv), "versions":{{name:
         "--timeout=45",
     )
     template, frontend = root / "template", root / "frontend"
-    run("export-template", "-m", "qwenpaw.plugins.check", "--template", str(template))
-    run("export-frontend", "-m", "qwenpaw.plugins.check", "--frontend", str(frontend))
     run(
-        "template-compliance", "-m", "qwenpaw.plugins.check", str(template), "--runtime"
+        "export-template",
+        "-m",
+        "qwenpaw.plugins.check",
+        "--template",
+        str(template),
+    )
+    run(
+        "export-frontend",
+        "-m",
+        "qwenpaw.plugins.check",
+        "--frontend",
+        str(frontend),
+    )
+    run(
+        "template-compliance",
+        "-m",
+        "qwenpaw.plugins.check",
+        str(template),
+        "--runtime",
     )
     run(
         "template-real-runtime",
@@ -149,10 +207,15 @@ from qwenpaw.plugins.testing import PluginTestHost
 async def main():
     async with PluginTestHost(Path({str(root / "template-host")!r})) as host:
         await host.load(Path({str(template)!r}))
-        assert (await host.call_tool("hello_sdk", {{"name":"outside"}})).content[0].text == "Hello outside (1)"
+        result = await host.call_tool("hello_sdk", {{"name":"outside"}})
+        assert result.content[0].text == "Hello outside (1)"
         assert (await host.reload("hello-sdk")).ok
-        assert (await host.call_tool("hello_sdk", {{"name":"outside"}})).content[0].text == "Hello outside (2)"
-        assert (await host.call_tool("hello_sdk", {{"name":"other"}}, workspace_id="other")).content[0].text == "Hello other (1)"
+        result = await host.call_tool("hello_sdk", {{"name":"outside"}})
+        assert result.content[0].text == "Hello outside (2)"
+        result = await host.call_tool(
+            "hello_sdk", {{"name":"other"}}, workspace_id="other",
+        )
+        assert result.content[0].text == "Hello other (1)"
 asyncio.run(main())
 """,
     )

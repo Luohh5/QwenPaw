@@ -533,3 +533,12 @@ def app_server(  # pylint: disable=too-many-statements,too-many-branches
     finally:
         client.close()
         _shutdown_app(process, log_thread)
+
+
+def pytest_addoption(parser):
+    """Accept an explicit built-artifact handoff for release-only checks."""
+    parser.addoption(
+        "--mcp-plugin-artifacts",
+        default=None,
+        help="Built wheel/sdist/external Python manifest for MCP acceptance",
+    )

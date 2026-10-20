@@ -59,40 +59,51 @@ async def text_result(host):
 def reuse_thirdparty_dependencies(library, mirror):
     from importlib.metadata import Distribution, distributions
     from pathlib import Path
-    import site
     import shutil
+    import sys
 
-    # Reuse third-party dependencies without foreign editable host checkouts.
+    # Only active dependency roots with real distribution metadata qualify.
+    # This also supports wheel hosts whose dependencies use a filtered mirror.
     existing = {
         dist.metadata["Name"].lower().replace("_", "-")
         for dist in distributions(path=[str(library)])
     }
-    mirror.mkdir()
-    for item in Path(site.getsitepackages()[0]).iterdir():
-        if (
-            item.name.endswith((".pth", ".egg-link"))
-            or item.name.startswith("__editable__")
-            or item.name == "qwenpaw"
-            or (library / item.name).exists()
-        ):
+    roots = []
+    for entry in sys.path:
+        path = Path(entry)
+        if not path.is_absolute() or not path.is_dir():
             continue
-        if item.name.endswith((".dist-info", ".egg-info")):
-            name = (
-                Distribution.at(item)
-                .metadata["Name"]
-                .lower()
-                .replace("_", "-")
-            )
-            if name == "qwenpaw" or name in existing:
+        path = path.resolve()
+        if path not in roots and any(distributions(path=[str(path)])):
+            roots.append(path)
+    mirror.mkdir()
+    for root in roots:
+        for item in root.iterdir():
+            if (
+                item.name.endswith((".pth", ".egg-link"))
+                or item.name.startswith("__editable__")
+                or item.name == "qwenpaw"
+                or (library / item.name).exists()
+                or (mirror / item.name).exists()
+            ):
                 continue
-        destination = mirror / item.name
-        try:
-            destination.symlink_to(item, target_is_directory=item.is_dir())
-        except OSError:
-            if item.is_dir():
-                shutil.copytree(item, destination)
-            else:
-                shutil.copy2(item, destination)
+            if item.name.endswith((".dist-info", ".egg-info")):
+                name = (
+                    Distribution.at(item)
+                    .metadata["Name"]
+                    .lower()
+                    .replace("_", "-")
+                )
+                if name == "qwenpaw" or name in existing:
+                    continue
+            destination = mirror / item.name
+            try:
+                destination.symlink_to(item, target_is_directory=item.is_dir())
+            except OSError:
+                if item.is_dir():
+                    shutil.copytree(item, destination)
+                else:
+                    shutil.copy2(item, destination)
     (library / "host_dependencies.pth").write_text(str(mirror) + "\n")
 
 
@@ -238,6 +249,8 @@ async def test_sdk_dependency_restart_rejected_before_module_execution(
         "addition",
     ],
 )
+# One subprocess transaction retains all before/after safety assertions.
+# pylint: disable-next=too-many-statements
 def test_sdk_transitive_dependency_cannot_replace_an_installed_distribution(
     tmp_path,
     change,
@@ -315,6 +328,37 @@ def test_sdk_transitive_dependency_cannot_replace_an_installed_distribution(
         requirement = "sdk-loaded-child>=2.0"
     wheel("sdk_new_parent", "1.0", requirement)
     reuse_thirdparty_dependencies(library, tmp_path / "host-dependencies")
+    import importlib.metadata
+    import shutil
+    import qwenpaw
+
+    # Admit only this host package and its matching metadata into the child.
+    host_package = Path(qwenpaw.__file__).resolve().parent
+    host_metadata = [
+        path
+        for path in host_package.parent.iterdir()
+        if path.name.endswith((".dist-info", ".egg-info"))
+        and importlib.metadata.Distribution.at(path)
+        .metadata["Name"]
+        .lower()
+        .replace("_", "-")
+        == "qwenpaw"
+    ]
+    assert len(host_metadata) == 1, host_metadata
+    host_version = importlib.metadata.Distribution.at(host_metadata[0]).version
+    host_root = tmp_path / "current-host-package"
+    host_root.mkdir()
+    for item in (host_package, host_metadata[0]):
+        destination = host_root / item.name
+        try:
+            destination.symlink_to(item, target_is_directory=item.is_dir())
+        except OSError:
+            if item.is_dir():
+                shutil.copytree(item, destination)
+            else:
+                shutil.copy2(item, destination)
+    expected_origin = (host_root / "qwenpaw/__init__.py").resolve()
+    assert expected_origin.read_bytes() == Path(qwenpaw.__file__).read_bytes()
     one, two = package(tmp_path, "1.0.0"), package(tmp_path, "2.0.0")
     (two / "requirements.txt").write_text("sdk-new-parent==1.0\n")
     code = """
@@ -325,16 +369,13 @@ source_root = Path(sys.argv[5]).resolve()
 sys.path.insert(0, str(source_root))
 import qwenpaw
 
-assert Path(qwenpaw.__file__).resolve().is_relative_to(source_root)
+assert Path(qwenpaw.__file__).resolve() == Path(sys.argv[6]).resolve()
 host_versions = [
     d.version
     for d in importlib.metadata.distributions()
     if d.metadata["Name"].lower().replace("_", "-") == "qwenpaw"
 ]
-source_version = importlib.metadata.Distribution.at(
-    source_root / "qwenpaw.egg-info"
-).version
-assert host_versions == [source_version], host_versions
+assert host_versions == [sys.argv[7]], host_versions
 import mcp.types
 from qwenpaw.plugins import SDKRestartRequiredError
 from qwenpaw.plugins.testing import PluginTestHost
@@ -458,7 +499,9 @@ asyncio.run(main())
             str(one),
             str(two),
             change,
-            str(Path(__file__).resolve().parents[3] / "src"),
+            str(host_root),
+            str(expected_origin),
+            host_version,
         ],
         cwd=tmp_path,
         env=env,
