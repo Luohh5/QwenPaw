@@ -2,10 +2,22 @@
 """Optional resource mapping must match the maintained wheel input exactly."""
 
 import ast
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import tomllib
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def resource_key(path):
+    """Return a logical frozen/archive resource key."""
+    return path.as_posix()
+
+
+def cloned_interpreter(original_python, clone):
+    """Locate the supplied venv interpreter inside its private clone."""
+    return clone / original_python.relative_to(original_python.parent.parent)
 
 
 def frozen_resources():
@@ -29,10 +41,14 @@ def frozen_resources():
             for path in source_path.rglob("*"):
                 if path.is_file():
                     result[
-                        str(Path(destination) / path.relative_to(source_path))
+                        resource_key(
+                            Path(destination) / path.relative_to(source_path),
+                        )
                     ] = path
         else:
-            result[str(Path(destination) / source_path.name)] = source_path
+            result[
+                resource_key(Path(destination) / source_path.name)
+            ] = source_path
     return result
 
 
@@ -42,12 +58,14 @@ def test_frozen_optional_mcp_matches_wheel_allowlist():
     source = ROOT / config["tool"]["setuptools"]["package-dir"][package]
     patterns = config["tool"]["setuptools"]["package-data"][package]
     expected = {
-        str(Path(*package.split(".")) / path.relative_to(source)): path
+        resource_key(
+            Path(*package.split(".")) / path.relative_to(source),
+        ): path
         for pattern in patterns
         for path in source.glob(pattern)
         if path.is_file()
     }
-    assert expected
+    assert len(expected) == 13
     actual = {
         key: value
         for key, value in frozen_resources().items()
@@ -75,8 +93,6 @@ def test_artifact_guard_rejects_actual_installed_wheel_with_wrong_bytes(
     import subprocess
     import sys
 
-    import pytest
-
     manifest = pytestconfig.getoption("--mcp-plugin-artifacts")
     if not manifest:
         pytest.skip("Pass --mcp-plugin-artifacts for built-wheel acceptance")
@@ -84,7 +100,7 @@ def test_artifact_guard_rejects_actual_installed_wheel_with_wrong_bytes(
     original_python = Path(artifacts["python"])
     clone = tmp_path / "external-venv"
     shutil.copytree(original_python.parent.parent, clone, symlinks=True)
-    interpreter = clone / "bin" / original_python.name
+    interpreter = cloned_interpreter(original_python, clone)
     result = subprocess.run(
         [str(interpreter), "-c", "import qwenpaw; print(qwenpaw.__file__)"],
         env={
@@ -150,8 +166,6 @@ def test_wheel_and_frozen_resource_layout_cold_start(tmp_path, pytestconfig):
     import os
     import subprocess
     import zipfile
-
-    import pytest
 
     manifest = pytestconfig.getoption("--mcp-plugin-artifacts")
     if not manifest:
@@ -228,3 +242,41 @@ def test_wheel_and_frozen_resource_layout_cold_start(tmp_path, pytestconfig):
             else:
                 assert (root / "plugins/qwenpaw-mcp/plugin.json").is_file()
                 assert observations["real_rpc"]
+
+
+@pytest.mark.parametrize("path_type", [PurePosixPath, PureWindowsPath])
+def test_logical_resource_keys_are_posix_for_each_path_layout(path_type):
+    path = path_type(
+        "qwenpaw",
+        "plugins",
+        "bundled",
+        "optional",
+        "mcp",
+        "plugin.json",
+    )
+    key = resource_key(path)
+    assert key == "qwenpaw/plugins/bundled/optional/mcp/plugin.json"
+    assert key.startswith("qwenpaw/plugins/bundled/optional/mcp/")
+
+
+@pytest.mark.parametrize(
+    "original, clone, expected",
+    [
+        (
+            PurePosixPath("/original/venv/bin/python"),
+            PurePosixPath("/private/clone"),
+            PurePosixPath("/private/clone/bin/python"),
+        ),
+        (
+            PureWindowsPath("C:/original/venv/Scripts/python.exe"),
+            PureWindowsPath("D:/private/clone"),
+            PureWindowsPath("D:/private/clone/Scripts/python.exe"),
+        ),
+    ],
+)
+def test_clone_preserves_supplied_venv_interpreter_layout(
+    original,
+    clone,
+    expected,
+):
+    assert cloned_interpreter(original, clone) == expected

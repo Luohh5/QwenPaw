@@ -77,6 +77,7 @@ and each target platform's startup still require their release pipeline.
 | Frozen spec parse and scoped whitespace checks | Passed |
 | Initial broad Python source regression | 1974 passed, 6 failed, 7 Windows skips; 375.80 s |
 | Corrected affected cold/distribution source tests | 15 passed; 77.88 s (covers five initial failures) |
+| Distribution path-portability review correction | 7 passed; 16.65 s, actual artifact manifest and no skips |
 | Existing UV dependency-plan case with corrected environment | 1 passed; 0.40 s (sixth initial failure) |
 | 1/10/50-workspace idle benchmark | 30/30 cache-matched samples; controller and strict validator exit 0 |
 | Official MCP static SDK compliance | `ok:true`, SDK 1.1 compatible, no private-import errors; eight unmanaged-resource warnings retained |
@@ -109,6 +110,18 @@ The sixth case needed the existing uv 0.8.15 executable on the runner PATH and
 authorized access to macOS SystemConfiguration outside the filesystem sandbox;
 it passed against local dependency artifacts. No production behavior or safety
 assertion was weakened. The seven skips are platform-specific Windows cases.
+
+Task 8 review found Windows-specific assumptions in the new distribution tests:
+native resource separators were compared with a POSIX prefix, and a copied
+venv's interpreter path assumed `bin`. Deterministic PureWindowsPath/PurePosixPath
+regressions first produced two failures and two passes. Logical resource keys
+now use `as_posix()` consistently; the cloned interpreter retains its supplied
+venv-relative layout. All seven affected distribution tests then passed with
+the actual artifact manifest, preserving the exact 13 resources, installed-byte
+rejection and cold-start checks. This is Windows-style path coverage on macOS,
+not a Windows native execution claim. The focused command is the distribution
+command below; raw results are `task8-fix1-path-red.log` and
+`task8-fix1-distribution-green.log`, and scoped hooks all passed.
 
 ## Reproduction commands and retained result index
 
