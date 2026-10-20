@@ -249,12 +249,12 @@
 
 **Interfaces:** 消费 Task 1–5。产出 `ensure_mcp_plugin_for_upgrade(snapshot: MCPUsageSnapshot) -> Awaitable[MCPPluginUpgradeResult]`，结果为 `unchanged/installed/skipped/needs_review/failed`，附无秘密诊断。明确使用请求复用同一安装协调器，不能绕过显式关闭或另写安装器。
 
-- [ ] **Step 1:** 写旧启用用户升级测试：从真实旧格式 fixture 启动，在网络被禁用时安装一次插件，完整保留多来源配置，并通过 fake 协议服务完成 list/call。
-- [ ] **Step 2:** 写未使用用户升级测试：默认配置及默认迁移卡片均不创建插件安装目录、不调用安装器/DependencyGate、不出现 loaded plugin、不写 `enabled=true`。
-- [ ] **Step 3:** 写重复启动、显式禁用/卸载、复制中断、配置提交中断、已有用户插件版本、单个损坏工作区测试。失败不得推进完成状态或破坏原文件。
-- [ ] **Step 4:** 运行 `PYTHONPATH=src python -m pytest -q tests/integration/test_mcp_plugin_upgrade.py`，确认当前没有条件安装流程而失败。
-- [ ] **Step 5:** 将同一插件源码打成不可发现的离线资源；实现事务编排、独立升级记录及启动前协议登记。启动只核验现有依赖；缺失时明确诊断，不能联网补装。
-- [ ] **Step 6:** 重跑测试，连续启动两次并比较安装目录、配置与 marker；在各事务阶段注入中断并验证恢复后提交。
+- [x] **Step 1:** 写旧启用用户升级测试：从真实旧格式 fixture 启动，在网络被禁用时安装一次插件，完整保留多来源配置，并通过 fake 协议服务完成 list/call。
+- [x] **Step 2:** 写未使用用户升级测试：默认配置及默认迁移卡片均不创建插件安装目录、不调用安装器/DependencyGate、不出现 loaded plugin、不写 `enabled=true`。
+- [x] **Step 3:** 写重复启动、显式禁用/卸载、复制中断、配置提交中断、已有用户插件版本、单个损坏工作区测试。失败不得推进完成状态或破坏原文件。
+- [x] **Step 4:** 运行 `PYTHONPATH=src python -m pytest -q tests/integration/test_mcp_plugin_upgrade.py`，确认当前没有条件安装流程而失败。
+- [x] **Step 5:** 将同一插件源码打成不可发现的离线资源；实现事务编排、独立升级记录及启动前协议登记。启动只核验现有依赖；缺失时明确诊断，不能联网补装。
+- [x] **Step 6:** 重跑测试，连续启动两次并比较安装目录、配置与 marker；在各事务阶段注入中断并验证恢复后提交。
 
 ### Task 7 保留 MCP 入口和初始界面并接入插件管理能力
 

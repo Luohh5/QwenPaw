@@ -208,6 +208,7 @@ async def test_refresh_retry_and_persistent_fields(
             },
             secrets=secrets,
         )
+        refresh_started = time.time()
         await host.open_driver(
             card(transport="sse", credentials={"oauth": credential(kind)}),
         )
@@ -223,7 +224,14 @@ async def test_refresh_retry_and_persistent_fields(
         assert current.public["issuer"] == "preserve"
         assert current.secrets["keep"] == "unchanged"
         assert current.secrets["client_secret"] == "secret"
-        assert current.meta == {"synthetic": True}
+        if kind == "oauth2_auth_code":
+            assert refresh_started <= current.meta["updated_at"] <= time.time()
+            assert current.meta == {
+                "synthetic": True,
+                "updated_at": current.meta["updated_at"],
+            }
+        else:
+            assert current.meta == {"synthetic": True}
         if kind == "oauth2_auth_code":
             assert current.secrets["refresh_token"] == "refresh-original"
             assert current.secrets["access_token"] == "fresh"

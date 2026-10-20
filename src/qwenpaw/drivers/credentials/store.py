@@ -7,6 +7,7 @@ import asyncio
 import os
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -101,7 +102,7 @@ class AsyncCredentialStore:
         public,
         secrets,
     ) -> None:
-        """Replace values atomically, preserving kind and metadata."""
+        """Replace values atomically, preserving metadata and stamping time."""
 
         def update():
             if ref.startswith("env:"):
@@ -119,7 +120,7 @@ class AsyncCredentialStore:
                         kind=record.kind,
                         public=dict(public),
                         secrets=dict(secrets),
-                        meta=record.meta,
+                        meta={**record.meta, "updated_at": time.time()},
                     ),
                 )
 

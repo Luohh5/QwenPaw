@@ -232,6 +232,31 @@ class MCPPluginCoordinator:
             and self.workspace_statuses.get(workspace_id) != "needs_review"
         )
 
+    async def install_explicitly(self):
+        """Use the native offline transaction only after an install click."""
+        async with self.loader.plugin_lifecycle(PLUGIN_ID):
+            installed = await asyncio.to_thread(
+                self.loader.find_installed_plugin_dir,
+                PLUGIN_ID,
+            )
+            if installed is None:
+                source = get_optional_mcp_plugin_dir()
+                _, manifest = await asyncio.to_thread(
+                    self.loader.read_source_manifest,
+                    source,
+                )
+                if manifest.id != PLUGIN_ID:
+                    raise ValueError("Invalid optional MCP resource")
+                await self.loader.install_plugin_files(
+                    source,
+                    allow_install=False,
+                    user_requested=True,
+                )
+            record = self.loader.get_loaded_plugin(PLUGIN_ID)
+            if record is not None and record.status == "failed":
+                await self.loader.lifecycle.reload(PLUGIN_ID)
+            return await self.loader.lifecycle.set_enabled(PLUGIN_ID, True)
+
     async def ensure_protocol(self, protocol):
         if protocol != "mcp":
             return

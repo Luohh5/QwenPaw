@@ -46,9 +46,9 @@ def _mcp_service(agent: Any) -> MCPConfigService:
 
 
 async def _agent_for_request(request: Request) -> Any:
-    from ..agent_context import get_agent_for_request
+    from ..mcp.plugin_service import configuration_workspace
 
-    return await get_agent_for_request(request)
+    return await configuration_workspace(request)
 
 
 async def _ensure_mcp_driver_active(manager: Any, client_key: str) -> None:
@@ -80,7 +80,11 @@ async def list_mcp_tools(
     client_key: str = Path(...),
 ) -> List[MCPToolInfo]:
     """Query a running MCP server for its available tools."""
-    agent = await _agent_for_request(request)
+    from ..agent_context import get_agent_for_request
+    from ..mcp.plugin_service import require_runtime
+
+    require_runtime(request)
+    agent = await get_agent_for_request(request)
     return await _mcp_service(agent).list_tools(client_key)
 
 

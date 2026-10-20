@@ -8,6 +8,7 @@ import { LockKeyhole, Plus, Server, Search } from "lucide-react";
 import type { MCPClientInfo } from "../../../api/types";
 import { MCPClientCard } from "./components";
 import { useMCP } from "./useMCP";
+import { useMCPPlugin } from "./useMCPPlugin";
 import { useTranslation } from "react-i18next";
 import { PageHeader } from "@/components/PageHeader";
 import styles from "./index.module.less";
@@ -75,8 +76,16 @@ const defaultForm = {
   cwd: "",
 };
 
-function MCPPage() {
+function MCPPage({
+  managementAvailable = false,
+  managementMounted = false,
+}: {
+  managementAvailable?: boolean;
+  managementMounted?: boolean;
+}) {
   const { t } = useTranslation();
+  const plugin = useMCPPlugin(managementMounted);
+  const readOnly = !managementAvailable || plugin.state?.status !== "active";
   const {
     clients,
     providerServers,
@@ -290,6 +299,7 @@ function MCPPage() {
         current={t("mcp.title")}
         extra={
           <Button
+            disabled={readOnly}
             type="primary"
             icon={<Plus size={14} />}
             onClick={() => setCreateModalOpen(true)}
@@ -298,6 +308,46 @@ function MCPPage() {
           </Button>
         }
       />
+
+      {readOnly && (
+        <Alert
+          type={
+            plugin.error || plugin.state?.status === "failed" ? "error" : "info"
+          }
+          showIcon
+          message={
+            plugin.error ||
+            t(`mcp.plugin.${plugin.state?.status ?? "loading"}`, {
+              defaultValue:
+                plugin.state?.status === "disabled"
+                  ? "MCP plugin is disabled"
+                  : plugin.state?.installed
+                  ? "MCP management is unavailable"
+                  : "Install the MCP plugin to manage servers",
+            })
+          }
+          description={t("mcp.readOnly")}
+          action={
+            (plugin.error ||
+              (plugin.state && plugin.state.status !== "active")) && (
+              <Button
+                loading={plugin.busy}
+                onClick={
+                  plugin.error && plugin.state?.status === "active"
+                    ? plugin.refresh
+                    : plugin.activate
+                }
+              >
+                {plugin.error || plugin.state?.status === "failed"
+                  ? t("common.retry", { defaultValue: "Retry" })
+                  : plugin.state?.installed
+                  ? t("common.enable", { defaultValue: "Enable" })
+                  : t("common.install", { defaultValue: "Install" })}
+              </Button>
+            )
+          }
+        />
+      )}
 
       <div className={styles.collectionToolbar}>
         <Input
@@ -345,6 +395,7 @@ function MCPPage() {
                 {visibleClients.map((client, index) => (
                   <Cascade key={client.key} index={index}>
                     <MCPClientCard
+                      readOnly={readOnly}
                       client={client}
                       onToggle={handleToggleEnabled}
                       onDelete={handleDelete}
@@ -409,7 +460,7 @@ function MCPPage() {
       <Modal
         centered
         title={t("mcp.create")}
-        open={createModalOpen}
+        open={createModalOpen && !readOnly}
         onCancel={() => {
           setCreateModalOpen(false);
           resetModal();

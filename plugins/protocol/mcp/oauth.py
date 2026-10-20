@@ -72,6 +72,7 @@ class OAuthManagement:
     def app(self):
         app = PawApp("MCP", app_id="qwenpaw-mcp")
         for path, method, handler in (
+            ("/management", "GET", self.management),
             ("/oauth/start/{client_key:path}", "POST", self.start),
             ("/oauth/callback", "POST", self.callback),
             ("/oauth/status/{client_key:path}", "GET", self.status),
@@ -79,6 +80,13 @@ class OAuthManagement:
         ):
             app.route(path, methods=(method,))(handler)
         return app
+
+    async def management(self, context, _request):
+        return {
+            "plugin_id": "qwenpaw-mcp",
+            "workspace_id": context.workspace_id,
+            "capabilities": ["oauth"],
+        }
 
     def _purge(self):
         for state, session in tuple(self._states.items()):
