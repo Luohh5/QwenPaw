@@ -122,7 +122,13 @@ def _configuration_error_detail(exc: ConfigurationException) -> dict:
     return detail
 
 
-def _build_capability_router() -> APIRouter:  # pylint: disable=R0915
+def _build_capability_router(  # pylint: disable=too-many-statements
+    context_dependency=get_scoped_ctx,
+    *,
+    route_class=None,
+    encode=jsonable_encoder,
+    managed_stream=False,
+) -> APIRouter:
     """Build the standard frontend-to-host routes every PawApp receives.
 
     Every route resolves its context through ``get_scoped_ctx``: identity
@@ -130,10 +136,10 @@ def _build_capability_router() -> APIRouter:  # pylint: disable=R0915
     """
     import json
 
-    router = APIRouter()
+    router = APIRouter(**({"route_class": route_class} if route_class else {}))
 
     @router.post("/chat")
-    async def chat(request: Request, ctx=Depends(get_scoped_ctx)):
+    async def chat(request: Request, ctx=Depends(context_dependency)):
         payload = await request.json()
         message = str(payload.get("message") or "").strip()
         if not message:
@@ -146,6 +152,11 @@ def _build_capability_router() -> APIRouter:  # pylint: disable=R0915
                 message,
                 skill=payload.get("skill"),
                 session_id=session_id,
+                **(
+                    {"request_id": payload.get("request_id")}
+                    if managed_stream
+                    else {}
+                ),
             )
         except ConfigurationException as exc:
             raise HTTPException(
@@ -155,7 +166,7 @@ def _build_capability_router() -> APIRouter:  # pylint: disable=R0915
         return {"text": reply.text}
 
     @router.post("/chat/stream")
-    async def chat_stream(request: Request, ctx=Depends(get_scoped_ctx)):
+    async def chat_stream(request: Request, ctx=Depends(context_dependency)):
         payload = await request.json()
         message = str(payload.get("message") or "").strip()
         if not message:
@@ -165,14 +176,20 @@ def _build_capability_router() -> APIRouter:  # pylint: disable=R0915
             await ctx.ensure_chat_session(session_id)
 
         async def events():
+            source = ctx.chat_stream(
+                message,
+                skill=payload.get("skill"),
+                session_id=session_id,
+                **(
+                    {"request_id": payload.get("request_id")}
+                    if managed_stream
+                    else {}
+                ),
+            )
             try:
-                async for event in ctx.chat_stream(
-                    message,
-                    skill=payload.get("skill"),
-                    session_id=session_id,
-                ):
+                async for event in source:
                     encoded = json.dumps(
-                        jsonable_encoder(event),
+                        encode(event),
                         ensure_ascii=False,
                     )
                     yield f"data: {encoded}\n\n"
@@ -185,13 +202,16 @@ def _build_capability_router() -> APIRouter:  # pylint: disable=R0915
                     ensure_ascii=False,
                 )
                 yield f"data: {encoded}\n\n"
+            finally:
+                if managed_stream:
+                    await source.aclose()
 
         return StreamingResponse(events(), media_type="text/event-stream")
 
     @router.get("/chat/history")
     async def chat_history(
         session_id: Optional[str] = None,
-        ctx=Depends(get_scoped_ctx),
+        ctx=Depends(context_dependency),
     ):
         """Return the host-persisted transcript for one PawApp chat session.
 
@@ -217,13 +237,13 @@ def _build_capability_router() -> APIRouter:  # pylint: disable=R0915
         }
 
     @router.get("/chat/sessions")
-    async def chat_sessions(ctx=Depends(get_scoped_ctx)):
+    async def chat_sessions(ctx=Depends(context_dependency)):
         return {"sessions": await ctx.list_chat_sessions()}
 
     @router.post("/chat/sessions")
     async def create_chat_session(
         request: _ChatSessionCreate,
-        ctx=Depends(get_scoped_ctx),
+        ctx=Depends(context_dependency),
     ):
         return await ctx.create_chat_session(name=request.name)
 
@@ -231,7 +251,7 @@ def _build_capability_router() -> APIRouter:  # pylint: disable=R0915
     async def rename_chat_session(
         chat_id: str,
         request: _ChatSessionUpdate,
-        ctx=Depends(get_scoped_ctx),
+        ctx=Depends(context_dependency),
     ):
         try:
             result = await ctx.rename_chat_session(chat_id, name=request.name)
@@ -245,7 +265,10 @@ def _build_capability_router() -> APIRouter:  # pylint: disable=R0915
         return result
 
     @router.post("/chat/sessions/{chat_id}/archive")
-    async def archive_chat_session(chat_id: str, ctx=Depends(get_scoped_ctx)):
+    async def archive_chat_session(
+        chat_id: str,
+        ctx=Depends(context_dependency),
+    ):
         result = await ctx.archive_chat_session(chat_id)
         if result is None:
             raise HTTPException(
@@ -258,7 +281,7 @@ def _build_capability_router() -> APIRouter:  # pylint: disable=R0915
     async def pin_chat_session(
         chat_id: str,
         request: _ChatSessionPin,
-        ctx=Depends(get_scoped_ctx),
+        ctx=Depends(context_dependency),
     ):
         result = await ctx.pin_chat_session(chat_id, pinned=request.pinned)
         if result is None:
@@ -269,7 +292,10 @@ def _build_capability_router() -> APIRouter:  # pylint: disable=R0915
         return result
 
     @router.delete("/chat/sessions/{chat_id}")
-    async def delete_chat_session(chat_id: str, ctx=Depends(get_scoped_ctx)):
+    async def delete_chat_session(
+        chat_id: str,
+        ctx=Depends(context_dependency),
+    ):
         deleted = await ctx.delete_chat_session(chat_id)
         if not deleted:
             raise HTTPException(
@@ -279,30 +305,30 @@ def _build_capability_router() -> APIRouter:  # pylint: disable=R0915
         return {"ok": True}
 
     @router.get("/storage")
-    async def storage_keys(ctx=Depends(get_scoped_ctx)):
+    async def storage_keys(ctx=Depends(context_dependency)):
         return {"keys": await ctx.storage.keys()}
 
     @router.get("/storage/{key}")
-    async def storage_get(key: str, ctx=Depends(get_scoped_ctx)):
+    async def storage_get(key: str, ctx=Depends(context_dependency)):
         return {"value": await ctx.storage.get(key)}
 
     @router.put("/storage/{key}")
     async def storage_set(
         key: str,
         request: Request,
-        ctx=Depends(get_scoped_ctx),
+        ctx=Depends(context_dependency),
     ):
         payload = await request.json()
         await ctx.storage.set(key, payload.get("value"))
         return {"ok": True}
 
     @router.delete("/storage/{key}")
-    async def storage_delete(key: str, ctx=Depends(get_scoped_ctx)):
+    async def storage_delete(key: str, ctx=Depends(context_dependency)):
         await ctx.storage.delete(key)
         return {"ok": True}
 
     @router.post("/toast")
-    async def toast(request: Request, ctx=Depends(get_scoped_ctx)):
+    async def toast(request: Request, ctx=Depends(context_dependency)):
         payload = await request.json()
         await ctx.toast(
             str(payload.get("message") or ""),
@@ -311,7 +337,7 @@ def _build_capability_router() -> APIRouter:  # pylint: disable=R0915
         return {"ok": True}
 
     @router.post("/notify")
-    async def notify(request: Request, ctx=Depends(get_scoped_ctx)):
+    async def notify(request: Request, ctx=Depends(context_dependency)):
         payload = await request.json()
         await ctx.notify(
             title=str(payload.get("title") or ""),
@@ -822,6 +848,13 @@ class PawApp:  # pylint: disable=too-many-public-methods
             priority=130,
         )
 
+    @classmethod
+    def sdk(cls, name: str = "", *, app_id: str):
+        """Use the versioned, finite plugin SDK contracts explicitly."""
+        from ..plugins.apps import PawApp as SDKPawApp
+
+        return SDKPawApp(name=name, app_id=app_id)
+
     def register(self, api: Any) -> None:  # pylint: disable=R0912
         """Called by PluginLoader when the plugin is loaded.
 
@@ -831,7 +864,13 @@ class PawApp:  # pylint: disable=too-many-public-methods
         self._plugin_api = api
 
         # Create app_id injector dependency
-        app_id_injector = Depends(_make_app_id_injector(self.app_id))
+        app_id_injector = Depends(
+            getattr(
+                self,
+                "_sdk_app_id_injector",
+                _make_app_id_injector(self.app_id),
+            ),
+        )
 
         # PluginRegistry owns one prefix per plugin. Aggregate every PawApp
         # router so standard capabilities and app routes share one atomic

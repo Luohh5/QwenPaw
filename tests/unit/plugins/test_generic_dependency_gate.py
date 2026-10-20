@@ -203,6 +203,167 @@ def wheel(tmp_path, name="f32-sdk", version="2.0", requires=()):
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case,allowed",
+    [
+        ("retained", True),
+        ("top-level", False),
+        ("non-wheel", False),
+        ("wrong-name", False),
+        ("wrong-version", False),
+        ("new-child", False),
+        ("child-closure", False),
+    ],
+)
+async def test_transitive_wheel_url_retains_only_original_installed_child(
+    tmp_path,
+    case,
+    allowed,
+):
+    """A URL cannot turn an added row into evidence of pre-existing code."""
+    site, reqs, process, usage, spec = inputs(tmp_path, "f32-parent==1.0\n")
+    child = wheel(
+        tmp_path,
+        name="f32-child",
+        version="1.0",
+        requires=(
+            "f32-leaf>=2" if case == "child-closure" else "f32-leaf==1",
+        ),
+    )
+    leaf = wheel(tmp_path, name="f32-leaf", version="1.0")
+    for addition in (leaf,) if case == "new-child" else (leaf, child):
+        with zipfile.ZipFile(addition.path) as archive:
+            archive.extractall(site)
+    url = child.path.as_uri()
+    if case == "non-wheel":
+        url = child.path.with_suffix(".tar.gz").as_uri()
+    elif case == "wrong-name":
+        url = leaf.path.as_uri()
+    elif case == "wrong-version":
+        url = (tmp_path / "f32_child-2.0-py3-none-any.whl").as_uri()
+    reference = "f32-child @ " + url
+    parent = wheel(
+        tmp_path,
+        name="f32-parent",
+        version="1.0",
+        requires=(reference,),
+    )
+    if case == "top-level":
+        reqs.write_text(reference + "\n")
+    before = {
+        str(path.relative_to(site)): path.read_bytes()
+        for path in site.rglob("*")
+        if path.is_file()
+    }
+    additions = (parent, child) if case == "new-child" else (parent,)
+
+    async def prepare():
+        return await gate.prepare_shared_dependencies(
+            process,
+            spec,
+            plugin_id="url-contract",
+            requirements_file=reqs,
+            usage_registry=usage,
+            install_target=site,
+            wheels=additions,
+        )
+
+    if allowed:
+        result = await prepare()
+        assert result.distributions["f32-parent"]["version"] == "1.0"
+        assert result.distributions["f32-child"]["version"] == "1.0"
+        assert (site / "f32_parent.py").is_file()
+        assert all(
+            (site / name).read_bytes() == data for name, data in before.items()
+        )
+    else:
+        with pytest.raises(gate.SharedDependencyError) as caught:
+            await prepare()
+        if case == "child-closure":
+            assert caught.value.reason_code == "DEPENDENCY_RESTART_REQUIRED"
+            assert "f32-leaf>=2" in caught.value.decision.host_conflicts
+        else:
+            assert caught.value.reason_code == "DEPENDENCY_PLAN_UNVERIFIED"
+            assert caught.value.decision.unsupported
+        after = {
+            str(path.relative_to(site)): path.read_bytes()
+            for path in site.rglob("*")
+            if path.is_file()
+        }
+        assert after == before
+    assert not repair_marker(site).exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    ["unchanged", "addition", "requires-dist", "origin"],
+)
+async def test_resolver_snapshot_change_refuses_before_publication(
+    tmp_path,
+    change,
+):
+    """A fresh audit must not silently rebase a completed resolver plan."""
+    site, reqs, process, usage, spec = inputs(tmp_path, "f32-parent==1.0\n")
+    child = wheel(tmp_path, name="f32-child", version="1.0")
+    with zipfile.ZipFile(child.path) as archive:
+        archive.extractall(site)
+    expected = (await process.audit(spec)).snapshot
+    if change == "addition":
+        peer = wheel(tmp_path, name="f32-peer", version="1.0")
+        with zipfile.ZipFile(peer.path) as archive:
+            archive.extractall(site)
+    elif change == "requires-dist":
+        metadata_path = site / "f32_child-1.0.dist-info/METADATA"
+        metadata_path.write_text(
+            metadata_path.read_text() + "Requires-Dist: f32-peer==1.0\n",
+        )
+    elif change == "origin":
+        (site / "f32_child-1.0.dist-info").rename(
+            site / "f32_child-1.0.0.dist-info",
+        )
+    before = {
+        str(path.relative_to(site)): path.read_bytes()
+        for path in site.rglob("*")
+        if path.is_file()
+    }
+    parent = wheel(tmp_path, name="f32-parent", version="1.0")
+
+    async def prepare():
+        return await gate.prepare_shared_dependencies(
+            process,
+            spec,
+            plugin_id="resolution-contract",
+            requirements_file=reqs,
+            usage_registry=usage,
+            install_target=site,
+            wheels=(parent,),
+            expected_snapshot=expected,
+        )
+
+    if change == "unchanged":
+        result = await prepare()
+        assert result.distributions["f32-parent"]["version"] == "1.0"
+        assert all(
+            (site / name).read_bytes() == data for name, data in before.items()
+        )
+        assert not repair_marker(site).exists()
+        return
+    with pytest.raises(gate.SharedDependencyError) as caught:
+        await prepare()
+    assert caught.value.reason_code == "DEPENDENCY_RESTART_REQUIRED"
+    assert caught.value.decision.require_restart
+    after = {
+        str(path.relative_to(site)): path.read_bytes()
+        for path in site.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert not (site / "f32_parent.py").exists()
+    assert not repair_marker(site).exists()
+
+
 def declare(usage, plugin, snapshot, requirements, *, revision="old"):
     token = usage.declare(
         DependencyDeclaration(

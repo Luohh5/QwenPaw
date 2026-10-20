@@ -36,7 +36,7 @@ import {
 } from "lucide-react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import type { ActiveModelsInfo } from "../../../api/types";
+import type { ActiveModelsInfo, ModelType } from "../../../api/types";
 import { useAgentStore } from "../../../stores/agentStore";
 import { confirmFreeModelSwitch } from "@/utils/freeModelSwitchWarning";
 import { ProviderIcon } from "../../Settings/Models/components/ProviderIconComponent";
@@ -83,6 +83,7 @@ const DEFAULT_VISIBLE_MODELS = 5;
 const VIEW_MORE_STEP = 20;
 
 interface ModelSelectorProps {
+  modelType?: ModelType;
   embedded?: boolean;
   onPick?: (providerId: string, modelId: string) => void;
   selectedSlot?: { provider_id: string; model: string } | null;
@@ -105,6 +106,7 @@ function readStoredModelKeys(key: string): string[] {
 
 export default function ModelSelector({
   embedded = false,
+  modelType = "chat",
   onPick,
   selectedSlot,
   onSelected,
@@ -218,8 +220,8 @@ export default function ModelSelector({
 
   // Eligible providers: configured + has models, OR is_free_tier
   const eligibleProviders = useMemo(
-    () => buildEligibleProviders(providers),
-    [providers],
+    () => buildEligibleProviders(providers, modelType),
+    [providers, modelType],
   );
 
   // Models are split by is_free; mixed-tier providers can appear in both tabs.
@@ -259,7 +261,8 @@ export default function ModelSelector({
   }, [open]);
 
   const activeProviderId = onPick
-    ? selectedSlot?.provider_id ?? activeModels?.active_llm?.provider_id
+    ? selectedSlot?.provider_id ??
+      (modelType === "chat" ? activeModels?.active_llm?.provider_id : undefined)
     : activeModels?.active_llm?.provider_id;
   const activeModelId = onPick
     ? selectedSlot?.model
@@ -276,7 +279,11 @@ export default function ModelSelector({
     expansionSession.current = key;
     setCollapsedProviders(
       new Set(
-        providers.filter((p) => p.id !== activeProviderId).map((p) => p.id),
+        providers
+          .filter(
+            (p) => p.id !== (activeProviderId ?? eligibleProviders[0]?.id),
+          )
+          .map((p) => p.id),
       ),
     );
   }, [
@@ -286,6 +293,7 @@ export default function ModelSelector({
     selectedAgent,
     sessionId,
     activeProviderId,
+    eligibleProviders,
   ]);
   const actualUsage = useTurnUsageStore((state) => state.snapshot?.usage);
   const fallbackModel = useMemo(() => {
@@ -311,13 +319,13 @@ export default function ModelSelector({
   }, [actualUsage, activeModelId, activeProviderId, providers]);
 
   const discoveryCandidates = useMemo(
-    () => buildDiscoveryCandidates(providers),
-    [providers],
+    () => buildDiscoveryCandidates(providers, modelType),
+    [providers, modelType],
   );
 
   const hiddenCandidates = useMemo(
-    () => buildHiddenCandidates(providers),
-    [providers],
+    () => buildHiddenCandidates(providers, modelType),
+    [providers, modelType],
   );
 
   const visibleCandidates = useMemo(() => {
@@ -743,6 +751,7 @@ export default function ModelSelector({
         {managingModels && addingProvider === provider.id && (
           <Suspense fallback={<Spin size="small" />}>
             <ProviderCandidatePicker
+              modelType={modelType}
               key={`${provider.id}:${activeTab}`}
               tier={activeTab === "free" ? "free" : undefined}
               providerId={provider.id}
@@ -1085,6 +1094,7 @@ export default function ModelSelector({
             </div>
             <Suspense fallback={<Spin size="small" />}>
               <ProviderCandidatePicker
+                modelType={modelType}
                 key={provider.id}
                 providerId={provider.id}
                 onSaved={async (modelId) => {

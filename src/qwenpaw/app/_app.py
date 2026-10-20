@@ -58,6 +58,7 @@ from .migration import (
 )
 from .routers import create_agent_scoped_router
 from .routers import router as api_router
+from .routers.advisor_mode import router as advisor_mode_router
 from .routers.agent_scoped import AgentContextMiddleware
 from .routers.approval import router as approval_router
 from .routers.coding_mode import router as coding_mode_router
@@ -476,6 +477,8 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
     app.state.get_agent_by_id = _get_agent_by_id
 
     app.state.startup_ready = asyncio.Event()
+    app.state.market_ready = asyncio.Event()
+    app.state.market_startup_failed = False
     app.state.startup_time = startup_start_time
     from ..browser.execution.kernel import get_default_kernel_manager
 
@@ -521,7 +524,7 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
     async def _background_startup():  # pylint: disable=too-many-statements
         try:
             # ---- Plugin System (phase 1: startup-critical plugins) ----
-            # Channel and memory plugins must register before agents start.
+            # Channels, memory backends and Hubs register before readiness.
             logger.debug("Initializing plugin system...")
 
             from ..config.utils import get_plugins_dir
@@ -532,6 +535,16 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
             # and load through the same pipeline as 'app'-type plugins
             # (plugin.json carrying meta.pawapp); surfaced only in the App
             # Center, hidden from the sidebar.
+            from ..market.builtin import seed_builtin_hub_plugins
+
+            try:
+                await asyncio.to_thread(
+                    seed_builtin_hub_plugins,
+                    get_plugins_dir(),
+                )
+            except (OSError, ValueError, TimeoutError):
+                logger.exception("Could not initialize default Hub plugins")
+
             plugin_dirs = [get_plugins_dir()]
 
             from ..plugins.official_channels import (
@@ -601,7 +614,7 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
             # Phase 1: register only; projection waits for activate_all
             await plugin_loader.load_all_plugins(
                 configs=plugin_configs,
-                types=["channel", "memory"],
+                types=["channel", "memory", "hub"],
                 activate=False,
             )
             try:
@@ -614,7 +627,8 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
                     )
             except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 logger.exception("Official channel migration pending")
-            logger.debug("Phase 1: channel and memory plugins loaded")
+            logger.debug("Phase 1: channel, memory and Hub plugins loaded")
+            app.state.market_ready.set()
 
             def _mark_core_agents_ready(_results: dict[str, bool]) -> None:
                 """Publish readiness after the core agent phase."""
@@ -699,6 +713,28 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
                     exc_info=True,
                 )
 
+            # ---- Orphan skill staging dirs ----
+            # Best-effort housekeeping: a leaked stage dir is harmless, so
+            # cleanup must never gate startup on temp-dir I/O.
+            try:
+                from ..agents.skill_system import (
+                    cleanup_orphan_skill_stages,
+                )
+
+                removed = await asyncio.to_thread(
+                    cleanup_orphan_skill_stages,
+                )
+                if removed:
+                    logger.info(
+                        "Removed %d orphan skill staging dir(s)",
+                        removed,
+                    )
+            except Exception:
+                logger.warning(
+                    "Orphan skill staging cleanup skipped",
+                    exc_info=True,
+                )
+
             startup_elapsed = time.time() - startup_start_time
             logger.info(
                 "Background startup completed in "
@@ -712,6 +748,10 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
                 "Background startup encountered an error",
                 exc_info=True,
             )
+        finally:
+            if not app.state.market_ready.is_set():
+                app.state.market_startup_failed = True
+                app.state.market_ready.set()
 
     _bg_task = asyncio.create_task(_background_startup())
     daily_telemetry = start_daily_telemetry()
@@ -986,6 +1026,9 @@ app.include_router(approval_router, prefix="/api")
 
 # Coding Mode router: /api/coding-mode
 app.include_router(coding_mode_router, prefix="/api")
+
+# Advisor Mode router: /api/advisor-mode
+app.include_router(advisor_mode_router, prefix="/api")
 
 # Loops router: /api/loops
 app.include_router(loops_router, prefix="/api")

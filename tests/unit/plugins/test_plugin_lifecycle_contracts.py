@@ -299,8 +299,9 @@ async def _load(
     *,
     config: dict | None = None,
     activate: bool = True,
+    workspace=None,
 ):
-    workspace = _slash_workspace()
+    workspace = workspace or _slash_workspace()
     fresh_registry.projector = WorkspaceProjector(
         live_workspaces=lambda: [workspace],
     )
@@ -324,6 +325,305 @@ async def _load(
         activate=activate,
     )
     return loader, workspace, installed
+
+
+async def _load_busy_command(tmp_path, registry, kind, *, ignore_cancel=False):
+    from qwenpaw.runtime.commands.control import handle_control_command
+
+    entered, release, cancelled = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    calls = []
+
+    async def handle(*_args):
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            if not ignore_cancel:
+                raise
+            await release.wait()
+        finally:
+            calls.append("command-exit")
+        return "ok"
+
+    body = (
+        _control_body("busyprobe").replace(
+            "return 'ok'",
+            "return await api.config['handler'](context)",
+        )
+        if kind != "slash"
+        else "api.register_slash_command('busyprobe', api.config['handler'], "
+        "aliases=('aliasprobe',))"
+    ) + (
+        "\n        api.effect('probe', None, "
+        "lambda: api.config['calls'].append('teardown'))"
+    )
+    if kind == "mode":
+        body = (
+            "from qwenpaw.modes.base import AgentMode\n"
+            "        from qwenpaw.runtime.slash_command_registry "
+            "import CommandSpec\n"
+            "        class Mode(AgentMode):\n"
+            "            name = 'busy-mode'\n"
+            "            def commands(self):\n"
+            "                return [CommandSpec(name='busyprobe', "
+            "help_text='probe', handler=api.config['handler'])]\n"
+            "        api.register_mode(Mode)\n"
+            "        api.effect('probe', None, "
+            "lambda: api.config['calls'].append('teardown'))"
+        )
+    workspace = _slash_workspace()
+    if kind == "mode":
+        workspace.plugins = WorkspacePlugins()
+    loader, workspace, installed = await _load(
+        tmp_path,
+        registry,
+        "busy-probe",
+        body,
+        config={"handler": handle, "calls": calls},
+        workspace=workspace,
+    )
+    ctx = SimpleNamespace(workspace=workspace)
+    if kind == "adapter":
+        from qwenpaw.runtime.builtin_commands import (
+            collect_builtin_command_specs,
+        )
+
+        spec = next(
+            item
+            for item in collect_builtin_command_specs()
+            if item.name == "busyprobe"
+        )
+        workspace.plugins.slash_command_registry.register(spec)
+    dispatch = (
+        handle_control_command
+        if kind == "control"
+        else workspace.plugins.slash_command_registry.dispatch
+    )
+    command = asyncio.create_task(
+        dispatch("/aliasprobe" if kind == "slash" else "/busyprobe", ctx),
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    return loader, installed, command, release, cancelled, calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_startup", [False, True])
+async def test_commands_wait_for_initial_activation(
+    tmp_path,
+    fresh_registry,
+    monkeypatch,
+    fail_startup,
+):
+    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def startup(*_args):
+        entered.set()
+        await release.wait()
+        if fail_startup:
+            raise RuntimeError("startup failed")
+
+    async def handler(*_args):
+        calls.append("called")
+        return "ok"
+
+    loader, workspace, _installed = await _load(
+        tmp_path,
+        fresh_registry,
+        "initial",
+        "api.register_slash_command('probe', api.config['handler'])\n"
+        "        api.register_startup_hook('wait', api.config['startup'])",
+        config={"handler": handler, "startup": startup},
+        activate=False,
+    )
+    activate = asyncio.create_task(loader.lifecycle.activate("initial"))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        with pytest.raises(RuntimeError):
+            await workspace.plugins.slash_command_registry.dispatch(
+                "/probe",
+                SimpleNamespace(),
+            )
+        assert not calls
+    finally:
+        release.set()
+        await asyncio.gather(activate, return_exceptions=True)
+    try:
+        result = await workspace.plugins.slash_command_registry.dispatch(
+            "/probe",
+            SimpleNamespace(),
+        )
+        assert calls == ([] if fail_startup else ["called"])
+        assert result == (None if fail_startup else "ok")
+    finally:
+        await loader.lifecycle.unload("initial", UnloadMode.UNLOAD)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["control", "slash", "adapter", "mode"])
+@pytest.mark.parametrize(
+    "operation",
+    ["unload", "reload", "config", "install"],
+)
+async def test_busy_command_blocks_lifecycle(
+    tmp_path,
+    fresh_registry,
+    monkeypatch,
+    kind,
+    operation,
+):
+    from qwenpaw.plugins.activity import PluginBusyError
+
+    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
+    (
+        loader,
+        installed,
+        command,
+        release,
+        _cancelled,
+        calls,
+    ) = await _load_busy_command(tmp_path, fresh_registry, kind)
+    record = loader.get_loaded_plugin("busy-probe")
+    workspace = fresh_registry.get_workspace_manager().agents["talk"]
+    retained = (
+        workspace.plugins.slash_command_registry.resolve("/busyprobe")[0]
+        if kind == "adapter"
+        else None
+    )
+    try:
+        with pytest.raises(PluginBusyError):
+            if operation == "unload":
+                await loader.lifecycle.unload(
+                    "busy-probe",
+                    UnloadMode.UNINSTALL,
+                )
+            elif operation == "reload":
+                await loader.lifecycle.reload("busy-probe")
+            elif operation == "config":
+                await loader.lifecycle.update_config("busy-probe", {})
+            else:
+                await loader.load_plugin_from_path(installed, force=True)
+        assert not calls
+        assert not command.done()
+        assert loader.get_loaded_plugin("busy-probe") is record
+        assert (installed / "plugin.json").exists()
+    finally:
+        release.set()
+        await command
+        if loader.get_loaded_plugin("busy-probe") is not None:
+            report = await loader.lifecycle.unload(
+                "busy-probe",
+                UnloadMode.UNLOAD,
+            )
+            assert report.clean and report.quiescent
+    assert calls == ["command-exit", "teardown"]
+    if kind == "mode":
+        assert not workspace.plugins.modes
+        assert (
+            workspace.plugins.slash_command_registry.resolve("/busyprobe")
+            is None
+        )
+    if retained is not None:
+        await retained.handler(SimpleNamespace(workspace=workspace), "")
+        assert calls == ["command-exit", "teardown"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ignore_cancel", [False, True])
+@pytest.mark.parametrize("kind", ["control", "mode"])
+async def test_interrupt_waits_for_actual_command_exit(
+    tmp_path,
+    fresh_registry,
+    monkeypatch,
+    ignore_cancel,
+    kind,
+):
+    from qwenpaw.plugins.activity import PluginBusyError
+    from qwenpaw.runtime.commands.control import handle_control_command
+
+    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
+    monkeypatch.setattr(
+        "qwenpaw.plugins.activity.INTERRUPT_TIMEOUT_SECONDS",
+        0.01,
+    )
+    (
+        loader,
+        installed,
+        command,
+        release,
+        cancelled,
+        calls,
+    ) = await _load_busy_command(
+        tmp_path,
+        fresh_registry,
+        kind,
+        ignore_cancel=ignore_cancel,
+    )
+    try:
+        unload = asyncio.create_task(
+            loader.lifecycle.unload(
+                "busy-probe",
+                UnloadMode.UNINSTALL,
+                delete_files=True,
+                interrupt_tasks=True,
+            ),
+        )
+        if ignore_cancel:
+            await asyncio.wait_for(cancelled.wait(), 0.5)
+            workspace = fresh_registry.get_workspace_manager().agents["talk"]
+            dispatch = (
+                handle_control_command
+                if kind == "control"
+                else workspace.plugins.slash_command_registry.dispatch
+            )
+            if kind == "control":
+                rejected = await dispatch("/busyprobe", SimpleNamespace())
+                assert "Command Failed" in rejected
+            else:
+                with pytest.raises(PluginBusyError):
+                    await dispatch("/busyprobe", SimpleNamespace())
+            with pytest.raises(PluginBusyError) as caught:
+                await asyncio.wait_for(unload, 0.5)
+            assert caught.value.detail["can_interrupt"] is False
+            assert cancelled.is_set()
+            assert not command.done()
+            assert not calls
+            assert installed.is_dir()
+            assert loader.get_loaded_plugin("busy-probe") is not None
+            with pytest.raises(PluginBusyError):
+                await loader.lifecycle.reload("busy-probe")
+            with pytest.raises(PluginBusyError):
+                await loader.lifecycle.unload(
+                    "busy-probe",
+                    UnloadMode.UNLOAD,
+                    interrupt_tasks=True,
+                )
+            assert not command.done()
+            assert not calls
+            release.set()
+            await command
+            report = await loader.lifecycle.unload(
+                "busy-probe",
+                UnloadMode.UNINSTALL,
+                delete_files=True,
+            )
+        else:
+            report = await asyncio.wait_for(unload, 0.5)
+            assert command.cancelled()
+        assert report.clean and report.quiescent
+        assert calls == ["command-exit", "teardown"]
+        assert not installed.exists()
+    finally:
+        release.set()
+        await asyncio.gather(command, return_exceptions=True)
+        if loader.get_loaded_plugin("busy-probe") is not None:
+            await loader.lifecycle.unload("busy-probe", UnloadMode.UNLOAD)
 
 
 @pytest.mark.asyncio

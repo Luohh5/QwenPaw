@@ -13,7 +13,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File
 from fastapi.responses import FileResponse
@@ -24,6 +24,8 @@ from ...plugins.dependency_upgrade import (
     dependency_upgrades,
 )
 from ...plugins.dependency_gate import SharedDependencyError
+from ...market.registry import MarketProviderBusyError
+from ...plugins.activity import PluginBusyError
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +104,11 @@ async def cancel_dependency_upgrade(operation_id: str, request: Request):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+def _interrupt_options(interrupt_tasks: bool) -> dict[str, Any]:
+    """Keep existing callers unchanged unless interruption is explicit."""
+    return {"interrupt_tasks": True} if interrupt_tasks else {}
+
+
 def _log_safe(value: object) -> str:
     """Strip CR/LF so request-derived values cannot forge log entries."""
     return str(value).replace("\r", "").replace("\n", "")
@@ -168,14 +175,9 @@ def memory_in_use_detail(
 
 
 def _list_plugins_from_disk() -> list[dict]:
-    """Read plugin manifests directly from the plugins directory on disk.
-
-    Used as a fallback when the plugin loader has not finished
-    initialising (e.g. the frontend opens before the backend startup
-    coroutine completes).  Returns the same shape as the normal list
-    endpoint so the frontend does not need to handle a different schema.
-    """
+    """List installed plugins, including those that could not be loaded."""
     from ...config.utils import get_plugins_dir
+    from ...plugins.architecture import PluginManifest
 
     plugins_dir: Path = get_plugins_dir()
     if not plugins_dir.exists():
@@ -194,30 +196,25 @@ def _list_plugins_from_disk() -> list[dict]:
             continue
         try:
             with open(manifest_path, encoding="utf-8") as f:
-                manifest = json.load(f)
+                manifest = PluginManifest.from_dict(json.load(f))
         except Exception as exc:
             logger.warning("Failed to read %s: %s", manifest_path, exc)
             continue
 
-        plugin_id = manifest.get("id", item.name)
-        frontend_entry = manifest.get("entry", {}).get("frontend")
-
-        from ...plugins.architecture import PluginManifest
         from ...plugins.settings import is_plugin_enabled
 
-        disk_manifest = PluginManifest.from_dict(manifest)
-        raw = _plugin_config_row(plugin_id)
+        raw = _plugin_config_row(manifest.id)
         result.append(
             {
-                "id": plugin_id,
-                "name": manifest.get("name", plugin_id),
-                "version": manifest.get("version", "0.0.0"),
-                "description": manifest.get("description", ""),
-                "author": manifest.get("author", ""),
+                "id": manifest.id,
+                "name": manifest.name,
+                "version": manifest.version,
+                "description": manifest.description,
+                "author": manifest.author,
                 "enabled": is_plugin_enabled(raw),
                 "loaded": False,
-                "plugin_type": disk_manifest.plugin_type,
-                "frontend_entry": frontend_entry,
+                "plugin_type": manifest.plugin_type,
+                "frontend_entry": manifest.entry.frontend,
             },
         )
     return result
@@ -276,6 +273,7 @@ async def _load_plugin_with_optional_force_reinstall(
     source_path: Path,
     *,
     force: bool,
+    interrupt_tasks: bool = False,
     reload_agents: bool = True,
     pawport_owner: dict | None = None,
     recover_incomplete: bool = False,
@@ -311,6 +309,7 @@ async def _load_plugin_with_optional_force_reinstall(
         source_path=source_path,
         install_dir=get_plugins_dir(),
         force=force,
+        **_interrupt_options(interrupt_tasks),
         before_force_unload=_before_force_unload if force else None,
         pawport_owner=pawport_owner,
         recover_incomplete=recover_incomplete,
@@ -340,47 +339,39 @@ def _extract_downloaded_plugin_zip(zip_path: Path, temp_dir: Path) -> Path:
 
 @router.get(
     "",
-    summary="List loaded plugins",
-    description="Return all loaded plugins with optional UI metadata.",
+    summary="List installed plugins",
+    description="Return installed plugins with their runtime state.",
 )
 async def list_plugins(request: Request):
-    """Return every loaded plugin with basic metadata and entry points.
-
-    If the plugin loader has not yet finished initialising (backend
-    still starting up when the frontend first requests the list), the
-    response is built by scanning the plugins directory on disk.
-    """
+    """Keep failed installations visible and removable in the installed UI."""
     loader = getattr(request.app.state, "plugin_loader", None)
-
+    result = {
+        item["id"]: item
+        for item in await asyncio.to_thread(_list_plugins_from_disk)
+    }
     if loader is None:
-        logger.debug(
-            "[plugins] plugin_loader not ready, falling back to disk scan",
-        )
-        return _list_plugins_from_disk()
+        return list(result.values())
 
     from ...plugins.settings import is_plugin_enabled
 
-    result = []
     for plugin_id, record in loader.get_all_loaded_plugins().items():
         manifest = record.manifest
         raw = _plugin_config_row(plugin_id)
-        result.append(
-            {
-                "id": manifest.id,
-                "name": manifest.name,
-                "version": manifest.version,
-                "description": manifest.description,
-                "author": manifest.author,
-                "enabled": is_plugin_enabled(raw),
-                "loaded": True,
-                "status": getattr(record, "status", "active"),
-                "diagnostics": list(record.diagnostics or []),
-                "plugin_type": manifest.plugin_type,
-                "frontend_entry": manifest.entry.frontend,
-            },
-        )
+        result[manifest.id] = {
+            "id": manifest.id,
+            "name": manifest.name,
+            "version": manifest.version,
+            "description": manifest.description,
+            "author": manifest.author,
+            "enabled": is_plugin_enabled(raw),
+            "loaded": True,
+            "status": getattr(record, "status", "active"),
+            "diagnostics": list(record.diagnostics or []),
+            "plugin_type": manifest.plugin_type,
+            "frontend_entry": manifest.entry.frontend,
+        }
 
-    return result
+    return list(result.values())
 
 
 @router.get(
@@ -403,6 +394,7 @@ class InstallPluginRequest(BaseModel):
 
     source: str
     force: bool = False
+    interrupt_tasks: bool = False
 
 
 async def install_plugin_source(
@@ -410,6 +402,7 @@ async def install_plugin_source(
     *,
     app,
     force: bool = False,
+    interrupt_tasks: bool = False,
     reload_agents: bool = True,
     pawport_owner: dict | None = None,
     recover_incomplete: bool = False,
@@ -456,6 +449,7 @@ async def install_plugin_source(
             request,
             source_path,
             force=force,
+            **_interrupt_options(interrupt_tasks),
             reload_agents=reload_agents,
             pawport_owner=pawport_owner,
             recover_incomplete=recover_incomplete,
@@ -470,6 +464,7 @@ async def uninstall_plugin_source(
     *,
     app,
     reload_agents: bool = True,
+    interrupt_tasks: bool = False,
 ) -> None:
     """Uninstall through the native plugin lifecycle.
 
@@ -487,6 +482,7 @@ async def uninstall_plugin_source(
             plugin_id,
             UnloadMode.UNINSTALL,
             delete_files=True,
+            **_interrupt_options(interrupt_tasks),
         )
         still_loaded = loader.get_loaded_plugin(plugin_id) is not None
         if not report.clean or not report.quiescent or still_loaded:
@@ -527,12 +523,17 @@ async def install_plugin(
             body.source,
             app=request.app,
             force=body.force,
+            **_interrupt_options(body.interrupt_tasks),
         )
     except HTTPException:
         raise
     except (DependencyUpgradeRequired, SharedDependencyError) as exc:
         raise dependency_http_error(exc) from exc
     except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PluginBusyError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    except MarketProviderBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (FileNotFoundError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -572,6 +573,7 @@ async def upload_plugin(
     request: Request,
     file: UploadFile = File(..., description="Plugin ZIP archive"),
     force: bool = False,
+    interrupt_tasks: bool = False,
 ):
     """Install and hot-load a plugin from an uploaded ZIP file."""
     loader = getattr(request.app.state, "plugin_loader", None)
@@ -602,12 +604,17 @@ async def upload_plugin(
             request,
             source_path,
             force=force,
+            **_interrupt_options(interrupt_tasks),
         )
     except HTTPException:
         raise
     except (DependencyUpgradeRequired, SharedDependencyError) as exc:
         raise dependency_http_error(exc) from exc
     except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PluginBusyError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    except MarketProviderBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (FileNotFoundError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -644,7 +651,11 @@ async def upload_plugin(
         "that are not currently loaded (disabled or FAILED)."
     ),
 )
-async def uninstall_plugin(plugin_id: str, request: Request):
+async def uninstall_plugin(
+    plugin_id: str,
+    request: Request,
+    interrupt_tasks: bool = False,
+):
     """Unload and delete a plugin by ID."""
     loader = getattr(request.app.state, "plugin_loader", None)
     if loader is None:
@@ -657,9 +668,14 @@ async def uninstall_plugin(plugin_id: str, request: Request):
         await uninstall_plugin_source(
             plugin_id,
             app=request.app,
+            **_interrupt_options(interrupt_tasks),
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PluginBusyError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    except MarketProviderBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except UnquiescentUnloadError as exc:
         raise HTTPException(
             status_code=409,
@@ -712,7 +728,11 @@ async def uninstall_plugin(plugin_id: str, request: Request):
         "agent.json and config.plugins are left unchanged."
     ),
 )
-async def unload_plugin_keep_config(plugin_id: str, request: Request):
+async def unload_plugin_keep_config(
+    plugin_id: str,
+    request: Request,
+    interrupt_tasks: bool = False,
+):
     """Callable entry for ``unload(mode=unload)``."""
     loader = getattr(request.app.state, "plugin_loader", None)
     if loader is None:
@@ -728,9 +748,12 @@ async def unload_plugin_keep_config(plugin_id: str, request: Request):
                 plugin_id,
                 UnloadMode.UNLOAD,
                 delete_files=False,
+                **_interrupt_options(interrupt_tasks),
             )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PluginBusyError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
     except RuntimeError as exc:
         if "memory backend is in use" in str(exc):
             still_loaded = loader.get_loaded_plugin(plugin_id) is not None
@@ -862,12 +885,14 @@ class UpdatePluginConfigRequest(BaseModel):
 
     config: dict
     confirm_legacy: bool = False
+    interrupt_tasks: bool = False
 
 
 class SetPluginEnabledRequest(BaseModel):
     """Enable or disable a plugin via ``config.plugins.<id>.enabled``."""
 
     enabled: bool
+    interrupt_tasks: bool = False
 
 
 @router.put(
@@ -891,11 +916,15 @@ async def update_plugin_config(
             status_code=503,
             detail="Plugin loader is not ready yet.",
         )
-    report = await loader.lifecycle.update_config(
-        plugin_id,
-        body.config,
-        confirm_legacy=body.confirm_legacy,
-    )
+    try:
+        report = await loader.lifecycle.update_config(
+            plugin_id,
+            body.config,
+            confirm_legacy=body.confirm_legacy,
+            **_interrupt_options(body.interrupt_tasks),
+        )
+    except PluginBusyError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
     if report.requires_confirmation:
         raise HTTPException(
             status_code=409,
@@ -969,7 +998,11 @@ async def set_plugin_enabled(
             )
     try:
         if not body.enabled:
-            result = await loader.lifecycle.set_enabled(plugin_id, False)
+            result = await loader.lifecycle.set_enabled(
+                plugin_id,
+                False,
+                **_interrupt_options(body.interrupt_tasks),
+            )
             clean = getattr(result, "clean", True)
             quiescent = getattr(result, "quiescent", True)
             needs_restart = getattr(result, "needs_restart", False)
@@ -1023,6 +1056,8 @@ async def set_plugin_enabled(
         raise
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PluginBusyError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
     except Exception as exc:
         logger.error(
             "Failed to set enabled=%s for plugin '%s': %s",

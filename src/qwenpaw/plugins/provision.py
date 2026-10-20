@@ -408,7 +408,7 @@ def provision_files(
     if not str(dest).strip() or dest in {Path(""), Path(".")}:
         raise ValueError("refusing to provision an empty dest")
     if not dest.is_absolute():
-        dest = dest.resolve()
+        dest = dest.absolute()
 
     dest_key = str(dest)
     data = load_inventory(plugin_id)
@@ -419,7 +419,13 @@ def provision_files(
     owned = location_owned(previous)
     dest_existed = os.path.lexists(dest)
 
-    if dest_existed and prev_version == version:
+    # Replacing a provision with a link is a user customization, even when
+    # its target still contains the previous factory bytes.
+    if (
+        dest_existed
+        and prev_version
+        and (prev_version == version or dest.is_symlink())
+    ):
         return "keep"
 
     if dest_existed and not prev_version:
@@ -494,7 +500,7 @@ def _allocate_provision_backup(dest: Path, plugin_id: str) -> Path:
         candidate = dest.with_name(
             f"{dest.name}.{plugin_id}.{uuid.uuid4().hex[:8]}.bak",
         )
-        if not candidate.exists():
+        if not os.path.lexists(candidate):
             return candidate
     raise RuntimeError(
         f"could not allocate a unique provision backup for '{plugin_id}'",
@@ -517,13 +523,13 @@ def _begin_migration(
     existing = parse_optional_absolute(
         (previous.get("migrating") or {}).get("backup_path"),
     )
-    if existing is not None and existing.exists():
+    if existing is not None and os.path.lexists(existing):
         return existing
     backup = _allocate_provision_backup(dest, plugin_id)
-    if dest.is_dir():
-        shutil.copytree(dest, backup)
+    if dest.is_dir() and not dest.is_symlink():
+        shutil.copytree(dest, backup, symlinks=True)
     else:
-        shutil.copy2(dest, backup)
+        shutil.copy2(dest, backup, follow_symlinks=False)
     data["locations"][dest_key] = {
         "src": str(src),
         "version": prev_version,
@@ -601,21 +607,34 @@ def _apply_factory_copy(
         rel = _rel(src, path)
         src_rels.add(rel)
         target = dest / rel
+        new_files[rel] = {"factory_hash": file_sha256(path)}
+        if _has_link_within(dest, target):
+            continue
         target.parent.mkdir(parents=True, exist_ok=True)
         _copy_one(path, target, prev_files.get(rel), branch)
-        new_files[rel] = {"factory_hash": file_sha256(path)}
     if branch != "migrate":
         return new_files
     for rel, info in prev_files.items():
         if rel in src_rels:
             continue
         target = dest / rel
-        if not target.is_file():
+        if _has_link_within(dest, target) or not target.is_file():
             continue
         old_hash = (info or {}).get("factory_hash", "")
         if old_hash and file_sha256(target) == old_hash:
             target.unlink()
     return new_files
+
+
+def _has_link_within(root: Path, path: Path) -> bool:
+    """Do not follow a user link anywhere below a provision location."""
+    while path != path.parent:
+        if path.is_symlink():
+            return True
+        if path == root:
+            return False
+        path = path.parent
+    raise ValueError(f"provision target is outside location: {path}")
 
 
 def _remove_path(path: Path | None) -> None:
@@ -633,6 +652,8 @@ def _copy_one(
     prev_info: dict[str, Any] | None,
     branch: str,
 ) -> None:
+    if dest_file.is_symlink():
+        return
     if branch == "create" or not dest_file.exists():
         shutil.copy2(src_file, dest_file)
         return
@@ -645,7 +666,8 @@ def _copy_one(
     # User edited this file: keep it, drop a .new sibling when factory moved.
     if dest_file.is_file() and file_sha256(src_file) != file_sha256(dest_file):
         sibling = dest_file.with_name(dest_file.name + ".new")
-        shutil.copy2(src_file, sibling)
+        if not sibling.is_symlink():
+            shutil.copy2(src_file, sibling)
 
 
 class PostCommitCleanupError(OSError):
@@ -833,16 +855,20 @@ def recover_migrating_inventory(
 
 def _restore_backup(backup: Path, dest: Path) -> None:
     """Replace *dest* with *backup* if the backup still exists."""
-    if not backup.exists():
+    if not os.path.lexists(backup):
         return
     dest = ensure_deletable(dest, purpose="restore provision dest")
+    if dest.is_symlink() and (
+        not backup.is_symlink() or os.readlink(dest) != os.readlink(backup)
+    ):
+        raise OSError(f"provision target replaced by a symlink: {dest}")
     _remove_path(dest)
-    if backup.is_dir():
-        shutil.copytree(backup, dest)
+    if backup.is_dir() and not backup.is_symlink():
+        shutil.copytree(backup, dest, symlinks=True)
         _remove_path(backup)
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(backup, dest)
+    shutil.copy2(backup, dest, follow_symlinks=False)
     _remove_path(backup)
 
 

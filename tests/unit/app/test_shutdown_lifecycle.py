@@ -112,6 +112,7 @@ async def test_plugin_resource_finishes_before_workspace_stop(
     with pytest.warns(DeprecationWarning):
         api.register_shutdown_hook("test", hook)
     instance.record_runtime("connection", close_resource, kind="custody")
+    # Seed a loaded record without importing a real plugin.
     record = PluginRecord(
         manifest=PluginManifest(
             id="test",

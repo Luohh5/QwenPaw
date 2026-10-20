@@ -11,10 +11,11 @@ from pathlib import Path
 import sys
 import sysconfig
 from typing import Any, Mapping
+from urllib.parse import unquote, urlsplit
 
 from packaging.markers import default_environment
 from packaging.tags import sys_tags
-from packaging.utils import canonicalize_name
+from packaging.utils import canonicalize_name, parse_wheel_filename
 from packaging.version import Version
 
 from .errors import ProtocolValidationError
@@ -288,6 +289,25 @@ def _installed_metadata(sites):
     return rows, invalid, observed
 
 
+def retains_installed_wheel_source(requirement, row, installed) -> bool:
+    """Match a wheel reference to retained metadata without reading its URL."""
+    if not requirement.url or installed is None or row != installed:
+        return False
+    try:
+        url = urlsplit(requirement.url)
+        if url.scheme not in {"file", "http", "https"}:
+            return False
+        name, version, _build, _tags = parse_wheel_filename(
+            Path(unquote(url.path)).name,
+        )
+        return (
+            str(name) == str(canonicalize_name(requirement.name))
+            and Version(installed["version"]) == version
+        )
+    except (ValueError, TypeError, KeyError):
+        return False
+
+
 def _dependency_closure(requirements, rows, environment):
     """Traverse active metadata edges with their requested extras intact."""
     from packaging.requirements import Requirement
@@ -306,11 +326,16 @@ def _dependency_closure(requirements, rows, environment):
             for extra in ("", *parent_extras)
         ):
             continue
-        if requirement.url or (requirement.extras and not transitive):
+        if requirement.extras and not transitive:
             raise dependency_error("DEPENDENCY_UNSATISFIED")
         name = str(canonicalize_name(requirement.name))
-        yield name, requirement
         row = rows.get(name)
+        if requirement.url and (
+            not transitive
+            or not retains_installed_wheel_source(requirement, row, row)
+        ):
+            raise dependency_error("DEPENDENCY_UNSATISFIED")
+        yield name, requirement
         if row is not None:
             extras = tuple(sorted(requirement.extras))
             pending.extend(

@@ -130,6 +130,7 @@ function ChannelsPage() {
         key,
         channels[key] || { enabled: false, bot_prefix: "" },
       );
+      form.resetFields();
       // Migrate legacy allowlist policy to new access control fields
       const accessControlDm =
         channelConfig.access_control_dm ||

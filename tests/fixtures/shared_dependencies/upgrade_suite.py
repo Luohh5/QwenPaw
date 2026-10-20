@@ -768,6 +768,10 @@ def retiring_backend(tmp_path):
         [
             backend_python(),
             "-I",
+            "-c",
+            "import runpy,sys; sys.path.insert(0, sys.argv.pop(1)); "
+            "runpy.run_path(sys.argv.pop(1), run_name='__main__')",
+            str(Path(pytest.__file__).resolve().parents[1]),
             str(Path(__file__).with_name("upgrade_restart_host.py")),
             str(tmp_path),
         ],

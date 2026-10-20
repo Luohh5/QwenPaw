@@ -290,6 +290,13 @@ def _client(loader: Any = None, provider_manager: Any = None):
 
 
 class TestListPluginsRoute:
+    @pytest.fixture(autouse=True)
+    def isolate_plugins_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "qwenpaw.config.utils.get_plugins_dir",
+            lambda: tmp_path,
+        )
+
     def test_without_loader_falls_back_to_disk_scan(self, tmp_path):
         monkey = tmp_path / "plugins"
         monkey.mkdir()
@@ -344,6 +351,39 @@ class TestListPluginsRoute:
         loader = MagicMock()
         loader.get_all_loaded_plugins.return_value = {}
         assert _client(loader).get("/api/plugins").json() == []
+
+    def test_disk_entries_and_failed_runtime_keep_real_settings(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        for plugin_id in ("disk-only", "plug"):
+            source = tmp_path / plugin_id
+            source.mkdir()
+            (source / "plugin.json").write_text(
+                json.dumps({"id": plugin_id, "version": "0.1"}),
+            )
+        record = _record()
+        record.status = "failed"
+        record.enabled = False
+        record.diagnostics = ["startup failed"]
+        loader = _loader_stub([], record=record)
+        monkeypatch.setattr(
+            plugins_module,
+            "_plugin_config_row",
+            lambda plugin_id: {"enabled": plugin_id == "plug"},
+        )
+        response = _client(loader).get("/api/plugins")
+        assert response.status_code == 200
+        rows = {row["id"]: row for row in response.json()}
+        assert len(response.json()) == len(rows) == 2
+        assert rows["disk-only"]["loaded"] is False
+        assert rows["disk-only"]["enabled"] is False
+        assert rows["plug"]["version"] == record.manifest.version
+        assert rows["plug"]["loaded"] is True
+        assert rows["plug"]["enabled"] is True
+        assert rows["plug"]["status"] == "failed"
+        assert rows["plug"]["diagnostics"] == ["startup failed"]
 
 
 class TestGetPluginStatusRoute:
@@ -796,6 +836,54 @@ class TestInstallPluginSource:
 
 
 class TestUninstallPluginSource:
+    async def test_failed_plugin_removal_preserves_tool_config(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from qwenpaw.plugins import api as plugin_api
+        from qwenpaw.plugins.loader import PluginLoader
+        from qwenpaw.plugins.registry import PluginRegistry
+
+        monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
+        monkeypatch.setattr(PluginRegistry, "_instance", None)
+        names = ["other_plugin_tool", "execute_shell_command"]
+        source = tmp_path / "installed-directory"
+        source.mkdir()
+        (source / "plugin.json").write_text(
+            json.dumps(
+                {
+                    "id": "failed-plugin",
+                    "version": "1.0",
+                    "meta": {
+                        "tool_name": names[0],
+                        "tools": [{"name": names[1]}],
+                    },
+                },
+            ),
+        )
+        settings = {name: {"enabled": True} for name in names}
+        cfg = SimpleNamespace(
+            tools=SimpleNamespace(builtin_tools=settings.copy()),
+        )
+        loader = PluginLoader([tmp_path])
+        with (
+            patch(
+                "qwenpaw.config.config.load_agent_config",
+                return_value=cfg,
+            ),
+            patch("qwenpaw.config.config.save_agent_config") as save,
+            patch(
+                "qwenpaw.plugins.api._remove_tool_config",
+                wraps=plugin_api._remove_tool_config,
+            ) as remove,
+        ):
+            await uninstall_plugin_source("failed-plugin", app=_app(loader))
+        assert not source.exists()
+        assert cfg.tools.builtin_tools == settings
+        remove.assert_not_called()
+        save.assert_not_called()
+
     @pytest.mark.parametrize("reload_agents", [False, True])
     async def test_uninstall_uses_lifecycle_without_rebuilding_agents(
         self,
@@ -870,11 +958,17 @@ class TestUninstallPluginSource:
 
 
 class TestInstallPluginRoute:
-    def test_success_payload(self, tmp_path):
+    @pytest.mark.parametrize(
+        "diagnostics",
+        [[], ["Existing files preserved at: /plugins/.plug.bak"]],
+    )
+    def test_success_payload(self, tmp_path, diagnostics):
         loader = _loader_stub([])
+        record = _record("plug")
+        record.diagnostics = diagnostics
         with patch(
             "qwenpaw.app.routers.plugins.install_plugin_source",
-            new=AsyncMock(return_value=_record("plug")),
+            new=AsyncMock(return_value=record),
         ):
             response = _client(loader).post(
                 "/api/plugins/install",
@@ -890,7 +984,7 @@ class TestInstallPluginRoute:
             "loaded": True,
             "status": "active",
             "enabled": True,
-            "diagnostics": [],
+            "diagnostics": diagnostics,
             "message": "Plugin 'plug display name' installation: active.",
         }
 
@@ -1059,6 +1153,32 @@ class TestSetPluginEnabledRoute:
 
 
 class TestUninstallPluginRoute:
+    @pytest.mark.parametrize("endpoint", ["plugins", "pawapps"])
+    @pytest.mark.parametrize("interrupt_tasks", [False, True])
+    def test_busy_response_preserves_explicit_interrupt_option(
+        self,
+        endpoint,
+        interrupt_tasks,
+    ):
+        from qwenpaw.plugins.activity import PluginBusyError
+
+        loader = _loader_stub([], record=_record())
+        error = PluginBusyError("plug", 1, can_interrupt=not interrupt_tasks)
+        loader.lifecycle.unload.side_effect = error
+        response = _client(loader).delete(
+            f"/api/{endpoint}/plug"
+            f"?interrupt_tasks={str(interrupt_tasks).lower()}",
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"] == error.detail
+        assert (
+            loader.lifecycle.unload.call_args.kwargs.get(
+                "interrupt_tasks",
+                False,
+            )
+            is interrupt_tasks
+        )
+
     @pytest.mark.parametrize(
         "endpoint,kind",
         [("plugins", "Plugin"), ("pawapps", "PawApp")],
@@ -1140,6 +1260,17 @@ class TestUninstallPluginRoute:
         assert detail["needs_restart"] is True
         assert detail["errors"] == ["memory backend is in use"]
 
+    def test_busy_market_provider_returns_409(self):
+        from qwenpaw.market.registry import MarketProviderBusyError
+
+        loader = _loader_stub([], record=_record())
+        loader.lifecycle.unload.side_effect = MarketProviderBusyError(
+            "Hub plugin 'plug' is in use; please retry later",
+        )
+        response = _client(loader).delete("/api/plugins/plug")
+        assert response.status_code == 409
+        assert "please retry later" in response.json()["detail"]
+
     def test_success_payload(self):
         loader = _loader_stub([])
         with patch(
@@ -1177,13 +1308,19 @@ class TestUninstallPluginRoute:
 
 
 class TestUploadPluginRoute:
-    def test_success_payload(self):
+    @pytest.mark.parametrize(
+        "diagnostics",
+        [[], ["Existing files preserved at: /plugins/.plug.bak"]],
+    )
+    def test_success_payload(self, diagnostics):
         loader = _loader_stub([])
+        record = _record("plug")
+        record.diagnostics = diagnostics
         payload = _zip_bytes({"plugin.json": '{"id": "p"}'})
         with patch(
             "qwenpaw.app.routers.plugins."
             "_load_plugin_with_optional_force_reinstall",
-            new=AsyncMock(return_value=_record("plug")),
+            new=AsyncMock(return_value=record),
         ):
             response = _client(loader).post(
                 "/api/plugins/upload?force=true",
@@ -1192,6 +1329,7 @@ class TestUploadPluginRoute:
         assert response.status_code == 200
         assert response.json()["id"] == "plug"
         assert response.json()["loaded"] is True
+        assert response.json()["diagnostics"] == diagnostics
 
     def test_non_zip_filename_is_400(self):
         loader = _loader_stub([])

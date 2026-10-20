@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Awaitable, Callable, Literal
 
+from .activity import PluginActivity
+
 logger = logging.getLogger(__name__)
 
 # Generous until CloudPaw / other slow startups are calibrated. Only
@@ -159,6 +161,7 @@ class PluginInstance:
 
     def __init__(self, plugin_id: str, *, generation: int = 0) -> None:
         self.plugin_id = plugin_id
+        self.activity = PluginActivity(plugin_id)
         self.delegate: LifecycleDelegate | None = None
         self.state = PluginState.ACTIVE
         self.generation = generation
@@ -170,6 +173,8 @@ class PluginInstance:
             str,
             dict[str, dict[str, Any] | None],
         ] = {}
+        self.accepts_provision_declarations = False
+        self.pending_provisions: list[Callable[[], Awaitable[None]]] = []
         self._runtime: list[LedgerEntry] = []
         self._install: list[LedgerEntry] = []
         self._created_dests: list[str] = []
@@ -491,6 +496,13 @@ class PluginLifecycle:
         self._loader = loader
         self.delegate = LifecycleDelegate()
         self._instances: dict[str, PluginInstance] = {}
+        self._activities: dict[str, PluginActivity] = {}
+
+    def activity(self, plugin_id: str) -> PluginActivity:
+        """One admission gate across all generations of a plugin."""
+        if plugin_id not in self._activities:
+            self._activities[plugin_id] = PluginActivity(plugin_id)
+        return self._activities[plugin_id]
 
     async def prepare_backend(
         self,
@@ -534,6 +546,7 @@ class PluginLifecycle:
             )
             self._instances[plugin_id] = inst
             inst.delegate = self.delegate
+            inst.activity = self.activity(plugin_id)
             return inst
         if generation is not None and inst.generation != generation:
             raise RuntimeError(
@@ -541,6 +554,7 @@ class PluginLifecycle:
                 f"{inst.generation} cannot be reused as {generation}",
             )
         inst.delegate = self.delegate
+        inst.activity = self.activity(plugin_id)
         return inst
 
     def drop_instance(self, plugin_id: str) -> None:
@@ -585,6 +599,7 @@ class PluginLifecycle:
         mode: UnloadMode,
         *,
         delete_files: bool = False,
+        interrupt_tasks: bool = False,
     ) -> UnloadReport:
         """Unload one plugin. ``delete_files`` only applies to uninstall."""
         async with self._loader.plugin_lifecycle(plugin_id):
@@ -592,6 +607,7 @@ class PluginLifecycle:
                 plugin_id,
                 mode,
                 delete_files=delete_files,
+                interrupt_tasks=interrupt_tasks,
             )
 
     async def _unload_unlocked(
@@ -600,6 +616,7 @@ class PluginLifecycle:
         mode: UnloadMode,
         *,
         delete_files: bool,
+        interrupt_tasks: bool = False,
     ) -> UnloadReport:
         if not self.delegate.owns_commit(plugin_id):
             receipt = await self.delegate.notify_unload(plugin_id, mode)
@@ -627,6 +644,7 @@ class PluginLifecycle:
             mode,
             instance=inst,
             delete_files=delete_files,
+            interrupt_tasks=interrupt_tasks,
         )
         if (
             mode is not UnloadMode.SHUTDOWN
@@ -643,6 +661,7 @@ class PluginLifecycle:
         config: dict[str, Any] | None = None,
         *,
         allow_install: bool = False,
+        interrupt_tasks: bool = False,
     ) -> ReloadReport:
         """Replace plugin code: probe first, then unload, then load."""
         async with self._loader.plugin_lifecycle(plugin_id):
@@ -658,6 +677,7 @@ class PluginLifecycle:
                 new_source=new_source,
                 config=config,
                 allow_install=allow_install,
+                interrupt_tasks=interrupt_tasks,
                 owns_dependency_env=self.delegate.owns_dependency_env(
                     plugin_id,
                 ),
@@ -669,19 +689,23 @@ class PluginLifecycle:
         new_config: dict[str, Any],
         *,
         confirm_legacy: bool = False,
+        interrupt_tasks: bool = False,
     ) -> ConfigUpdateReport:
         """Rebuild contributions from *new_config* without reimporting."""
         from qwenpaw.memory import memory_registry
 
         async with self._loader.plugin_lifecycle(plugin_id):
-            try:
-                return await self._update_config_unlocked(
-                    plugin_id,
-                    new_config,
-                    confirm_legacy=confirm_legacy,
-                )
-            finally:
-                memory_registry.cancel_owner_unload(plugin_id)
+            async with self.activity(plugin_id).mutation(
+                interrupt_tasks=interrupt_tasks,
+            ):
+                try:
+                    return await self._update_config_unlocked(
+                        plugin_id,
+                        new_config,
+                        confirm_legacy=confirm_legacy,
+                    )
+                finally:
+                    memory_registry.cancel_owner_unload(plugin_id)
 
     # pylint: disable=too-many-return-statements,too-many-statements
     # pylint: disable=too-many-branches
@@ -784,7 +808,10 @@ class PluginLifecycle:
             # its outcome so cancellation cannot undo a completed disk commit.
             persisted = True
 
-        teardown_report = await inst.teardown_runtime()
+        teardown_report = await self._loader.teardown_config_runtime(
+            plugin_id,
+            inst,
+        )
         if not teardown_report.quiescent:
             record.status = "failed"
             record.diagnostics = list(inst.diagnostics)
@@ -809,7 +836,12 @@ class PluginLifecycle:
             if persisted:
                 inst.config = incoming
                 raise
-            undo_report = await inst.teardown_runtime()
+            undo_report = getattr(exc, "plugin_cleanup_report", None)
+            if undo_report is None:
+                undo_report = await self._loader.teardown_config_runtime(
+                    plugin_id,
+                    inst,
+                )
             if not undo_report.quiescent:
                 inst.mark_failed(
                     str(exc) or "config update did not go quiescent",
@@ -885,7 +917,13 @@ class PluginLifecycle:
 
     # Lifecycle and Loader share the locked load boundary.
     # pylint: disable=protected-access
-    async def set_enabled(self, plugin_id: str, enabled: bool) -> Any:
+    async def set_enabled(
+        self,
+        plugin_id: str,
+        enabled: bool,
+        *,
+        interrupt_tasks: bool = False,
+    ) -> Any:
         """Persist an enable only after the bound definition activates."""
         from .settings import persist_plugin_settings, runtime_config
         from .execution_backend import probes_before_activation
@@ -900,6 +938,7 @@ class PluginLifecycle:
                         plugin_id,
                         UnloadMode.UNLOAD,
                         delete_files=False,
+                        interrupt_tasks=interrupt_tasks,
                     )
                     if not report.quiescent:
                         return report
@@ -960,6 +999,7 @@ class PluginLifecycle:
                     plugin_id,
                     UnloadMode.UNLOAD,
                     delete_files=False,
+                    interrupt_tasks=interrupt_tasks,
                 )
                 if not report.quiescent:
                     return report

@@ -94,6 +94,10 @@ export function AgentModelDefaults({
                 key={`${agent.id}:${agent.active_model?.provider_id}:${agent.active_model?.model}`}
                 agentId={agent.id}
                 providers={eligible}
+                decisionProviders={buildEligibleProviders(
+                  providers,
+                  "decision",
+                )}
                 activeProviderId={
                   agent.active_model?.provider_id ??
                   activeModels?.active_llm?.provider_id

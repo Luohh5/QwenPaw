@@ -67,6 +67,8 @@ def write_updating_marker(
     status: str = STATUS_PREPARED,
     phase: str | None = None,
     old_version: str | None = None,
+    preserve_backup: bool = False,
+    old_identity: tuple[int, int] | None = None,
 ) -> None:
     """Record an in-flight directory swap so boot can restore it."""
     payload: dict[str, Any] = {
@@ -81,6 +83,9 @@ def write_updating_marker(
         payload["phase"] = phase
     if old_version is not None:
         payload["old_version"] = old_version
+    if preserve_backup:
+        payload["preserve_backup"] = True
+        payload["old_identity"] = old_identity
     write_json_atomic(marker_path(plugin_id), payload)
 
 
@@ -137,6 +142,19 @@ def clear_updating_marker(plugin_id: str) -> None:
     path = marker_path(plugin_id)
     if path.is_file():
         path.unlink()
+
+
+def preserved_update_backup(plugin_id: str) -> Path | None:
+    """Return unknown-owner files that a committed repair must retain."""
+    path = marker_path(plugin_id)
+    if not path.is_file():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return (
+        parse_optional_absolute(data.get("backup_path"))
+        if data.get("preserve_backup")
+        else None
+    )
 
 
 def allocate_update_backup_path(target: Path, plugin_id: str) -> Path:
@@ -263,7 +281,7 @@ def _restore_one_marker(path: Path) -> str | None:
             from .provision import commit_prepared_migrations
 
             commit_prepared_migrations(plugin_id)
-        if backup is not None:
+        if backup is not None and not data.get("preserve_backup"):
             safe_remove(backup, purpose="drop committed update backup")
         if staging is not None:
             safe_remove(staging, purpose="drop committed update staging")
@@ -280,7 +298,7 @@ def _restore_one_marker(path: Path) -> str | None:
             raise OSError(
                 f"Update marker for '{plugin_id}' has no usable backup",
             )
-        _validate_old_target(plugin_id, target, data.get("old_version"))
+        _validate_previous_target(plugin_id, target, data)
         if staging is not None:
             safe_remove(staging, purpose="drop interrupted update staging")
         path.unlink(missing_ok=True)
@@ -296,6 +314,24 @@ def _restore_one_marker(path: Path) -> str | None:
         plugin_id,
     )
     return plugin_id
+
+
+def _validate_previous_target(
+    plugin_id: str,
+    target: Path,
+    data: dict[str, Any],
+) -> None:
+    """Validate residual identity without pretending it has a manifest."""
+    if not data.get("preserve_backup"):
+        _validate_old_target(plugin_id, target, data.get("old_version"))
+        return
+    identity = target.lstat()
+    if (
+        target.is_symlink()
+        or not target.is_dir()
+        or [identity.st_dev, identity.st_ino] != data.get("old_identity")
+    ):
+        raise OSError(f"Original residual directory changed: {target}")
 
 
 def _validate_old_target(

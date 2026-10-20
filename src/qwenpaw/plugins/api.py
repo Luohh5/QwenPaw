@@ -336,6 +336,7 @@ def _write_tool_config(
     agent_before: dict[str, dict[str, dict[str, Any] | None]] | None = None,
 ) -> None:
     """Persist BuiltinToolConfig on every agent profile this host knows."""
+    from ..config.utils import _agent_config_lock
     from ..config.config import (
         BuiltinToolConfig,
         ToolsConfig,
@@ -355,50 +356,62 @@ def _write_tool_config(
     factory = _tool_factory(enabled, description, icon)
     persisted = False
     previous_factory: dict | None = None
+    # Use the same transaction lock as mutate_agent_config, preserving the
+    # existing read-failure skip and write-failure propagation below.
     for agent_id in agent_ids:
-        try:
-            agent_config = load_agent_config(agent_id)
-        except Exception:  # noqa: BLE001
-            logger.debug(
-                "Skip tool '%s' write for agent '%s'",
-                tool_name,
-                agent_id,
-                exc_info=True,
-            )
-            continue
-        if not agent_config.tools:
-            agent_config.tools = ToolsConfig()
-        existing = agent_config.tools.builtin_tools.get(tool_name)
-        current = None
-        if existing is not None:
-            dumped = getattr(existing, "model_dump", None)
-            if callable(dumped):
-                raw = dumped()
-                if isinstance(raw, dict):
-                    current = raw
-                    current.pop("name", None)
-        if agent_before is not None:
-            agent_before.setdefault(agent_id, {}).setdefault(
-                tool_name,
-                current,
-            )
-        if not persisted:
-            merged = apply_tool_factory(plugin_id, tool_name, factory, current)
-            persisted = True
-            from .provision import load_inventory
+        with _agent_config_lock:
+            try:
+                agent_config = load_agent_config(agent_id)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "Skip tool '%s' write for agent '%s'",
+                    tool_name,
+                    agent_id,
+                    exc_info=True,
+                )
+                continue
+            if not agent_config.tools:
+                agent_config.tools = ToolsConfig()
+            existing = agent_config.tools.builtin_tools.get(tool_name)
+            current = None
+            if existing is not None:
+                dumped = getattr(existing, "model_dump", None)
+                if callable(dumped):
+                    raw = dumped()
+                    if isinstance(raw, dict):
+                        current = raw
+                        current.pop("name", None)
+            if agent_before is not None:
+                agent_before.setdefault(agent_id, {}).setdefault(
+                    tool_name,
+                    current,
+                )
+            if not persisted:
+                merged = apply_tool_factory(
+                    plugin_id,
+                    tool_name,
+                    factory,
+                    current,
+                )
+                persisted = True
+                from .provision import load_inventory
 
-            row = (load_inventory(plugin_id).get("tools") or {}).get(
-                tool_name,
-            ) or {}
-            previous_factory = dict(row.get("factory") or factory)
-        else:
-            merged = merge_tool_factory(factory, current, previous_factory)
-        merged.pop("name", None)
-        agent_config.tools.builtin_tools[tool_name] = BuiltinToolConfig(
-            name=tool_name,
-            **merged,
-        )
-        save_agent_config(agent_id, agent_config)
+                row = (load_inventory(plugin_id).get("tools") or {}).get(
+                    tool_name,
+                ) or {}
+                previous_factory = dict(row.get("factory") or factory)
+            else:
+                merged = merge_tool_factory(
+                    factory,
+                    current,
+                    previous_factory,
+                )
+            merged.pop("name", None)
+            agent_config.tools.builtin_tools[tool_name] = BuiltinToolConfig(
+                name=tool_name,
+                **merged,
+            )
+            save_agent_config(agent_id, agent_config)
         logger.info(
             "Wrote tool '%s' into agent '%s' config",
             tool_name,
@@ -422,7 +435,7 @@ def _remove_tool_config(
         return
     if tool_name not in owned_names:
         return
-    from ..config.utils import load_config
+    from ..config.utils import _agent_config_lock, load_config
     from ..config.config import load_agent_config, save_agent_config
 
     config = load_config()
@@ -431,13 +444,14 @@ def _remove_tool_config(
     errors = []
     for agent_id in config.agents.profiles:
         try:
-            agent_cfg = load_agent_config(agent_id)
-            if not agent_cfg.tools or (
-                tool_name not in agent_cfg.tools.builtin_tools
-            ):
-                continue
-            del agent_cfg.tools.builtin_tools[tool_name]
-            save_agent_config(agent_id, agent_cfg)
+            with _agent_config_lock:
+                agent_cfg = load_agent_config(agent_id)
+                if not agent_cfg.tools or (
+                    tool_name not in agent_cfg.tools.builtin_tools
+                ):
+                    continue
+                del agent_cfg.tools.builtin_tools[tool_name]
+                save_agent_config(agent_id, agent_cfg)
         except Exception as exc:  # noqa: BLE001
             errors.append(f"tool '{tool_name}', agent '{agent_id}': {exc}")
     if errors:
@@ -487,6 +501,7 @@ def _restore_agent_tools_from_snapshot(
     agent_before: dict[str, dict[str, dict[str, Any] | None]],
 ) -> None:
     """Put existing tool rows back without ``merge_tool_factory``."""
+    from ..config.utils import _agent_config_lock
     from ..config.config import (
         BuiltinToolConfig,
         ToolsConfig,
@@ -495,31 +510,32 @@ def _restore_agent_tools_from_snapshot(
     )
 
     for agent_id, snap in agent_before.items():
-        try:
-            agent_cfg = load_agent_config(agent_id)
-        except Exception:  # noqa: BLE001
-            continue
-        if not agent_cfg.tools:
-            agent_cfg.tools = ToolsConfig()
-        changed = False
-        for name in names:
-            if name not in snap:
+        with _agent_config_lock:
+            try:
+                agent_cfg = load_agent_config(agent_id)
+            except Exception:  # noqa: BLE001
                 continue
-            previous = snap[name]
-            if previous is None:
-                if name in agent_cfg.tools.builtin_tools:
-                    del agent_cfg.tools.builtin_tools[name]
-                    changed = True
-                continue
-            payload = dict(previous)
-            payload.pop("name", None)
-            agent_cfg.tools.builtin_tools[name] = BuiltinToolConfig(
-                name=name,
-                **payload,
-            )
-            changed = True
-        if changed:
-            save_agent_config(agent_id, agent_cfg)
+            if not agent_cfg.tools:
+                agent_cfg.tools = ToolsConfig()
+            changed = False
+            for name in names:
+                if name not in snap:
+                    continue
+                previous = snap[name]
+                if previous is None:
+                    if name in agent_cfg.tools.builtin_tools:
+                        del agent_cfg.tools.builtin_tools[name]
+                        changed = True
+                    continue
+                payload = dict(previous)
+                payload.pop("name", None)
+                agent_cfg.tools.builtin_tools[name] = BuiltinToolConfig(
+                    name=name,
+                    **payload,
+                )
+                changed = True
+            if changed:
+                save_agent_config(agent_id, agent_cfg)
 
 
 def rollback_activate_install(
@@ -943,30 +959,14 @@ class PluginApi:  # pylint: disable=too-many-public-methods
             return True
         return bool(inst.owns_commit())
 
-    def provision_files(self, src, dest, version: str) -> str:
-        """Copy factory files with three-way merge.
-
-        This call is synchronous and runs on the same thread as
-        ``register()``. Keep the copied tree small. Framework-owned
-        directory swap, crash recovery, and config persistence leave
-        the event loop through ``run_sync_io``.
-        """
-        from .provision import provision_files as _provision_files
-
-        self._guard_register()
-        if not self._owns_commit():
-            return "skipped"
+    @staticmethod
+    def _provision_paths(src, dest) -> tuple[Path, Path]:
         dest = Path(dest)
         if not str(dest).strip() or dest == Path("."):
             raise ValueError("refusing to provision an empty dest")
-        if not dest.is_absolute():
-            dest = dest.resolve()
-        branch = _provision_files(
-            self.plugin_id,
-            Path(src),
-            dest,
-            version,
-        )
+        return Path(src).absolute(), dest.absolute()
+
+    def _record_provision_files(self, dest: Path, branch: str) -> str:
         if self._instance is not None and branch == "create":
             self._instance.note_created_dest(str(dest))
         self._note_install(
@@ -974,6 +974,67 @@ class PluginApi:  # pylint: disable=too-many-public-methods
             kind="provision_files",
         )
         return branch
+
+    def provision_files(self, src, dest, version: str) -> str:
+        """Provision immediately; synchronous compatibility API.
+
+        Prefer ``declare_provision_files`` during registration or await
+        ``provision_files_async`` during startup to avoid blocking the loop.
+        """
+        from .provision import provision_files as provision
+
+        self._guard_register()
+        if not self._owns_commit():
+            return "skipped"
+        src, dest = self._provision_paths(src, dest)
+        branch = provision(self.plugin_id, src, dest, version)
+        return self._record_provision_files(dest, branch)
+
+    async def provision_files_async(self, src, dest, version: str) -> str:
+        """Provision in a worker; retain rollback records on cancellation."""
+        from ..utils.io_utils import run_async_to_completion, run_sync_io
+        from .provision import provision_files as provision
+
+        self._guard_register()
+        if not self._owns_commit():
+            return "skipped"
+        src, dest = self._provision_paths(src, dest)
+
+        async def perform() -> str:
+            branch = await run_sync_io(
+                provision,
+                self.plugin_id,
+                src,
+                dest,
+                version,
+            )
+            return self._record_provision_files(dest, branch)
+
+        return await run_async_to_completion(perform())
+
+    def declare_provision_files(self, src, dest, version: str) -> None:
+        """Declare files during register; prepare them before any startup.
+
+        This returns no creation result and does not make files available
+        during register. Use the async API when files are needed immediately.
+        """
+        self._guard_register()
+        instance = self._instance
+        if instance is None or not instance.accepts_provision_declarations:
+            raise RuntimeError("declare_provision_files requires register()")
+        if not self._owns_commit():
+            return
+        src, dest = self._provision_paths(src, dest)
+
+        async def prepare() -> None:
+            await self.provision_files_async(src, dest, version)
+
+        def discard() -> None:
+            if prepare in instance.pending_provisions:
+                instance.pending_provisions.remove(prepare)
+
+        instance.pending_provisions.append(prepare)
+        self._note_runtime(f"provision_declaration:{dest}", discard)
 
     def provision(
         self,
@@ -1170,6 +1231,21 @@ class PluginApi:  # pylint: disable=too-many-public-methods
             kind="custody",
         )
         return client
+
+    def register_market_provider(self, provider, priority: int = 100) -> None:
+        """Register a searchable/downloadable Hub owned by this plugin.
+
+        Import MarketProvider, MarketInstallProvider and MarketResult from
+        qwenpaw.market. Lower priority values appear first in the market.
+        """
+        from qwenpaw.market import market_registry
+
+        self._guard_register()
+        market_registry.register(self.plugin_id, provider, priority)
+        self._note_runtime(
+            f"market_provider:{provider.key}",
+            lambda: market_registry.unregister_owner(self.plugin_id),
+        )
 
     def register_provider(
         self,

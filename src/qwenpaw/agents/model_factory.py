@@ -74,6 +74,21 @@ from ..utils.media_paths import (
     local_media_path as _local_media_path,
 )
 
+# Only SDK single-request consumers opt into construction-time ownership.
+# Normal agent construction retains its existing provider lifecycle.
+_model_creation_observer = ContextVar("model_creation_observer", default=None)
+
+
+def _create_provider_model(provider, model_id):
+    observer = _model_creation_observer.get()
+    if observer is not None:
+        observer.before_create(provider)
+    model = provider.get_chat_model_instance(model_id)
+    if observer is not None:
+        observer.capture(model)
+    return model
+
+
 # TODO(AgentScope compatibility): This is a temporary workaround for
 # AgentScope releases that emit random promoted-media identifiers. Remove it
 # once QwenPaw's minimum AgentScope version provides stable, request-unique
@@ -2182,7 +2197,9 @@ def _apply_model_fallbacks(
         # from being built: skip the slot instead of propagating.
         try:
             with agent_thinking_level(thinking_level, thinking_budget):
-                fallback_model = fallback_provider.get_chat_model_instance(
+                fallback_provider.validate_chat_model(fallback_slot.model)
+                fallback_model = _create_provider_model(
+                    fallback_provider,
                     fallback_slot.model,
                 )
             fallback_provider_id = _bind_provider_id_to_model(
@@ -2197,7 +2214,9 @@ def _apply_model_fallbacks(
             _install_model_formatter(
                 fallback_model,
                 provider_id=fallback_provider_id,
-                model_info=fallback_info,
+                model_info=fallback_provider.resolve_model_info(
+                    fallback_slot.model,
+                ),
             )
         except Exception:
             logger.warning(
@@ -2240,12 +2259,13 @@ def _create_hub_model_and_formatter(settings, model_slot, *, explicit):
         settings.thinking_level,
         settings.thinking_budget,
     ):
-        model = provider.get_chat_model_instance(selected.model)
+        provider.validate_chat_model(selected.model)
+        model = _create_provider_model(provider, selected.model)
     _ensure_model_context_size(model, provider, selected.model)
     formatter = _install_model_formatter(
         model,
         provider_id=PROVIDER_ID,
-        model_info=provider.get_model_info(selected.model),
+        model_info=provider.resolve_model_info(selected.model),
     )
     wrapped = TokenRecordingModelWrapper(
         PROVIDER_ID,
@@ -2323,7 +2343,8 @@ def create_model_and_formatter(
         settings.thinking_level,
         settings.thinking_budget,
     ):
-        model = provider.get_chat_model_instance(model_slot.model)
+        provider.validate_chat_model(model_slot.model)
+        model = _create_provider_model(provider, model_slot.model)
     provider_id = _resolved_provider_id(provider, model_slot.provider_id)
     selected_model_id = model_slot.model
 
@@ -2337,7 +2358,7 @@ def create_model_and_formatter(
     formatter = _install_model_formatter(
         model,
         provider_id=provider_id,
-        model_info=provider.get_model_info(selected_model_id),
+        model_info=provider.resolve_model_info(selected_model_id),
     )
 
     # agentscope 2.0 ChatModelBase has its own retry loop

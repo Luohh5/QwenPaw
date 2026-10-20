@@ -137,6 +137,18 @@ def _extract_placeholder_name(content_parts: list) -> tuple[str, str]:
 
 async def _persist_pending_model_settings(workspace, chat, request_context):
     """Bind first-turn model and reasoning before building the runtime."""
+    pending_decision = request_context.pop("session_decision_enabled", None)
+    if pending_decision is not None:
+        if not isinstance(pending_decision, bool):
+            raise HTTPException(422, "Invalid decision preference")
+        chat = await workspace.chat_manager.set_session_decision(
+            chat.id,
+            pending_decision,
+            only_if_unset=True,
+        )
+        if chat is None:
+            raise HTTPException(409, "Session disappeared before saving")
+
     pending_model = request_context.pop(f"session_model", None)
     if pending_model is not None and session_model(chat.meta) is None:
         try:
@@ -555,6 +567,7 @@ async def post_console_chat(
 async def post_console_chat_stop(
     request: Request,
     chat_id: str = Query(..., description="Chat id (ChatSpec.id) to stop"),
+    cancel_reason: CancelReason = Query(default=CancelReason.USER),
 ) -> dict:
     """Stop the running chat and its foreground tool calls."""
     logger.debug("[STOP API] Received stop request for chat_id=%s", chat_id)
@@ -596,13 +609,16 @@ async def post_console_chat_stop(
         tool_cancelled = await cancel_session(
             runtime_session_id,
             agent_id=workspace.agent_id,
-            reason=CancelReason.USER,
+            reason=cancel_reason,
         )
 
     logger.debug(
         "[STOP API] Got workspace, calling task_tracker.request_stop...",
     )
-    run_stopped = await workspace.task_tracker.request_stop(resolved_chat_id)
+    run_stopped = await workspace.task_tracker.request_stop(
+        resolved_chat_id,
+        reason=cancel_reason.value,
+    )
     stopped = run_stopped or tool_cancelled > 0
 
     logger.debug(

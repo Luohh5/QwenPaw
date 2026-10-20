@@ -200,7 +200,7 @@ class ApprovalCommandHandler(BaseControlCommandHandler):
 
         if resolved is None:
             self._resolution(context, request_id, "unavailable")
-            return "❌ **审批请求不存在**\n\n可能已被处理或已超时。"
+            return f"审批请求已处理或已超时。\n\n请求 ID: `{request_id[:16]}`"
         self._resolution(context, request_id, "approved", resolved)
 
         # Show cross-session hint if applicable
@@ -272,7 +272,7 @@ class ApprovalCommandHandler(BaseControlCommandHandler):
 
         if resolved is None:
             self._resolution(context, request_id, "unavailable")
-            return "❌ **审批请求不存在**\n\n可能已被处理或已超时。"
+            return f"审批请求已处理或已超时。\n\n请求 ID: `{request_id[:16]}`"
         self._resolution(context, request_id, "denied", resolved)
 
         # Show cross-session hint if applicable

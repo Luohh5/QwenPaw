@@ -176,7 +176,10 @@ class SlashCommandRegistry:
         match = self.resolve(raw_text)
         if match is not None:
             spec, args = match
-            return await spec.handler(ctx, args)
+            from ..plugins.activity import plugin_invocation
+
+            with plugin_invocation(spec.owner_plugin_id):
+                return await spec.handler(ctx, args)
         if (
             self._fallback is not None
             and raw_text

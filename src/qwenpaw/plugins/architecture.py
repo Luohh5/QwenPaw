@@ -34,6 +34,9 @@ class PluginType(str, Enum):
     CHANNEL = "channel"
     """Registers a custom messaging channel."""
 
+    HUB = "hub"
+    """Registers a Skill marketplace source."""
+
     MEMORY = "memory"
     """Registers a memory backend required before workspace startup."""
 
@@ -175,6 +178,7 @@ class PluginManifest(BaseModel):
     min_version: str = "0.1.0"
     max_version: Optional[str] = None
     qwenpaw_version: Optional[QwenPawVersionConstraint] = None
+    sdk: Optional[Dict[str, Any]] = None
     meta: Dict[str, Any] = Field(default_factory=dict)
     plugin_type: PluginType = PluginType.GENERAL
 

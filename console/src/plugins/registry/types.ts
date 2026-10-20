@@ -18,6 +18,13 @@
  * Both surfaces share the single audit log in `./audit.ts`.
  */
 import type React from "react";
+import type { ChatCodeBlockProps } from "../types/qwenpaw";
+
+export interface ChatCodeBlockItem {
+  id: string;
+  language: string;
+  render: React.ComponentType<ChatCodeBlockProps>;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Disposable
@@ -114,6 +121,32 @@ export interface MenuItem {
 // Route (console-wide)
 // ─────────────────────────────────────────────────────────────────────────────
 
+export type RouteDomain =
+  | "chat"
+  | "tasks"
+  | "workspace"
+  | "extensions"
+  | "settings";
+
+export type RouteScope = "global" | "agent" | "session" | "workspace";
+
+export type RouteLayout = "standard" | "workbench" | "immersive";
+
+export type RouteNavigation = "rail" | "context" | "settings" | "search-only";
+
+/**
+ * Optional semantic metadata used by the host shell. It is intentionally
+ * additive so routes registered by older plugins remain valid.
+ */
+export interface RouteMeta {
+  domain: RouteDomain;
+  title: Localized<string>;
+  description?: Localized<string>;
+  scope: RouteScope;
+  layout: RouteLayout;
+  navigation: RouteNavigation;
+}
+
 /** A registered route entry (added via builtinRoutes or QwenPaw.route.add). */
 export interface Route {
   /** Stable id, e.g. "core.chat" / "cloudpaw.a2a". */
@@ -123,6 +156,8 @@ export interface Route {
   /** Lazy or eager component. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   component: React.ComponentType<any>;
+  /** Optional host-shell semantics. Omit for legacy plugin compatibility. */
+  meta?: RouteMeta;
 }
 
 /**

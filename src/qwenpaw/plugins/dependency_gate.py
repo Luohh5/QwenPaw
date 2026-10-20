@@ -16,7 +16,9 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _dist_version
 from packaging.markers import default_environment
 from packaging.requirements import Requirement
-from .wheel_additions import WheelAddition  # pylint: disable=unused-import
+from . import wheel_additions
+
+WheelAddition = wheel_additions.WheelAddition
 
 logger = logging.getLogger(__name__)
 
@@ -368,11 +370,16 @@ def evaluate_shared_dependencies(
     uses=(),
     install_target: Path | None = None,
     extra_requirements=(),
+    installed_distributions=None,
 ) -> GateDecision:
     """Validate each consumer in its own observed environment."""
     from packaging.utils import canonicalize_name
     from packaging.version import Version
-    from .execution.dependencies import _installed_metadata, repair_marker
+    from .execution.dependencies import (
+        _installed_metadata,
+        repair_marker,
+        retains_installed_wheel_source,
+    )
     from .install_lock import canonical_environment_path as canonical
 
     parsed = (
@@ -394,7 +401,7 @@ def evaluate_shared_dependencies(
         except ValueError:
             pass  # The normal requirement checker reports unsupported syntax.
 
-    def check(values, inventory, markers, invalid=()):
+    def check(values, inventory, markers, invalid=(), *, installed=None):
         pending = [(value, (), False) for value in values]
         visited = set()
         while pending:
@@ -420,7 +427,7 @@ def evaluate_shared_dependencies(
                         for extra in ("", *parent_extras)
                     ):
                         continue
-                if requirement.url or (requirement.extras and not transitive):
+                if requirement.extras and not transitive:
                     unsupported.append(str(value))
                     continue
                 name = str(canonicalize_name(requirement.name))
@@ -428,6 +435,16 @@ def evaluate_shared_dependencies(
                     unsupported.append(f"{invalid[name]}: {name}")
                     continue
                 row = inventory.get(name)
+                if requirement.url and (
+                    not transitive
+                    or not retains_installed_wheel_source(
+                        requirement,
+                        row,
+                        (installed or {}).get(name),
+                    )
+                ):
+                    unsupported.append(str(value))
+                    continue
                 if row is None:
                     missing.append(str(value))
                     continue
@@ -449,6 +466,11 @@ def evaluate_shared_dependencies(
         [*parsed.requirements, *extra_requirements],
         snapshot.distributions,
         snapshot.marker_environment,
+        installed=(
+            snapshot.distributions
+            if installed_distributions is None
+            else installed_distributions
+        ),
     )
     for use in uses:
         environment, evidence = use.environment, use.snapshot
@@ -537,6 +559,7 @@ def evaluate_shared_dependencies(
                 dict(evidence.distributions) if evidence is not None else {}
             )
             invalid = ()
+        installed = dict(inventory)
         relevant_rows = {
             name: row
             for name, row in snapshot.distributions.items()
@@ -560,7 +583,13 @@ def evaluate_shared_dependencies(
                 )
             elif use.origin != "host" or previous is None:
                 inventory[name] = row
-        check(values, inventory, environment.marker_environment, invalid)
+        check(
+            values,
+            inventory,
+            environment.marker_environment,
+            invalid,
+            installed=installed,
+        )
     from .dependency_maintenance import authorized
 
     dirty = host_dirty or any(
@@ -620,6 +649,7 @@ async def prepare_shared_dependencies(
     install_target: Path | None = None,
     wheels=(),
     lock_timeout: float = 300.0,
+    expected_snapshot=None,
 ):
     """Coordinate, audit, query current usage and publish safe additions."""
     from contextlib import AsyncExitStack
@@ -653,6 +683,7 @@ async def prepare_shared_dependencies(
             ).uses,
             install_target=target,
             extra_requirements=extra,
+            installed_distributions=snapshot.distributions,
         )
 
     # A known destination waits before inspection so an in-flight marker is
@@ -697,6 +728,19 @@ async def prepare_shared_dependencies(
                     ),
                 ) from exc
         snapshot = await audit()
+        if expected_snapshot is not None and snapshot != expected_snapshot:
+            raise SharedDependencyError(
+                GateDecision(
+                    False,
+                    False,
+                    require_restart=True,
+                    reason=(
+                        "DEPENDENCY_RESTART_REQUIRED: "
+                        "environment changed during resolution"
+                    ),
+                    reason_code="DEPENDENCY_RESTART_REQUIRED",
+                ),
+            )
         if target is None and {
             canonical(path) for path in snapshot.dependency_sites or ()
         } != {canonical(path) for path in keys}:

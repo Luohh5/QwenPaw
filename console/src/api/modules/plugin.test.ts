@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { Modal } from "antd";
+
+vi.mock("antd", () => ({ Modal: { confirm: vi.fn() } }));
 
 vi.mock("../config", () => ({
   getApiUrl: vi.fn((p: string) => "http://test" + p),
@@ -25,18 +28,14 @@ interface MockResponseOptions {
   text?: string;
 }
 
-function mockResponse({
-  ok,
-  status,
-  json,
-  text,
-}: MockResponseOptions): Response {
-  return {
-    ok,
-    status,
-    json: async () => json,
-    text: async () => text ?? "",
-  } as unknown as Response;
+function mockResponse({ status, json, text }: MockResponseOptions): Response {
+  const body =
+    status === 204
+      ? null
+      : json === undefined
+      ? text ?? ""
+      : JSON.stringify(json);
+  return new Response(body, { status });
 }
 
 describe("plugin module", () => {
@@ -46,6 +45,34 @@ describe("plugin module", () => {
 
   afterEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("confirmed interruption preserves force and source on install retry", async () => {
+    const installed = { id: "plug", loaded: true };
+    global.fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        mockResponse({
+          ok: false,
+          status: 409,
+          json: { detail: { code: "plugin_busy", can_interrupt: true } },
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({ ok: true, status: 200, json: installed }),
+      );
+    const pending = installPlugin("/plugin.zip", { force: true });
+    await vi.waitFor(() => expect(Modal.confirm).toHaveBeenCalledOnce());
+    expect(fetch).toHaveBeenCalledTimes(1);
+    await vi.mocked(Modal.confirm).mock.calls[0][0].onOk?.();
+    expect(await pending).toEqual(installed);
+    const bodies = vi
+      .mocked(fetch)
+      .mock.calls.map(([, init]) => JSON.parse(String(init?.body)));
+    expect(bodies).toEqual([
+      { source: "/plugin.zip", force: true },
+      { source: "/plugin.zip", force: true, interrupt_tasks: true },
+    ]);
   });
 
   it("fetchPlugins returns parsed list on success", async () => {

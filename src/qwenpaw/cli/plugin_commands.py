@@ -37,17 +37,19 @@ def _echo_install_result(body, fallback):
             f"Plugin '{name}' installation: {body['status']}; "
             f"enabled={body.get('enabled', 'unknown')}.",
         )
-        for diagnostic in body.get("diagnostics") or []:
-            click.echo(f"  {diagnostic}")
     else:
         click.echo(f"✅ Plugin '{name}' installed and loaded (hot reload).")
+    for diagnostic in body.get("diagnostics") or []:
+        click.echo(f"  {diagnostic}")
 
 
 def _echo_dependency_operation(operation):
     click.echo(f"Dependency upgrade {operation['id']}: {operation['status']}")
     for change in operation.get("changes") or ():
         click.echo(
-            f"  {change['name']}: {change.get('current_version') or 'missing'} -> {change['target_version']}",
+            f"  {change['name']}: "
+            f"{change.get('current_version') or 'missing'} -> "
+            f"{change['target_version']}",
         )
     click.echo(operation.get("message") or "")
     for instruction in operation.get("instructions") or ():
@@ -540,6 +542,8 @@ def install(source: str, force: bool):
         f"\n✅ Plugin '{record.manifest.name}' installed successfully!",
     )
     click.echo(f"Location: {record.source_path}")
+    for diagnostic in record.diagnostics:
+        click.echo(diagnostic)
     click.echo("\nNext steps:")
     click.echo("   1. Start QwenPaw to load the plugin")
     click.echo("   2. Configure the plugin in the web UI")
@@ -807,7 +811,8 @@ def _dependency_operation(action, operation_id):
                 operation = response.json()
         except httpx.HTTPError as exc:
             raise click.ClickException(
-                "Dependency operation failed through the running backend; no offline write was attempted.",
+                "Dependency operation failed through the running backend; "
+                "no offline write was attempted.",
             ) from exc
     else:
         from ..plugins.channel_bootstrap import resolve_default_channel_runtime
@@ -827,13 +832,15 @@ def _dependency_operation(action, operation_id):
             )
             if action == "apply" and operation["status"] == "waiting_restart":
                 import subprocess
-                import sys
 
+                # Offline maintenance consumes the manager's authenticated record.
+                # pylint: disable=protected-access
                 script = (
                     manager._directory(operation_id)
                     / "worker/dependency_worker.py"
                 )
                 worker_python = manager._read(operation_id)["worker_python"]
+                # pylint: enable=protected-access
                 options = (
                     {"start_new_session": True}
                     if os.name != "nt"
@@ -846,7 +853,9 @@ def _dependency_operation(action, operation_id):
                     }
                 )
                 with (script.parent.parent / "worker.log").open("ab") as log:
-                    subprocess.Popen(
+                    # The maintenance worker waits for this CLI to exit; a
+                    # Popen context manager would wait for it and deadlock.
+                    subprocess.Popen(  # pylint: disable=consider-using-with
                         [worker_python, "-I", "-S", str(script)],
                         stdin=subprocess.DEVNULL,
                         stdout=log,

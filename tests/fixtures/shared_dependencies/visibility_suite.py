@@ -89,6 +89,83 @@ async def report(process, **params):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "retained",
+        "top-level",
+        "non-wheel",
+        "wrong-name",
+        "wrong-version",
+        "missing-child",
+        "child-closure",
+    ],
+)
+async def test_actual_worker_retained_wheel_url_checks_identity_and_closure(
+    tmp_path, case
+):
+    from qwenpaw.plugins.execution.process import ProcessError
+
+    target = tmp_path / "site"
+    install(target, "url-leaf")
+    if case != "missing-child":
+        install(
+            target,
+            "url-child",
+            requires=(
+                "url-leaf>=2" if case == "child-closure" else "url-leaf==1",
+            ),
+        )
+    filename = {
+        "non-wheel": "url_child-1.0.tar.gz",
+        "wrong-name": "url_leaf-1.0-py3-none-any.whl",
+        "wrong-version": "url_child-2.0-py3-none-any.whl",
+    }.get(case, "url_child-1.0-py3-none-any.whl")
+    edge = "url-child @ " + (tmp_path / filename).as_uri()
+    install(target, "url-parent", requires=(edge,))
+    spec = launch(
+        tmp_path,
+        paths=(target,),
+        requirements=(edge if case == "top-level" else "url-parent==1") + "\n",
+    )
+    before = {
+        str(path.relative_to(target)): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file()
+    }
+    process = PluginProcess()
+    try:
+        if case == "retained":
+            assert (await process.start(spec))["state"] == "ready"
+            actual = await report(process)
+            assert actual["versions"] == {
+                "url-parent": "1.0",
+                "url-child": "1.0",
+                "url-leaf": "1.0",
+            }
+            assert actual["blocked"] == []
+        else:
+            with pytest.raises(ProcessError) as caught:
+                await process.start(spec)
+            # Top-level URLs are refused before the dependency handshake.
+            expected = (
+                "WORKER_START_FAILED"
+                if case == "top-level"
+                else "DEPENDENCY_UNSATISFIED"
+            )
+            assert caught.value.reason_code == expected
+    finally:
+        receipt = await process.stop()
+        assert receipt.exited and not receipt.residual
+    after = {
+        str(path.relative_to(target)): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+@pytest.mark.asyncio
 async def test_default_runtime_finds_active_user_site_in_actual_worker(
     tmp_path,
     user_site,
@@ -947,7 +1024,8 @@ async def test_paired_workers_measure_readable_unused_roots_without_imports(
 
 
 def test_live_readers_survives_removed_candidate_and_keeps_locked_reader(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     from qwenpaw.plugins import dependency_maintenance as maintenance
 

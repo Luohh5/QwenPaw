@@ -13,7 +13,8 @@ import type { ChannelSchema } from "../../../../api/modules/channel";
 import type { ChannelQrcodeConfig } from "./useChannelQrcode";
 
 vi.mock("@agentscope-ai/design", async () => vi.importActual("antd"));
-vi.mock("react-i18next", () => ({
+vi.mock("react-i18next", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("react-i18next")>()),
   useTranslation: () => ({
     t: (key: string, fallback?: unknown) =>
       typeof fallback === "string" ? fallback : key,
@@ -124,7 +125,6 @@ describe("C6 official plugin form parity", () => {
       );
     },
   );
-
 
   it.each(["message_type", "cron_message_type"])(
     "DingTalk %s controls required card template",
@@ -244,7 +244,12 @@ describe("C6 review structured fields and failed runtime", () => {
   );
 
   it("saves valid entered JSON as an array", async () => {
-    const { onSubmitSnapshot } = c6Drawer("custom", {}, false, c6JsonSchema(true));
+    const { onSubmitSnapshot } = c6Drawer(
+      "custom",
+      {},
+      false,
+      c6JsonSchema(true),
+    );
     const input = document.querySelector(
       "textarea#options",
     ) as HTMLTextAreaElement;

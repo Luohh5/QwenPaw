@@ -1,6 +1,8 @@
+import { notifyPluginChange } from "../../utils/pluginChangeEvents";
 import { getApiUrl } from "../config";
 import { buildAuthHeaders } from "../authHeaders";
 import { formatApiError, responseErrorMessage } from "../error";
+import { requestWithPluginBusyConfirmation } from "../pluginBusy";
 
 /** Matches the backend ``PluginType`` enum values. */
 export type PluginType =
@@ -11,6 +13,7 @@ export type PluginType =
   | "frontend"
   | "channel"
   | "memory"
+  | "hub"
   | "app"
   | "general";
 
@@ -26,6 +29,7 @@ export interface PluginInfo {
   enabled: boolean;
   /** Whether the plugin is currently loaded in memory. */
   loaded: boolean;
+  status?: string;
   /** Primary capability type declared in plugin.json. */
   plugin_type: PluginType;
   /** Frontend JS entry-point path (if any). */
@@ -157,6 +161,7 @@ export const cancelDependencyUpgrade = (id: string) =>
 export interface PluginStatus {
   id: string;
   loaded: boolean;
+  status?: string;
   enabled: boolean;
   version?: string;
 }
@@ -232,14 +237,22 @@ export async function installPlugin(
   source: string,
   options?: { force?: boolean },
 ): Promise<InstallPluginResult> {
-  const response = await fetch(getApiUrl("/plugins/install"), {
-    method: "POST",
-    headers: {
-      ...buildAuthHeaders(),
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ source, force: options?.force ?? false }),
-  });
+  const response = await requestWithPluginBusyConfirmation(
+    (interruptTasks) =>
+      fetch(getApiUrl("/plugins/install"), {
+        method: "POST",
+        headers: {
+          ...buildAuthHeaders(),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          source,
+          force: options?.force ?? false,
+          ...(interruptTasks ? { interrupt_tasks: true } : {}),
+        }),
+      }),
+    "update",
+  );
 
   if (!response.ok) {
     throw await pluginResponseError(
@@ -248,7 +261,9 @@ export async function installPlugin(
     );
   }
 
-  return response.json();
+  const result = await response.json();
+  notifyPluginChange();
+  return result;
 }
 
 /**
@@ -258,11 +273,20 @@ export async function uploadPlugin(file: File): Promise<InstallPluginResult> {
   const form = new FormData();
   form.append("file", file);
 
-  const response = await fetch(getApiUrl("/plugins/upload"), {
-    method: "POST",
-    headers: buildAuthHeaders(),
-    body: form,
-  });
+  const response = await requestWithPluginBusyConfirmation(
+    (interruptTasks) =>
+      fetch(
+        getApiUrl(
+          `/plugins/upload${interruptTasks ? "?interrupt_tasks=true" : ""}`,
+        ),
+        {
+          method: "POST",
+          headers: buildAuthHeaders(),
+          body: form,
+        },
+      ),
+    "update",
+  );
 
   if (!response.ok) {
     throw await pluginResponseError(
@@ -271,7 +295,9 @@ export async function uploadPlugin(file: File): Promise<InstallPluginResult> {
     );
   }
 
-  return response.json();
+  const result = await response.json();
+  notifyPluginChange();
+  return result;
 }
 
 export async function repairPluginDependencies(
@@ -294,10 +320,18 @@ export async function repairPluginDependencies(
  * Uninstall (hot-unload + delete) a plugin by ID.
  */
 export async function uninstallPlugin(pluginId: string): Promise<void> {
-  const response = await fetch(getApiUrl(`/plugins/${pluginId}`), {
-    method: "DELETE",
-    headers: buildAuthHeaders(),
-  });
+  const response = await requestWithPluginBusyConfirmation(
+    (interruptTasks) =>
+      fetch(
+        getApiUrl(
+          `/plugins/${pluginId}${
+            interruptTasks ? "?interrupt_tasks=true" : ""
+          }`,
+        ),
+        { method: "DELETE", headers: buildAuthHeaders() },
+      ),
+    "uninstall",
+  );
 
   if (!response.ok) {
     throw new Error(
@@ -307,6 +341,7 @@ export async function uninstallPlugin(pluginId: string): Promise<void> {
       ),
     );
   }
+  notifyPluginChange();
 }
 
 /**

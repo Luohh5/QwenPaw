@@ -23,6 +23,7 @@ def test_channel_catalog_contracts(tmp_path):
             str(suite.parent),
             str(suite),
             str(suite.with_name("catalog_review_gates_suite.py")),
+            str(suite.with_name("sdk_coexistence_suite.py")),
             "-q",
         ],
         env={**os.environ, "QWENPAW_WORKING_DIR": str(tmp_path / "host")},

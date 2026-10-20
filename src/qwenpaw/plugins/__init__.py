@@ -1,10 +1,26 @@
 # -*- coding: utf-8 -*-
 # pylint: disable=undefined-all-variable
-"""QwenPaw plugin system with import-safe execution primitives."""
+"""Public SDK and legacy exports, resolved lazily for execution workers.
+
+The supported versioned author API is the whitelist in ``compliance.PUBLIC_API``.
+Legacy exports such as PluginApi and PluginLoader remain compatibility APIs.
+"""
 
 from importlib import import_module
 
 _EXPORTS = {
+    "Plugin": "sdk",
+    "PluginContext": "sdk",
+    "SDK_VERSION": "sdk_version",
+    "SDK_CAPABILITIES": "sdk_version",
+    "SDKError": "errors",
+    "SDKAccessError": "errors",
+    "SDKCompatibilityError": "errors",
+    "SDKRestartRequiredError": "errors",
+    "StaleContextError": "errors",
+    "ResourceError": "errors",
+    "ToolInputError": "errors",
+    "PluginBusyError": "activity",
     "PluginLoader": "loader",
     "PluginRegistry": "registry",
     "PluginApi": "api",

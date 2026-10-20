@@ -169,7 +169,9 @@ interface ChannelDrawerProps {
   channelSchema?: ChannelSchema;
   onRuntimeChange?: () => void | Promise<void>;
   onClose: () => void;
-  onSubmit: (values: Record<string, unknown>) => void | Promise<void>;
+  onSubmit: (
+    values: Record<string, unknown>,
+  ) => void | boolean | Promise<void | boolean>;
   onSubmitSnapshot?: (job: ChannelSaveJob) => Promise<void | boolean>;
 }
 
@@ -2038,7 +2040,7 @@ export function ChannelDrawer({
       else {
         if (job.authSession)
           throw new Error("Authorization save requires its session provenance");
-        await onSubmit(job.body);
+        return (await onSubmit(job.body)) !== false;
       }
       if (saved === false) return true;
       if (saved === true && capturedAuthorization && submittedJob.authSession) {
@@ -2064,7 +2066,7 @@ export function ChannelDrawer({
     enqueue?.(save);
     return save;
   };
-  const { schedule, flush } = useAutoSave(async () => {
+  const { schedule, flush, requestClose } = useAutoSave(async () => {
     const save = await prepareSave();
     return save ? save() : false;
   });
@@ -2115,12 +2117,13 @@ export function ChannelDrawer({
       onClose={() => {
         const generation = scopeGeneration.current;
         void (async () => {
-          if (pendingValidation.current && !(await pendingValidation.current))
-            return false;
-          return flush();
-        })().then((saved) => {
-          if (saved && generation === scopeGeneration.current) onClose();
-        });
+          const validated = await pendingValidation.current;
+          if (generation !== scopeGeneration.current) return;
+          if (validated === false) schedule();
+          await requestClose(() => {
+            if (generation === scopeGeneration.current) onClose();
+          });
+        })();
       }}
       destroyOnHidden
       footer={null}

@@ -103,6 +103,7 @@ COPY pyproject.toml setup.py MANIFEST.in README.md ./
 COPY scripts/pack ./scripts/pack
 COPY plugins/channel ./plugins/channel
 COPY src ./src
+COPY plugins/hub ./plugins/hub
 COPY packages/qwenpawmail-mcp/src/qwenpawmail_mcp ./packages/qwenpawmail-mcp/src/qwenpawmail_mcp
 COPY website/public/docs/ ./src/qwenpaw/docs/
 # Inject console dist from build stage (repo does not commit dist).

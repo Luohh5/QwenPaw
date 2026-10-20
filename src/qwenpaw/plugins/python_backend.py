@@ -171,19 +171,36 @@ class PythonBackend:
     ):
         del wheels
         if owns_dependency_env:
-            decision = await self.services.ensure_dependencies(
-                description.source_path,
-                description.manifest.id,
-                allow_install=allow_install,
-            )
+            from .dependency_gate import SharedDependencyError
+
+            try:
+                decision = await self.services.ensure_dependencies(
+                    description.source_path,
+                    description.manifest.id,
+                    allow_install=allow_install,
+                )
+            except SharedDependencyError as exc:
+                if (
+                    description.manifest.sdk is not None
+                    and exc.decision.require_restart
+                ):
+                    from .errors import SDKRestartRequiredError
+
+                    raise SDKRestartRequiredError(str(exc)) from exc
+                raise
             if (
                 decision.require_restart
                 or decision.unsupported
                 or (decision.missing and not decision.allow_install)
             ):
-                if decision.reason_code:
-                    from .dependency_gate import SharedDependencyError
+                if (
+                    description.manifest.sdk is not None
+                    and decision.require_restart
+                ):
+                    from .errors import SDKRestartRequiredError
 
+                    raise SDKRestartRequiredError(decision.reason)
+                if decision.reason_code:
                     raise SharedDependencyError(decision)
                 raise RuntimeError(decision.reason)
         if probe:
