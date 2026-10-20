@@ -28,6 +28,7 @@ class MCPUsageSnapshot:
     workspaces: tuple[MCPWorkspaceSnapshot, ...]
     plugin_settings: Mapping[str, Any] | None = None
     plugin_uninstalled: bool = False
+    config_path: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workspaces", tuple(self.workspaces))
@@ -51,6 +52,41 @@ class MCPUsageDecision:
             MappingProxyType(dict(self.workspace_statuses)),
         )
         object.__setattr__(self, "reasons", tuple(self.reasons))
+
+
+@dataclass(frozen=True)
+class MCPPluginUpgradeResult:
+    status: str
+    decision: MCPUsageDecision
+    diagnostics: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "diagnostics", tuple(self.diagnostics))
+
+
+def inventory_mcp_usage(*, config_path=None, plugins_dir=None):
+    """Read raw evidence without hydrating or migrating workspace models."""
+    from .mcp_plugin_upgrade import inventory_mcp_usage as inventory
+
+    return inventory(config_path=config_path, plugins_dir=plugins_dir)
+
+
+async def ensure_mcp_plugin_for_upgrade(snapshot, *, loader):
+    """Reuse the loader-owned offline protocol installation coordinator."""
+    from .mcp_plugin_upgrade import get_coordinator
+
+    return await get_coordinator(loader).ensure(snapshot)
+
+
+def validate_mcp_upgrade_preflight(snapshot):
+    """Stop repairing root migrations when their raw input needs review."""
+    if any(
+        {"invalid_root_config", "invalid_legacy_root_mcp"}.intersection(
+            item.errors,
+        )
+        for item in snapshot.workspaces
+    ):
+        raise RuntimeError("Root configuration requires review before startup")
 
 
 # Fingerprints from MCPConfig and legacy_mcp_client_to_driver, versions 0/1/2.

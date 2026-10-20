@@ -236,12 +236,12 @@
 
 **Interfaces:** 内部 `LazyDriverService` 保留当前消费者实际使用的方法和存储访问面；`workspace.driver_manager` 兼容入口可返回该轻量 facade。它不是 SDK 公共 Manager，空查询不创建实际 manager。现有 watcher 读取轻量卡片存储并调用惰性服务；扫描启停由插件状态和工作区监测需求决定，默认间隔保持 `2.0` 秒。
 
-- [ ] **Step 1:** 写未安装、未启用以及工作区无 MCP 来源且无监测需求测试：没有其他 Driver 时真正的 manager 构造计数为零，工具目录为空，无连接、子进程、MCP 扫描任务和周期 snapshot；空清理不触发装载。
-- [ ] **Step 2:** 写首次非空来源并发触发只创建一次、最后来源退出回收 manager、工作区替换不复用旧实例、其他协议仍可用的测试。最后一个来源停用后，只要仍需手工编辑自动生效，扫描必须继续且连接数为零。
-- [ ] **Step 3:** 写 `test_monitoring_keeps_two_second_interval`、`test_disabled_source_can_be_enabled_by_manual_edit`、`test_plugin_disable_stops_config_scan`；保留文件新增/删除/原子替换/目录首次创建的扫描回归测试。用可控时钟验证下一轮扫描后更新，不引入文件事件监听。
-- [ ] **Step 4:** 运行 `PYTHONPATH=src python -m pytest -q tests/unit/app/test_lazy_driver_runtime.py tests/unit/app/test_mcp_config_watcher_activation.py`，确认现有无条件初始化和扫描路径无法通过。
-- [ ] **Step 5:** 实现惰性 facade 及现有 watcher 的条件启停；移除工作区无条件注册具体 MCP handler 和 watcher 的路径，保持两秒间隔与 snapshot/变更检测逻辑。已有兼容方法委托通用来源服务，不修改现有消费者业务模块。
-- [ ] **Step 6:** 重跑同一命令及现有 Driver 工作区生命周期集成测试，核对不使用时无扫描、需要监测时保留扫描、停用服务时只监测不连接三条路径后提交。
+- [x] **Step 1:** 写未安装、未启用以及工作区无 MCP 来源且无监测需求测试：没有其他 Driver 时真正的 manager 构造计数为零，工具目录为空，无连接、子进程、MCP 扫描任务和周期 snapshot；空清理不触发装载。
+- [x] **Step 2:** 写首次非空来源并发触发只创建一次、最后来源退出回收 manager、工作区替换不复用旧实例、其他协议仍可用的测试。最后一个来源停用后，只要仍需手工编辑自动生效，扫描必须继续且连接数为零。
+- [x] **Step 3:** 写 `test_monitoring_keeps_two_second_interval`、`test_disabled_source_can_be_enabled_by_manual_edit`、`test_plugin_disable_stops_config_scan`；保留文件新增/删除/原子替换/目录首次创建的扫描回归测试。用可控时钟验证下一轮扫描后更新，不引入文件事件监听。
+- [x] **Step 4:** 运行 `PYTHONPATH=src python -m pytest -q tests/unit/app/test_lazy_driver_runtime.py tests/unit/app/test_mcp_config_watcher_activation.py`，确认现有无条件初始化和扫描路径无法通过。
+- [x] **Step 5:** 实现惰性 facade 及现有 watcher 的条件启停；移除工作区无条件注册具体 MCP handler 和 watcher 的路径，保持两秒间隔与 snapshot/变更检测逻辑。已有兼容方法委托通用来源服务，不修改现有消费者业务模块。
+- [x] **Step 6:** 重跑同一命令及现有 Driver 工作区生命周期集成测试，核对不使用时无扫描、需要监测时保留扫描、停用服务时只监测不连接三条路径后提交。
 
 ### Task 6 实现有条件安装与可恢复升级
 

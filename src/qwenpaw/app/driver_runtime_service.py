@@ -43,7 +43,11 @@ class LazyDriverService:  # pylint: disable=too-many-public-methods
     def __init__(self, workspace, *, registry=None, ensure_protocol=None):
         self._workspace = workspace
         self._registry = registry or PluginRegistry()
-        self._ensure_protocol = ensure_protocol
+        self._ensure_protocol = ensure_protocol or getattr(
+            self._registry,
+            "protocol_resolver",
+            None,
+        )
         self.cards_dir = workspace.workspace_dir / "drivers"
         self.card_store = AsyncDriverCardStore(self.cards_dir)
         self.credential_store = AsyncCredentialStore(
@@ -76,6 +80,15 @@ class LazyDriverService:  # pylint: disable=too-many-public-methods
         _workspace_guard(self._registry, self._workspace)
 
     def _available(self, protocol):
+        eligibility = getattr(self._registry, "protocol_eligibility", None)
+        # The callback is assigned by the host after registry construction.
+        # pylint: disable=not-callable
+        if callable(eligibility) and not eligibility(
+            self._workspace.agent_id,
+            protocol,
+        ):
+            return False
+        # pylint: enable=not-callable
         descriptor = self._registry._driver_protocols.get(protocol)
         return (
             descriptor is not None
@@ -112,6 +125,21 @@ class LazyDriverService:  # pylint: disable=too-many-public-methods
     async def activate_registered_protocols(self):
         """Apply protocol intents after workspace publication commits."""
         self._guard()
+        # Compatibility consumers can create configured sources after the
+        # global inventory. They use the same offline coordinator.
+        if self._ensure_protocol:
+            protocols = set()
+            for path in await self.card_store.list_paths():
+                try:
+                    card = await self.card_store.load_path(path)
+                    if self._configured(card) and not self._available(
+                        card.protocol,
+                    ):
+                        protocols.add(card.protocol)
+                except Exception:
+                    continue
+            for protocol in protocols:
+                await self._ensure_protocol(protocol)
         for protocol, descriptor in tuple(
             self._registry._driver_protocols.items(),
         ):
@@ -456,7 +484,12 @@ class LazyDriverService:  # pylint: disable=too-many-public-methods
         return await self._refresh(await self._load(name), reload=True)
 
     async def refresh_driver(self, name):
-        return await self._refresh(await self._load(name), ensure=False)
+        card = await self._load(name)
+        return await self._refresh(
+            card,
+            ensure=self._ensure_protocol is not None
+            and self._configured(card),
+        )
 
     async def sync_driver_policy(self, card):
         self._guard()
