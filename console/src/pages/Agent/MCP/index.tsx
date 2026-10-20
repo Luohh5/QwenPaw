@@ -15,6 +15,20 @@ import styles from "./index.module.less";
 
 type MCPTransport = "stdio" | "streamable_http" | "sse";
 
+const recoveryGuidance: Record<string, string> = {
+  invalid_upgrade_record: "Review the MCP installation record, then retry",
+  orphaned_installation_record:
+    "Review the MCP installation record, then retry",
+  offline_upgrade_failed_check_dependencies_and_storage:
+    "Check offline dependencies and storage, then retry",
+  workspace_needs_review:
+    "Review this workspace’s saved MCP configuration, then retry",
+  invalid_plugin_settings: "Review the MCP plugin settings, then retry",
+  plugin_runtime_failed:
+    "Check the MCP plugin dependencies and settings, then retry",
+  plugin_diagnostics_present: "Review MCP plugin diagnostics before retrying",
+};
+
 function normalizeTransport(raw?: unknown): MCPTransport | undefined {
   if (typeof raw !== "string") return undefined;
   const value = raw.trim().toLowerCase();
@@ -85,7 +99,16 @@ function MCPPage({
 }) {
   const { t } = useTranslation();
   const plugin = useMCPPlugin(managementMounted);
-  const readOnly = !managementAvailable || plugin.state?.status !== "active";
+  const readOnly =
+    !managementAvailable ||
+    plugin.state?.status !== "active" ||
+    plugin.state.workspace?.eligible === false;
+  const recoveryCodes = [
+    ...new Set([
+      ...(plugin.state?.diagnostics ?? []),
+      ...(plugin.state?.workspace?.diagnostics ?? []),
+    ]),
+  ].filter((code) => recoveryGuidance[code]);
   const {
     clients,
     providerServers,
@@ -309,7 +332,29 @@ function MCPPage({
         }
       />
 
-      {readOnly && (
+      {recoveryCodes.length > 0 && (
+        <Alert
+          type="warning"
+          showIcon
+          message={t("mcp.recovery.title", {
+            defaultValue: "MCP needs attention",
+          })}
+          description={recoveryCodes.map((code) => (
+            <div key={code}>
+              {t(`mcp.recovery.${code}`, {
+                defaultValue: recoveryGuidance[code],
+              })}
+            </div>
+          ))}
+          action={
+            <Button loading={plugin.busy} onClick={plugin.activate}>
+              {t("common.retry", { defaultValue: "Retry" })}
+            </Button>
+          }
+        />
+      )}
+
+      {readOnly && recoveryCodes.length === 0 && (
         <Alert
           type={
             plugin.error || plugin.state?.status === "failed" ? "error" : "info"

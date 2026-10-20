@@ -5,6 +5,15 @@ The broad source run and its focused repairs are recorded separately; there was
 no invented single all-green broad run. Final review and plan checkboxes remain
 with the coordinating reviewer. See the [design decisions](2026-10-20-mcp-plugin-decisions.md).
 
+The Task 8 artifact hashes and thirty numeric samples below are historical
+pre-final-review evidence. A later consolidated fix corrects failed source
+replacement, embedded-text delivery and visible recovery diagnostics. Its
+affected verification passed 184 Python and 70 Console tests, followed by
+42 replacement/lifecycle tests after a final async sampling correction.
+Publication of the rebuilt artifacts and current-source unused-runtime checks
+is pending. The original measurements and their source hashes are preserved;
+they must not be represented as measurements of the revised source.
+
 ## Scope and environment
 
 The deliverables are the official `qwenpaw-mcp` plugin (protocol `mcp`) and the

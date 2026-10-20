@@ -110,7 +110,13 @@ def _blocks_from_value(value: Any) -> list[Any]:
                 ),
             )
 
-        blocks = [_to_block(mutable(block)) for block in value.content]
+        blocks = []
+        for block in value.content:
+            # A file can supply both its inline body and an attachment URI.
+            # Preserve each through the final consumer boundary.
+            if block.type == "file" and block.text:
+                blocks.append(_text_block(block.text))
+            blocks.append(_to_block(mutable(block)))
         if value.structured_content is not None:
             blocks.append(
                 _text_block(_stringify(_thaw(value.structured_content))),

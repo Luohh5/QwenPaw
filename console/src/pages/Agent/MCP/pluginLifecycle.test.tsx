@@ -113,7 +113,7 @@ const absent = {
   installed: false,
   enabled: false,
   status: "not_installed",
-  diagnostics: [],
+  diagnostics: [] as string[],
 };
 const active = { ...absent, installed: true, enabled: true, status: "active" };
 const bundle = readFileSync(
@@ -364,3 +364,76 @@ it.each(["Disable", "Uninstall"])(
     ).toBeInTheDocument();
   },
 );
+
+it.each([
+  ["invalid_upgrade_record", "Review the MCP installation record, then retry"],
+  [
+    "offline_upgrade_failed_check_dependencies_and_storage",
+    "Check offline dependencies and storage, then retry",
+  ],
+])(
+  "shows actionable passive startup recovery for %s",
+  async (code, guidance) => {
+    lifecycle = { ...absent, diagnostics: [code] };
+    render(<CurrentRoute />);
+    await screen.findByText(guidance);
+    expect(screen.getByText("Saved offline server")).toBeInTheDocument();
+    expect(mocks.request.mock.calls.every(([, init]) => !init?.method)).toBe(
+      true,
+    );
+    expect(mocks.fetch).not.toHaveBeenCalled();
+  },
+);
+
+it("shows selected blocked workspace recovery beside active global management and clears on scope change", async () => {
+  lifecycle = Object.assign({}, active, {
+    upgrade: { status: "installed", diagnostics: [] },
+    workspace: {
+      id: "one",
+      status: "needs_review",
+      eligible: false,
+      diagnostics: ["workspace_needs_review"],
+    },
+  });
+  mountActualPlugin();
+  const view = render(<CurrentRoute />);
+  const guidance =
+    "Review this workspace’s saved MCP configuration, then retry";
+  await screen.findByText(guidance);
+  expect(mocks.request.mock.calls.every(([, init]) => !init?.method)).toBe(
+    true,
+  );
+  lifecycle = Object.assign({}, active, {
+    upgrade: { status: "installed", diagnostics: [] },
+    workspace: {
+      id: "two",
+      status: "configured",
+      eligible: true,
+      diagnostics: [],
+    },
+  });
+  mocks.agent.selectedAgent = "two";
+  view.rerender(<CurrentRoute />);
+  await waitFor(() =>
+    expect(screen.queryByText(guidance)).not.toBeInTheDocument(),
+  );
+});
+
+it("ordinary unused state does not imply blocked recovery", async () => {
+  lifecycle = Object.assign({}, absent, {
+    upgrade: { status: "skipped", diagnostics: [] },
+    workspace: {
+      id: "one",
+      status: "unused",
+      eligible: false,
+      diagnostics: [],
+    },
+  });
+  render(<CurrentRoute />);
+  await screen.findByRole("button", { name: "Install" });
+  expect(
+    screen.queryByText(
+      /Review the MCP installation record|Check offline dependencies|Review this workspace/,
+    ),
+  ).not.toBeInTheDocument();
+});

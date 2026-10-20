@@ -25,6 +25,7 @@ PLUGIN_ID = "driver-lifecycle"
 PROTOCOL = "author-driver"
 SOURCE = """
 import asyncio
+import threading
 from pathlib import Path
 from qwenpaw.plugins import SDKError
 from qwenpaw.plugins.apps import PawApp, HttpResponse
@@ -36,11 +37,14 @@ from qwenpaw.plugins.messages import Attachment, ContentBlock
 class Plugin:
     def register(self, plugin):
         directory = Path(plugin.config.get("directory"))
+        record_lock = threading.Lock()
         def record(event, context):
-            rows = plugin.storage.read_json("events.json", [])
-            rows.append([event, context.workspace_id, context.source_id,
-                         context.source_revision, context.generation])
-            plugin.storage.write_json("events.json", rows)
+            # Resource callbacks may run concurrently in cleanup threads.
+            with record_lock:
+                rows = plugin.storage.read_json("events.json", [])
+                rows.append([event, context.workspace_id, context.source_id,
+                             context.source_revision, context.generation])
+                plugin.storage.write_json("events.json", rows)
         async def wait(name):
             while not (directory / name).exists():
                 await asyncio.sleep(.005)
@@ -54,6 +58,8 @@ class Plugin:
                     lambda: record("resource-close", self.context))
                 if self.source.config.get("wait_open"):
                     await wait("release-open")
+                if self.source.config.get("fail_open"):
+                    raise SDKError("synthetic preparation failure")
                 record("opened", self.context)
             async def discover(self, request):
                 record("discover", self.context)

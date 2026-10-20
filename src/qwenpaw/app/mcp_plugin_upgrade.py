@@ -224,6 +224,7 @@ class MCPPluginCoordinator:
         self.config_path = None
         self.workspace_statuses = {}
         self.root_valid = True
+        self.latest_result = None
 
     def eligible(self, workspace_id, protocol):
         return protocol != "mcp" or (
@@ -233,29 +234,52 @@ class MCPPluginCoordinator:
         )
 
     async def install_explicitly(self):
-        """Use the native offline transaction only after an install click."""
+        """Retry offline installation, then refresh saved recovery evidence."""
         async with self.loader.plugin_lifecycle(PLUGIN_ID):
-            installed = await asyncio.to_thread(
-                self.loader.find_installed_plugin_dir,
-                PLUGIN_ID,
+            snapshot = await asyncio.to_thread(
+                inventory_mcp_usage,
+                config_path=self.config_path,
+                plugins_dir=self.loader.plugin_dirs[0],
             )
-            if installed is None:
-                source = get_optional_mcp_plugin_dir()
-                _, manifest = await asyncio.to_thread(
-                    self.loader.read_source_manifest,
-                    source,
+            try:
+                installed = await asyncio.to_thread(
+                    self.loader.find_installed_plugin_dir,
+                    PLUGIN_ID,
                 )
-                if manifest.id != PLUGIN_ID:
-                    raise ValueError("Invalid optional MCP resource")
-                await self.loader.install_plugin_files(
-                    source,
-                    allow_install=False,
-                    user_requested=True,
+                if installed is None:
+                    source = get_optional_mcp_plugin_dir()
+                    _, manifest = await asyncio.to_thread(
+                        self.loader.read_source_manifest,
+                        source,
+                    )
+                    if manifest.id != PLUGIN_ID:
+                        raise ValueError("Invalid optional MCP resource")
+                    await self.loader.install_plugin_files(
+                        source,
+                        allow_install=False,
+                        user_requested=True,
+                    )
+                record = self.loader.get_loaded_plugin(PLUGIN_ID)
+                if record is not None and record.status == "failed":
+                    await self.loader.lifecycle.reload(PLUGIN_ID)
+                record = await self.loader.lifecycle.set_enabled(
+                    PLUGIN_ID,
+                    True,
                 )
-            record = self.loader.get_loaded_plugin(PLUGIN_ID)
-            if record is not None and record.status == "failed":
-                await self.loader.lifecycle.reload(PLUGIN_ID)
-            return await self.loader.lifecycle.set_enabled(PLUGIN_ID, True)
+                snapshot = await asyncio.to_thread(
+                    inventory_mcp_usage,
+                    config_path=self.config_path,
+                    plugins_dir=self.loader.plugin_dirs[0],
+                )
+                self.latest_result = await self._ensure_owned(snapshot)
+                return record
+            except Exception:
+                self.latest_result = MCPPluginUpgradeResult(
+                    "failed",
+                    classify_mcp_usage(snapshot),
+                    ("offline_upgrade_failed_check_dependencies_and_storage",),
+                )
+                raise
 
     async def ensure_protocol(self, protocol):
         if protocol != "mcp":
@@ -298,7 +322,8 @@ class MCPPluginCoordinator:
 
     async def ensure(self, snapshot):
         async with self.loader.plugin_lifecycle(PLUGIN_ID):
-            return await self._ensure_owned(snapshot)
+            self.latest_result = await self._ensure_owned(snapshot)
+            return self.latest_result
 
     async def _ensure_owned(self, snapshot):
         self.config_path = snapshot.config_path or self.config_path

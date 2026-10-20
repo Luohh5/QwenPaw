@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable, Iterable
+from copy import deepcopy
 from pathlib import Path
 
 from .approval import ApprovalGate
@@ -74,6 +75,9 @@ class DriverManager:  # pylint: disable=too-many-public-methods
         self._cleanup_handler_ids: set[int] = set()
         self._lock = asyncio.Lock()
         self._revisions: dict[str, int] = {}
+        self._active_revisions: dict[str, int] = {}
+        self._preparing_revisions: set[tuple[str, int]] = set()
+        self._accepted_sources: dict[str, DriverCard] = {}
         self._scope_revisions: dict[str, int] = {}
         self._owned: set[DriverHandler] = set()
         self._failed_cleanup: set[DriverHandler] = set()
@@ -115,7 +119,7 @@ class DriverManager:  # pylint: disable=too-many-public-methods
                 if card.name in self._handler_scopes:
                     collisions.add(card.name)
                     return
-                revision = self._reserve(card.name)
+                revision = self._reserve(card.name, card)
                 reservations[card.name] = revision
             if not card.enabled:
                 return
@@ -157,10 +161,19 @@ class DriverManager:  # pylint: disable=too-many-public-methods
                         raise RuntimeError(
                             "Driver source changed while opening",
                         )
+                retained = {
+                    name: handler
+                    for name, handler in self._handlers.items()
+                    if name not in self._handler_scopes
+                    and name in reservations
+                    and name not in built
+                    and self._accepted_sources[name].enabled
+                }
                 old = [
                     handler
                     for name, handler in self._handlers.items()
                     if name not in self._handler_scopes
+                    and name not in retained
                 ]
                 self._handlers = {
                     **{
@@ -168,8 +181,20 @@ class DriverManager:  # pylint: disable=too-many-public-methods
                         for name, handler in self._handlers.items()
                         if name in self._handler_scopes
                     },
+                    **retained,
                     **{name: handler for name, (handler, _) in built.items()},
                 }
+                self._active_revisions = {
+                    name: revision
+                    for name, revision in self._active_revisions.items()
+                    if name in self._handlers
+                }
+                self._active_revisions.update(
+                    {name: revision for name, (_, revision) in built.items()},
+                )
+                self._preparing_revisions.difference_update(
+                    (name, revision) for name, (_, revision) in built.items()
+                )
         except BaseException:
             for task in tasks:
                 if not task.done():
@@ -200,7 +225,7 @@ class DriverManager:  # pylint: disable=too-many-public-methods
                 raise ValueError(
                     "Persistent Driver collides with a transient Driver",
                 )
-            revision = self._reserve(card.name)
+            revision = self._reserve(card.name, card)
             await self._card_store.save(card)
         await self._replace_persistent(card, revision)
 
@@ -213,7 +238,7 @@ class DriverManager:  # pylint: disable=too-many-public-methods
             )
         try:
             async with self._lock:
-                if not self.source_is_current(card.name, revision):
+                if not self.candidate_is_current(card.name, revision):
                     raise RuntimeError("Driver source revision is stale")
                 latest = await self._card_store.load(
                     card.name,
@@ -222,8 +247,11 @@ class DriverManager:  # pylint: disable=too-many-public-methods
                 if latest != card:
                     raise RuntimeError("Driver source changed while opening")
                 old = self._handlers.pop(card.name, None)
+                self._active_revisions.pop(card.name, None)
                 if handler is not None:
                     self._handlers[card.name] = handler
+                    self._active_revisions[card.name] = revision
+                    self._preparing_revisions.discard((card.name, revision))
         except BaseException:
             if handler is not None:
                 await self._shutdown_handler(handler)
@@ -234,12 +262,12 @@ class DriverManager:  # pylint: disable=too-many-public-methods
     async def reload_driver(self, name: str) -> DriverRuntimeInfo | None:
         """Build-before-swap without overwriting a newer persisted card."""
         async with self._lock:
-            revision = self._reserve(name)
             path = await self._card_store.stored_path(name)
             if path is None:
                 raise DriverNotFoundError(name)
             card = await self._card_store.load_path(path)
             card = self._validate_card_for_registered_protocol(card)
+            revision = self._reserve(name, card)
         await self._replace_persistent(card, revision)
         return self._runtime_info_from_card(card)
 
@@ -258,6 +286,7 @@ class DriverManager:  # pylint: disable=too-many-public-methods
                 card,
             ):
                 handler.sync_runtime_metadata(card)
+                self._accepted_sources[name] = deepcopy(card)
                 return self._runtime_info_from_card(card)
 
         return await self.reload_driver(name)
@@ -280,6 +309,7 @@ class DriverManager:  # pylint: disable=too-many-public-methods
             if handler is None or handler.card.protocol != card.protocol:
                 return
             handler.set_policy(card.policy)
+            self._accepted_sources[card.name] = deepcopy(card)
 
     @staticmethod
     def _requires_reconnect(old: DriverCard, new: DriverCard) -> bool:
@@ -308,7 +338,7 @@ class DriverManager:  # pylint: disable=too-many-public-methods
                 raise ValueError(
                     f"Transient Driver '{name}' must be removed by scope",
                 )
-            self._reserve(name)
+            self._invalidate(name)
             await self._card_store.delete(name)
             old = self._handlers.pop(name, None)
         if old is not None:
@@ -348,7 +378,9 @@ class DriverManager:  # pylint: disable=too-many-public-methods
                     raise ValueError(
                         f"Transient Driver name already exists: {name}",
                     )
-            revisions = {card.name: self._reserve(card.name) for card in cards}
+            revisions = {
+                card.name: self._reserve(card.name, card) for card in cards
+            }
             scope_revision = self._invalidate_scope(scope_id)
         epoch = self._epoch
         built: dict[str, DriverHandler] = {}
@@ -370,7 +402,7 @@ class DriverManager:  # pylint: disable=too-many-public-methods
                     epoch != self._epoch
                     or self._scope_revisions.get(scope_id) != scope_revision
                     or any(
-                        not self.source_is_current(name, revision)
+                        not self.candidate_is_current(name, revision)
                         for name, revision in revisions.items()
                     )
                 ):
@@ -399,9 +431,12 @@ class DriverManager:  # pylint: disable=too-many-public-methods
                     if old is not None:
                         old_handlers.append(old)
                     self._handler_scopes.pop(name, None)
+                    self._active_revisions.pop(name, None)
 
                 for name, handler in built.items():
                     self._handlers[name] = handler
+                    self._active_revisions[name] = revisions[name]
+                    self._preparing_revisions.discard((name, revisions[name]))
                     self._handler_scopes[name] = scope_id
 
                 if built:
@@ -455,8 +490,11 @@ class DriverManager:  # pylint: disable=too-many-public-methods
                 self._scope_handlers.get(scope_id, set()).discard(name)
             # Private lifecycle metadata is assigned by this manager.
             # pylint: disable-next=protected-access
-            if self.source_is_current(name, handler._source_revision):
-                self._invalidate(name)
+            revision = handler._source_revision
+            if self._active_revisions.get(name) == revision:
+                self._active_revisions.pop(name, None)
+            if self.candidate_is_current(name, revision):
+                self._revisions[name] += 1
 
     async def _close_owned_handlers(self, handlers):
         """Descriptor custody release, separate from user close-by-source."""
@@ -533,10 +571,12 @@ class DriverManager:  # pylint: disable=too-many-public-methods
         await asyncio.gather(*pending, return_exceptions=True)
 
     def _invalidate(self, name):
+        self._active_revisions.pop(name, None)
+        self._accepted_sources.pop(name, None)
         self._revisions[name] = self._revisions.get(name, 0) + 1
         return self._revisions[name]
 
-    def _reserve(self, name):
+    def _reserve(self, name, card=None):
         if any(
             handler.name == name
             for handler in self._owned
@@ -545,10 +585,37 @@ class DriverManager:  # pylint: disable=too-many-public-methods
             or id(handler) in self._cleanup_handler_ids
         ):
             raise RuntimeError(f"Driver '{name}' cleanup has not stopped")
-        return self._invalidate(name)
+        self._revisions[name] = self._revisions.get(name, 0) + 1
+        if card is not None:
+            self._accepted_sources[name] = deepcopy(card)
+        return self._revisions[name]
+
+    def candidate_is_current(self, name, revision):
+        """Only the newest preparation may publish a replacement."""
+        return self._revisions.get(name) == revision
 
     def source_is_current(self, name, revision):
-        return self._revisions.get(name) == revision
+        """Keep committed ownership valid while a candidate is preparing."""
+        return self._active_revisions.get(name) == revision or (
+            (name, revision) in self._preparing_revisions
+            and self.candidate_is_current(name, revision)
+        )
+
+    def source_card_is_current(self, card, revision, latest=None):
+        """Accept a known replacement without extending old authority."""
+        if self._active_revisions.get(card.name) != revision:
+            return latest is None or latest == card
+        accepted = self._accepted_sources.get(card.name, card)
+        if latest is not None and latest not in (card, accepted):
+            return False
+        authority = latest if latest is not None else accepted
+        return (
+            authority.enabled == card.enabled
+            and authority.protocol == card.protocol
+            and authority.credentials == card.credentials
+            and authority.policy == card.policy
+            and authority.config.get("tools") == card.config.get("tools")
+        )
 
     async def list_drivers(
         self,
@@ -706,7 +773,7 @@ class DriverManager:  # pylint: disable=too-many-public-methods
         session_scope="",
     ) -> DriverHandler:
         if revision is None:
-            revision = self._reserve(card.name)
+            revision = self._reserve(card.name, card)
         handler = self._build_handler(card)
         # Private binding shared with the SDK source adapter.
         # pylint: disable-next=protected-access
@@ -714,13 +781,14 @@ class DriverManager:  # pylint: disable=too-many-public-methods
         # pylint: disable-next=protected-access
         handler._source_revision = revision
         self._owned.add(handler)
+        self._preparing_revisions.add((card.name, revision))
         self._pending[handler] = asyncio.current_task()
         try:
             bind = getattr(handler, "bind_source", None)
             if bind is not None:
                 bind(self, revision, session_scope)
             await handler.init()
-            if not self.source_is_current(card.name, revision):
+            if not self.candidate_is_current(card.name, revision):
                 raise RuntimeError("Driver source revision is stale")
         except BaseException:
             await self._shutdown_handler(handler)
@@ -848,6 +916,10 @@ class DriverManager:  # pylint: disable=too-many-public-methods
             raise RuntimeError("Driver cleanup has not stopped")
 
     async def _shutdown_handler(self, handler):
+        self._preparing_revisions.discard(
+            # pylint: disable-next=protected-access
+            (handler.name, handler._source_revision),
+        )
         if handler not in self._owned:
             return
         task = self._closing.get(handler)

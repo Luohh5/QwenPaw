@@ -413,6 +413,57 @@ async def test_all_content_types_and_structured_result_cross_public_boundary(
         )
         assert result.content[5].metadata["mcp"]["size"] == 7
 
+        # Continue through the production consumer, using actual AgentScope.
+        from agentscope.message import TextBlock, DataBlock, ToolResultState
+        from qwenpaw.drivers.adapters.agentscope_tool import (
+            build_driver_agent_tools,
+        )
+
+        manager = host._workspaces["test"]._service_manager.services[
+            "driver_manager"
+        ]
+        tools, _ = await build_driver_agent_tools(
+            manager,
+            {"agent_id": "test"},
+        )
+        chunk = await next(
+            tool for tool in tools if tool.name == "same__echo"
+        )()
+        assert chunk.is_last is True
+        assert chunk.state is (
+            ToolResultState.ERROR if is_error else ToolResultState.SUCCESS
+        )
+        assert chunk.metadata["mcp"]["_meta"]["trace"] == "synthetic"
+        text = [
+            block.text
+            for block in chunk.content
+            if isinstance(block, TextBlock)
+        ]
+        assert "detail" in text
+        assert "embedded text" in text
+        assert json.loads(text[-1]) == {"nested": [1, {"ok": True}]}
+        data = [
+            block.model_dump(mode="json")
+            for block in chunk.content
+            if isinstance(block, DataBlock)
+        ]
+        serialized = json.dumps(data)
+        for payload in (
+            "aW1hZ2U=",
+            "YXVkaW8=",
+            "YmxvYg==",
+            "https://peer.invalid/document",
+            "file:///synthetic.txt",
+        ):
+            assert payload in serialized
+        for mime in (
+            "image/png",
+            "audio/wav",
+            "application/octet-stream",
+            "application/pdf",
+        ):
+            assert mime in serialized
+
 
 @pytest.mark.parametrize("payload", [[1, "two"], 7, "value", True])
 async def test_modern_nonobject_structured_output_is_not_lost(

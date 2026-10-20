@@ -10,6 +10,45 @@ from fastapi import HTTPException
 from ...config.utils import get_config_path, load_config
 from ..mcp_plugin_upgrade import PLUGIN_ID
 
+# These codes are the complete public recovery vocabulary. Never expose raw
+# parser, dependency, credential or plugin exception strings from status.
+_RECOVERY_CODES = {
+    "invalid_upgrade_record",
+    "orphaned_installation_record",
+    "offline_upgrade_failed_check_dependencies_and_storage",
+    "workspace_needs_review",
+    "invalid_plugin_settings",
+}
+
+
+def _recovery_state(loader, request, config):
+    coordinator = getattr(loader, "protocol_coordinator", None)
+    result = getattr(coordinator, "latest_result", None)
+    if result is None:
+        return {}, []
+    agent_id = (
+        getattr(request.state, "agent_id", None)
+        or request.headers.get("X-Agent-Id")
+        or config.agents.active_agent
+        or "default"
+    )
+    status = result.decision.workspace_statuses.get(agent_id, "unused")
+    codes = [code for code in result.diagnostics if code in _RECOVERY_CODES]
+    # Workspace-specific uncertainty must not mark a healthy sibling blocked.
+    diagnostics = [code for code in codes if code != "workspace_needs_review"]
+    workspace_codes = (
+        ["workspace_needs_review"] if status == "needs_review" else []
+    )
+    return {
+        "upgrade": {"status": result.status, "diagnostics": codes},
+        "workspace": {
+            "id": agent_id,
+            "status": status,
+            "eligible": coordinator.eligible(agent_id, "mcp"),
+            "diagnostics": workspace_codes,
+        },
+    }, list(dict.fromkeys([*diagnostics, *workspace_codes]))
+
 
 def unavailable():
     return HTTPException(
@@ -58,12 +97,18 @@ async def plugin_state(request):
     )
     if status not in {"not_installed", "disabled", "active", "failed"}:
         status = "inactive"
+    recovery, diagnostics = _recovery_state(loader, request, config)
+    if getattr(record, "status", None) == "failed":
+        diagnostics.append("plugin_runtime_failed")
+    elif getattr(record, "diagnostics", None):
+        diagnostics.append("plugin_diagnostics_present")
     return {
         "id": PLUGIN_ID,
         "installed": bool(directory or record),
         "enabled": enabled,
         "status": status,
-        "diagnostics": list(getattr(record, "diagnostics", None) or []),
+        "diagnostics": diagnostics,
+        **recovery,
     }
 
 

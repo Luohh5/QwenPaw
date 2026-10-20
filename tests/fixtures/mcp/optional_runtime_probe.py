@@ -152,11 +152,17 @@ class LocalPeer:
     def stop(self):
         if self.process and self.process.poll() is None:
             self.process.terminate()
-            self.process.wait(timeout=10)
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=10)
 
     def close(self):
-        self.stop()
-        self.log.close()
+        try:
+            self.stop()
+        finally:
+            self.log.close()
 
 
 async def prepare(host):
@@ -444,22 +450,22 @@ async def auth_oauth():  # pylint: disable=too-many-statements
 
     ROOT.mkdir(parents=True, exist_ok=True)
     peer = LocalPeer("sse")
-    await peer.start()
-    oauth_source = source("oauth", "sse", peer.port, enabled=False)
-    oauth_source["credentials"] = {
-        "oauth": {"kind": "oauth2_auth_code", "ref": "controlled-oauth"},
-    }
-    seed(cards=[("test", oauth_source)], workspaces=("test", "other"))
-    os.environ["QWENPAW_AUTH_ENABLED"] = "1"
-    original_init = DriverManager.__init__
-    constructions = []
-
-    def observe(self, *args, **kwargs):
-        constructions.append(self)
-        original_init(self, *args, **kwargs)
-
-    DriverManager.__init__ = observe
     try:
+        await peer.start()
+        oauth_source = source("oauth", "sse", peer.port, enabled=False)
+        oauth_source["credentials"] = {
+            "oauth": {"kind": "oauth2_auth_code", "ref": "controlled-oauth"},
+        }
+        seed(cards=[("test", oauth_source)], workspaces=("test", "other"))
+        os.environ["QWENPAW_AUTH_ENABLED"] = "1"
+        original_init = DriverManager.__init__
+        constructions = []
+
+        def observe(self, *args, **kwargs):
+            constructions.append(self)
+            original_init(self, *args, **kwargs)
+
+        DriverManager.__init__ = observe
         async with PluginTestHost(
             ROOT,
             workspace_dirs={"test": "test", "other": "other"},

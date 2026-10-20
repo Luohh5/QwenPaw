@@ -9,6 +9,13 @@ export interface MCPPluginState {
   enabled: boolean;
   status: "not_installed" | "disabled" | "active" | "inactive" | "failed";
   diagnostics: string[];
+  upgrade?: { status: string; diagnostics: string[] };
+  workspace?: {
+    id: string;
+    status: "unused" | "configured" | "needs_review";
+    eligible: boolean;
+    diagnostics: string[];
+  };
 }
 
 export function useMCPPlugin(mounted: boolean) {
@@ -47,7 +54,12 @@ export function useMCPPlugin(mounted: boolean) {
     setBusy(true);
     setError("");
     try {
-      if (!state?.installed || state.status === "failed") {
+      if (
+        !state?.installed ||
+        state.status === "failed" ||
+        state.diagnostics.length > 0 ||
+        (state.workspace?.diagnostics.length ?? 0) > 0
+      ) {
         await request("/mcp-plugin/install", { method: "POST" });
       } else {
         await request("/plugins/qwenpaw-mcp/enabled", {

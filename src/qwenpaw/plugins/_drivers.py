@@ -465,14 +465,23 @@ class SDKDriverHandler(DriverHandler):
 
     async def check(self):
         self.guard()
+        latest = None
         if not self.session_scope:
-            latest = await self.manager.card_store.load(
-                self.name,
-                protocol=self.card.protocol,
-            )
-            self.guard()
-            if latest != self.card:
-                raise StaleContextError("Driver source configuration changed")
+            while True:
+                candidate = self.manager._revisions.get(self.name)
+                latest = await self.manager.card_store.load(
+                    self.name,
+                    protocol=self.card.protocol,
+                )
+                self.guard()
+                if self.manager.candidate_is_current(self.name, candidate):
+                    break
+        if not self.manager.source_card_is_current(
+            self.card,
+            self.revision,
+            latest,
+        ):
+            raise StaleContextError("Driver source configuration changed")
 
     @contextmanager
     def admission(self):
