@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Run with ``python -m qwenpaw.plugins.check PATH``; opt in to execution."""
 
 import argparse
@@ -7,11 +8,23 @@ import sys
 import tempfile
 import threading
 from dataclasses import asdict, replace
+from functools import lru_cache
 from pathlib import Path
 
-from .compliance import PUBLIC_API, CheckFinding, CheckReport, check_plugin
+from .compliance import PUBLIC_API, CheckFinding, check_plugin
 
 
+def _source_file(filename: str, directory: Path) -> Path | None:
+    """Resolve caller ownership using the current platform's path rules."""
+    try:
+        file = Path(filename).resolve()
+        return file if file.is_relative_to(directory) else None
+    except (ValueError, OSError):
+        return None
+
+
+# Keep related adapter declarations and lifecycle ordering together.
+# pylint: disable-next=too-many-statements
 async def _runtime(directory, report):
     from .testing import PluginTestHost
 
@@ -20,7 +33,9 @@ async def _runtime(directory, report):
     phases = []
     stage = "host-start"
     public_types = {
-        (module, name) for module, names in PUBLIC_API.items() for name in names
+        (module, name)
+        for module, names in PUBLIC_API.items()
+        for name in names
     }
     public_types.update(
         {
@@ -44,13 +59,24 @@ async def _runtime(directory, report):
                 ("qwenpaw.plugins._testing_http", name)
                 for name in ("TestHttpResponse", "TestConnection")
             ),
-        }
+        },
     )
-    source_prefix = str(directory) + "/"
+    directory = directory.resolve()
+
+    @lru_cache(maxsize=4096)
+    def source_file(filename):
+        return _source_file(filename, directory)
+
     protocols = {
-        ("qwenpaw.plugins.resources", "Registration"): {"__aenter__", "__aexit__"},
+        ("qwenpaw.plugins.resources", "Registration"): {
+            "__aenter__",
+            "__aexit__",
+        },
         ("qwenpaw.plugins.testing", "TestFault"): {"__enter__", "__exit__"},
-        ("qwenpaw.plugins.testing", "PluginTestHost"): {"__aenter__", "__aexit__"},
+        ("qwenpaw.plugins.testing", "PluginTestHost"): {
+            "__aenter__",
+            "__aexit__",
+        },
         ("qwenpaw.plugins._testing_http", "TestConnection"): {
             "__aenter__",
             "__aexit__",
@@ -63,19 +89,18 @@ async def _runtime(directory, report):
         if event != "call" or frame.f_back is None:
             return
         caller = frame.f_back
-        if not caller.f_code.co_filename.startswith(source_prefix):
-            return
-        try:
-            file = Path(caller.f_code.co_filename).resolve()
-            if not file.is_relative_to(directory):
-                return
-        except (ValueError, OSError):
+        file = source_file(caller.f_code.co_filename)
+        if file is None:
             return
         module = frame.f_globals.get("__name__", "")
         if module == "importlib" and frame.f_code.co_name == "import_module":
             imported = frame.f_locals.get("name", "")
             if imported.startswith("qwenpaw.") and imported not in PUBLIC_API:
-                key = (str(file.relative_to(directory)), caller.f_lineno, imported)
+                key = (
+                    str(file.relative_to(directory)),
+                    caller.f_lineno,
+                    imported,
+                )
                 if key not in seen:
                     seen.add(key)
                     findings.append(
@@ -84,7 +109,7 @@ async def _runtime(directory, report):
                             key[1],
                             "runtime-private-import",
                             f"Plugin imported private host module: {imported}",
-                        )
+                        ),
                     )
             return
         if not module.startswith("qwenpaw."):
@@ -99,7 +124,8 @@ async def _runtime(directory, report):
             if not imported.startswith("qwenpaw") or (
                 imported in PUBLIC_API
                 and all(
-                    name in PUBLIC_API[imported] or f"{imported}.{name}" in PUBLIC_API
+                    name in PUBLIC_API[imported]
+                    or f"{imported}.{name}" in PUBLIC_API
                     for name in fromlist
                 )
             ):
@@ -110,16 +136,27 @@ async def _runtime(directory, report):
         )
         allowed |= module in PUBLIC_API and qualname in PUBLIC_API[module]
         allowed |= method in protocols.get((module, owner), ())
-        if frame.f_code.co_name in {"__init__", "__eq__", "__hash__", "__repr__"}:
+        if frame.f_code.co_name in {
+            "__init__",
+            "__eq__",
+            "__hash__",
+            "__repr__",
+        }:
             from dataclasses import is_dataclass
 
             cls = type(frame.f_locals.get("self"))
             allowed |= (
-                is_dataclass(cls) and (cls.__module__, cls.__qualname__) in public_types
+                is_dataclass(cls)
+                and (cls.__module__, cls.__qualname__) in public_types
             )
         if allowed:
             return
-        key = (str(file.relative_to(directory)), caller.f_lineno, module, qualname)
+        key = (
+            str(file.relative_to(directory)),
+            caller.f_lineno,
+            module,
+            qualname,
+        )
         if key not in seen:
             seen.add(key)
             findings.append(
@@ -128,14 +165,16 @@ async def _runtime(directory, report):
                     key[1],
                     "runtime-private-call",
                     f"Plugin called private host entry: {module}.{qualname}",
-                )
+                ),
             )
 
     previous = sys.getprofile()
     previous_threads = threading.getprofile()
     try:
         threading.setprofile(profile)
-        with tempfile.TemporaryDirectory(prefix="qwenpaw-sdk-check-") as temporary:
+        with tempfile.TemporaryDirectory(
+            prefix="qwenpaw-sdk-check-",
+        ) as temporary:
             sys.setprofile(profile)
             try:
                 async with PluginTestHost(Path(temporary)) as host:
@@ -150,8 +189,11 @@ async def _runtime(directory, report):
         phases.append(f"{stage}:failed")
         findings.append(
             CheckFinding(
-                "plugin.json", 1, "runtime-failure", f"{type(exc).__name__}: {exc}"
-            )
+                "plugin.json",
+                1,
+                "runtime-failure",
+                f"{type(exc).__name__}: {exc}",
+            ),
         )
     finally:
         sys.setprofile(previous)
@@ -161,7 +203,9 @@ async def _runtime(directory, report):
         findings=tuple(findings),
         uncovered=(
             *report.uncovered,
-            "Only load/activation/cleanup executed; uncalled handlers, dynamic attribute access, pre-existing threads and native calls remain unverified",
+            "Only load/activation/cleanup executed; uncalled handlers, "
+            "dynamic attribute access, pre-existing threads and native "
+            "calls remain unverified",
         ),
         runtime_checked=True,
         lifecycle_checks=tuple(phases),
@@ -172,12 +216,17 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path, nargs="?")
     parser.add_argument(
-        "--template", type=Path, help="Copy the public hello plugin to a new directory"
+        "--template",
+        type=Path,
+        help="Copy the public hello plugin to a new directory",
     )
     parser.add_argument(
         "--runtime",
         action="store_true",
-        help="Execute plugin activation in an isolated temporary host (plugin code is trusted)",
+        help=(
+            "Execute plugin activation in an isolated temporary host "
+            "(plugin code is trusted)"
+        ),
     )
     parser.add_argument(
         "--frontend",
@@ -188,7 +237,10 @@ def main(argv=None):
     if args.template is not None:
         import shutil
 
-        shutil.copytree(Path(__file__).with_name("templates") / "hello", args.template)
+        shutil.copytree(
+            Path(__file__).with_name("templates") / "hello",
+            args.template,
+        )
     if args.frontend is not None:
         import shutil
 
@@ -200,7 +252,13 @@ def main(argv=None):
     report = check_plugin(args.directory)
     if args.runtime and report.ok:
         report = asyncio.run(_runtime(args.directory.resolve(), report))
-    print(json.dumps({"ok": report.ok, **asdict(report)}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {"ok": report.ok, **asdict(report)},
+            ensure_ascii=False,
+            indent=2,
+        ),
+    )
     return 0 if report.ok else 1
 
 

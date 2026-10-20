@@ -38,7 +38,7 @@ from .lifecycle import (
 )
 from .module_isolation import (
     build_plugin_builtins,
-    clear_plugin_bytecode,
+    source_only_loader,
     compile_plugin_import_closure,
     get_namespace_finder,
     probe_plugin_source,
@@ -112,7 +112,6 @@ async def _probe_incoming(
             search_paths.append(plugin_dir)
 
         def prepare() -> None:
-            clear_plugin_bytecode(source_path)
             compile_plugin_import_closure(entry_file, search_paths)
 
         await run_sync_io(prepare)
@@ -669,9 +668,6 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             ImportError: If module spec cannot be created.
             AttributeError: If plugin doesn't export required objects.
         """
-        from ..utils.io_utils import run_sync_io
-
-        await run_sync_io(clear_plugin_bytecode, source_path)
         module_name = f"plugin_{plugin_id.replace('-', '_')}"
         plugin_dir_str = str(source_path)
         # Plugins with a nested entry (e.g. ``backend/main.py``) resolve
@@ -694,6 +690,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             raise ImportError(
                 f"Failed to load module spec for {backend_entry_file}",
             )
+        spec.loader = source_only_loader(spec.loader)
 
         modules_before = dict(sys.modules)
         module = importlib.util.module_from_spec(spec)

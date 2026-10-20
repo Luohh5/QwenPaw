@@ -313,7 +313,7 @@ async def test_reload_ignores_same_size_same_mtime_bytecode(
 
 
 @pytest.mark.asyncio
-async def test_bytecode_cleanup_failure_keeps_running_plugin(
+async def test_reload_preserves_locked_bytecode_and_uses_new_source(
     tmp_path,
     fresh_registry,
     monkeypatch,
@@ -322,7 +322,7 @@ async def test_bytecode_cleanup_failure_keeps_running_plugin(
     installed = _write_plugin(
         tmp_path / "plugins" / "cached",
         "cached",
-        body="self.value = 'old'",
+        body="self.value = 'old'; self.api = api",
     )
     incoming = _write_plugin(
         tmp_path / "incoming",
@@ -330,7 +330,9 @@ async def test_bytecode_cleanup_failure_keeps_running_plugin(
         body="self.value = 'new'",
         version="2.0.0",
     )
-    py_compile.compile(str(incoming / "main.py"), doraise=True)
+    cache = Path(py_compile.compile(str(incoming / "main.py"), doraise=True))
+    cached_before = (cache.read_bytes(), cache.stat().st_mtime_ns)
+    delete_attempts = []
     loader = PluginLoader([installed.parent])
     loader.registry = fresh_registry
     manifest = PluginManifest.from_dict(
@@ -341,6 +343,7 @@ async def test_bytecode_cleanup_failure_keeps_running_plugin(
 
     def deny_cache_delete(path, *args, **kwargs):
         if path.suffix == ".pyc" and incoming in path.parents:
+            delete_attempts.append(path)
             raise PermissionError("bytecode cache locked")
         return unlink(path, *args, **kwargs)
 
@@ -351,11 +354,21 @@ async def test_bytecode_cleanup_failure_keeps_running_plugin(
                 "cached",
                 new_source=incoming,
             )
-        assert not report.ok
-        assert report.unchanged
-        assert any("bytecode cache locked" in error for error in report.errors)
-        assert loader.get_loaded_plugin("cached") is original
-        assert original.instance.value == "old"
+        assert report.ok
+        assert not report.unchanged
+        assert not delete_attempts
+        assert (cache.read_bytes(), cache.stat().st_mtime_ns) == cached_before
+        current = loader.get_loaded_plugin("cached")
+        assert current is not original
+        assert current.instance.value == "new"
+        with pytest.raises(
+            RuntimeError,
+            match="new registrations are forbidden",
+        ):
+            original.instance.api.register_slash_command(
+                "stale",
+                lambda *_: None,
+            )
         assert not marker_path("cached").exists()
     finally:
         await loader.unload_plugin("cached")

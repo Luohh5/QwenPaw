@@ -1,12 +1,14 @@
+# -*- coding: utf-8 -*-
 """PawApp adapter using authenticated identity and existing host services."""
 
 import asyncio
 import hashlib
 import json
 import re
+import weakref
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import asdict, fields, is_dataclass, replace
+from dataclasses import fields, is_dataclass, replace
 from collections.abc import Mapping
 
 from .apps import (
@@ -59,7 +61,7 @@ def wire_event(value):
     return plain(value)
 
 
-class CapabilityContext:
+class CapabilityContext:  # pylint: disable=protected-access
     """Internal bridge to PawApp's single standard route implementation."""
 
     def __init__(self, context):
@@ -67,18 +69,34 @@ class CapabilityContext:
         self.app_id = context.app_id
         self.storage = CapabilityStorage(context.storage)
 
-    async def chat(self, message, *, session_id=None, skill=None, request_id=None):
+    async def chat(
+        self,
+        message,
+        *,
+        session_id=None,
+        skill=None,
+        request_id=None,
+    ):
         return await self.public.chat(
-            ChatRequest(message, session_id, skill, request_id)
+            ChatRequest(message, session_id, skill, request_id),
         )
 
-    def chat_stream(self, message, *, session_id=None, skill=None, request_id=None):
+    def chat_stream(
+        self,
+        message,
+        *,
+        session_id=None,
+        skill=None,
+        request_id=None,
+    ):
         return self.public.chat_stream(
-            ChatRequest(message, session_id, skill, request_id)
+            ChatRequest(message, session_id, skill, request_id),
         )
 
     async def get_session_history(self, session_id):
-        return [wire_event(item) for item in await self.public.history(session_id)]
+        return [
+            wire_event(item) for item in await self.public.history(session_id)
+        ]
 
     async def list_chat_sessions(self):
         return [plain(item) for item in await self.public.sessions()]
@@ -108,40 +126,45 @@ class CapabilityContext:
         await self.public.notify(body, title=title)
 
 
-class CapabilityStorage:
+class CapabilityStorage:  # pylint: disable=protected-access
     def __init__(self, storage):
         self.storage = storage
 
     async def get(self, key):
-        return self.storage.read_json(key)
+        return await self.storage.aread_json(key)
 
     async def set(self, key, value):
-        self.storage.write_json(key, value)
+        await self.storage.awrite_json(key, value)
 
     async def delete(self, key):
-        self.storage.delete(key)
+        await self.storage.adelete(key)
 
     async def keys(self):
-        self.storage._guard()
-        return [
-            str(path.relative_to(self.storage._root))
-            for path in self.storage._root.rglob("*")
-            if path.is_file() and not path.is_symlink()
-        ]
+        return await self.storage._io(
+            lambda: [
+                str(path.relative_to(self.storage._root))
+                for path in self.storage._root.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            ],
+        )
 
 
 def _summary(value):
     if value is None:
-        raise SDKError("Session not found in this app, user, channel and workspace")
+        raise SDKError(
+            "Session not found in this app, user, channel and workspace",
+        )
     return SessionSummary(
         **{
             key: str(item) if key in {"created_at", "updated_at"} else item
             for key, item in value.items()
-        }
+        },
     )
 
 
-class Services:
+# Keep related adapter declarations and lifecycle ordering together.
+# pylint: disable-next=too-many-public-methods
+class Services:  # pylint: disable=protected-access
     def __init__(self, plugin, legacy, admitted):
         self.plugin, self.legacy, self.admitted = plugin, legacy, admitted
         self._scope = None
@@ -154,10 +177,12 @@ class Services:
         if (
             not delegation
             and self._scope is not None
-            and (self._scope.closed or self._scope._closing or self._cancelled())
+            and (
+                self._scope.closed or self._scope._closing or self._cancelled()
+            )
         ):
             raise StaleContextError(
-                "App call has ended; enter for_workspace() for a new call"
+                "App call has ended; enter for_workspace() for a new call",
             )
 
     async def workspaces(self):
@@ -175,7 +200,11 @@ class Services:
             for name, profile in load_config().agents.profiles.items():
                 config = load_agent_config(name)
                 result.append(
-                    WorkspaceSummary(name, config.name or name, profile.enabled)
+                    WorkspaceSummary(
+                        name,
+                        config.name or name,
+                        profile.enabled,
+                    ),
                 )
             return tuple(result)
 
@@ -185,14 +214,19 @@ class Services:
     async def for_workspace(self, workspace_id):
         self.guard(delegation=True)
         available = await self._configured_workspaces()
-        if not any(item.id == workspace_id and item.enabled for item in available):
+        if not any(
+            item.id == workspace_id and item.enabled for item in available
+        ):
             raise SDKAccessError("Workspace is not configured and enabled")
         services = Services(
-            self.plugin, replace(self.legacy, agent_id=workspace_id), self.admitted
+            self.plugin,
+            replace(self.legacy, agent_id=workspace_id),
+            self.admitted,
         )
         await services.workspace()
         async with self.plugin._invocation(
-            workspace_id=workspace_id, session_id=""
+            workspace_id=workspace_id,
+            session_id="",
         ) as base:
             yield services.context(base)
 
@@ -200,9 +234,16 @@ class Services:
         self._scope = base.resources
         self._cancelled = lambda: base.cancelled
         key = hashlib.sha256(
-            f"{self.legacy.app_id}:{self.legacy.user_id}:{self.legacy.channel}".encode()
+            (
+                f"{self.legacy.app_id}:{self.legacy.user_id}:"
+                f"{self.legacy.channel}"
+            ).encode(),
         ).hexdigest()
-        storage = PluginStorage(base.storage._root / "apps" / key, self.guard)
+        storage = PluginStorage(
+            base.storage._root / "apps" / key,
+            self.guard,
+            _admission=self.plugin._storage_admission,
+        )
         media_root = base.media._storage._root / "apps" / key
         return AppContext(
             **{
@@ -212,7 +253,11 @@ class Services:
             },
             storage=storage,
             media=MediaStore(
-                PluginStorage(media_root, self.guard),
+                PluginStorage(
+                    media_root,
+                    self.guard,
+                    _admission=self.plugin._storage_admission,
+                ),
                 "/api/files/preview/" + str(media_root),
             ),
             app_id=self.legacy.app_id,
@@ -224,7 +269,7 @@ class Services:
     def session_id(self, value):
         namespace = f"pawapp:{self.legacy.app_id}"
         identity = hashlib.sha256(
-            f"{self.legacy.user_id}:{self.legacy.channel}".encode()
+            f"{self.legacy.user_id}:{self.legacy.channel}".encode(),
         ).hexdigest()
         owned = f"{namespace}:scope:{identity}"
         if value is None or value == namespace:
@@ -251,13 +296,17 @@ class Services:
         await self.legacy.ensure_chat_session(self.session_id(None))
         workspace = await self.workspace()
         chats = await workspace.chat_manager.list_chats(
-            user_id=self.legacy.user_id, channel=self.legacy.channel, archived=False
+            user_id=self.legacy.user_id,
+            channel=self.legacy.channel,
+            archived=False,
         )
         namespace = self.session_id(None)
         return tuple(
             _summary(self.legacy._chat_session_payload(chat))
             for chat in sorted(
-                chats, key=lambda item: (item.pinned, item.updated_at), reverse=True
+                chats,
+                key=lambda item: (item.pinned, item.updated_at),
+                reverse=True,
             )
             if self.legacy._owns_chat_spec(chat)
             and (
@@ -272,13 +321,16 @@ class Services:
         self.guard()
         return _summary(
             await self.legacy.ensure_chat_session(
-                self.session_id(f"dialogue:{uuid4()}"), name=name
-            )
+                self.session_id(f"dialogue:{uuid4()}"),
+                name=name,
+            ),
         )
 
     async def rename_session(self, chat_id, name):
         self.guard()
-        return _summary(await self.legacy.rename_chat_session(chat_id, name=name))
+        return _summary(
+            await self.legacy.rename_chat_session(chat_id, name=name),
+        )
 
     async def archive_session(self, chat_id):
         self.guard()
@@ -286,7 +338,9 @@ class Services:
 
     async def pin_session(self, chat_id, pinned):
         self.guard()
-        return _summary(await self.legacy.pin_chat_session(chat_id, pinned=pinned))
+        return _summary(
+            await self.legacy.pin_chat_session(chat_id, pinned=pinned),
+        )
 
     async def delete_session(self, chat_id):
         self.guard()
@@ -296,14 +350,17 @@ class Services:
         self.guard()
         sid = self.session_id(session_id)
         return tuple(
-            _message(item) for item in await self.legacy.get_session_history(sid)
+            _message(item)
+            for item in await self.legacy.get_session_history(sid)
         )
 
     async def _owned_chat(self, run_id):
         workspace = await self.workspace()
         chat = await workspace.chat_manager.get_chat(run_id)
         if chat is None or not self.legacy._owns_chat_spec(chat):
-            raise SDKAccessError("Task/session does not belong to this app scope")
+            raise SDKAccessError(
+                "Task/session does not belong to this app scope",
+            )
         return workspace, chat
 
     async def _produce_chat(self, request):
@@ -320,7 +377,9 @@ class Services:
                 raise SDKError("Skill must be a registered skill name")
             text = f"/{request.skill} {text}"
         envelope = AgentRequest(
-            input=[{"role": "user", "content": [{"type": "text", "text": text}]}],
+            input=[
+                {"role": "user", "content": [{"type": "text", "text": text}]},
+            ],
             session_id=sid,
             user_id=self.legacy.user_id,
             channel=self.legacy.channel,
@@ -329,9 +388,12 @@ class Services:
             request_context={"app_id": self.legacy.app_id},
         )
         async with self.plugin._invocation(
-            workspace_id=self.legacy.agent_id, session_id=sid
+            workspace_id=self.legacy.agent_id,
+            session_id=sid,
         ):
-            workspace_token = current_workspace_dir.set(workspace.workspace_dir)
+            workspace_token = current_workspace_dir.set(
+                workspace.workspace_dir,
+            )
             session_token = current_session_id.set(sid)
             observation_token = _observing.set(True)
             stream = workspace.stream_query(envelope)
@@ -353,9 +415,12 @@ class Services:
         if not isinstance(request, ChatRequest):
             raise SDKError("chat_stream requires ChatRequest or text")
         return self.plugin._managed_stream(
-            lambda: self._produce_chat(request), f"app:{self.legacy.app_id}:chat"
+            lambda: self._produce_chat(request),
+            f"app:{self.legacy.app_id}:chat",
         )
 
+    # Keep related adapter declarations and lifecycle ordering together.
+    # pylint: disable-next=too-many-statements
     async def start_task(self, request):
         if isinstance(request, str):
             request = ChatRequest(request)
@@ -364,15 +429,13 @@ class Services:
         session = _summary(await self.legacy.ensure_chat_session(sid))
         run_id = session.id
         records = self.plugin._app_tasks
-        key = (
-            self.legacy.app_id,
-            self.legacy.agent_id,
-            self.legacy.user_id,
-            self.legacy.channel,
-            run_id,
-        )
+        key = self._task_key(run_id)
         status = TaskSnapshot(
-            run_id, sid, self.legacy.agent_id, self.legacy.app_id, "running"
+            run_id,
+            sid,
+            self.legacy.agent_id,
+            self.legacy.app_id,
+            "running",
         )
         # The accepted run is owned by TaskTracker and the plugin generation,
         # independently of the HTTP call that requested it.
@@ -383,6 +446,8 @@ class Services:
 
         owned = _RunStreams()
 
+        # Keep related adapter declarations and lifecycle ordering together.
+        # pylint: disable-next=too-many-branches,too-many-statements
         async def run(_payload):
             # Do not execute author/model code until status persistence and
             # custody registration have both completed.
@@ -395,7 +460,8 @@ class Services:
                     if event.status in {"failed", "cancelled"}:
                         outcome = event.status
                     if event.output or (
-                        event.object == "message" and event.status == "completed"
+                        event.object == "message"
+                        and event.status == "completed"
                     ):
                         text = ChatReply((event,)).text
                         value = text if event.output else summary + text
@@ -418,7 +484,9 @@ class Services:
                 # Runtime wrappers may finish before an uncooperative provider
                 # acknowledges cancellation. Keep the native run and its owner
                 # alive until every descendant producer has actually finished.
-                while pending := {task for task in owned.tasks if not task.done()}:
+                while pending := {
+                    task for task in owned.tasks if not task.done()
+                }:
                     for task in pending:
                         task.cancel()
                     try:
@@ -426,7 +494,8 @@ class Services:
                     except asyncio.CancelledError:
                         outcome = "cancelled"
                 # A finished producer may have left a failed thread/connection
-                # close behind. Reuse those exact scopes, never other runs' work.
+                # close behind. Reuse those exact scopes, never other runs'
+                # work.
                 while owned.streams or owned.scopes:
                     for close_scope in owned.closers():
                         try:
@@ -437,9 +506,10 @@ class Services:
                             error = f"Run cleanup has not finished: {exc}"
                             records[key] = replace(status, error=error)
                     if owned.streams or owned.scopes:
-                        # Retain the run and its activity until an explicit stop
-                        # retries cleanup; do not spin on a permanently bad close.
-                        if await self.plugin._instance.activity.retry_cleanup():
+                        # Retain this run until an explicit stop retries
+                        # cleanup; do not spin on a permanently bad close.
+                        retry = self.plugin._instance.activity.retry_cleanup
+                        if await retry():
                             outcome = "cancelled"
                 terminal = replace(
                     status,
@@ -448,32 +518,23 @@ class Services:
                     result=summary,
                     result_truncated=truncated,
                 )
-                try:
-                    self.plugin.storage.write_json(
-                        self._task_file(run_id), plain(terminal)
-                    )
-                except Exception as exc:
-                    terminal = replace(
-                        terminal,
-                        status="failed",
-                        error=f"Task status could not be saved: {exc}",
-                    )
-                    records[key] = terminal
-                    # Retain the failure in memory if storage stays unavailable;
-                    # a successful retry persists the diagnostic across reload.
-                    try:
-                        self.plugin.storage.write_json(
-                            self._task_file(run_id), plain(terminal)
-                        )
-                    except Exception as retry_error:
-                        self.plugin._instance.add_diagnostic(str(retry_error))
-                    else:
-                        records.pop(key, None)
-                else:
-                    records.pop(key, None)
+                from ..utils.io_utils import run_async_to_completion
+
+                # Finish persistence and memory bookkeeping even if stop or
+                # reload cancels this producer again while its disk I/O waits.
+                saving = asyncio.create_task(
+                    self._finish_task(run_id, terminal),
+                )
+                self.plugin._instance.activity.retain_cleanup(saving)
+                terminal = await run_async_to_completion(saving)
             # This SDK API subscribes to snapshots; history owns complete chat
-            # output. Do not fill the native tracker's replay buffer with tokens.
-            return "data: " + json.dumps(plain(terminal), ensure_ascii=False) + "\n\n"
+            # output. Do not fill the native tracker's replay buffer with
+            # tokens.
+            return (
+                "data: "
+                + json.dumps(plain(terminal), ensure_ascii=False)
+                + "\n\n"
+            )
 
         async def produce(payload):
             with self.plugin._admission():
@@ -496,7 +557,7 @@ class Services:
             if created:
                 if task is None:
                     tasks = await workspace.task_tracker.snapshot_active_tasks(
-                        owner=self.plugin._instance
+                        owner=self.plugin._instance,
                     )
                     task = tasks.get(run_id)
                 if task is not None:
@@ -510,24 +571,35 @@ class Services:
                 self.plugin.resources._handles.remove(handle)
 
         try:
-            if await workspace.task_tracker.get_status(run_id) != "running":
-                self.plugin.storage.write_json(self._task_file(run_id), plain(status))
-            queue, created = await workspace.task_tracker.attach_or_start(
-                run_id, None, produce, owner=self.plugin._instance
-            )
-            if created:
-                records[key] = status
-                tasks = await workspace.task_tracker.snapshot_active_tasks(
-                    owner=self.plugin._instance
+            async with self._task_lock(run_id):
+                if (
+                    await workspace.task_tracker.get_status(run_id)
+                    != "running"
+                ):
+                    await self.plugin.storage.awrite_json(
+                        self._task_file(run_id),
+                        plain(status),
+                    )
+                queue, created = await workspace.task_tracker.attach_or_start(
+                    run_id,
+                    None,
+                    produce,
+                    owner=self.plugin._instance,
                 )
-                task = tasks.get(run_id)
-                if task is not None:
-                    task.add_done_callback(finished)
+                if created:
+                    records[key] = status
+                    tasks = await workspace.task_tracker.snapshot_active_tasks(
+                        owner=self.plugin._instance,
+                    )
+                    task = tasks.get(run_id)
+                    if task is not None:
+                        task.add_done_callback(finished)
+                    else:
+                        finished()
                 else:
                     finished()
-            else:
-                finished()
-            await workspace.task_tracker.detach_subscriber(run_id, queue)
+                await workspace.task_tracker.detach_subscriber(run_id, queue)
+                ready.set()
         except BaseException:
             # Failed stops retain the registered handle and block replacement.
             await handle.close()
@@ -535,59 +607,97 @@ class Services:
             if created:
                 records.pop(key, None)
             raise
-        ready.set()
         return records.get(key, status)
 
-    def _task_file(self, run_id):
-        owner = (
+    def _task_lock(self, run_id):
+        # Each HTTP request has its own Services; locks belong to the plugin
+        # generation and survive while any start/read/finalizer uses the run.
+        name = self._task_file(run_id)
+        return self.plugin._app_task_locks.setdefault(name, asyncio.Lock())
+
+    async def _finish_task(self, run_id, terminal):
+        key = self._task_key(run_id)
+        records = self.plugin._app_tasks
+        async with self._task_lock(run_id):
+            try:
+                await self.plugin.storage.awrite_json(
+                    self._task_file(run_id),
+                    plain(terminal),
+                )
+            except Exception as exc:
+                terminal = replace(
+                    terminal,
+                    status="failed",
+                    error=f"Task status could not be saved: {exc}",
+                )
+                records[key] = terminal
+                # Preserve the failure in memory if the diagnostic also
+                # cannot be persisted, so callers can still inspect it.
+                try:
+                    await self.plugin.storage.awrite_json(
+                        self._task_file(run_id),
+                        plain(terminal),
+                    )
+                except Exception as retry_error:
+                    self.plugin._instance.add_diagnostic(str(retry_error))
+                else:
+                    records.pop(key, None)
+            else:
+                records.pop(key, None)
+        return terminal
+
+    def _task_key(self, run_id):
+        return (
             self.legacy.app_id,
             self.legacy.agent_id,
             self.legacy.user_id,
             self.legacy.channel,
             run_id,
         )
-        return (
-            "sdk-task-status/"
-            + hashlib.sha256(json.dumps(owner).encode()).hexdigest()
-            + ".json"
-        )
+
+    def _task_file(self, run_id):
+        owner = json.dumps(self._task_key(run_id)).encode()
+        return "sdk-task-status/" + hashlib.sha256(owner).hexdigest() + ".json"
 
     async def task(self, run_id):
         workspace, chat = await self._owned_chat(run_id)
-        key = (
-            self.legacy.app_id,
-            self.legacy.agent_id,
-            self.legacy.user_id,
-            self.legacy.channel,
-            run_id,
-        )
-        running = await workspace.task_tracker.get_status(run_id) == "running"
-        saved = self.plugin._app_tasks.get(key)
-        if saved is None:
-            value = self.plugin.storage.read_json(self._task_file(run_id))
-            saved = TaskSnapshot(**value) if value else None
-        if saved is not None:
-            if saved.status == "running" and not running:
-                saved = replace(
-                    saved,
-                    status="interrupted",
-                    error="Run ended without a recorded terminal state",
+        async with self._task_lock(run_id):
+            key = self._task_key(run_id)
+            running = (
+                await workspace.task_tracker.get_status(run_id) == "running"
+            )
+            saved = self.plugin._app_tasks.get(key)
+            if saved is None:
+                value = await self.plugin.storage.aread_json(
+                    self._task_file(run_id),
                 )
-                self.plugin.storage.write_json(self._task_file(run_id), plain(saved))
-                self.plugin._app_tasks.pop(key, None)
-            return saved
-        return TaskSnapshot(
-            run_id,
-            chat.session_id,
-            self.legacy.agent_id,
-            self.legacy.app_id,
-            ("running" if running else "idle"),
-        )
+                saved = TaskSnapshot(**value) if value else None
+            if saved is not None:
+                if saved.status == "running" and not running:
+                    saved = replace(
+                        saved,
+                        status="interrupted",
+                        error="Run ended without a recorded terminal state",
+                    )
+                    await self.plugin.storage.awrite_json(
+                        self._task_file(run_id),
+                        plain(saved),
+                    )
+                    self.plugin._app_tasks.pop(key, None)
+                return saved
+            return TaskSnapshot(
+                run_id,
+                chat.session_id,
+                self.legacy.agent_id,
+                self.legacy.app_id,
+                ("running" if running else "idle"),
+            )
 
     def task_stream(self, run_id):
         async def snapshots():
             async with self.plugin._invocation(
-                workspace_id=self.legacy.agent_id, session_id=self.session_id(None)
+                workspace_id=self.legacy.agent_id,
+                session_id=self.session_id(None),
             ):
                 previous = None
                 while True:
@@ -607,14 +717,21 @@ class Services:
         async def stop():
             from ..tool_calls import CancelReason
 
-            coordinator = getattr(self.legacy._app_services, "tool_coordinator", None)
+            coordinator = getattr(
+                self.legacy._app_services,
+                "tool_coordinator",
+                None,
+            )
             if coordinator is not None:
                 await coordinator.cancel_running_for_session(
                     chat.session_id,
                     agent_id=self.legacy.agent_id,
                     reason=CancelReason.USER,
                 )
-            return await workspace.task_tracker.request_stop(run_id, reason="user")
+            return await workspace.task_tracker.request_stop(
+                run_id,
+                reason="user",
+            )
 
         task = self.plugin.resources.task(stop(), f"cancel app task:{run_id}")
         done, _ = await asyncio.wait({task}, timeout=timeout)
@@ -642,13 +759,18 @@ class Services:
         sid = self.session_id(session_id)
         pending = await get_approval_service().list_pending_by_session(sid)
         return tuple(
-            approval_snapshot(item) for item in pending if self._owns_approval(item)
+            approval_snapshot(item)
+            for item in pending
+            if self._owns_approval(item)
         )
 
     async def resolve_approval(self, request_id, approved, scope):
         from ..app.approvals import get_approval_service
         from ..app.approvals.service import ApprovalActor
-        from ..security.tool_guard.approval import ApprovalDecision, ApprovalScope
+        from ..security.tool_guard.approval import (
+            ApprovalDecision,
+            ApprovalScope,
+        )
 
         self.guard()
         if not isinstance(approved, bool):
@@ -676,7 +798,10 @@ class Services:
 
     async def request_approval(self, name, session_id, summary, timeout):
         from ..app.approvals import get_approval_service
-        from ..app.approvals.service import ApprovalIdentityPolicy, ApprovalActor
+        from ..app.approvals.service import (
+            ApprovalIdentityPolicy,
+            ApprovalActor,
+        )
         from ..app.approvals.models import ApprovalRequestSummary
         from ..security.tool_guard.approval import ApprovalDecision
 
@@ -690,7 +815,11 @@ class Services:
             agent_id=self.legacy.agent_id,
             user_id=self.legacy.user_id,
             channel=self.legacy.channel,
-            summary=ApprovalRequestSummary("sdk_app", name, result_summary=summary),
+            summary=ApprovalRequestSummary(
+                "sdk_app",
+                name,
+                result_summary=summary,
+            ),
             extra={"app_id": self.legacy.app_id},
             timeout_seconds=timeout,
             identity_policy=ApprovalIdentityPolicy.EXACT_REQUESTER,
@@ -717,11 +846,17 @@ class Services:
         self.guard()
         await self.legacy.toast(message, kind=level)
         await self.legacy.notify(
-            channels=[self.legacy.channel], title=title, body=message
+            channels=[self.legacy.channel],
+            title=title,
+            body=message,
         )
 
 
+# Keep related adapter declarations and lifecycle ordering together.
+# pylint: disable-next=too-many-statements
 def register(plugin, app):
+    # This host adapter bridges SDK contracts to private runtime services.
+    # pylint: disable=protected-access
     from fastapi import APIRouter, Request, WebSocket as NativeWebSocket
     from fastapi.routing import APIRoute
     from starlette.responses import (
@@ -733,13 +868,15 @@ def register(plugin, app):
 
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", app.app_id):
         raise SDKError(
-            "App ID must contain only letters, digits, underscores and hyphens"
+            "App ID must contain only letters, digits, "
+            "underscores and hyphens",
         )
     plugin._guard()
     if getattr(plugin, "_app_registered", False):
         raise SDKError("One PawApp may be registered per plugin")
     plugin._app_registered = True
     plugin._app_tasks = {}
+    plugin._app_task_locks = weakref.WeakValueDictionary()
     admitted = True
     current = ContextVar(f"sdk_app:{plugin.plugin_id}:{app.app_id}")
 
@@ -755,7 +892,8 @@ def register(plugin, app):
         )
         legacy = await get_scoped_ctx(identity_request)
         async with plugin._invocation(
-            workspace_id=legacy.agent_id, session_id=""
+            workspace_id=legacy.agent_id,
+            session_id="",
         ) as base:
             services = Services(plugin, legacy, lambda: admitted)
             public = services.context(base)
@@ -852,7 +990,7 @@ def register(plugin, app):
                 from starlette.websockets import WebSocketState
 
                 identity = Request(
-                    {**connection.scope, "type": "http", "method": "GET"}
+                    {**connection.scope, "type": "http", "method": "GET"},
                 )
                 if not AuthMiddleware._should_skip_auth(identity):
                     token = AuthMiddleware._extract_token(identity)
@@ -864,7 +1002,11 @@ def register(plugin, app):
                 async with scope(connection) as public:
                     await connection.accept()
                     try:
-                        await plugin._call(callback, public, WebSocket(connection))
+                        await plugin._call(
+                            callback,
+                            public,
+                            WebSocket(connection),
+                        )
                     finally:
                         if (
                             connection.application_state
@@ -888,7 +1030,7 @@ def register(plugin, app):
                 route_class=Route,
                 encode=wire_event,
                 managed_stream=True,
-            )
+            ),
         )
 
         async def start_task(ctx, request):
@@ -899,7 +1041,7 @@ def register(plugin, app):
                     payload.get("session_id"),
                     payload.get("skill"),
                     payload.get("request_id"),
-                )
+                ),
             )
 
         async def task(ctx, request):
@@ -914,7 +1056,8 @@ def register(plugin, app):
                 try:
                     async for item in stream:
                         yield "data: " + json.dumps(
-                            plain(item), ensure_ascii=False
+                            plain(item),
+                            ensure_ascii=False,
                         ) + "\n\n"
                 finally:
                     await stream.aclose()
@@ -926,7 +1069,9 @@ def register(plugin, app):
 
         async def approvals(ctx, request):
             return {
-                "approvals": await ctx.approvals(request.query.get("session_id", ""))
+                "approvals": await ctx.approvals(
+                    request.query.get("session_id", ""),
+                ),
             }
 
         async def resolve(ctx, request):
@@ -940,7 +1085,7 @@ def register(plugin, app):
                     request.path_params["request_id"],
                     approved=payload["approved"],
                     scope=payload.get("scope", "exact"),
-                )
+                ),
             }
 
         for path, methods, handler in (

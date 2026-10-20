@@ -154,6 +154,21 @@ def clear_plugin_bytecode(source_path: Path) -> None:
     importlib.invalidate_caches()
 
 
+class _PluginSourceLoader(importlib.machinery.SourceFileLoader):
+    """Execute current plugin source without reading or writing bytecode."""
+
+    def get_code(self, fullname: str) -> Any:
+        path = self.get_filename(fullname)
+        return self.source_to_code(self.get_data(path), path)
+
+
+def source_only_loader(loader: Any) -> Any:
+    """Bypass source caches only at explicit plugin import boundaries."""
+    if isinstance(loader, importlib.machinery.SourceFileLoader):
+        return _PluginSourceLoader(loader.name, loader.path)
+    return loader
+
+
 class _NamespaceLoader:
     """Wrap a real loader so the module executes with plugin builtins.
 
@@ -170,7 +185,7 @@ class _NamespaceLoader:
         wrapped: importlib.abc.Loader,
         plugin_builtins: Dict[str, Any],
     ) -> None:
-        self._wrapped = wrapped
+        self._wrapped = source_only_loader(wrapped)
         self._builtins = plugin_builtins
 
     def exec_module(self, module: Any) -> None:
@@ -202,6 +217,7 @@ class PluginNamespaceFinder(importlib.abc.MetaPathFinder):
         module_name: str,
         plugin_builtins: Dict[str, Any],
     ) -> None:
+        importlib.invalidate_caches()
         self._namespaces[module_name] = plugin_builtins
 
     def unregister(self, module_name: str) -> None:
@@ -563,7 +579,7 @@ def probe_plugin_source(
     *,
     compiled: bool = False,
 ) -> None:
-    """Import a probe; ``compiled`` means source/cache preparation is done."""
+    """Import a probe; ``compiled`` means source validation is done."""
     probe_name = plugin_module_name(plugin_id, probe=True)
     plugin_dir = str(source_path)
     entry_dir = str(entry_file.parent)
@@ -571,7 +587,6 @@ def probe_plugin_source(
     if _norm(entry_dir) != _norm(plugin_dir):
         search_paths.append(plugin_dir)
     if not compiled:
-        clear_plugin_bytecode(source_path)
         compile_plugin_import_closure(entry_file, search_paths)
     plugin_builtins = build_plugin_builtins(
         probe_name,
@@ -588,6 +603,7 @@ def probe_plugin_source(
     if spec is None or spec.loader is None:
         unregister_namespace(probe_name)
         raise ImportError(f"Failed to load probe spec for {entry_file}")
+    spec.loader = source_only_loader(spec.loader)
     module = importlib.util.module_from_spec(spec)
     module.__dict__["__builtins__"] = plugin_builtins
     try:

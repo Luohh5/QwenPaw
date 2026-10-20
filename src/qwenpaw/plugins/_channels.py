@@ -1,4 +1,5 @@
-"""SDK transport adapter; platform implementations never receive host objects."""
+# -*- coding: utf-8 -*-
+"""SDK transport adapter that keeps host objects private."""
 
 import asyncio
 import inspect
@@ -36,11 +37,19 @@ def _metadata(values):
     from ._events import freeze
 
     return freeze(
-        {key: value for key, value in (values or {}).items() if not key.startswith("_")}
+        {
+            key: value
+            for key, value in (values or {}).items()
+            if not key.startswith("_")
+        },
     )
 
 
+# Keep related adapter declarations and lifecycle ordering together.
+# pylint: disable-next=too-many-statements
 def register(plugin, spec):
+    # This host adapter bridges SDK contracts to private runtime services.
+    # pylint: disable=protected-access
     from ..app.channels.base import BaseChannel
     from ..app.channels.registry import _BUILTIN_SPECS
     from ..schemas import (
@@ -59,13 +68,22 @@ def register(plugin, spec):
     class Adapter(BaseChannel):
         channel = spec.name
 
+        # Keep related adapter declarations and lifecycle ordering together.
+        # pylint: disable-next=too-many-statements
         def __init__(
-            self, process, config, on_reply_sent, display_config, no_text_debounce
+            self,
+            process,
+            config,
+            on_reply_sent,
+            display_config,
+            no_text_debounce,
         ):
             values = (
                 config.model_dump()
                 if hasattr(config, "model_dump")
-                else dict(config) if isinstance(config, Mapping) else dict(vars(config))
+                else dict(config)
+                if isinstance(config, Mapping)
+                else dict(vars(config))
             )
             super().__init__(
                 process,
@@ -97,9 +115,14 @@ def register(plugin, spec):
             self._run_states = {}
             self._pending_message_ids = {}
             original_process = getattr(
-                self._process, "_sdk_original_process", self._process
+                self._process,
+                "_sdk_original_process",
+                self._process,
             )
 
+            # Keep related adapter declarations and lifecycle ordering
+            # together.
+            # pylint: disable-next=too-many-branches,too-many-statements
             async def produce(request):
                 from ._events import _observing
                 from ..agents.context.overflow_recovery import _stream_observer
@@ -150,8 +173,10 @@ def register(plugin, spec):
                             _stream_tasks.reset(owner_token)
                             _observing.reset(token)
                             # Host model wrappers can finish before their SDK
-                            # producer does. This channel run retains custody of
-                            # only its descendants, including failed scope close.
+                            # producer does. This channel run retains custody
+                            # of
+                            # only its descendants, including failed scope
+                            # close.
                             while pending := {
                                 task for task in owned.tasks if not task.done()
                             }:
@@ -169,19 +194,24 @@ def register(plugin, spec):
                                         status = "cancelled"
                                     except Exception as exc:
                                         logger.warning(
-                                            "Channel %s run cleanup requires retry: %s",
+                                            "Channel %s run cleanup "
+                                            "requires retry: %s",
                                             spec.name,
                                             exc,
                                         )
                                 if owned.streams or owned.scopes:
-                                    if await plugin._instance.activity.retry_cleanup():
+                                    retry = (
+                                        plugin._instance.activity.retry_cleanup
+                                    )
+                                    if await retry():
                                         status = "cancelled"
                             self._set_run_status(request, status)
                             await self._finish_streams(request, status)
 
             def owned_process(request):
                 return plugin._managed_stream(
-                    lambda: produce(request), f"channel:{spec.name}:run"
+                    lambda: produce(request),
+                    f"channel:{spec.name}:run",
                 )
 
             owned_process._sdk_original_process = original_process
@@ -196,7 +226,13 @@ def register(plugin, spec):
             display_config=None,
             no_text_debounce=True,
         ):
-            return cls(process, config, on_reply_sent, display_config, no_text_debounce)
+            return cls(
+                process,
+                config,
+                on_reply_sent,
+                display_config,
+                no_text_debounce,
+            )
 
         @classmethod
         def from_env(cls, process, on_reply_sent=None):
@@ -210,12 +246,23 @@ def register(plugin, spec):
                 raise StaleContextError("Channel instance has stopped")
 
         @asynccontextmanager
-        async def _owned_call(self, *, allow_stopping=False, propagate_cancel=False):
+        async def _owned_call(
+            self,
+            *,
+            allow_stopping=False,
+            propagate_cancel=False,
+        ):
             task = asyncio.current_task()
-            if self._stopping and task not in self._calls and not allow_stopping:
+            if (
+                self._stopping
+                and task not in self._calls
+                and not allow_stopping
+            ):
                 raise StaleContextError("Channel instance is stopping")
             if task not in self._calls:
-                self._call_done[task] = asyncio.get_running_loop().create_future()
+                self._call_done[
+                    task
+                ] = asyncio.get_running_loop().create_future()
             self._calls[task] = self._calls.get(task, 0) + 1
             try:
                 yield
@@ -238,20 +285,34 @@ def register(plugin, spec):
             self._guard()
             if not self._receiving or self._enqueue is None:
                 raise StaleContextError("Channel is not accepting messages")
-            if not isinstance(message, ChannelMessage) or not message.sender_id:
-                raise SDKError("Channel receive requires a sender and ChannelMessage")
-            # Convert/validate before enqueue; malformed input cannot affect queue state.
+            if (
+                not isinstance(message, ChannelMessage)
+                or not message.sender_id
+            ):
+                raise SDKError(
+                    "Channel receive requires a sender and ChannelMessage",
+                )
+            # Convert/validate before enqueue; malformed input cannot affect
+            # queue state.
             request = self.build_agent_request_from_native(message)
             if self._sdk_values.get(
-                "group_disabled" if message.is_group else "dm_disabled", False
+                "group_disabled" if message.is_group else "dm_disabled",
+                False,
             ):
                 return
-            if not self._check_group_mention(message.is_group, request.channel_meta):
+            if not self._check_group_mention(
+                message.is_group,
+                request.channel_meta,
+            ):
                 return
             self._enqueue(
-                _Incoming((request,)) if message.session_scope != "default" else request
+                _Incoming((request,))
+                if message.session_scope != "default"
+                else request,
             )
 
+        # Keep the existing adapter callback signature.
+        # pylint: disable-next=arguments-renamed
         def build_agent_request_from_native(self, message):
             if not isinstance(message, ChannelMessage):
                 raise SDKError("Channel input must be ChannelMessage")
@@ -272,25 +333,33 @@ def register(plugin, spec):
                     elif block.type == "audio":
                         parts.append(
                             AudioContent(
-                                data=attachment.url, format=attachment.mime_type
-                            )
+                                data=attachment.url,
+                                format=attachment.mime_type,
+                            ),
                         )
                     elif block.type == "file":
                         parts.append(
                             FileContent(
-                                file_url=attachment.url, filename=attachment.name
-                            )
+                                file_url=attachment.url,
+                                filename=attachment.name,
+                            ),
                         )
                     else:
-                        raise SDKError("Unsupported incoming channel attachment")
+                        raise SDKError(
+                            "Unsupported incoming channel attachment",
+                        )
                 else:
                     raise SDKError(
-                        "Incoming channel content requires text or attachment"
+                        "Incoming channel content requires text or attachment",
                     )
-            sid = message.session_id or self.resolve_session_id(message.sender_id)
+            sid = message.session_id or self.resolve_session_id(
+                message.sender_id,
+            )
             request = self.build_agent_request_from_user_content(
                 self.channel,
-                "group" if message.session_scope == "group" else message.sender_id,
+                "group"
+                if message.session_scope == "group"
+                else message.sender_id,
                 sid,
                 parts,
             )
@@ -301,7 +370,9 @@ def register(plugin, spec):
                 "bot_mentioned": message.mentioned,
                 "sdk_reply_to": message.reply_to,
                 "_sdk_channel_instance": self._sdk_id,
-                "_sdk_message_ids": (message.message_id,) if message.message_id else (),
+                "_sdk_message_ids": (message.message_id,)
+                if message.message_id
+                else (),
                 "_sdk_session_scope": message.session_scope,
                 "_sdk_sender_id": message.sender_id,
             }
@@ -312,7 +383,7 @@ def register(plugin, spec):
                 request = payload.requests[0]
                 return str((request.session_id, request.user_id))
             if (getattr(payload, "channel_meta", {}) or {}).get(
-                "_sdk_session_scope"
+                "_sdk_session_scope",
             ) in {"sender", "group"}:
                 return str((payload.session_id, payload.user_id))
             return super().get_debounce_key(payload)
@@ -342,7 +413,7 @@ def register(plugin, spec):
 
         def get_to_handle_from_request(self, request):
             return (getattr(request, "channel_meta", {}) or {}).get(
-                "sdk_reply_to"
+                "sdk_reply_to",
             ) or request.user_id
 
         async def start(self):
@@ -356,10 +427,12 @@ def register(plugin, spec):
             workspace_id = self._workspace.agent_id
             self._sdk_loop = asyncio.get_running_loop()
             async with plugin._invocation(
-                workspace_id=workspace_id, session_id=""
+                workspace_id=workspace_id,
+                session_id="",
             ) as base:
                 self._sdk_scope = plugin.resources.child(
-                    workspace_id=workspace_id, instance_id=self._sdk_id
+                    workspace_id=workspace_id,
+                    instance_id=self._sdk_id,
                 )
                 declared = {item["name"]: item for item in spec.config_fields}
                 values = {
@@ -372,7 +445,9 @@ def register(plugin, spec):
                     if field.get("type") == "password"
                 ]
                 storage = PluginStorage(
-                    base.storage._root / "channels" / spec.name, plugin._storage_guard
+                    base.storage._root / "channels" / spec.name,
+                    plugin._storage_guard,
+                    _admission=plugin._storage_admission,
                 )
                 media_root = base.media._storage._root / "channels" / spec.name
                 self._sdk_context = replace(
@@ -388,7 +463,11 @@ def register(plugin, spec):
                     config=PluginConfig(values, {"secrets": secrets}),
                     storage=storage,
                     media=MediaStore(
-                        PluginStorage(media_root, plugin._storage_guard),
+                        PluginStorage(
+                            media_root,
+                            plugin._storage_guard,
+                            _admission=plugin._storage_admission,
+                        ),
                         "/api/files/preview/" + str(media_root),
                     ),
                 )
@@ -401,12 +480,14 @@ def register(plugin, spec):
                     if not callable(getattr(self._backend, method, None)):
                         raise SDKError(f"Channel backend requires {method}()")
                 if spec.streaming and not callable(
-                    getattr(self._backend, "on_stream", None)
+                    getattr(self._backend, "on_stream", None),
                 ):
                     raise SDKError("A streaming channel requires on_stream()")
                 self._receiving = True
                 await plugin._call(self._backend.start, self._sdk_context)
 
+        # Keep related adapter declarations and lifecycle ordering together.
+        # pylint: disable-next=too-many-branches
         async def stop(self):
             if self._closed:
                 return
@@ -415,9 +496,12 @@ def register(plugin, spec):
             from .custody import stop_task, TASK_STOP_SECONDS
 
             if asyncio.current_task() in self._calls:
-                raise SDKError("A channel callback cannot stop its own active call")
+                raise SDKError(
+                    "A channel callback cannot stop its own active call",
+                )
             # A transport must stay usable for cancellation/final stream events
-            # until its actual consumers and TaskTracker producers have stopped.
+            # until its actual consumers and TaskTracker producers have
+            # stopped.
             while self._calls or self._terminal_notifications:
                 for task in sorted(
                     self._calls.keys() | self._terminal_notifications,
@@ -428,11 +512,14 @@ def register(plugin, spec):
                         # state. Drain it without cancelling and triggering a
                         # second terminal from the backend's recovery path.
                         _, pending = await asyncio.wait(
-                            {task}, timeout=TASK_STOP_SECONDS
+                            {task},
+                            timeout=TASK_STOP_SECONDS,
                         )
                         if pending:
                             raise SDKError(
-                                f"Channel {spec.name!r} terminal notification has not stopped; retry is required"
+                                f"Channel {spec.name!r} terminal "
+                                "notification has not stopped; "
+                                "retry is required",
                             )
                         continue
                     completion = self._call_done.get(task)
@@ -448,30 +535,40 @@ def register(plugin, spec):
                                 self._call_cancels.get(task, 0) + 1
                             )
                         _, pending = await asyncio.wait(
-                            {completion}, timeout=TASK_STOP_SECONDS
+                            {completion},
+                            timeout=TASK_STOP_SECONDS,
                         )
                         if pending:
                             raise SDKError(
-                                f"Channel {spec.name!r} call has not stopped; retry is required"
+                                f"Channel {spec.name!r} call has not "
+                                "stopped; retry is required",
                             )
             if self._backend is not None:
-                result = await plugin._call(self._backend.stop, self._sdk_context)
+                result = await plugin._call(
+                    self._backend.stop,
+                    self._sdk_context,
+                )
                 if result is not True:
-                    raise SDKError("Channel backend has not stopped; retry is required")
+                    raise SDKError(
+                        "Channel backend has not stopped; retry is required",
+                    )
             if self._sdk_scope is not None:
                 await self._sdk_scope.close()
                 plugin.resources._handles[:] = [
                     handle
                     for handle in plugin.resources._handles
-                    if getattr(handle._release, "__self__", None) is not self._sdk_scope
+                    if getattr(handle._release, "__self__", None)
+                    is not self._sdk_scope
                 ]
             self._closed = True
 
         def _owns_request(self, payload):
             if isinstance(payload, _Incoming):
-                return all(self._owns_request(item) for item in payload.requests)
+                return all(
+                    self._owns_request(item) for item in payload.requests
+                )
             return (getattr(payload, "channel_meta", {}) or {}).get(
-                "_sdk_channel_instance"
+                "_sdk_channel_instance",
             ) == self._sdk_id
 
         def merge_requests(self, requests):
@@ -482,10 +579,10 @@ def register(plugin, spec):
                         for incoming in requests
                         for item in incoming.requests
                         if self._owns_request(item)
-                    )
+                    ),
                 )
             return super().merge_requests(
-                [item for item in requests if self._owns_request(item)]
+                [item for item in requests if self._owns_request(item)],
             )
 
         async def consume_one(self, payload):
@@ -506,7 +603,8 @@ def register(plugin, spec):
             async with (
                 self._owned_call(propagate_cancel=True),
                 plugin._invocation(
-                    workspace_id=self._workspace.agent_id, session_id=session_id
+                    workspace_id=self._workspace.agent_id,
+                    session_id=session_id,
                 ),
             ):
                 if isinstance(payload, _Incoming):
@@ -514,13 +612,13 @@ def register(plugin, spec):
                     for request in payload.requests:
                         if await self._access_control_gate(request):
                             continue
-                        else:
-                            allowed.append(request)
+                        allowed.append(request)
                     if not allowed:
                         return
                     payload = super().merge_requests(allowed)
                     # Identity comes from the first accepted sender. Delivery
-                    # addresses may expire, so use the newest accepted metadata.
+                    # addresses may expire, so use the newest accepted
+                    # metadata.
                     payload.channel_meta = {
                         **allowed[0].channel_meta,
                         **{
@@ -536,7 +634,10 @@ def register(plugin, spec):
                         "_sdk_message_ids": tuple(
                             mid
                             for item in allowed
-                            for mid in item.channel_meta.get("_sdk_message_ids", ())
+                            for mid in item.channel_meta.get(
+                                "_sdk_message_ids",
+                                (),
+                            )
                         ),
                     }
                 await super()._consume_one_request(payload)
@@ -605,15 +706,22 @@ def register(plugin, spec):
                 ):
                     async with state["lock"]:
                         if cleanup:
-                            # Complete this run's stream final before a platform
+                            # Complete this run's stream final before a
+                            # platform
                             # backend performs its run-level fallback final.
                             pending = [
                                 asyncio.shield(task)
-                                for (request_id, _), task in self._stream_ends.items()
+                                for (
+                                    request_id,
+                                    _,
+                                ), task in self._stream_ends.items()
                                 if request_id == id(request)
                             ]
                             if pending:
-                                await asyncio.gather(*pending, return_exceptions=True)
+                                await asyncio.gather(
+                                    *pending,
+                                    return_exceptions=True,
+                                )
                         await plugin._call(
                             callback,
                             replace(
@@ -634,23 +742,33 @@ def register(plugin, spec):
                     self._retain_terminal(task)
                 else:
                     self._terminal_notifications.add(task)
-                    task.add_done_callback(self._terminal_notifications.discard)
+                    task.add_done_callback(
+                        self._terminal_notifications.discard,
+                    )
                 state["end_task"] = task
 
             def finished(completed):
                 if phase == "end" and completed.cancelled():
                     logger.warning(
-                        "Channel %s terminal notification cancelled", spec.name
+                        "Channel %s terminal notification cancelled",
+                        spec.name,
                     )
-                if not completed.cancelled() and completed.exception() is not None:
+                if (
+                    not completed.cancelled()
+                    and completed.exception() is not None
+                ):
                     logger.warning(
                         "Channel %s run notification failed: %s",
                         spec.name,
                         completed.exception(),
                     )
-                if phase == "end" and self._run_states.get(id(request)) is state:
+                if (
+                    phase == "end"
+                    and self._run_states.get(id(request)) is state
+                ):
                     # Keep the original run until delivery actually finishes or
-                    # its failure is recorded. A second finally cannot resend it.
+                    # its failure is recorded. A second finally cannot resend
+                    # it.
                     self._run_states.pop(id(request))
 
             task.add_done_callback(finished)
@@ -662,7 +780,10 @@ def register(plugin, spec):
                     # card permanently running after the model has finished.
                     if phase == "start":
                         task.cancel()
-                    logger.warning("Channel %s run notification timed out", spec.name)
+                    logger.warning(
+                        "Channel %s run notification timed out",
+                        spec.name,
+                    )
             except asyncio.CancelledError:
                 if phase == "start":
                     task.cancel()
@@ -739,17 +860,25 @@ def register(plugin, spec):
                 )
 
         async def send(self, to_handle, text, meta=None):
-            await self.send_content_parts(to_handle, [TextContent(text=text)], meta)
+            await self.send_content_parts(
+                to_handle,
+                [TextContent(text=text)],
+                meta,
+            )
 
         async def health_check(self):
             self._guard()
             callback = getattr(self._backend, "health", None)
-            result = ChannelHealth("unsupported", "Backend has no health probe")
+            result = ChannelHealth(
+                "unsupported",
+                "Backend has no health probe",
+            )
             if callback is not None:
                 async with (
                     self._owned_call(),
                     plugin._invocation(
-                        workspace_id=self._workspace.agent_id, session_id=""
+                        workspace_id=self._workspace.agent_id,
+                        session_id="",
                     ) as base,
                 ):
                     result = await plugin._call(
@@ -769,7 +898,16 @@ def register(plugin, spec):
                 "detail": result.detail,
             }
 
-        async def _stream(self, phase, request, target, event, meta, stream_type, text):
+        async def _stream(
+            self,
+            phase,
+            request,
+            target,
+            event,
+            meta,
+            stream_type,
+            text,
+        ):
             self._guard()
             key = (id(request), stream_type)
             if key in self._stream_ends:
@@ -821,7 +959,10 @@ def register(plugin, spec):
 
             def finished(completed):
                 if completed.cancelled():
-                    logger.warning("Channel %s stream terminal cancelled", spec.name)
+                    logger.warning(
+                        "Channel %s stream terminal cancelled",
+                        spec.name,
+                    )
                 elif completed.exception() is not None:
                     logger.warning(
                         "Channel %s stream terminal failed: %s",
@@ -834,14 +975,15 @@ def register(plugin, spec):
 
             task.add_done_callback(finished)
             # Cancelling its producer must not cancel an already committed
-            # platform final. Lifecycle/stop bound their own wait and retain it.
+            # platform final. Lifecycle/stop bound their own wait and retain
+            # it.
             await asyncio.shield(task)
 
         async def _finish_streams(self, owner_request, status):
             from .custody import stop_task
 
             for (_, kind), (request, target, meta, text) in tuple(
-                self._stream_contexts.items()
+                self._stream_contexts.items(),
             ):
                 if request is not owner_request:
                     continue
@@ -887,7 +1029,13 @@ def register(plugin, spec):
             )
 
         async def on_streaming_start(
-            self, request, to_handle, event, send_meta, stream_type, accumulated_text=""
+            self,
+            request,
+            to_handle,
+            event,
+            send_meta,
+            stream_type,
+            accumulated_text="",
         ):
             await self._stream(
                 "start",
@@ -900,7 +1048,13 @@ def register(plugin, spec):
             )
 
         async def on_streaming_delta(
-            self, request, to_handle, event, send_meta, stream_type, accumulated_text=""
+            self,
+            request,
+            to_handle,
+            event,
+            send_meta,
+            stream_type,
+            accumulated_text="",
         ):
             await self._stream(
                 "delta",
@@ -913,7 +1067,13 @@ def register(plugin, spec):
             )
 
         async def on_streaming_end(
-            self, request, to_handle, event, send_meta, stream_type, accumulated_text=""
+            self,
+            request,
+            to_handle,
+            event,
+            send_meta,
+            stream_type,
+            accumulated_text="",
         ):
             await self._stream(
                 "end",

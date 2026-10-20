@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
-"""QwenPaw Plugin System."""
+"""Public plugin SDK and legacy compatibility exports.
+
+The versioned author API is the explicit whitelist in
+``compliance.PUBLIC_API``.
+Exports such as PluginApi, PluginLoader and PluginRegistry remain for legacy
+compatibility; their presence here does not make them supported SDK contracts.
+"""
 
 from .loader import PluginLoader
 from .registry import PluginRegistry

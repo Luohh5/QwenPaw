@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Opt-in public context and internal bridge to the existing PluginApi."""
 
 from __future__ import annotations
@@ -9,9 +10,6 @@ from dataclasses import fields, replace
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from typing import Protocol, Callable, Awaitable, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .logging import PluginLogger
 
 from .errors import SDKError, StaleContextError, ToolInputError, ResourceError
 from .resources import Registration, ResourceOwner, ResourceScope
@@ -28,6 +26,10 @@ from .providers import ProviderSpec
 from .memory import MemorySpec
 from .events import EventSubscription
 from .apps import PawApp
+
+if TYPE_CHECKING:
+    from .logging import PluginLogger
+
 
 _activation_owners = ContextVar("sdk_activation_owners", default=frozenset())
 # An App run owns only the SDK stream producers spawned in its call chain.
@@ -48,7 +50,8 @@ class _RunStreams:
 
         self.streams.setdefault(stream, close)
         if self.closing:
-            # The factory already created it: retain cleanup even when rejecting
+            # The factory already created it: retain cleanup even when
+            # rejecting
             # late work, rather than losing the returned generator to GC.
             raise StaleContextError("The model run is closing")
 
@@ -64,7 +67,7 @@ class Plugin(Protocol):
         """Declare contributions and activation callbacks."""
 
 
-class PluginContext:
+class PluginContext:  # pylint: disable=protected-access
     """Finite plugin capabilities; internal host objects are never returned."""
 
     def __init__(self, api):
@@ -79,22 +82,31 @@ class PluginContext:
         self._tools = {}
         self.config = PluginConfig(api.config, api.manifest.get("sdk") or {})
         self.storage = PluginStorage(
-            WORKING_DIR / "plugin-data" / self.plugin_id, self._storage_guard
+            WORKING_DIR / "plugin-data" / self.plugin_id,
+            self._storage_guard,
+            _admission=self._storage_admission,
         )
         self.media = MediaStore(
             PluginStorage(
-                DEFAULT_MEDIA_DIR / "plugins" / self.plugin_id, self._storage_guard
+                DEFAULT_MEDIA_DIR / "plugins" / self.plugin_id,
+                self._storage_guard,
+                _admission=self._storage_admission,
             ),
-            "/api/files/preview/" + str(DEFAULT_MEDIA_DIR / "plugins" / self.plugin_id),
+            "/api/files/preview/"
+            + str(DEFAULT_MEDIA_DIR / "plugins" / self.plugin_id),
         )
         self.resources = ResourceScope(
             ResourceOwner(
-                self.plugin_id, self.generation, instance_id=uuid.uuid4().hex
+                self.plugin_id,
+                self.generation,
+                instance_id=uuid.uuid4().hex,
             ),
             self._resource_guard,
         )
         self._instance.record_runtime(
-            "sdk:resources", self.resources.close, kind="custody"
+            "sdk:resources",
+            self.resources.close,
+            kind="custody",
         )
 
     @property
@@ -107,21 +119,25 @@ class PluginContext:
         from .lifecycle import PluginState
 
         if (
-            self._loader.lifecycle.get_instance(self.plugin_id) is not self._instance
+            self._loader.lifecycle.get_instance(self.plugin_id)
+            is not self._instance
             or getattr(self._instance, "sdk_context", None) is not self
             or self._instance.state is not PluginState.ACTIVE
         ):
             raise StaleContextError(
-                f"Plugin {self.plugin_id!r} generation {self.generation} is no longer active"
+                f"Plugin {self.plugin_id!r} generation {self.generation} "
+                "is no longer active",
             )
 
     def _storage_guard(self):
         # Retained failed/stopping generations may persist cleanup state, but
-        # replacement immediately revokes writes even if an old handle survives.
+        # replacement immediately revokes writes even if an old handle
+        # survives.
         from .lifecycle import PluginState
 
         if (
-            self._loader.lifecycle.get_instance(self.plugin_id) is not self._instance
+            self._loader.lifecycle.get_instance(self.plugin_id)
+            is not self._instance
             or getattr(self._instance, "sdk_context", None) is not self
             or self._instance.state is PluginState.DISPOSED
         ):
@@ -133,12 +149,49 @@ class PluginContext:
             any(owner == id(self) for owner, _ in _activation_owners.get())
             or self._instance.activated
         ):
-            raise ResourceError("Create resources in on_activate(), not register()")
+            raise ResourceError(
+                "Create resources in on_activate(), not register()",
+            )
+
+    @contextmanager
+    def _storage_admission(self):
+        from .resources import _storage_cleanup
+
+        self._storage_guard()
+        activity = self._instance.activity
+        task = asyncio.current_task()
+        cleanup = _storage_cleanup.get()
+        finishing = (
+            cleanup is not None
+            and cleanup[1] is task
+            and (
+                cleanup[0].plugin_id == self.plugin_id
+                and cleanup[0].generation == self.generation
+            )
+        )
+        if (
+            task in activity.tasks
+            or task in activity.cleanup_tasks
+            or task is activity.mutator
+            or finishing
+        ):
+            # Only storage may finish an admitted call or its exact release
+            # task. This does not reopen model/resource/business admission.
+            activity.tasks[task] = activity.tasks.get(task, 0) + 1
+            try:
+                yield
+            finally:
+                activity.tasks[task] -= 1
+                if not activity.tasks[task]:
+                    del activity.tasks[task]
+        else:
+            with self._admission():
+                yield
 
     @contextmanager
     def _activation(self):
         token = _activation_owners.set(
-            _activation_owners.get() | {(id(self), asyncio.current_task())}
+            _activation_owners.get() | {(id(self), asyncio.current_task())},
         )
         try:
             yield
@@ -164,7 +217,8 @@ class PluginContext:
                 del activity.tasks[task]
 
     def on_activate(
-        self, callback: Callable[[PluginContext], None | Awaitable[None]]
+        self,
+        callback: Callable[[PluginContext], None | Awaitable[None]],
     ) -> Registration:
         self._guard()
         name = f"sdk:activate:{len(self._instance._runtime)}"
@@ -182,24 +236,36 @@ class PluginContext:
 
         def release():
             if (
-                self._loader.lifecycle.get_instance(self.plugin_id) is self._instance
+                self._loader.lifecycle.get_instance(self.plugin_id)
+                is self._instance
                 and getattr(self._instance, "sdk_context", None) is self
             ):
                 self._api._drop_hook(name)()
 
-        handle = Registration(release, owner=self.resources.owner, description=name)
+        handle = Registration(
+            release,
+            owner=self.resources.owner,
+            description=name,
+        )
         return handle
 
     @asynccontextmanager
     async def _invocation(
-        self, *, workspace_id: str, session_id: str, deadline=None, cleanup=False
+        self,
+        *,
+        workspace_id: str,
+        session_id: str,
+        deadline=None,
+        cleanup=False,
     ):
         self._guard()
         from ._models import model_deadline
 
         inherited = model_deadline.get()
         if inherited is not None:
-            deadline = inherited if deadline is None else min(deadline, inherited)
+            deadline = (
+                inherited if deadline is None else min(deadline, inherited)
+            )
         owned = None if cleanup else _stream_tasks.get()
         if owned is not None and owned.closing:
             raise SDKError("The owning app run is closing")
@@ -211,7 +277,8 @@ class PluginContext:
         with self._admission(cleanup=cleanup):
             task = asyncio.current_task()
             scope = self.resources.child(
-                workspace_id=workspace_id, instance_id=uuid.uuid4().hex
+                workspace_id=workspace_id,
+                instance_id=uuid.uuid4().hex,
             )
             storage, media = self.storage, self.media
             if workspace_id:
@@ -219,11 +286,17 @@ class PluginContext:
 
                 key = hashlib.sha256(workspace_id.encode()).hexdigest()
                 storage = PluginStorage(
-                    self.storage._root / "workspaces" / key, self._storage_guard
+                    self.storage._root / "workspaces" / key,
+                    self._storage_guard,
+                    _admission=self._storage_admission,
                 )
                 media_root = self.media._storage._root / "workspaces" / key
                 media = MediaStore(
-                    PluginStorage(media_root, self._storage_guard),
+                    PluginStorage(
+                        media_root,
+                        self._storage_guard,
+                        _admission=self._storage_admission,
+                    ),
                     "/api/files/preview/" + str(media_root),
                 )
             context = ToolContext(
@@ -257,7 +330,14 @@ class PluginContext:
             finally:
                 await close_scope()
 
-    async def _managed_stream(self, factory, label, *, deadline=None, resources=None):
+    async def _managed_stream(
+        self,
+        factory,
+        label,
+        *,
+        deadline=None,
+        resources=None,
+    ):
         """A producer owns the complete stream, including suspended yields."""
         from .custody import stop_task
 
@@ -292,7 +372,10 @@ class PluginContext:
                     remaining = (
                         None
                         if deadline is None
-                        else max(0, deadline - asyncio.get_running_loop().time())
+                        else max(
+                            0,
+                            deadline - asyncio.get_running_loop().time(),
+                        )
                     )
                     done, _ = await asyncio.wait(
                         {producer, receiver},
@@ -318,10 +401,19 @@ class PluginContext:
 
         return register(self, spec)
 
-    async def _stream_tool(self, name, arguments, *, workspace_id="", session_id=""):
+    async def _stream_tool(
+        self,
+        name,
+        arguments,
+        *,
+        workspace_id="",
+        session_id="",
+    ):
         timeout = self._tools[name][0].timeout
         deadline = (
-            None if timeout is None else asyncio.get_running_loop().time() + timeout
+            None
+            if timeout is None
+            else asyncio.get_running_loop().time() + timeout
         )
         stream = self._managed_stream(
             lambda: self._produce_tool(
@@ -340,8 +432,16 @@ class PluginContext:
         finally:
             await stream.aclose()
 
+    # Keep related adapter declarations and lifecycle ordering together.
+    # pylint: disable-next=too-many-branches
     async def _produce_tool(
-        self, name, arguments, *, workspace_id="", session_id="", deadline=None
+        self,
+        name,
+        arguments,
+        *,
+        workspace_id="",
+        session_id="",
+        deadline=None,
     ):
         import jsonschema
 
@@ -354,7 +454,9 @@ class PluginContext:
         except jsonschema.ValidationError as exc:
             raise ToolInputError(exc.message) from exc
         async with self._invocation(
-            workspace_id=workspace_id, session_id=session_id, deadline=deadline
+            workspace_id=workspace_id,
+            session_id=session_id,
+            deadline=deadline,
         ) as context:
             if spec.config_fields:
                 values = dict(self._api.config)
@@ -362,12 +464,14 @@ class PluginContext:
 
                 settings = (
                     await run_sync_io(
-                        self._api._registry.get_tool_config, spec.name, workspace_id
+                        self._api._registry.get_tool_config,
+                        spec.name,
+                        workspace_id,
                     )
                     or {}
                 )
                 declared_secrets = list(
-                    (self._api.manifest.get("sdk") or {}).get("secrets", [])
+                    (self._api.manifest.get("sdk") or {}).get("secrets", []),
                 )
                 for field in spec.config_fields:
                     key = field["name"]
@@ -378,12 +482,17 @@ class PluginContext:
                     if field.get("type") == "password":
                         declared_secrets.append(key)
                     if field.get("required") and values.get(key) in (None, ""):
-                        raise SDKError(f"Tool {spec.name!r} requires setting {key!r}")
+                        raise SDKError(
+                            f"Tool {spec.name!r} requires setting {key!r}",
+                        )
                 context = replace(
-                    context, config=PluginConfig(values, {"secrets": declared_secrets})
+                    context,
+                    config=PluginConfig(values, {"secrets": declared_secrets}),
                 )
-            if inspect.iscoroutinefunction(spec.handler) or inspect.isasyncgenfunction(
-                spec.handler
+            if inspect.iscoroutinefunction(
+                spec.handler,
+            ) or inspect.isasyncgenfunction(
+                spec.handler,
             ):
                 result = spec.handler(context, arguments)
             else:
@@ -408,7 +517,8 @@ class PluginContext:
                             or terminal
                         ):
                             raise SDKError(
-                                "Tool stream must yield ToolEvent values before its end event"
+                                "Tool stream must yield ToolEvent values "
+                                "before its end event",
                             )
                         terminal = event.kind == "end"
                         if not terminal:
@@ -419,10 +529,13 @@ class PluginContext:
                         await closer()
             else:
                 raise SDKError(
-                    "Tool handler must return ToolResult or an asynchronous ToolEvent stream"
+                    "Tool handler must return ToolResult or an "
+                    "asynchronous ToolEvent stream",
                 )
             yield ToolEvent("end")
 
+    # Keep related adapter declarations and lifecycle ordering together.
+    # pylint: disable-next=too-many-statements
     def register_tool(self, spec: ToolSpec, *, _mode="") -> Registration:
         import jsonschema
 
@@ -443,7 +556,9 @@ class PluginContext:
             metadata = self._api.manifest.setdefault("meta", {})
             descriptions = metadata.setdefault("tools", [])
             descriptions[:] = [
-                entry for entry in descriptions if entry.get("name") != spec.name
+                entry
+                for entry in descriptions
+                if entry.get("name") != spec.name
             ]
             descriptions.append(
                 {
@@ -452,7 +567,7 @@ class PluginContext:
                     "icon": spec.icon,
                     "requires_config": True,
                     "config_fields": deepcopy(list(spec.config_fields)),
-                }
+                },
             )
 
         async def invoke(**arguments):
@@ -486,11 +601,13 @@ class PluginContext:
                     )
 
                     if any(
-                        block.type not in {"text", "image", "audio", "video", "file"}
+                        block.type
+                        not in {"text", "image", "audio", "video", "file"}
                         for block in result.content
                     ):
                         raise SDKError(
-                            "Tool results support text and attachment blocks only"
+                            "Tool results support text "
+                            "and attachment blocks only",
                         )
                     blocks = [_to_block(block) for block in result.content]
                     for public, host in zip(result.content, blocks):
@@ -500,8 +617,9 @@ class PluginContext:
                                 and text_metadata != public.metadata
                             ):
                                 raise SDKError(
-                                    "Adjacent tool text blocks must have equal metadata; "
-                                    "the host merges their text into one block"
+                                    "Adjacent tool text blocks must have "
+                                    "equal metadata; the host merges their "
+                                    "text into one block",
                                 )
                             text_metadata = deepcopy(public.metadata)
                         else:
@@ -526,8 +644,12 @@ class PluginContext:
                         state=state,
                         is_last=event.kind == "end",
                         metadata=_tool_metadata(
-                            author_metadata if event.kind == "end" else result.metadata,
-                            accumulated.content if event.kind == "end" else blocks,
+                            author_metadata
+                            if event.kind == "end"
+                            else result.metadata,
+                            accumulated.content
+                            if event.kind == "end"
+                            else blocks,
                             event.kind,
                             failed,
                             (
@@ -583,7 +705,7 @@ class PluginContext:
                     annotation=types.get(schema.get("type"), object),
                 )
                 for name, schema in properties.items()
-            ]
+            ],
         )
         before = len(self._instance._runtime)
         self._api.register_tool(
@@ -610,14 +732,17 @@ class PluginContext:
                 await original_startup()
             finally:
                 rows.extend(
-                    row for row in self._instance._runtime if id(row) not in known
+                    row
+                    for row in self._instance._runtime
+                    if id(row) not in known
                 )
 
         hook.callback = startup
 
         async def release():
             if (
-                self._loader.lifecycle.get_instance(self.plugin_id) is self._instance
+                self._loader.lifecycle.get_instance(self.plugin_id)
+                is self._instance
                 and getattr(self._instance, "sdk_context", None) is self
             ):
                 for row in reversed(rows):
@@ -627,12 +752,19 @@ class PluginContext:
                             await value
 
         handle = Registration(
-            release, owner=self.resources.owner, description=f"tool:{spec.name}"
+            release,
+            owner=self.resources.owner,
+            description=f"tool:{spec.name}",
         )
         self._tools[spec.name] = (spec, handle, invoke)
         return handle
 
-    def _register_contribution(self, register, *args, **kwargs) -> Registration:
+    def _register_contribution(
+        self,
+        register,
+        *args,
+        **kwargs,
+    ) -> Registration:
         self._guard()
         before = len(self._instance._runtime)
         register(*args, **kwargs)
@@ -686,9 +818,12 @@ class PluginContext:
 
         async def handler(runtime, arguments):
             if getattr(handler, "_sdk_closed", False):
-                raise StaleContextError(f"Command {spec.name!r} has been released")
+                raise StaleContextError(
+                    f"Command {spec.name!r} has been released",
+                )
             async with self._invocation(
-                workspace_id=runtime.agent_id, session_id=runtime.session_id
+                workspace_id=runtime.agent_id,
+                session_id=runtime.session_id,
             ) as base:
                 context = CommandContext(
                     **{f.name: getattr(base, f.name) for f in fields(base)},
@@ -706,11 +841,14 @@ class PluginContext:
                     ]
                 elif result.action != "continue":
                     raise SDKError(
-                        "Command result requires a valid action and reply message"
+                        "Command result requires a valid action "
+                        "and reply message",
                     )
                 return None
 
-        from ..runtime.slash_command_registry import CommandSpec as RuntimeCommand
+        from ..runtime.slash_command_registry import (
+            CommandSpec as RuntimeCommand,
+        )
 
         return RuntimeCommand(
             spec.name,
@@ -735,7 +873,11 @@ class PluginContext:
         from .hooks import HookContext, HookPhase, HookResult
         from ._messages import from_host, to_host
         from ._replies import to_reply
-        from ..runtime.hooks import HookBase, HookAction, HookResult as RuntimeResult
+        from ..runtime.hooks import (
+            HookBase,
+            HookAction,
+            HookResult as RuntimeResult,
+        )
         from ..runtime.phases import Phase
 
         context = self
@@ -752,9 +894,14 @@ class PluginContext:
                 )
                 self.before, self.after = spec.before, spec.after
 
+            # Keep related adapter declarations and lifecycle ordering
+            # together.
+            # pylint: disable-next=too-many-branches
             async def run(self, runtime):
                 if getattr(self, "_sdk_closed", False):
-                    raise StaleContextError(f"Hook {spec.name!r} has been released")
+                    raise StaleContextError(
+                        f"Hook {spec.name!r} has been released",
+                    )
 
                 async def invoke():
                     deadline = (
@@ -768,9 +915,14 @@ class PluginContext:
                         deadline=deadline,
                     ) as base:
                         public = HookContext(
-                            **{f.name: getattr(base, f.name) for f in fields(base)},
+                            **{
+                                f.name: getattr(base, f.name)
+                                for f in fields(base)
+                            },
                             phase=phase,
-                            messages=tuple(from_host(m) for m in runtime.input_msgs),
+                            messages=tuple(
+                                from_host(m) for m in runtime.input_msgs
+                            ),
                             error=(
                                 str(runtime.error)
                                 if runtime.error is not None
@@ -783,7 +935,9 @@ class PluginContext:
                 try:
                     done, _ = await asyncio.wait({task}, timeout=spec.timeout)
                     if not done:
-                        raise SDKError(f"Hook {spec.name!r} exceeded its deadline")
+                        raise SDKError(
+                            f"Hook {spec.name!r} exceeded its deadline",
+                        )
                     result = task.result()
                 finally:
                     if not task.done():
@@ -798,41 +952,57 @@ class PluginContext:
                 }
                 if result.replace_input is not None and phase not in early:
                     raise SDKError(
-                        f"Input replacement is not permitted during {phase.value}"
+                        "Input replacement is not permitted during "
+                        f"{phase.value}",
                     )
                 if result.injections and phase not in early | {
                     HookPhase.POST_AGENT_BUILD,
                     HookPhase.PRE_EXECUTE,
                 }:
                     raise SDKError(
-                        f"Context injection is not permitted during {phase.value}"
+                        "Context injection is not permitted during "
+                        f"{phase.value}",
                     )
-                if result.action not in {"continue", "reply", "skip_agent"} or (
-                    result.action == "reply" and result.message is None
-                ):
+                if result.action not in {
+                    "continue",
+                    "reply",
+                    "skip_agent",
+                } or (result.action == "reply" and result.message is None):
                     raise SDKError(
-                        "Hook result requires a valid action and reply message"
+                        "Hook result requires a valid action "
+                        "and reply message",
                     )
                 if result.action != "continue" and phase not in early | {
-                    HookPhase.PRE_EXECUTE
+                    HookPhase.PRE_EXECUTE,
                 }:
                     raise SDKError(
-                        f"Control-flow actions are not permitted during {phase.value}"
+                        "Control-flow actions are not permitted during "
+                        f"{phase.value}",
                     )
                 replacement = (
                     None
                     if result.replace_input is None
                     else [to_host(message) for message in result.replace_input]
                 )
-                reply = to_reply(result.message) if result.action == "reply" else None
+                reply = (
+                    to_reply(result.message)
+                    if result.action == "reply"
+                    else None
+                )
                 for injection in result.injections:
-                    if not isinstance(injection.content, str) or not isinstance(
-                        injection.priority, int
+                    if not isinstance(
+                        injection.content,
+                        str,
+                    ) or not isinstance(
+                        injection.priority,
+                        int,
                     ):
                         raise SDKError(
-                            "Context injections require text and integer priority"
+                            "Context injections require text "
+                            "and integer priority",
                         )
-                # Apply only after validating and converting every requested change.
+                # Apply only after validating and converting every requested
+                # change.
                 if replacement is not None:
                     runtime.input_msgs = replacement
                 for injection in result.injections:
@@ -856,14 +1026,19 @@ class PluginContext:
 
     def register_hook(self, spec: HookSpec) -> Registration:
         adapter = self._hook_adapter(spec)
-        handle = self._register_contribution(self._api.register_runtime_hook, adapter)
+        handle = self._register_contribution(
+            self._api.register_runtime_hook,
+            adapter,
+        )
         return self._with_admission(handle, adapter)
 
     def register_prompt(self, spec: PromptSpec) -> Registration:
         def provider(_runtime):
             self._guard()
             if getattr(provider, "_sdk_closed", False):
-                raise StaleContextError(f"Prompt {spec.name!r} has been released")
+                raise StaleContextError(
+                    f"Prompt {spec.name!r} has been released",
+                )
             return spec.text
 
         handle = self._register_contribution(
@@ -884,13 +1059,17 @@ class PluginContext:
 
         self._guard()
         if not spec.name or not callable(spec.is_active):
-            raise SDKError("Modes require a name and synchronous is_active predicate")
+            raise SDKError(
+                "Modes require a name and synchronous is_active predicate",
+            )
         context = self
         admitted = True
 
         def snapshot(runtime):
             if not admitted:
-                raise StaleContextError(f"Mode {spec.name!r} has been released")
+                raise StaleContextError(
+                    f"Mode {spec.name!r} has been released",
+                )
             return ModeContext(
                 context.plugin_id,
                 context.generation,
@@ -904,6 +1083,8 @@ class PluginContext:
         class Adapter(AgentMode):
             name = spec.name
 
+            # Keep the existing adapter callback signature.
+            # pylint: disable-next=arguments-renamed
             def is_active(self, runtime):
                 context._guard()
                 with context._instance.activity.invocation():
@@ -911,11 +1092,15 @@ class PluginContext:
                 if not isinstance(result, bool):
                     if inspect.iscoroutine(result):
                         result.close()
-                    raise SDKError("Mode is_active must return bool synchronously")
+                    raise SDKError(
+                        "Mode is_active must return bool synchronously",
+                    )
                 return result
 
             def commands(self):
-                return [context._command_adapter(item) for item in spec.commands]
+                return [
+                    context._command_adapter(item) for item in spec.commands
+                ]
 
             def hooks(self):
                 owner = self
@@ -924,6 +1109,8 @@ class PluginContext:
                     adapted = context._hook_adapter(item)
 
                     class Gated(ModeGatedHook):
+                        # Keep the existing adapter callback signature.
+                        # pylint: disable-next=arguments-renamed
                         async def _run(self, runtime):
                             return await self.adapted.run(runtime)
 
@@ -947,16 +1134,25 @@ class PluginContext:
                 for item in spec.prompts:
 
                     class Contributor(SyncPromptContributor):
+                        # Keep the existing adapter callback signature.
+                        # pylint: disable-next=arguments-renamed
                         def contribute_sync(self, runtime):
                             if (
                                 self.spec.workspace_id
                                 and runtime.agent_id != self.spec.workspace_id
                             ):
                                 return None
-                            return self.spec.text if owner.is_active(runtime) else None
+                            return (
+                                self.spec.text
+                                if owner.is_active(runtime)
+                                else None
+                            )
 
                     contributor = Contributor()
-                    contributor.name, contributor.priority = item.name, item.priority
+                    contributor.name, contributor.priority = (
+                        item.name,
+                        item.priority,
+                    )
                     contributor.owner_plugin_id, contributor.spec = (
                         context.plugin_id,
                         item,
@@ -967,18 +1163,27 @@ class PluginContext:
             async def _event(self, callback, runtime):
                 if callback is not None:
                     async with context._invocation(
-                        workspace_id=runtime.agent_id, session_id=runtime.session_id
+                        workspace_id=runtime.agent_id,
+                        session_id=runtime.session_id,
                     ):
                         await context._call(callback, snapshot(runtime))
 
+            # Keep the existing adapter callback signature.
+            # pylint: disable-next=arguments-renamed
             async def on_turn_start(self, runtime):
                 await self._event(spec.on_turn_start, runtime)
 
+            # Keep the existing adapter callback signature.
+            # pylint: disable-next=arguments-renamed
             async def on_conversation_reset(self, runtime):
                 await self._event(spec.on_reset, runtime)
 
-        handles = [self.register_tool(tool, _mode=spec.name) for tool in spec.tools]
-        handles.append(self._register_contribution(self._api.register_mode, Adapter))
+        handles = [
+            self.register_tool(tool, _mode=spec.name) for tool in spec.tools
+        ]
+        handles.append(
+            self._register_contribution(self._api.register_mode, Adapter),
+        )
 
         async def release():
             nonlocal admitted
@@ -987,7 +1192,9 @@ class PluginContext:
                 await handle.close()
 
         return Registration(
-            release, owner=self.resources.owner, description=f"mode:{spec.name}"
+            release,
+            owner=self.resources.owner,
+            description=f"mode:{spec.name}",
         )
 
     def register_skills(self, spec: SkillSpec) -> Registration:
@@ -1000,10 +1207,14 @@ class PluginContext:
         root = Path(self._instance.source_path).resolve()
         directory = (root / spec.directory).resolve()
         if not directory.is_relative_to(root) or not directory.is_dir():
-            raise SDKError("Skill directory must exist inside the plugin package")
+            raise SDKError(
+                "Skill directory must exist inside the plugin package",
+            )
         for entry in directory.rglob("*"):
             if not entry.resolve().is_relative_to(root):
-                raise SDKError("Skill sources must stay inside the plugin package")
+                raise SDKError(
+                    "Skill sources must stay inside the plugin package",
+                )
         handle = self._register_contribution(
             self._api.register_skill_provider,
             directory,
@@ -1023,25 +1234,39 @@ class PluginContext:
             await run_sync_io(self._api.unregister_skill_provider)
             self._skills_registered = False
 
-        return Registration(release, owner=self.resources.owner, description="skills")
+        return Registration(
+            release,
+            owner=self.resources.owner,
+            description="skills",
+        )
 
     def register_market(self, spec: MarketSpec) -> Registration:
         from copy import deepcopy
-        from .markets import Availability, MarketContext, SearchPage, SkillBundle
+        from .markets import (
+            Availability,
+            MarketContext,
+            SearchPage,
+            SkillBundle,
+        )
         from ..market.schema import MarketResult as RuntimeResult
         from ..market.registry import market_registry
 
         context = self
 
         class Adapter:
-            key, label, supports_browse = spec.key, spec.label, spec.supports_browse
+            key, label, supports_browse = (
+                spec.key,
+                spec.label,
+                spec.supports_browse,
+            )
 
             def available(self):
                 context._guard()
                 result = spec.available()
                 if not isinstance(result, Availability):
                     raise SDKError(
-                        "Market availability must return Availability synchronously"
+                        "Market availability must return "
+                        "Availability synchronously",
                     )
                 return result.available, result.reason
 
@@ -1049,7 +1274,9 @@ class PluginContext:
                 context._guard()
                 result = spec.matches_url(url)
                 if not isinstance(result, bool):
-                    raise SDKError("Market matches_url must return bool synchronously")
+                    raise SDKError(
+                        "Market matches_url must return bool synchronously",
+                    )
                 return result
 
             async def _call(self, callback, *args):
@@ -1061,7 +1288,9 @@ class PluginContext:
                     session_id=get_current_session_id() or "",
                 ) as base:
                     public = MarketContext(
-                        **{f.name: getattr(base, f.name) for f in fields(base)},
+                        **{
+                            f.name: getattr(base, f.name) for f in fields(base)
+                        },
                         market_id=spec.key,
                     )
                     return await context._call(callback, public, *args)
@@ -1107,13 +1336,16 @@ class PluginContext:
         # the public handle revokes this exact provider only.
         async def release():
             if (
-                self._loader.lifecycle.get_instance(self.plugin_id) is self._instance
+                self._loader.lifecycle.get_instance(self.plugin_id)
+                is self._instance
                 and getattr(self._instance, "sdk_context", None) is self
             ):
                 market_registry.unregister(spec.key, expected=adapter)
 
         return Registration(
-            release, owner=self.resources.owner, description=f"market:{spec.key}"
+            release,
+            owner=self.resources.owner,
+            description=f"market:{spec.key}",
         )
 
     def register_provider(self, spec: ProviderSpec) -> Registration:
@@ -1127,7 +1359,7 @@ class PluginContext:
         return register(self, spec)
 
     def subscribe_events(self, spec: EventSubscription) -> Registration:
-        """Subscribe during activation; overflow reports a gap or disconnect."""
+        """Subscribe on activation; overflow reports a gap or disconnect."""
         from ._events import subscribe
 
         return subscribe(self, spec)

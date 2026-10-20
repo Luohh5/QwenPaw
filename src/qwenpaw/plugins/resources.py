@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Owned resource scopes backed by the existing lifecycle teardown ledger."""
 
 from __future__ import annotations
@@ -7,11 +8,14 @@ import inspect
 import subprocess
 import threading
 from dataclasses import dataclass
+from contextvars import ContextVar
 from typing import Any, Callable
 from types import SimpleNamespace
 
 from . import custody
 from .errors import ResourceError
+
+_storage_cleanup = ContextVar("sdk_storage_cleanup", default=None)
 
 
 @dataclass(frozen=True)
@@ -36,13 +40,42 @@ class Registration:
         self.owner = owner
         self.description = description
         self._release = release
+        self._storage_owner: ResourceOwner | None = None
         self._closer = (
-            custody.ConnectionCloser(SimpleNamespace(close=release), description)
+            custody.ConnectionCloser(
+                SimpleNamespace(
+                    close=(
+                        self._release_async
+                        if inspect.iscoroutinefunction(release)
+                        else self._release_sync
+                    ),
+                ),
+                description,
+            )
             if _bounded
             else None
         )
         self._lock = asyncio.Lock()
         self.closed = False
+
+    async def _release_async(self, result=None):
+        token = _storage_cleanup.set(
+            (self._storage_owner, asyncio.current_task())
+            if self._storage_owner is not None
+            else None,
+        )
+        try:
+            return await (self._release() if result is None else result)
+        finally:
+            _storage_cleanup.reset(token)
+
+    def _release_sync(self):
+        result = self._release()
+        return (
+            self._release_async(result)
+            if inspect.isawaitable(result)
+            else result
+        )
 
     async def close(self) -> None:
         async with self._lock:
@@ -51,7 +84,7 @@ class Registration:
             if self._closer is not None:
                 await self._closer()
             else:
-                await self._release()
+                await self._release_async()
             self.closed = True
 
     async def __aenter__(self):
@@ -61,14 +94,17 @@ class Registration:
         await self.close()
 
 
-class ResourceScope:
-    """Resources stop in reverse creation order; incomplete stops are retained."""
+class ResourceScope:  # pylint: disable=protected-access
+    """Stop resources in reverse order, retaining incomplete stops."""
 
     def __init__(self, owner: ResourceOwner, guard: Callable):
         self.owner = owner
         self._guard = guard
         self._handles: list[Registration] = []
-        self._parent_registration: tuple[ResourceScope, Registration] | None = None
+        self._parent_registration: tuple[
+            ResourceScope,
+            Registration,
+        ] | None = None
         self._errors: list[str] = []
         self._closing = False
         self.closed = False
@@ -78,19 +114,34 @@ class ResourceScope:
         if self._closing or self.closed:
             raise ResourceError("Resource scope is closing")
 
-    def defer(self, callback: Callable, description: str = "cleanup") -> Registration:
+    def defer(
+        self,
+        callback: Callable,
+        description: str = "cleanup",
+    ) -> Registration:
         return self._defer(callback, description, bounded=True)
 
     def _defer(self, callback, description, *, bounded=False):
         self._check()
-        self._handles[:] = [handle for handle in self._handles if not handle.closed]
+        self._handles[:] = [
+            handle for handle in self._handles if not handle.closed
+        ]
         handle = Registration(
-            callback, owner=self.owner, description=description, _bounded=bounded
+            callback,
+            owner=self.owner,
+            description=description,
+            _bounded=bounded,
         )
+        handle._storage_owner = self.owner
         self._handles.append(handle)
         return handle
 
-    def child(self, *, workspace_id: str = "", instance_id: str = "") -> ResourceScope:
+    def child(
+        self,
+        *,
+        workspace_id: str = "",
+        instance_id: str = "",
+    ) -> ResourceScope:
         self._check()
         owner = ResourceOwner(
             self.owner.plugin_id,
@@ -100,7 +151,8 @@ class ResourceScope:
         )
         child = ResourceScope(owner, self._check)
         handle = self._defer(
-            child.close, f"scope:{owner.workspace_id}:{owner.instance_id}"
+            child.close,
+            f"scope:{owner.workspace_id}:{owner.instance_id}",
         )
         child._parent_registration = (self, handle)
         return child
@@ -113,7 +165,8 @@ class ResourceScope:
                 coroutine.close()
             raise
         task = asyncio.create_task(
-            coroutine, name=f"{self.owner.plugin_id}:{description}"
+            coroutine,
+            name=f"{self.owner.plugin_id}:{description}",
         )
 
         async def stop():
@@ -143,11 +196,17 @@ class ResourceScope:
         return client
 
     def thread(
-        self, target: Callable, *, stop: threading.Event, description: str = "thread"
+        self,
+        target: Callable,
+        *,
+        stop: threading.Event,
+        description: str = "thread",
     ):
         self._check()
         thread = threading.Thread(
-            target=target, name=f"{self.owner.plugin_id}:{description}", daemon=True
+            target=target,
+            name=f"{self.owner.plugin_id}:{description}",
+            daemon=True,
         )
 
         async def close():
@@ -161,6 +220,8 @@ class ResourceScope:
 
     def process(self, args, *, description: str = "process", **kwargs):
         self._check()
+        # ResourceScope owns deferred process exit, not this stack frame.
+        # pylint: disable-next=consider-using-with
         process = subprocess.Popen(args, **kwargs)  # noqa: S603
 
         async def close():
@@ -193,6 +254,8 @@ class ResourceScope:
         return {
             "owner": self.owner,
             "closed": self.closed,
-            "resources": tuple(h.description for h in self._handles if not h.closed),
+            "resources": tuple(
+                h.description for h in self._handles if not h.closed
+            ),
             "errors": tuple(self._errors),
         }
