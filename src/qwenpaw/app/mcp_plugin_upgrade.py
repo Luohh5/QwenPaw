@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import re
 from pathlib import Path
 from uuid import uuid4
 
+from ..plugins.install_receipts import (
+    has_install_commit,
+    plugin_tree_digest as _digest,
+)
 from .mcp_plugin_migration import (
     MCPPluginUpgradeResult,
     MCPUsageSnapshot,
@@ -182,25 +185,6 @@ def get_optional_mcp_plugin_dir():
     )
 
 
-def _digest(directory):
-    digest = hashlib.sha256()
-    for path in sorted(directory.rglob("*")):
-        if path.is_symlink():
-            raise ValueError("Optional plugin ownership cannot follow links")
-        relative = path.relative_to(directory)
-        if (
-            not path.is_file()
-            or "__pycache__" in relative.parts
-            or path.suffix == ".pyc"
-            or any(part.startswith(".") for part in relative.parts)
-        ):
-            continue
-        digest.update(relative.as_posix().encode())
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
-
-
 def _read_marker(path):
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -310,6 +294,11 @@ class MCPPluginCoordinator:
                 marker is None
                 and installed is not None
                 and await asyncio.to_thread((installed / ORIGIN).exists)
+                and not await asyncio.to_thread(
+                    has_install_commit,
+                    installed,
+                    PLUGIN_ID,
+                )
             ):
                 return MCPPluginUpgradeResult(
                     "needs_review",
@@ -325,7 +314,13 @@ class MCPPluginCoordinator:
         if decision.status in {"unused", "explicit_off", "needs_review"}:
             if decision.status == "unused":
                 if installed and (
-                    marker is None or marker["stage"] == "completed"
+                    marker is None
+                    or marker["stage"] == "completed"
+                    or await asyncio.to_thread(
+                        has_install_commit,
+                        installed,
+                        PLUGIN_ID,
+                    )
                 ):
                     self.loader.startup_blocked_plugins.discard(PLUGIN_ID)
             return MCPPluginUpgradeResult(
@@ -388,6 +383,7 @@ class MCPPluginCoordinator:
             PLUGIN_ID,
         )
         installed = False
+        explicit_commit = False
         if target is None:
             source = get_optional_mcp_plugin_dir()
             _, manifest = await asyncio.to_thread(
@@ -418,7 +414,18 @@ class MCPPluginCoordinator:
             )
             target = base / PLUGIN_ID
             installed = True
-        elif marker is not None and marker["stage"] != "completed":
+        elif marker is None or marker["stage"] != "completed":
+            explicit_commit = await asyncio.to_thread(
+                has_install_commit,
+                target,
+                PLUGIN_ID,
+            )
+        if (
+            not installed
+            and not explicit_commit
+            and marker is not None
+            and marker["stage"] != "completed"
+        ):
             origin = json.loads(
                 await asyncio.to_thread((target / ORIGIN).read_text),
             )
@@ -432,7 +439,11 @@ class MCPPluginCoordinator:
                 or await asyncio.to_thread(_digest, target) != marker["digest"]
             ):
                 raise ValueError("Unowned incomplete installation")
-        if marker is not None and marker["stage"] != "completed":
+        if (
+            not explicit_commit
+            and marker is not None
+            and marker["stage"] != "completed"
+        ):
             marker = {**marker, "stage": "files_committed"}
             await run_sync_io(write_json_atomic, marker_path, marker)
         row, off = await asyncio.to_thread(self._current_settings)
@@ -459,7 +470,20 @@ class MCPPluginCoordinator:
             raise RuntimeError(
                 "Optional MCP dependencies or registration unavailable",
             )
-        if marker is not None and marker["stage"] != "completed":
+        if explicit_commit:
+            await run_sync_io(
+                write_json_atomic,
+                marker_path,
+                {
+                    "schema": 1,
+                    "transaction": uuid4().hex,
+                    "stage": "completed",
+                    "version": manifest.version,
+                    "digest": await asyncio.to_thread(_digest, target),
+                    "workspaces": dict(decision.workspace_statuses),
+                },
+            )
+        elif marker is not None and marker["stage"] != "completed":
             await run_sync_io(
                 persist_plugin_settings,
                 PLUGIN_ID,

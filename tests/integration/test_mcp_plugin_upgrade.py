@@ -1187,3 +1187,150 @@ async def test_orphan_owned_install_without_global_marker_is_not_user_code(
             .get("enabled")
             is not True
         )
+
+
+async def test_explicit_reinstall_retires_interrupted_upgrade_before_restart(
+    tmp_path,
+    monkeypatch,
+):
+    from qwenpaw.config import utils
+    from tests.unit.plugins.mcp.fixtures import PLUGIN
+
+    root = tmp_path / "host"
+    workspace = root / "workspaces/test"
+    source = card("retained", config={"tools": ["echo"]})
+    seed(root, [("test", workspace, {}, [source], True)])
+    workspace_before = bytes_under(workspace)
+    marker = root / "plugins/.mcp-plugin-migration.json"
+    target = root / "plugins" / PLUGIN_ID
+    peer = Peer()
+    peer.install(monkeypatch)
+
+    def interrupt(*_args, **_kwargs):
+        raise OSError("Synthetic settings commit interruption")
+
+    async with PluginTestHost(root) as host:
+        with monkeypatch.context() as patch:
+            patch.setattr(utils, "mutate_config", interrupt)
+            result = await entry("ensure_mcp_plugin_for_upgrade")(
+                inventory(root),
+                loader=host._loader,
+            )
+        assert result.status == "failed"
+        assert (target / ".plugin-install-origin.json").is_file()
+        assert json.loads(marker.read_text())["stage"] != "completed"
+        assert (await host.uninstall(PLUGIN_ID)).quiescent
+        assert not target.exists()
+        assert (await host.install(PLUGIN)).ok
+        assert (
+            await host.update_config(PLUGIN_ID, {"user_setting": "keep"})
+        ).ok
+        workspace_after = bytes_under(workspace)
+        assert all(
+            workspace_after.get(path) == value
+            for path, value in workspace_before.items()
+        )
+    installed = bytes_under(target)
+    config_before = json.loads((root / "config.json").read_text())["plugins"][
+        PLUGIN_ID
+    ]
+    async with PluginTestHost(root) as host:
+        result = await prepare(host)
+        assert result.status == "unchanged"
+        assert host._loader.get_loaded_plugin(PLUGIN_ID) is not None
+        assert "mcp" in host._loader.registry._driver_protocols
+        assert bytes_under(target) == installed
+        workspace_after = bytes_under(workspace)
+        assert all(
+            workspace_after.get(path) == value
+            for path, value in workspace_before.items()
+        )
+        assert (
+            json.loads((root / "config.json").read_text())["plugins"][
+                PLUGIN_ID
+            ]
+            == config_before
+        )
+        await host._workspace("test")
+        await host._loader.activate_all_loaded()
+        await host.open_driver(source)
+        rows = await host.list_driver_capabilities("retained")
+        assert [row["capability_id"] for row in rows] == [
+            "driver://mcp/retained/tools/echo#invoke",
+        ]
+        assert (
+            await host.call_driver("retained", "echo", {"value": 7})
+        ).content[0].text == "ok"
+        assert peer.calls == [("echo", {"value": 7})]
+
+
+@pytest.mark.parametrize("tamper", ["receipt-json", "plugin-code"])
+async def test_explicit_commit_receipt_requires_valid_json_and_matching_code(
+    tmp_path,
+    monkeypatch,
+    tamper,
+):
+    from qwenpaw.config import utils
+    from tests.unit.plugins.mcp.fixtures import PLUGIN
+
+    root = tmp_path / "host"
+    workspace = root / "workspaces/test"
+    seed(root, [("test", workspace, {}, [card()], True)])
+    original_workspace = bytes_under(workspace)
+    target = root / "plugins" / PLUGIN_ID
+    marker = root / "plugins/.mcp-plugin-migration.json"
+
+    def interrupt(*_args, **_kwargs):
+        raise OSError("Synthetic settings commit interruption")
+
+    async with PluginTestHost(root) as host:
+        with monkeypatch.context() as patch:
+            patch.setattr(utils, "mutate_config", interrupt)
+            result = await entry("ensure_mcp_plugin_for_upgrade")(
+                inventory(root),
+                loader=host._loader,
+            )
+        assert result.status == "failed"
+        assert (target / ".plugin-install-origin.json").is_file()
+        assert json.loads(marker.read_text())["stage"] != "completed"
+        assert (await host.uninstall(PLUGIN_ID)).quiescent
+        assert (await host.install(PLUGIN)).ok
+        assert (
+            await host.update_config(PLUGIN_ID, {"user_setting": "keep"})
+        ).ok
+    assert json.loads(marker.read_text())["stage"] != "completed"
+    receipt = target / ".plugin-install-commit.json"
+    assert (
+        receipt.is_file()
+    ), "Successful explicit install needs a durable receipt"
+    if tamper == "receipt-json":
+        receipt.write_text('{"private":"' + SECRET, encoding="utf-8")
+    else:
+        entrypoint = target / "plugin.py"
+        entrypoint.write_text(
+            entrypoint.read_text(encoding="utf-8")
+            + "\n# Edited after commit\n",
+            encoding="utf-8",
+        )
+    installed = bytes_under(target)
+    config_before = json.loads((root / "config.json").read_text())["plugins"][
+        PLUGIN_ID
+    ]
+    async with PluginTestHost(root) as host:
+        result = await prepare(host)
+        assert result.status in {"failed", "needs_review"}
+        assert SECRET not in repr(result)
+        assert host._loader.get_loaded_plugin(PLUGIN_ID) is None
+        assert "mcp" not in host._loader.registry._driver_protocols
+        assert bytes_under(target) == installed
+        workspace_after = bytes_under(workspace)
+        assert all(
+            workspace_after.get(path) == value
+            for path, value in original_workspace.items()
+        )
+        assert (
+            json.loads((root / "config.json").read_text())["plugins"][
+                PLUGIN_ID
+            ]
+            == config_before
+        )

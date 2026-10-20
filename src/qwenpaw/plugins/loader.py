@@ -50,6 +50,7 @@ from .module_isolation import (
 )
 from .safe_fs import safe_remove, same_location
 from .registry import PluginRegistry
+from .install_receipts import INSTALL_COMMIT, write_install_commit
 
 logger = logging.getLogger(__name__)
 
@@ -2118,6 +2119,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             if staging.exists():
                 safe_remove(staging, purpose="clear plugin staging")
             shutil.copytree(incoming, staging)
+            (staging / INSTALL_COMMIT).unlink(missing_ok=True)
             if not (staging / "plugin.json").exists():
                 raise RuntimeError("staged plugin is missing plugin.json")
             if backup.exists():
@@ -2439,15 +2441,30 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 install_origin=install_origin,
             )
             if user_requested:
-                from .settings import clear_plugin_intent
-
-                await asyncio.to_thread(
-                    clear_plugin_intent,
-                    manifest.id,
-                    plugins_dir=self.plugin_dirs[0],
-                )
-                self.startup_blocked_plugins.discard(manifest.id)
+                await self._commit_explicit_install(record)
             return record
+
+    async def _commit_explicit_install(self, record: PluginRecord) -> None:
+        """Publish explicit intent only after the installed record commits."""
+        from ..utils.io_utils import run_sync_io
+        from .settings import clear_plugin_intent
+
+        def commit():
+            if any(
+                same_location(
+                    record.source_path,
+                    Path(base) / record.manifest.id,
+                )
+                for base in self.plugin_dirs
+            ):
+                write_install_commit(record.source_path, record.manifest.id)
+            clear_plugin_intent(
+                record.manifest.id,
+                plugins_dir=self.plugin_dirs[0],
+            )
+
+        await run_sync_io(commit)
+        self.startup_blocked_plugins.discard(record.manifest.id)
 
     async def load_plugin_from_path(
         self,
@@ -2553,14 +2570,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                         (record.source_path / _PAWPORT_MARKER).unlink,
                         missing_ok=True,
                     )
-                from .settings import clear_plugin_intent
-
-                await asyncio.to_thread(
-                    clear_plugin_intent,
-                    plugin_id,
-                    plugins_dir=self.plugin_dirs[0],
-                )
-                self.startup_blocked_plugins.discard(plugin_id)
+                await self._commit_explicit_install(record)
                 return record
             record = None
             from ..config import load_config
@@ -2596,14 +2606,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                         (record.source_path / _PAWPORT_MARKER).unlink,
                         missing_ok=True,
                     )
-                from .settings import clear_plugin_intent
-
-                await asyncio.to_thread(
-                    clear_plugin_intent,
-                    plugin_id,
-                    plugins_dir=self.plugin_dirs[0],
-                )
-                self.startup_blocked_plugins.discard(plugin_id)
+                await self._commit_explicit_install(record)
                 return record
             except BaseException:
                 inst = self.lifecycle.get_instance(plugin_id)
@@ -2702,6 +2705,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 stage_dir = stage_root / plugin_id
                 try:
                     shutil.copytree(source_path, stage_dir)
+                    (stage_dir / INSTALL_COMMIT).unlink(missing_ok=True)
                     if install_origin is not None:
                         from ..utils.io_utils import write_json_atomic
 
