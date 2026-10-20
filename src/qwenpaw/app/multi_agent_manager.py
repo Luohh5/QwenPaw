@@ -262,11 +262,11 @@ class MultiAgentManager:
             async with self._lock:
                 self.agents[agent_id] = instance
 
-            elapsed = time.perf_counter() - t0
+            await self._activate_workspace_drivers(instance)
             logger.debug(
                 "Workspace created and started: "
                 f"{sanitize_log_value(agent_id)} "
-                f"({elapsed:.3f}s)",
+                f"({time.perf_counter() - t0:.3f}s)",
             )
 
             # Fire workspace_created hooks so plugins can provision
@@ -345,6 +345,12 @@ class MultiAgentManager:
             workspace_info,
             "workspace_created",
         )
+
+    @staticmethod
+    async def _activate_workspace_drivers(workspace):
+        """Open sources after the exact workspace instance is published."""
+        if service := getattr(workspace, "driver_manager", None):
+            await service.activate_registered_protocols()
 
     @classmethod
     async def _setup_workspace_plugins(
@@ -784,6 +790,7 @@ class MultiAgentManager:
             agent_id,
             active_tasks=old_active_tasks,
         )
+        await self._activate_workspace_drivers(new_instance)
 
         return True
 

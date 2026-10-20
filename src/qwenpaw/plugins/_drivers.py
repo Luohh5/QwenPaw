@@ -36,6 +36,7 @@ from ..drivers.capabilities import (
     mcp_tool_whitelist,
 )
 from ..drivers.contracts import PolicyTarget, validate_card
+from ..drivers.errors import ApprovalRequiredError, DriverPermissionDeniedError
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +64,15 @@ def _revision(card):
     return int.from_bytes(hashlib.sha256(payload.encode()).digest()[:8], "big")
 
 
-def _workspace_guard(registry, workspace):
+def workspace_is_current(registry, workspace):
+    """Match actual live identity, including during workspace replacement."""
     manager = registry.get_workspace_manager()
     live = getattr(manager, "agents", getattr(manager, "workspaces", {}))
-    if live.get(workspace.agent_id) is not workspace:
+    return live.get(workspace.agent_id) is workspace
+
+
+def _workspace_guard(registry, workspace):
+    if not workspace_is_current(registry, workspace):
         raise StaleContextError("Driver workspace instance has been replaced")
 
 
@@ -275,6 +281,7 @@ class ProtocolRegistration:
         self.bindings = set()
         self.credential_locks = WeakValueDictionary()
         self.revoked = False
+        self.projected = False
 
     def guard(self):
         self.plugin._guard()
@@ -294,12 +301,23 @@ class ProtocolRegistration:
                 await handler.manager._close_owned_handlers((handler,))
             except Exception as exc:
                 errors.append(str(exc))
+        if self.projected:
+            # Custody also runs at shutdown, when ordinary intents do not.
+            try:
+                await self.plugin._api._registry.projector.revoke(
+                    "driver_protocol",
+                    self.spec.protocol,
+                    self.owner.plugin_id,
+                )
+            except Exception as exc:
+                errors.append(str(exc))
         if errors:
             raise SDKError("Driver cleanup failed: " + "; ".join(errors))
         for manager, factory in self.bindings:
             if manager._handler_types.get(self.spec.protocol) is factory:
                 manager._handler_types.pop(self.spec.protocol, None)
                 manager._endpoint_validators.pop(self.spec.protocol, None)
+        self.bindings.clear()
         self.plugin._api._registry.unregister_driver_protocol(
             self.spec.protocol,
             expected_owner=self.owner,
@@ -331,6 +349,32 @@ def register(context, spec):
             expected_owner=descriptor.owner,
         )
         raise
+
+    async def apply(workspace):
+        service = getattr(workspace, "driver_manager", None)
+        if service is None or not hasattr(service, "activate_protocol"):
+            return None
+        if not workspace_is_current(registry, workspace) or service._stopped:
+            return None
+        try:
+            with context._activation():
+                await service.activate_protocol(spec.protocol)
+        except BaseException as exc:
+            exc.binding = service
+            raise
+        return service
+
+    async def revoke(workspace, service):
+        del workspace
+        await service.deactivate_protocol(spec.protocol)
+
+    context._api._schedule_workspace_intent(
+        "driver_protocol",
+        spec.protocol,
+        apply,
+        revoke,
+    )
+    descriptor.projected = True
     return handle
 
 
@@ -371,6 +415,16 @@ def attach_driver_protocols(manager, registry, workspace):
             descriptor.validate,
         )
         descriptor.bindings.add((manager, factory))
+
+
+def detach_driver_protocols(manager, registry):
+    """Release references to a fully stopped workspace runtime."""
+    for descriptor in registry._driver_protocols.values():
+        descriptor.bindings = {
+            binding
+            for binding in descriptor.bindings
+            if binding[0] is not manager
+        }
 
 
 class SDKDriverHandler(DriverHandler):
@@ -609,25 +663,53 @@ class SDKDriverHandler(DriverHandler):
                 )
             return result
 
-    async def invoke_capability(self, invocation):
+    def _invocation_target(self, invocation):
         try:
             protocol, source, kind, action, name = parse_capability_id(
                 invocation.capability_id,
             )
-            if (protocol, source, kind, action) != (
-                self.card.protocol,
-                self.name,
-                "tool",
-                "invoke",
-            ):
-                raise SDKError("Unsupported Driver capability")
+        except ValueError as exc:
+            return None, DriverInvocationResult(
+                ok=False,
+                error_type="invalid_capability_id",
+                message=str(exc),
+            )
+        if (protocol, source, kind, action) != (
+            self.card.protocol,
+            self.name,
+            "tool",
+            "invoke",
+        ):
+            return None, DriverInvocationResult(
+                ok=False,
+                error_type="unsupported_capability",
+                message=(
+                    "Unsupported Driver capability: "
+                    f"{invocation.capability_id}"
+                ),
+            )
+        return name, None
+
+    async def invoke_capability(self, invocation):
+        name, error = self._invocation_target(invocation)
+        if error is not None:
+            return error
+        try:
             with self.admission():
                 await self.check()
                 if not self.card.enabled or not mcp_tool_is_enabled(
                     mcp_tool_whitelist(self.card.config.get("tools")),
                     name,
                 ):
-                    raise SDKError("Driver tool is disabled")
+                    return DriverInvocationResult(
+                        ok=False,
+                        error_type="tool_disabled",
+                        message=(
+                            f"Driver tool '{name}' is disabled for "
+                            f"driver '{self.name}'"
+                        ),
+                        metadata={"driver_name": self.name, "tool_name": name},
+                    )
                 revision = self.metadata_revision
                 values = invocation.request_context
                 subjects = []
@@ -691,11 +773,25 @@ class SDKDriverHandler(DriverHandler):
                         "Driver invoke must return DriverCallResult",
                     )
                 return DriverInvocationResult(ok=True, value=result)
+        except DriverPermissionDeniedError as exc:
+            return DriverInvocationResult(
+                ok=False,
+                error_type="driver_policy_denied",
+                message=exc.to_user_message(),
+                metadata=exc.to_result(),
+            )
+        except ApprovalRequiredError as exc:
+            return DriverInvocationResult(
+                ok=False,
+                error_type="driver_policy_approval_required",
+                message=str(exc),
+            )
         except Exception as exc:
             return DriverInvocationResult(
                 ok=False,
-                error_type="driver_error",
+                error_type="execution_error",
                 message=str(exc),
+                metadata={"driver_name": self.name, "tool_name": name},
             )
 
 

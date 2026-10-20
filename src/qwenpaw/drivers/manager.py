@@ -289,6 +289,16 @@ class DriverManager:  # pylint: disable=too-many-public-methods
             or old.endpoint != new.endpoint
             or old.credentials != new.credentials
             or old.enabled != new.enabled
+            or {
+                key: value
+                for key, value in old.config.items()
+                if key not in {"display_name", "description", "tools"}
+            }
+            != {
+                key: value
+                for key, value in new.config.items()
+                if key not in {"display_name", "description", "tools"}
+            }
         )
 
     async def delete_driver(self, name: str) -> None:
@@ -455,6 +465,17 @@ class DriverManager:  # pylint: disable=too-many-public-methods
             self._unpublish_owned_handlers(owned)
         await self._stop_pending(owned)
         await self._shutdown_handlers(owned)
+
+    @property
+    def has_owned_sources(self) -> bool:
+        """Include pending opens and failed cleanup in runtime custody."""
+        return bool(self._owned or self._cleanup_tasks)
+
+    async def close_protocol(self, protocol: str) -> None:
+        """Close only this protocol, retaining failed cleanup for retry."""
+        await self._close_owned_handlers(
+            tuple(h for h in self._owned if h.card.protocol == protocol),
+        )
 
     async def shutdown_all(self) -> None:
         """Revoke pending work and retain failed stops for explicit retry."""

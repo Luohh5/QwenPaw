@@ -228,7 +228,7 @@
 - [x] **Step 2:** 运行 `PYTHONPATH=src python -m pytest -q tests/unit/plugins/mcp`，确认插件缺失或不符合契约导致失败。
 - [x] **Step 3:** 迁移已有实现并适配公开 DTO，不顺便替换协议栈。移除内部导入；连接运行时与管理 HTTP 分文件，entry 仅登记协议和管理能力。
 - [x] **Step 4:** 通过 Task 3 的宿主测试入口验证发现、策略、实际调用和关闭；保持原 capability ID、工具名称、内容块、错误和结构化结果。
-- [ ] **Step 5:** 执行 `PYTHONPATH=src python -m qwenpaw.plugins.check plugins/protocol/mcp`；第三方 MCP 依赖允许，宿主内部依赖为零；测试通过后提交。
+- [x] **Step 5:** 执行 `PYTHONPATH=src python -m qwenpaw.plugins.check plugins/protocol/mcp`；第三方 MCP 依赖允许，宿主内部依赖为零；测试通过后提交。
 
 ### Task 5 改造工作区为惰性 Driver 服务并按需保留两秒扫描
 
