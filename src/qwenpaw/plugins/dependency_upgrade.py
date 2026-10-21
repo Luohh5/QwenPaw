@@ -277,7 +277,7 @@ class DependencyUpgradeManager:
                     "origin": "host",
                     "active": True,
                     "source_revision": host["version"],
-                    "requirements": list(host["requires_dist"]),
+                    "requirements": [f"qwenpaw=={host['version']}"],
                     "environment": snapshot.to_mapping(),
                 },
             )
@@ -467,12 +467,20 @@ class DependencyUpgradeManager:
             wheels_dir = directory / "wheels"
             wheels_dir.mkdir()
             resolver = directory / "requirements.txt"
+            # Resolve host dependencies without acquiring a new QwenPaw wheel.
             resolver.write_text(
                 "".join(str(value) + "\n" for value in requirements)
                 + "".join(
                     value + "\n"
                     for consumer in consumers
-                    for value in consumer["requirements"]
+                    for value in (
+                        consumer["environment"]["distributions"]["qwenpaw"][
+                            "requires_dist"
+                        ]
+                        if consumer["origin"] == "host"
+                        and consumer["plugin_id"] == "qwenpaw"
+                        else consumer["requirements"]
+                    )
                 ),
                 encoding="utf-8",
             )

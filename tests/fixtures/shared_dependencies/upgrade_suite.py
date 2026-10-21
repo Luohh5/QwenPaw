@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tomllib
 import venv
 import zipfile
 
@@ -46,7 +47,7 @@ def tree_bytes(root):
     }
 
 
-def distribution(root, name, version, module=None):
+def distribution(root, name, version, module=None, *, requires=()):
     """A tiny installed distribution with actual import and RECORD ownership."""
     module = module or name.replace("-", "_")
     info = f"{name.replace('-', '_')}-{version}.dist-info"
@@ -54,6 +55,7 @@ def distribution(root, name, version, module=None):
         f"{module}.py": f"VERSION = {version!r}\n".encode(),
         f"{info}/METADATA": (
             f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+            + "".join(f"Requires-Dist: {value}\n" for value in requires)
         ).encode(),
         f"{info}/WHEEL": (
             b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
@@ -164,6 +166,7 @@ def isolated_loader(tmp_path, monkeypatch):
         destination = Path(command[command.index("--wheel-dir") + 1])
         requirements = Path(command[command.index("-r") + 1])
         from packaging.requirements import Requirement
+        from importlib import metadata
 
         versions = {
             "markdown-it-py": ("3.0.0", "markdown_it"),
@@ -173,15 +176,30 @@ def isolated_loader(tmp_path, monkeypatch):
             "linkify-it-py": ("2.0.0", "linkify_it"),
             "cryptography": ("43.0.0", "cryptography"),
             "upgrade-sdk": ("2.0", "upgrade_sdk"),
+            "agentscope": ("2.0.10", "agentscope_fixture"),
+            "python-lsp-server": ("1.13.1", "pylsp_fixture"),
         }
         for line in requirements.read_text().splitlines():
             if not line.strip() or line.startswith("#"):
                 continue
             requirement = Requirement(line)
+            if requirement.marker and not requirement.marker.evaluate():
+                continue
             version, module = versions[requirement.name]
             assert requirement.specifier.contains(version), requirement
             scratch = tmp_path / ("wheel-" + requirement.name)
-            files = distribution(scratch, requirement.name, version, module)
+            installed = {
+                item.metadata["Name"]: item
+                for item in metadata.distributions(path=[str(site)])
+            }
+            observed = installed.get(requirement.name)
+            files = distribution(
+                scratch,
+                requirement.name,
+                version,
+                module,
+                requires=(observed.requires or ()) if observed else (),
+            )
             name = requirement.name.replace("-", "_")
             destination.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(
@@ -346,6 +364,150 @@ def imported_sdk(loader, site):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     return json.loads(result.stdout)
+
+
+def host_extra_graph(site, package, *, bridge_requires="host-extra-leaf>=1"):
+    """Install metadata with the project's exact default extra declaration."""
+    from packaging.requirements import Requirement
+
+    requirement = next(
+        value
+        for value in tomllib.loads((ROOT / "pyproject.toml").read_text())[
+            "project"
+        ]["dependencies"]
+        if Requirement(value).name == package
+    )
+    extra = "model-ollama" if package == "agentscope" else "rope"
+    version = "2.0.10" if package == "agentscope" else "1.13.1"
+    distribution(
+        site,
+        package,
+        version,
+        "agentscope_fixture" if package == "agentscope" else "pylsp_fixture",
+        requires=(
+            f"host-extra-bridge>=1; extra == '{extra}'",
+            "missing-inactive-extra>=1; extra == 'unused-extra'",
+            "missing-inactive-marker>=1; python_version < '0'",
+        ),
+    )
+    distribution(
+        site,
+        "host-extra-bridge",
+        "1.0",
+        requires=(bridge_requires,),
+    )
+    distribution(site, "host-extra-leaf", "1.0")
+    # Deliberately differ from the running source version: ownership must use
+    # the version observed inside the dependency interpreter.
+    distribution(
+        site,
+        "qwenpaw",
+        "0.0.7",
+        "host_fixture",
+        requires=(
+            requirement,
+            "missing-host-extra>=1; extra == 'unused-extra'",
+            "missing-host-marker>=1; python_version < '0'",
+        ),
+    )
+    return requirement
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("package", ["agentscope", "python-lsp-server"])
+async def test_default_host_extras_stage_preflight_and_apply(
+    isolated_loader,
+    tmp_path,
+    package,
+):
+    from qwenpaw.plugins.dependency_upgrade import continue_operation
+
+    loader, _, site, destination = isolated_loader
+    requirement = host_extra_graph(site, package)
+    distribution(site, "upgrade-sdk", "1.0")
+    before = tree_bytes(site)
+    source = channel_source(tmp_path / "incoming")
+    source_before = tree_bytes(source)
+    manager = upgrade_manager(loader)
+    operation = await manager.stage(source)
+    assert operation["status"] == "needs_confirmation"
+    assert operation["requires_restart"] is False
+    assert tree_bytes(site) == before
+    assert tree_bytes(source) == source_before
+    assert not list(destination.iterdir())
+
+    directory = manager.root / operation["id"]
+    stored = json.loads((directory / "operation.json").read_text())
+    (host,) = (row for row in stored["consumers"] if row["origin"] == "host")
+    assert host["requirements"] == ["qwenpaw==0.0.7"]
+    assert host["source_revision"] == "0.0.7"
+    observed_requires = host["environment"]["distributions"]["qwenpaw"][
+        "requires_dist"
+    ]
+    resolver_roots = (directory / "requirements.txt").read_text().splitlines()
+    assert resolver_roots == ["upgrade-sdk>=2", *observed_requires]
+    assert requirement in resolver_roots
+    assert all(not value.startswith("qwenpaw") for value in resolver_roots)
+    assert not stored["approved"]
+    await continue_operation(directory, preflight=True)
+    assert tree_bytes(site) == before
+    assert tree_bytes(source) == source_before
+    assert not list(destination.iterdir())
+
+    applied = await manager.apply(operation["id"])
+    assert applied["status"] == "succeeded", applied
+    assert imported_sdk(loader, site)["value"] == "2.0"
+    assert (destination / "upgrade_fixture/driver.py").read_bytes() == (
+        source / "driver.py"
+    ).read_bytes()
+    assert tree_bytes(source) == source_before
+
+
+@pytest.mark.asyncio
+async def test_requested_host_extra_transitive_conflict_is_refused(
+    isolated_loader,
+    tmp_path,
+):
+    from qwenpaw.plugins.dependency_gate import SharedDependencyError
+
+    loader, _, site, destination = isolated_loader
+    host_extra_graph(site, "agentscope", bridge_requires="upgrade-sdk<2")
+    distribution(site, "upgrade-sdk", "1.0")
+    before = tree_bytes(site)
+    manager = upgrade_manager(loader)
+    # The fixture solver emits SDK 2.0, letting the real host closure reject
+    # this unsafe proposal independently of the external resolver's result.
+    with pytest.raises(SharedDependencyError) as refused:
+        await manager.stage(channel_source(tmp_path / "incoming"))
+    assert refused.value.reason_code == "DEPENDENCY_CONFLICT"
+    assert "upgrade-sdk<2" in str(refused.value)
+    assert tree_bytes(site) == before
+    assert not list(manager.root.iterdir())
+    assert not list(destination.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_requested_host_extra_upgrade_requires_restart_before_write(
+    isolated_loader,
+    tmp_path,
+):
+    from qwenpaw.plugins.dependency_upgrade import continue_operation
+
+    loader, _, site, destination = isolated_loader
+    host_extra_graph(site, "agentscope", bridge_requires="upgrade-sdk>=1")
+    distribution(site, "upgrade-sdk", "1.0")
+    before = tree_bytes(site)
+    manager = upgrade_manager(loader)
+    operation = await manager.stage(channel_source(tmp_path / "incoming"))
+    assert operation["requires_restart"] is True
+    assert tree_bytes(site) == before
+    assert not list(destination.iterdir())
+    await continue_operation(manager.root / operation["id"], preflight=True)
+    applied = await manager.apply(operation["id"])
+    assert applied["status"] == "waiting_restart", applied
+    assert applied["requires_restart"] is True
+    assert tree_bytes(site) == before
+    assert not list(destination.iterdir())
 
 
 @pytest.mark.asyncio

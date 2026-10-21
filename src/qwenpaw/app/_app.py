@@ -45,6 +45,7 @@ from ..utils.system_info import summarize_python_environment
 from .auth import (
     AuthMiddleware,
     RuntimeBoundaryMiddleware,
+    TrustedProxySchemeMiddleware,
     auto_register_from_env,
     check_proxy_config_sanity,
 )
@@ -858,6 +859,7 @@ app.add_middleware(ResponseCompressionMiddleware, minimum_size=1000)
 app.add_middleware(AgentContextMiddleware)
 
 app.add_middleware(AuthMiddleware)
+app.add_middleware(TrustedProxySchemeMiddleware)
 app.add_middleware(RuntimeBoundaryMiddleware)
 
 # Apply CORS middleware if CORS_ORIGINS is set
