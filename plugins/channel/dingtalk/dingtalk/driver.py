@@ -86,6 +86,12 @@ class DingTalkDriver(SharedResponseDriver):
             raise
         return updated
 
+    @staticmethod
+    def _feedback_fingerprint(delivery_id):
+        return hashlib.sha256(
+            ("dingtalk.feedback:" + delivery_id).encode(),
+        ).hexdigest()
+
     async def _feedback(self, snapshot, meta, label, *, recall=False):
         if not meta.get("message_id") or not meta.get("conversation_id"):
             return snapshot
@@ -97,6 +103,7 @@ class DingTalkDriver(SharedResponseDriver):
         ):
             return snapshot
         attrs = {
+            "fingerprint": self._feedback_fingerprint(delivery_id),
             "operation": "reaction",
             "state": "unknown",
             "reason_code": "PLATFORM_RESULT_UNKNOWN",
@@ -135,6 +142,38 @@ class DingTalkDriver(SharedResponseDriver):
         except Exception:
             await self._diagnostic("REACTION_CHECKPOINT_FAILED")
             return self._routes.snapshot(snapshot.response_handle)
+
+    def _compact_receipt(self, snapshot):
+        feedback_ids = {
+            snapshot.response_handle + ":" + label
+            for label in ("🤔Thinking", "recall", "🥳Done", "☹️Error")
+        }
+        refs = []
+        for ref in snapshot.resource_refs:
+            attrs = dict(ref.attributes)
+            # Only the exact pre-fingerprint internal journal is repairable.
+            if (
+                ref.kind == "dingtalk.attempt"
+                and ref.resource_id in feedback_ids
+                and attrs
+                == {
+                    "operation": "reaction",
+                    "state": "unknown",
+                    "reason_code": "PLATFORM_RESULT_UNKNOWN",
+                }
+            ):
+                attrs["fingerprint"] = self._feedback_fingerprint(
+                    ref.resource_id,
+                )
+                ref = ResponseResourceRef.create(
+                    ref.kind,
+                    ref.resource_id,
+                    attrs,
+                )
+            refs.append(ref)
+        return super()._compact_receipt(
+            replace(snapshot, resource_refs=tuple(refs)),
+        )
 
     async def _before_cleanup_complete(self, snapshot):
         if not snapshot.route_refs:

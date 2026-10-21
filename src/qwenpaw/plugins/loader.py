@@ -221,7 +221,9 @@ _LIFECYCLE_HELD: ContextVar[Optional[_LifecycleHoldKey]] = ContextVar(
 )
 
 
-def _ensure_plugin_site_on_path() -> None:
+def _ensure_plugin_site_on_path(
+    site_dir: Path | None = None,
+) -> None:
     """Put the plugin-deps site dir on ``sys.path`` (idempotent).
 
     Only relevant for the frozen desktop build, where plugin dependencies are
@@ -231,16 +233,14 @@ def _ensure_plugin_site_on_path() -> None:
     if not _is_frozen():
         return
     try:
-        site_dir = str(_plugin_site_dir())
+        site = str(_plugin_site_dir() if site_dir is None else site_dir)
     except Exception:
         return
     # Expose the dir so plugins that spawn the bundled Python (e.g. the pet
     # desktop window) can put their installed deps on the child's PYTHONPATH.
-    os.environ["QWENPAW_PLUGIN_SITE"] = site_dir
-    if site_dir in sys.path:
-        return
-    if site_dir not in sys.path:
-        sys.path.insert(0, site_dir)
+    os.environ["QWENPAW_PLUGIN_SITE"] = site
+    if site not in sys.path:
+        sys.path.insert(0, site)
     importlib.invalidate_caches()
 
 
@@ -782,7 +782,6 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         plugin_id: str,
     ):
         """Stage explicit legacy wheel installs through the shared gate."""
-        from dataclasses import replace
         from .dependency_gate import (
             SharedDependencyError,
             prepare_shared_dependencies,
@@ -791,16 +790,49 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         from .execution.bootstrap import _hash_code_root
         from .execution.environment import shared_dependency_paths
 
-        python = _desktop_python() if _is_frozen() else sys.executable
-        if (
-            not python
-            or os.environ.get("QWENPAW_RUNTIME_PROVISIONER") == "local"
-        ):
+        if os.environ.get("QWENPAW_RUNTIME_PROVISIONER") == "local":
             raise RuntimeError(
                 "Shared runtime requires explicit administrator repair",
             )
+        frozen = _is_frozen()
+        runtime = None
+        target = None
+        support = Path(__file__).resolve().parents[2]
+        python = sys.executable
+        paths = shared_dependency_paths() if not frozen else ()
+        if frozen:
+            from .channel_bootstrap import (
+                resolve_default_channel_runtime,
+                validate_runtime_identity,
+            )
+            from .install_lock import (
+                async_lock,
+                environment_install_lock_path,
+                plugin_install_lock,
+            )
+
+            runtime = self.registry.channel_runtime
+            if runtime is None:
+                runtime = await asyncio.to_thread(
+                    resolve_default_channel_runtime,
+                )
+            if (
+                runtime.runtime_identity is None
+                or runtime.dependency_install_target is None
+            ):
+                raise ValueError("CHANNEL_RUNTIME_MISSING")
+            python = runtime.python_executable
+            support = runtime.support_root
+            target = Path(runtime.dependency_install_target)
+            async with async_lock(
+                plugin_install_lock(environment_install_lock_path(target)),
+            ):
+                if target.is_symlink():
+                    raise ValueError("CHANNEL_RUNTIME_TARGET_INVALID")
+                target.mkdir(parents=True, exist_ok=True)
+            target = target.resolve()
+            paths = tuple(dict.fromkeys((*runtime.dependency_paths, target)))
         root = requirements_file.parent.resolve()
-        paths = () if _is_frozen() else shared_dependency_paths()
         await self._stop_preparation(plugin_id)
         process, lease = self._own_preparation(
             plugin_id,
@@ -810,10 +842,11 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         )
         usage = self.registry.dependency_usage
         token = None
+        identity_error = None
         try:
             spec = PluginLaunchSpec(
                 python_executable=python,
-                support_root=Path(__file__).resolve().parents[2],
+                support_root=support,
                 code_root=root,
                 source_revision=_hash_code_root(root),
                 plugin_id=plugin_id,
@@ -839,23 +872,24 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 ),
             )
             usage.bind(lease, token)
-            process.dependency_observer = lambda snapshot: usage.observe(
-                lease,
-                snapshot,
-            )
-            snapshot = (await process.audit(spec)).snapshot
-            usage.observe(lease, snapshot)
-            if _is_frozen():
-                environment = snapshot.marker_environment
-                bucket = (
-                    f"py{environment['python_version']}-"
-                    f"{environment['platform_system'].lower()}-"
-                    f"{environment['platform_machine'].lower()}"
-                )
-                paths = (_plugin_runtime_dir() / bucket / "site",)
-                spec = replace(spec, dependency_paths=paths)
-                snapshot = (await process.audit(spec)).snapshot
+
+            def observe(snapshot):
+                nonlocal identity_error
+                if runtime is not None:
+                    try:
+                        validate_runtime_identity(
+                            snapshot,
+                            runtime.runtime_identity,
+                            python,
+                        )
+                    except ValueError as exc:
+                        identity_error = exc
+                        raise
                 usage.observe(lease, snapshot)
+
+            process.dependency_observer = observe
+            snapshot = (await process.audit(spec)).snapshot
+            observe(snapshot)
             # A selected interpreter can expose package sites absent from the
             # host's sys.path (including an active user site). Retain its real
             # audited roots before the additive writer admits another audit.
@@ -864,17 +898,14 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             lease_environment(snapshot.dependency_sites or ())
             from .dependency_usage import current_admission_token
 
-            targets = (
-                list(paths)
-                if _is_frozen()
-                else [
+            if not frozen:
+                targets = [
                     Path(site)
                     for site in snapshot.dependency_sites or ()
                     if Path(site).name in {"site-packages", "dist-packages"}
                     and Path(site).is_relative_to(snapshot.prefix)
                 ]
-            )
-            target = targets[0] if len(targets) == 1 else None
+                target = targets[0] if len(targets) == 1 else None
             try:
                 await prepare_shared_dependencies(
                     process,
@@ -889,7 +920,6 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     ),
                     install_target=target,
                 )
-                return GateDecision(False, True, reason="already satisfied")
             except SharedDependencyError as exc:
                 if exc.decision.require_restart or exc.decision.unsupported:
                     raise
@@ -897,15 +927,21 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     raise RuntimeError(
                         "DEPENDENCY_ENVIRONMENT_AMBIGUOUS",
                     ) from exc
-            await self._acquire_dependency_wheels(
-                process,
-                spec,
-                snapshot,
-                target,
-                plugin_id,
-                requirements_file,
-            )
+                await self._acquire_dependency_wheels(
+                    process,
+                    spec,
+                    snapshot,
+                    target,
+                    plugin_id,
+                    requirements_file,
+                )
+            if frozen:
+                _ensure_plugin_site_on_path(target)
             return GateDecision(False, True, reason="already satisfied")
+        except Exception:
+            if identity_error is not None:
+                raise identity_error
+            raise
         finally:
             try:
                 observed = getattr(process, "dependency_snapshot", None)
