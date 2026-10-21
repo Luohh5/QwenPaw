@@ -59,6 +59,12 @@ from qwenpaw.channel_protocol.models import (
 )
 from qwenpaw.channel_protocol.shared import SharedChannelDescriptor
 from qwenpaw.schemas import Message, AgentRequest
+from qwenpaw.utils.io_utils import (
+    get_path_lock,
+    run_async_to_completion,
+    run_sync_io,
+)
+from qwenpaw.utils.outbound_media import update_outbound_media
 from .base import BaseChannel
 from .process_supervisor import ChannelCallUnknown, ChannelProcess, LaunchSpec
 from .renderer import ChannelDisplayConfig
@@ -278,7 +284,13 @@ class IsolatedChannelProxy(BaseChannel):
         self._owner_registry = None
         self._admission_wakeup = None
         self._state = {}
-        self._state_lock = asyncio.Lock()
+        state_path = self._state_path()
+        self._state_lock = (
+            get_path_lock(state_path)
+            if state_path is not None
+            else asyncio.Lock()
+        )
+        self._state_closed = False
         self._ingress_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
         self._started = False
@@ -386,12 +398,17 @@ class IsolatedChannelProxy(BaseChannel):
 
     async def start(self):
         async with self._lifecycle_lock:
+            if self._state_closed:
+                result = self.last_stop_result
+                if result and "HOST_STATE_IO_PENDING" in result.residual:
+                    raise RuntimeError("HOST_STATE_IO_PENDING")
+                if result is None or not result.exited or result.residual:
+                    raise RuntimeError("CHANNEL_STOP_INCOMPLETE")
             if self._started or not self.enabled:
                 return
             if self._text_merge:
                 raise RuntimeError("TEXT_MERGE_CLEANUP_PENDING")
             self._text_merge_stopping = False
-            self.last_stop_result = None
             self._ingress_open = True
             generation = self.channel_process.health_snapshot()["generation"]
             if generation and self._owner_registry is not None:
@@ -432,6 +449,8 @@ class IsolatedChannelProxy(BaseChannel):
                             ),
                         ),
                     )
+                self.last_stop_result = None
+                self._state_closed = False
                 await self.channel_process.start(self._launch_spec)
             finally:
                 if (
@@ -474,6 +493,9 @@ class IsolatedChannelProxy(BaseChannel):
         self._text_merge_stopping = True
         if self._admission_wakeup is not None:
             self._admission_wakeup()
+        return await run_async_to_completion(self._stop())
+
+    async def _stop(self):
         async with self._lifecycle_lock:
             # Cancel owned requests before retiring their process generation.
             for state in self._text_merge.values():
@@ -489,7 +511,17 @@ class IsolatedChannelProxy(BaseChannel):
                     self.endpoint_service,
                     timeout=self._launch_spec.shutdown_timeout,
                 )
-            result = await self.channel_process.stop()
+            try:
+                result = await self.channel_process.stop()
+            finally:
+                # Driver.stop may checkpoint until worker shutdown finishes.
+                self._state_closed = True
+            try:
+                async with asyncio.timeout(self._launch_spec.shutdown_timeout):
+                    async with self._state_lock:
+                        pass
+            except TimeoutError:
+                residual = (*residual, "HOST_STATE_IO_PENDING")
             if residual:
                 result = replace(
                     result,
@@ -570,8 +602,6 @@ class IsolatedChannelProxy(BaseChannel):
         logger.warning("Channel diagnostic: %s", reason)
 
     async def _event_batch(self, params, request):
-        from ...utils.io_utils import run_async_to_completion
-
         # RPC cancellation cannot split queue commit from the dedup record.
         return await run_async_to_completion(self._admit_batch(params))
 
@@ -712,37 +742,37 @@ class IsolatedChannelProxy(BaseChannel):
         ).hexdigest()
         return self._workspace_dir / "channel_state" / (scope + ".json")
 
+    def _check_state_open(self, params):
+        self._check_identity(params)
+        if self._state_closed:
+            raise ValueError("CHANNEL_STOPPING")
+
     async def _host_state(self, operation, params):
         params = (
             params
             if isinstance(params, HostStateParams)
             else HostStateParams.from_mapping(params)
         )
-        self._check_identity(params)
+        self._check_state_open(params)
         async with self._state_lock:
-            self._check_identity(params)
-            task = asyncio.create_task(
-                asyncio.to_thread(self._state_operation, operation, params),
+            self._check_state_open(params)
+            return await run_sync_io(
+                self._state_operation,
+                operation,
+                params,
             )
-            try:
-                return await asyncio.shield(task)
-            except asyncio.CancelledError:
-                await asyncio.shield(task)
-                raise
 
     async def _host_receipt(self, operation, params):
-        from ...utils.io_utils import run_sync_io
-
         params = (
             params
             if isinstance(params, HostStateParams)
             else HostStateParams.from_mapping(params)
         )
-        self._check_identity(params)
+        self._check_state_open(params)
         if params.schema_version != 1 or operation not in {"get", "put"}:
             raise ValueError("RESPONSE_RECEIPT_VERSION")
         async with self._state_lock:
-            self._check_identity(params)
+            self._check_state_open(params)
             return await run_sync_io(
                 self._receipt_operation,
                 operation,
@@ -763,26 +793,30 @@ class IsolatedChannelProxy(BaseChannel):
 
     def _state_operation(self, operation, params):
         path = self._state_path()
-        if not self._state and path and path.exists():
-            with path.open("rb") as source:
-                raw = source.read(_STATE_MAX_BYTES + 1)
-            if len(raw) > _STATE_MAX_BYTES:
-                raise ValueError("HOST_STATE_CAPACITY")
-            restored = json.loads(raw)
-            if (
-                not isinstance(restored, dict)
-                or len(restored) > _STATE_MAX_KEYS
-            ):
-                raise ValueError("HOST_STATE_INVALID")
-            if any(
-                not isinstance(row, dict)
-                or set(row) != {"schema_version", "value"}
-                or type(row["schema_version"]) is not int
-                or row["schema_version"] < 1
-                for row in restored.values()
-            ):
-                raise ValueError("HOST_STATE_INVALID")
-            self._state = restored
+        if path is not None:
+            try:
+                with path.open("rb") as source:
+                    raw = source.read(_STATE_MAX_BYTES + 1)
+            except FileNotFoundError:
+                self._state = {}
+            else:
+                if len(raw) > _STATE_MAX_BYTES:
+                    raise ValueError("HOST_STATE_CAPACITY")
+                restored = json.loads(raw)
+                if (
+                    not isinstance(restored, dict)
+                    or len(restored) > _STATE_MAX_KEYS
+                ):
+                    raise ValueError("HOST_STATE_INVALID")
+                if any(
+                    not isinstance(row, dict)
+                    or set(row) != {"schema_version", "value"}
+                    or type(row["schema_version"]) is not int
+                    or row["schema_version"] < 1
+                    for row in restored.values()
+                ):
+                    raise ValueError("HOST_STATE_INVALID")
+                self._state = restored
         key = params.key
         if operation == "get":
             row = self._state.get(key)
@@ -1177,7 +1211,9 @@ class IsolatedChannelProxy(BaseChannel):
                         to_handle,
                         meta,
                         fields,
-                        separator_newlines=policy.text_merge_separator_newlines,
+                        separator_newlines=(
+                            policy.text_merge_separator_newlines
+                        ),
                         format_policy=deferred_format,
                     )
                     return None
@@ -1240,6 +1276,12 @@ class IsolatedChannelProxy(BaseChannel):
                 **fields,
             }
         self._require_enabled()
+        await update_outbound_media(
+            self._workspace_dir,
+            fields.get("content_parts", []),
+            delivery_id,
+            pending=True,
+        )
         try:
             result = OutboundResult.from_mapping(
                 await self.channel_process.call(
@@ -1259,6 +1301,12 @@ class IsolatedChannelProxy(BaseChannel):
                     meta["_reply_unknown"] = True
                 else:
                     meta.pop("_pending_delivery", None)
+                    await update_outbound_media(
+                        self._workspace_dir,
+                        fields.get("content_parts", []),
+                        delivery_id,
+                        pending=False,
+                    )
                 raise error
         except (ChannelCallUnknown, asyncio.CancelledError):
             meta["_reply_unknown"] = True
@@ -1273,6 +1321,12 @@ class IsolatedChannelProxy(BaseChannel):
             raise
         meta.pop("_pending_delivery", None)
         meta["_last_delivery_id"] = delivery_id
+        await update_outbound_media(
+            self._workspace_dir,
+            fields.get("content_parts", []),
+            delivery_id,
+            pending=False,
+        )
         return delivery_id
 
     def _check_text_state(self, state):
@@ -2097,9 +2151,11 @@ class IsolatedChannelProxy(BaseChannel):
             {"state": exc.state, "reason_code": exc.reason_code},
         )
         self._record_diagnostic(
-            "EVENT_DELIVERY_UNKNOWN"
-            if exc.side_effect_possible
-            else "EVENT_DELIVERY_FAILED",
+            (
+                "EVENT_DELIVERY_UNKNOWN"
+                if exc.side_effect_possible
+                else "EVENT_DELIVERY_FAILED"
+            ),
         )
 
     async def _send_model_fallback_notice(self, to_handle, event, send_meta):
@@ -2165,7 +2221,8 @@ class IsolatedChannelProxy(BaseChannel):
                     locator = "data" if kind == "audio" else kind + "_url"
                     if item.role == "message" and not value.get(locator):
                         # A runtime-only reference has no transport locator.
-                        # Rendered tool media still undergoes strict validation.
+                        # Rendered tool media still undergoes strict
+                        # validation.
                         continue
                     part = {
                         key: value[key]

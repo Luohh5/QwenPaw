@@ -363,6 +363,7 @@ class FeishuDriver(SharedResponseDriver):
             feishu_sender_id=operator,
             is_group=bool(ctx.get("is_group")),
             from_card_action=True,
+            has_bot_command=True,
             user_id=operator,
             session_id=ctx.get("session_id")
             or self._session(str(ctx.get("sender_id") or operator), meta),

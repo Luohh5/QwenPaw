@@ -27,6 +27,7 @@ class HostPeer(core.Peer):
             health_snapshot=lambda: {"generation": 1}
         )
         owner._state, owner._state_lock = {}, asyncio.Lock()
+        owner._state_closed = False
         self.owner = owner
         self.fail_archive = self.fail_live_removal = False
         self.lose_archive_ack = False

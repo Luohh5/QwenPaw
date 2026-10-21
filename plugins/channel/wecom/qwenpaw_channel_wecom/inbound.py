@@ -42,6 +42,11 @@ class InboundDecoder:
         epoch = self._epoch
         try:
             body = frame.get("body") or {}
+            if frame.get("cmd") != "aibot_msg_callback" or (
+                "aibotid" in body
+                and body["aibotid"] != self.config.get("bot_id")
+            ):
+                return False
             msgtype = body.get("msgtype") or ""
             sender_id = (body.get("from") or {}).get("userid", "")
             chatid = body.get("chatid", "")
@@ -292,6 +297,8 @@ class InboundDecoder:
                 "wecom_chatid": chatid,
                 "wecom_chat_type": chat_type,
                 "is_group": is_group,
+                # Group callbacks target this authenticated bot connection.
+                "bot_mentioned": is_group,
                 "user_name": sender_id,
             }
 

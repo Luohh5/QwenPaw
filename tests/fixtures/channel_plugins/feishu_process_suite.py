@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import time
 from types import SimpleNamespace as NS
 
 import pytest
@@ -465,6 +466,7 @@ async def test_media_download_and_upload_round_trip_through_child(runtime):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["approve", "deny"])
 @pytest.mark.parametrize(
     "shared,thread",
     [(False, ""), (True, ""), (False, "omt-topic")],
@@ -473,6 +475,8 @@ async def test_card_callback_preserves_actual_approval_actor(
     runtime,
     shared,
     thread,
+    decision,
+    monkeypatch,
 ):
     """Approval must use operator identity even in synthetic group/topic
     sessions.
@@ -488,10 +492,10 @@ async def test_card_callback_preserves_actual_approval_actor(
         PendingApproval,
     )
 
-    rt = await runtime(share_session_in_group=shared)
+    rt = await runtime(share_session_in_group=shared, require_mention=True)
     payload = await inbound(
         rt,
-        message("approval-source", group=True, thread=thread),
+        message("approval-source", group=True, mentioned=True, thread=thread),
     )
     request = rt.channel.build_agent_request_from_native(payload)
     event = Message(
@@ -513,7 +517,7 @@ async def test_card_callback_preserves_actual_approval_actor(
     )
     action = json.loads(rt.rows("create")[-1]["content"])["elements"][-1][
         "actions"
-    ][0]["value"]
+    ][0 if decision == "approve" else 1]["value"]
     assert action["session_ctx"]["session_id"] == request.session_id
     click = {
         "header": {"event_id": "card-1"},
@@ -526,7 +530,9 @@ async def test_card_callback_preserves_actual_approval_actor(
     command = rt.channel.build_agent_request_from_native(callback)
     assert command.session_id == request.session_id
     assert command.user_id == callback["acl_sender_id"] == "ou_alice"
-    assert command.input[0].content[0].text == "/approval approve approval-1"
+    assert (
+        command.input[0].content[0].text == f"/approval {decision} approval-1"
+    )
     context = ControlContext(
         workspace=None,
         payload=command,
@@ -534,7 +540,7 @@ async def test_card_callback_preserves_actual_approval_actor(
         session_id=command.session_id,
         user_id=command.user_id,
         agent_id="default",
-        args={"action": "approve", "request_id": "approval-1"},
+        args={"action": decision, "request_id": "approval-1"},
     )
     pending = PendingApproval(
         request_id="approval-1",
@@ -545,7 +551,7 @@ async def test_card_callback_preserves_actual_approval_actor(
         channel="feishu",
         agent_id="default",
         tool_name="shell",
-        created_at=0,
+        created_at=time.time(),
         future=asyncio.get_running_loop().create_future(),
         identity_policy=ApprovalIdentityPolicy.EXACT_REQUESTER,
     )
@@ -553,6 +559,55 @@ async def test_card_callback_preserves_actual_approval_actor(
         pending,
         ApprovalCommandHandler._actor(context),
     ) is (not shared and not thread)
+    service = ApprovalService()
+    service._pending[pending.request_id] = pending
+    monkeypatch.setattr(
+        "qwenpaw.runtime.commands.control.approval_handler."
+        "get_approval_service",
+        lambda: service,
+    )
+    # A different real card operator passes mention admission, but cannot
+    # resolve the original request even in a shared group session.
+    click["header"]["event_id"] = "card-other-actor"
+    click["event"]["operator"]["open_id"] = "ou_mallory"
+    outsider = rt.channel.build_agent_request_from_native(
+        await inbound(rt, click, "card")
+    )
+    outsider_context = replace(
+        context, payload=outsider, user_id=outsider.user_id
+    )
+    await ApprovalCommandHandler().handle(outsider_context)
+    assert outsider_context.approval_resolution.outcome.value == "forbidden"
+    assert not pending.future.done()
+    assert await service.get_request("approval-1") is pending
+
+    await ApprovalCommandHandler().handle(context)
+    if shared or thread:
+        assert context.approval_resolution.outcome.value == "forbidden"
+        assert not pending.future.done()
+    else:
+        expected = "approved" if decision == "approve" else "denied"
+        assert context.approval_resolution.outcome.value == expected
+        assert pending.future.result().value == expected
+        assert await service.get_request("approval-1") is None
+
+    # Control events still cross the ordinary Host ACL gate.
+    from qwenpaw.app.channels.access_control import AccessControlStore
+
+    store = AccessControlStore(rt.work / "card-acl.json")
+    monkeypatch.setattr(
+        "qwenpaw.app.channels.base.get_access_control_store",
+        lambda *_a, **_k: store,
+    )
+    rt.channel.access_control_group = True
+    queued = len(rt.queued)
+    click["header"]["event_id"] = "card-denied-by-acl"
+    rt.emit(click, "card")
+    await eventually(lambda: store.get_all_pending())
+    assert len(rt.queued) == queued
+    assert [row["user_id"] for row in store.get_all_pending()] == [
+        "ou_mallory"
+    ]
 
 
 async def stream_request(rt, mid, **settings):
