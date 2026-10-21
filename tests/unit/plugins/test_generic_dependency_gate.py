@@ -102,10 +102,10 @@ class Audit:
                 rows[name] = {
                     "version": dist.version,
                     "metadata_path": str(dist._path),
-                    "requires_dist": list(dist.requires or ()),
-                    "top_level": (
-                        dist.read_text("top_level.txt") or ""
-                    ).splitlines(),
+                    "requires_dist": tuple(dist.requires or ()),
+                    "top_level": tuple(
+                        (dist.read_text("top_level.txt") or "").splitlines(),
+                    ),
                 }
         return SimpleNamespace(
             snapshot=replace(self.snapshot, distributions=rows),

@@ -180,6 +180,8 @@ async def test_enabled_candidate_failure_restores_code_session_and_delivery(
         )
         question(server, "before-update", "persist before update")
         await eventually(lambda: len(finals(server, "before-update")) == 1)
+        # The wire final precedes completion of the session metadata write.
+        assert await rt.manager._drain_channel("wecom", timeout=5)
         sessions = {
             p: p.read_bytes()
             for p in (rt.ws.workspace_dir / "sessions").rglob("*.json")

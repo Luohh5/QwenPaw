@@ -7,10 +7,14 @@ import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import replace
 import hashlib
+import json
 import uuid
 
 from qwenpaw.channel_protocol.models import InboundEvent
-from qwenpaw.channel_protocol.response_lifecycle import ResponseResourceRef
+from qwenpaw.channel_protocol.response_lifecycle import (
+    ResponseCleanupState,
+    ResponseResourceRef,
+)
 from qwenpaw.channel_protocol.response_policy import (
     ResponsePolicy,
     SendFormatPolicy,
@@ -27,6 +31,7 @@ from .inbound import parse_chatid_from_handle, resolve_session_id
 class WeComDriver(SharedResponseDriver):
     def __init__(self):
         super().__init__("wecom", "wecom.shared.responses", WeComDeliveryError)
+        self._native_recovery_lock = asyncio.Lock()
 
     @staticmethod
     async def manage(request):
@@ -59,7 +64,28 @@ class WeComDriver(SharedResponseDriver):
         if connected != self._connected:
             self._connection_generation += 1
         self._connected = connected
-        await self._context.set_platform_state(state)
+        generation = self._connection_generation
+        if connected:
+            async with self._native_recovery_lock:
+                self._check_connection(generation)
+                await self._context.set_platform_state(state)
+                for pending in self._routes.pending_cleanups():
+                    self._check_connection(generation)
+                    async with self._lock(pending.response_handle):
+                        self._check_connection(generation)
+                        snapshot = self._routes.snapshot(
+                            pending.response_handle,
+                        )
+                        if snapshot is None or not self._expired_native(
+                            snapshot,
+                        ):
+                            continue
+                        try:
+                            await self._cleanup(snapshot)
+                        except Exception:
+                            await self._diagnostic("RESPONSE_FINISH_FAILED")
+        else:
+            await self._context.set_platform_state(state)
 
     def _require_connected(self):
         if self._stopping or not self._connected or self._platform is None:
@@ -122,7 +148,7 @@ class WeComDriver(SharedResponseDriver):
         return {"response_handle": handle}
 
     async def _message(self, value):
-        platform = self._require_connected()
+        generation = self._connection_generation
         event_id, session = value["event_id"], value["session_id"]
         handle = (
             "wecom:reply:"
@@ -136,17 +162,20 @@ class WeComDriver(SharedResponseDriver):
         for key in ("approval_binding_id", "approval_actor_id"):
             if key in value:
                 route[key] = value[key]
-        snapshot = self._routes.snapshot(handle)
-        created = snapshot is None
-        if snapshot is not None and snapshot.kind.value == "terminal":
-            return True
-        if created:
-            route.update(platform.register_frame(handle, value["frame"]))
-            try:
-                await self._persist_route(handle, route)
-            except BaseException:
-                await platform.release_route(handle)
-                raise
+        async with self._native_recovery_lock:
+            self._check_connection(generation)
+            platform = self._require_connected()
+            snapshot = self._routes.snapshot(handle)
+            created = snapshot is None
+            if snapshot is not None and snapshot.kind.value == "terminal":
+                return True
+            if created:
+                route.update(platform.register_frame(handle, value["frame"]))
+                try:
+                    await self._persist_route(handle, route)
+                except BaseException:
+                    await platform.release_route(handle)
+                    raise
         event = InboundEvent(
             **self._context.identity.to_mapping(),
             event_id=event_id,
@@ -401,6 +430,106 @@ class WeComDriver(SharedResponseDriver):
     def _needs_stream_cleanup(self, ref):
         return bool(dict(ref.attributes).get("stream_id"))
 
+    def _expired_native(self, snapshot):
+        if (
+            self._platform is None
+            or self._stopping
+            or snapshot.cleanup_state is not ResponseCleanupState.PENDING
+        ):
+            return None
+        for ref in snapshot.route_refs:
+            if (
+                ref.kind != "wecom.route"
+                or ref.resource_id != snapshot.response_handle
+            ):
+                continue
+            route = dict(ref.attributes)
+            if route.get("response_handle") != snapshot.response_handle:
+                continue
+            reason = self._platform.native_route_expiry(route)
+            if reason:
+                return route, reason
+        return None
+
+    async def _cleanup(self, snapshot):
+        expired = self._expired_native(snapshot)
+        if expired is None:
+            try:
+                return await super()._cleanup(snapshot)
+            except Exception:
+                # A reconnect may invalidate the target after the first check.
+                snapshot = self._routes.snapshot(snapshot.response_handle)
+                if snapshot is None or not self._expired_native(snapshot):
+                    raise
+                return await self._cleanup(snapshot)
+        handle = snapshot.response_handle
+        platform = self._platform
+        async with platform.delivery():
+            if await self._archived(handle):
+                await self._retire_archived(handle)
+                return
+            route, reason = expired
+            if not any(
+                ref.kind == "wecom.retirement"
+                for ref in snapshot.resource_refs
+            ):
+                receipt_id = handle + ":native-retirement"
+                while any(
+                    ref.kind == "wecom.attempt"
+                    and ref.resource_id == receipt_id
+                    for ref in snapshot.resource_refs
+                ):
+                    receipt_id += ":local"
+                context = {
+                    **route,
+                    "reason_code": reason,
+                    "cleanup": "local_only",
+                }
+                evidence = (
+                    ResponseResourceRef.create(
+                        "wecom.retirement",
+                        handle,
+                        context,
+                    ),
+                    ResponseResourceRef.create(
+                        "wecom.attempt",
+                        receipt_id,
+                        {
+                            "operation": "response.cleanup",
+                            "state": "unknown",
+                            "reason_code": reason,
+                            "fingerprint": hashlib.sha256(
+                                json.dumps(context, sort_keys=True).encode(),
+                            ).hexdigest(),
+                        },
+                    ),
+                )
+                snapshot = replace(
+                    snapshot,
+                    version=snapshot.version + 1,
+                    resource_refs=tuple(
+                        sorted((*snapshot.resource_refs, *evidence)),
+                    ),
+                )
+                self._routes.restore(snapshot)
+            await self._checkpoint()
+            await platform.cleanup_resource(route, local_only=True)
+            candidate = self._compact_receipt(
+                self._routes.cleanup_candidate(handle, snapshot.outcome),
+            )
+            try:
+                await self._archive(candidate)
+            finally:
+                # A durable archive may precede a failed live checkpoint write.
+                if self._routes.snapshot(handle) is None:
+                    await platform.release_route(handle, local_only=True)
+
+    async def _retire_archived(self, handle):
+        if self._platform is not None:
+            async with self._platform.delivery():
+                await self._platform.release_route(handle, local_only=True)
+        await super()._retire_archived(handle)
+
     async def _perform_stream_cleanup(self, ref, resource, sequence):
         platform = self._require_connected()
         async with platform.delivery():
@@ -413,6 +542,23 @@ class WeComDriver(SharedResponseDriver):
 
     def _compact_receipt(self, snapshot):
         compact = super()._compact_receipt(snapshot)
+        if any(
+            ref.kind == "wecom.retirement" for ref in snapshot.resource_refs
+        ):
+            return replace(
+                compact,
+                resource_refs=tuple(
+                    sorted(
+                        (
+                            replace(ref, kind="wecom.receipt")
+                            if ref.kind == "wecom.attempt"
+                            and dict(ref.attributes).get("state") != "unknown"
+                            else ref
+                        )
+                        for ref in snapshot.resource_refs
+                    ),
+                ),
+            )
         # Ephemeral native targets cannot be reconstructed after reconnect/restart.
         # Unknown stream references remain evidence, never a replay instruction.
         if any(

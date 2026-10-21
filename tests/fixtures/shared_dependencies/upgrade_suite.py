@@ -111,6 +111,7 @@ def isolated_loader(tmp_path, monkeypatch):
 
     shutil.copytree(Path(packaging.__file__).parent, site / "packaging")
     from qwenpaw.__version__ import __version__
+    import qwenpaw.config as config_package
     from qwenpaw.config import utils as config_utils
     from qwenpaw.config import config as config_model
 
@@ -132,6 +133,9 @@ def isolated_loader(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         config_utils, "load_config", lambda *args, **kwargs: saved
+    )
+    monkeypatch.setattr(
+        config_package, "load_config", config_utils.load_config
     )
     from qwenpaw.app.channels import base as channel_base
 

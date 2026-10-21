@@ -140,6 +140,24 @@ class WeComPlatform(InboundDecoder):
             raise WeComDeliveryError("NATIVE_ROUTE_EXPIRED")
         return value[1]
 
+    def native_route_expiry(self, route):
+        """Identify native reply targets that this worker cannot ever reuse."""
+        token, epoch = route.get("frame_token"), route.get("connection_epoch")
+        if not token or token != route.get("response_handle"):
+            return None
+        try:
+            recorded_epoch = int(epoch)
+        except (TypeError, ValueError):
+            return None
+        if recorded_epoch < 0 or str(recorded_epoch) != epoch:
+            return None
+        if recorded_epoch != self._epoch:
+            return "CONNECTION_EPOCH_EXPIRED"
+        frame = self._frames.get(token)
+        if frame is None or frame[0] != recorded_epoch:
+            return "NATIVE_ROUTE_EXPIRED"
+        return None
+
     async def start(self):
         if self._ws_thread is not None:
             raise RuntimeError("PLATFORM_ALREADY_STARTED")
@@ -201,6 +219,8 @@ class WeComPlatform(InboundDecoder):
                         ),
                     )
         await self.on_state(state)
+        if self._stopping or epoch != self._epoch:
+            return
         if state == "connected" and not self._ready.done():
             self._ready.set_result(None)
         elif state == "failed" and not self._ready.done():
@@ -724,7 +744,7 @@ class WeComPlatform(InboundDecoder):
                     )
                 return media_id
 
-    async def _cancel_processing(self, handle):
+    async def _cancel_processing(self, handle, *, local_only=False):
         state = self._processing.get(handle)
         if state is None:
             return ""
@@ -735,13 +755,13 @@ class WeComPlatform(InboundDecoder):
                 and self._keepalive_tasks.get(state["stream_id"]) is task
             ):
                 self._keepalive_tasks.pop(state["stream_id"])
-            if state.get("unknown"):
+            if state.get("unknown") and not local_only:
                 raise WeComDeliveryError(
                     "STREAM_RESULT_UNKNOWN",
                     side_effect_possible=True,
                 )
             return ""
-        if not state.get("finishing"):
+        if local_only or not state.get("finishing"):
             task.cancel()
         try:
             await _settle(
@@ -755,7 +775,7 @@ class WeComPlatform(InboundDecoder):
                 and self._keepalive_tasks.get(state["stream_id"]) is task
             ):
                 self._keepalive_tasks.pop(state["stream_id"])
-        if state.get("unknown"):
+        if state.get("unknown") and not local_only:
             raise WeComDeliveryError(
                 "STREAM_RESULT_UNKNOWN",
                 side_effect_possible=True,
@@ -976,8 +996,11 @@ class WeComPlatform(InboundDecoder):
             state["final"] = True
         return {"final": "true"}
 
-    async def cleanup_resource(self, resource):
+    async def cleanup_resource(self, resource, *, local_only=False):
         handle = resource["response_handle"]
+        if local_only:
+            await self._cancel_processing(handle, local_only=True)
+            return
         state = self._processing.get(handle)
         if resource.get("role") == "processing":
             sid = await self._cancel_processing(handle)
@@ -995,10 +1018,10 @@ class WeComPlatform(InboundDecoder):
             final=True,
         )
 
-    async def release_route(self, handle):
+    async def release_route(self, handle, *, local_only=False):
         state = self._processing.get(handle)
         if state is not None:
-            await self._cancel_processing(handle)
+            await self._cancel_processing(handle, local_only=local_only)
         self._frames.pop(handle, None)
         self._processing.pop(handle, None)
 

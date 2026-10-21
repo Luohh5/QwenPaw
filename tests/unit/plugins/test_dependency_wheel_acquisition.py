@@ -250,9 +250,11 @@ async def test_acquisition_respects_existing_distribution_version_constraints(
         if path.is_file()
     }
 
-    with pytest.raises(RuntimeError, match="DEPENDENCY_PLAN_UNVERIFIED"):
+    with pytest.raises(SharedDependencyError) as error:
         await acquisition.acquire(snapshot)
 
+    assert error.value.reason_code == "DEPENDENCY_RESTART_REQUIRED"
+    assert error.value.decision.require_restart
     assert {
         str(path.relative_to(acquisition.site)): path.read_bytes()
         for path in acquisition.site.rglob("*")
