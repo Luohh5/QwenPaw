@@ -188,7 +188,11 @@ class UnifiedQueueManager:
         def rejected():
             if self._closed:
                 return EnqueueResult(False, "QUEUE_CLOSED", True)
-            if state is not None and self._queues.get(queue_key) is not state:
+            if state is not None and (
+                self._queues.get(queue_key) is not state
+                or state.consumer_task.done()
+                or state.consumer_task.cancelling()
+            ):
                 return EnqueueResult(False, "QUEUE_UNAVAILABLE", True)
             return admission_guard() if admission_guard is not None else None
 
@@ -337,7 +341,9 @@ class UnifiedQueueManager:
                     and not queue.unfinished
                 ):
                     self._queues.pop(queue_key)
-                    queue.changed.set()
+                # A dead consumer may retain unfinished work. Wake blocked
+                # admissions so they reject rather than fill an orphan queue.
+                queue.changed.set()
 
             logger.info(
                 f"Consumer stopped: channel={channel_id} "
@@ -448,7 +454,8 @@ class UnifiedQueueManager:
 
         if consumer_tasks:
             for task in consumer_tasks:
-                task.cancel()
+                if not task.done() and not task.cancelling():
+                    task.cancel()
 
             # Wait for all consumers to finish
             _, pending = await asyncio.wait(
@@ -463,9 +470,32 @@ class UnifiedQueueManager:
                     f"still pending after 5s",
                 )
 
-        # Clear queues dict
+        # Keep timed-out consumers and any work they still own available for
+        # a retry. Only messages never fetched by a stopped consumer can be
+        # cancelled and settled here.
         async with self._lock:
-            self._queues.clear()
+            for key, state in list(self._queues.items()):
+                if not state.consumer_task.done():
+                    continue
+                cancelled_count = 0
+                while not state.queue.empty():
+                    state.queue.get_nowait()
+                    state.queue.task_done()
+                    cancelled_count += 1
+                if cancelled_count:
+                    logger.info(
+                        "Cancelled %s queued messages during shutdown: %s",
+                        cancelled_count,
+                        key,
+                    )
+                if not state.queue.unfinished:
+                    self._queues.pop(key)
+                    state.queue.changed.set()
+            if self._queues:
+                raise TimeoutError(
+                    "Queue shutdown incomplete; retained "
+                    f"{len(self._queues)} queue owner(s) for retry",
+                )
 
         logger.info(f"Stopped all queues: total={queue_count}")
 

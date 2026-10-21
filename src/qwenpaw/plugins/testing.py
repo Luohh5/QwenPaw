@@ -238,7 +238,7 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
 
     async def close(self) -> None:
         """Retry cleanup after a failed close; ownership stays until it succeeds."""
-        from .lifecycle import UnloadMode
+        from .lifecycle import QuiescenceError, UnloadMode
 
         if _ACTIVE_HOST is not self:
             return
@@ -247,7 +247,13 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
             await connection.close()
         for workspace_id, workspace in tuple(self._workspaces.items()):
             if workspace.channel_manager is not None:
-                await workspace.channel_manager.stop_all()
+                try:
+                    await workspace.channel_manager.stop_all()
+                except QuiescenceError as exc:
+                    raise SDKError(
+                        f"Workspace {workspace_id!r} channel cleanup has not "
+                        "stopped; retry close()",
+                    ) from exc
             # Native channel producers still persist their completion after
             # leaving the SDK invocation. Keep this host's environment until
             # that workspace-owned tail finishes; do not cancel its I/O.

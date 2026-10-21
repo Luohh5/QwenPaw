@@ -106,7 +106,6 @@ def register(plugin, spec):
             self._prepare_stop_lock = asyncio.Lock()
             self._calls = {}
             self._call_done = {}
-            self._call_cancels = {}
             self._tracker_calls = set()
             self._terminal_notifications = set()
             self._sdk_id = uuid.uuid4().hex
@@ -181,7 +180,8 @@ def register(plugin, spec):
                                 task for task in owned.tasks if not task.done()
                             }:
                                 for task in pending:
-                                    task.cancel()
+                                    if not task.cancelling():
+                                        task.cancel()
                                 try:
                                     await asyncio.wait(pending)
                                 except asyncio.CancelledError:
@@ -212,6 +212,7 @@ def register(plugin, spec):
                 return plugin._managed_stream(
                     lambda: produce(request),
                     f"channel:{spec.name}:run",
+                    wait_for_cleanup=True,
                 )
 
             owned_process._sdk_original_process = original_process
@@ -264,24 +265,16 @@ def register(plugin, spec):
                     task
                 ] = asyncio.get_running_loop().create_future()
             self._calls[task] = self._calls.get(task, 0) + 1
-            call = {"stop_cancelled": False}
             try:
-                yield call
+                yield
             finally:
                 self._calls[task] -= 1
                 if not self._calls[task]:
                     del self._calls[task]
-                    # Only retract cancellation requests issued by our scoped
-                    # stop. A shared queue worker may continue after this call.
-                    cancellations = self._call_cancels.pop(task, 0)
-                    call["stop_cancelled"] = bool(cancellations)
-                    for _ in range(cancellations):
-                        task.uncancel()
                     self._call_done.pop(task).set_result(None)
                     if propagate_cancel and task.cancelling():
-                        # The manager owns the queue worker's lifetime. A host
-                        # stream may consume its cancellation while producing
-                        # a terminal event; do not then return to queue.get().
+                        # Host streams may consume cancellation to produce a
+                        # terminal event; the request still remains cancelled.
                         raise asyncio.CancelledError
 
         def _receive(self, message):
@@ -510,7 +503,7 @@ def register(plugin, spec):
                 return True
             self._receiving = False
             self._stopping = True
-            from .custody import stop_task, TASK_STOP_SECONDS
+            from .custody import TASK_STOP_SECONDS
 
             # A transport must stay usable for cancellation/final stream events
             # until its actual consumers and TaskTracker producers have
@@ -538,24 +531,17 @@ def register(plugin, spec):
                     completion = self._call_done.get(task)
                     if completion is None:
                         continue
-                    if task in self._tracker_calls:
-                        await stop_task(task, f"channel:{spec.name}:run")
-                    else:
-                        # A queue worker can swallow cancellation and return to
-                        # queue.get(); only this channel's invocation must end.
-                        if task.cancel():
-                            self._call_cancels[task] = (
-                                self._call_cancels.get(task, 0) + 1
-                            )
-                        _, pending = await asyncio.wait(
-                            {completion},
-                            timeout=TASK_STOP_SECONDS,
+                    if not task.cancelling():
+                        task.cancel()
+                    _, pending = await asyncio.wait(
+                        {completion},
+                        timeout=TASK_STOP_SECONDS,
+                    )
+                    if pending:
+                        raise SDKError(
+                            f"Channel {spec.name!r} call has not "
+                            "stopped; retry is required",
                         )
-                        if pending:
-                            raise SDKError(
-                                f"Channel {spec.name!r} call has not "
-                                "stopped; retry is required",
-                            )
             return True
 
         async def stop(self):
@@ -605,13 +591,24 @@ def register(plugin, spec):
             )
 
         async def consume_one(self, payload):
-            if self._receiving and self._owns_request(payload):
+            if self._owns_request(payload):
                 await super().consume_one(payload)
 
         async def _consume_one_request(self, payload):
-            if not self._receiving or not self._owns_request(payload):
+            if not self._owns_request(payload):
                 return
             if isinstance(payload, _Incoming) and not payload.requests:
+                return
+            if not self._receiving or plugin._instance.activity.blocked:
+                # These accepted messages belong to this exact instance.
+                # Interruption cancels them before a run starts; a successor
+                # must never replay them or emit a terminal for an absent run.
+                logger.info(
+                    "Cancelled queued messages for stopping channel %s "
+                    "instance %s",
+                    spec.name,
+                    self._sdk_id,
+                )
                 return
             self._guard()
             session_id = (
@@ -619,57 +616,47 @@ def register(plugin, spec):
                 if isinstance(payload, _Incoming)
                 else payload.session_id
             )
-            try:
-                async with (
-                    self._owned_call(propagate_cancel=True) as call,
-                    plugin._invocation(
-                        workspace_id=self._workspace.agent_id,
-                        session_id=session_id,
-                    ),
-                ):
-                    if isinstance(payload, _Incoming):
-                        allowed = []
-                        for request in payload.requests:
-                            if await self._access_control_gate(request):
-                                continue
-                            allowed.append(request)
-                        if not allowed:
-                            return
-                        payload = super().merge_requests(allowed)
-                        # Identity comes from the first accepted sender.
-                        # Delivery addresses may expire, so use the newest
-                        # accepted metadata.
-                        payload.channel_meta = {
-                            **allowed[0].channel_meta,
-                            **{
-                                key: allowed[-1].channel_meta[key]
-                                for key in (
-                                    "conversation_id",
-                                    "session_webhook",
-                                    "session_webhook_expired_time",
-                                    "conversation_type",
-                                )
-                                if key in allowed[-1].channel_meta
-                            },
-                            "_sdk_message_ids": tuple(
-                                mid
-                                for item in allowed
-                                for mid in item.channel_meta.get(
-                                    "_sdk_message_ids",
-                                    (),
-                                )
-                            ),
-                        }
-                    await super()._consume_one_request(payload)
-            except asyncio.CancelledError:
-                # Ownership cleanup has retracted only our stop requests. A
-                # finished SDK invocation must release its queue batch while
-                # cancellation from the manager or caller still propagates.
-                if (
-                    not call["stop_cancelled"]
-                    or asyncio.current_task().cancelling()
-                ):
-                    raise
+            async with (
+                self._owned_call(propagate_cancel=True),
+                plugin._invocation(
+                    workspace_id=self._workspace.agent_id,
+                    session_id=session_id,
+                ),
+            ):
+                if isinstance(payload, _Incoming):
+                    allowed = []
+                    for request in payload.requests:
+                        if await self._access_control_gate(request):
+                            continue
+                        allowed.append(request)
+                    if not allowed:
+                        return
+                    payload = super().merge_requests(allowed)
+                    # Identity comes from the first accepted sender.
+                    # Delivery addresses may expire, so use the newest
+                    # accepted metadata.
+                    payload.channel_meta = {
+                        **allowed[0].channel_meta,
+                        **{
+                            key: allowed[-1].channel_meta[key]
+                            for key in (
+                                "conversation_id",
+                                "session_webhook",
+                                "session_webhook_expired_time",
+                                "conversation_type",
+                            )
+                            if key in allowed[-1].channel_meta
+                        },
+                        "_sdk_message_ids": tuple(
+                            mid
+                            for item in allowed
+                            for mid in item.channel_meta.get(
+                                "_sdk_message_ids",
+                                (),
+                            )
+                        ),
+                    }
+                await super()._consume_one_request(payload)
 
         async def _stream_with_tracker(self, payload):
             if not self._receiving:
@@ -807,14 +794,14 @@ def register(plugin, spec):
                     # A terminal waiting behind a slow start remains owned and
                     # queued. Dropping it could leave a late-created platform
                     # card permanently running after the model has finished.
-                    if phase == "start":
+                    if phase == "start" and not task.cancelling():
                         task.cancel()
                     logger.warning(
                         "Channel %s run notification timed out",
                         spec.name,
                     )
             except asyncio.CancelledError:
-                if phase == "start":
+                if phase == "start" and not task.cancelling():
                     task.cancel()
                 raise
 

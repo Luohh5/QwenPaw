@@ -452,17 +452,27 @@ async def _process_owned_batch(default_channel, batch):
             await _process_batch(bound_channel, group)
 
 
-async def _complete_queue_batch(queue, channel, batch):
-    cancelled = False
+async def _complete_queue_batch(channel, batch):
+    # Plugin invocation ownership belongs to this request, never to the
+    # long-lived queue consumer. Its cancellation must leave that consumer
+    # available for the next batch.
+    execution = asyncio.create_task(_process_owned_batch(channel, batch))
     try:
-        await _process_owned_batch(channel, batch)
+        await asyncio.shield(execution)
+        return True
     except asyncio.CancelledError:
-        cancelled = True
+        if not asyncio.current_task().cancelling():
+            return False
+        # Cancelling the consumer still owns cancellation and cleanup of its
+        # request. Repeated cancellation must not interrupt that cleanup.
+        if not execution.done() and not execution.cancelling():
+            execution.cancel()
+        from ...utils.io_utils import run_async_to_completion
+
+        await run_async_to_completion(
+            asyncio.gather(execution, return_exceptions=True),
+        )
         raise
-    finally:
-        if not cancelled:
-            for _ in batch:
-                queue.task_done()
 
 
 class ChannelManager:  # pylint: disable=too-many-public-methods
@@ -984,9 +994,11 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
         )
 
         while True:
+            batch = []
             try:
                 # Get first payload
                 payload = await queue.get()
+                batch.append(payload)
 
                 # Re-fetch channel each iteration so replace_channel()
                 # swaps are picked up automatically.
@@ -1017,7 +1029,6 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
                 # so all payloads in this queue already have same
                 # (channel_id, session_id, priority_level).
                 # We still drain to merge rapid-fire messages (e.g. images)
-                batch = [payload]
                 while True:
                     try:
                         next_payload = queue.get_nowait()
@@ -1028,7 +1039,13 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
                 # Process batch (with merge logic). A shared-session
                 # group chat can put several senders in one queue key, so
                 # never merge across ACL identities.
-                await _complete_queue_batch(queue, ch, batch)
+                if not await _complete_queue_batch(ch, batch):
+                    logger.debug(
+                        "Cancelled queue batch: channel=%s session=%s",
+                        channel_id,
+                        session_id[:30],
+                    )
+                    continue
 
                 # Update processed count
                 if self._queue_manager is not None:
@@ -1052,13 +1069,18 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
                     f"session={session_id[:30]} "
                     f"priority={priority_level}",
                 )
-                break
+                raise
             except Exception:
                 logger.exception(
                     f"Consumer failed: channel={channel_id} "
                     f"session={session_id[:30]} "
                     f"priority={priority_level}",
                 )
+            finally:
+                # Start custody at the first get, including channel lookup
+                # and retries before batch execution can begin.
+                for _ in batch:
+                    queue.task_done()
 
     async def start_all(self) -> None:
         """Prepare queues, then connect owned channels in background."""
@@ -1199,7 +1221,7 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
         return None
 
     async def quiesce(self, *, timeout=None, for_stop=False) -> bool:
-        """Close admission and drain; optionally prepare owners for stopping."""
+        """Close admission, drain, and optionally prepare owners to stop."""
         deadline = asyncio.get_running_loop().time() + (
             _CHANNEL_DRAIN_TIMEOUT if timeout is None else timeout
         )

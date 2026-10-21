@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Actual lifespan construction and loaded retired-Workspace fencing.
 
 Migration/telemetry and unused legacy platform inventory are isolated inputs.
@@ -21,6 +22,8 @@ from management_process_suite import (
 )
 from wechat_w2_config_support import write_profiles
 from wechat_w2_session_suite import qr, narrow_legacy_test_guard
+
+__all__ = ["qr", "narrow_legacy_test_guard"]
 
 
 @pytest.mark.asyncio
@@ -128,7 +131,7 @@ async def test_actual_lifespan_constructs_single_service_sessions_and_exact_bind
                 loader,
                 {
                     "configs": {},
-                    "types": ["channel", "memory"],
+                    "types": ["channel", "memory", "hub"],
                     "activate": False,
                 },
             )

@@ -590,6 +590,7 @@ class BaseChannel(ABC):
                 async for _ in self._workspace.task_tracker.stream_from_queue(
                     queue,
                     chat.id,
+                    cancel_run=True,
                 ):
                     pass
             except asyncio.CancelledError:

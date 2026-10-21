@@ -30,7 +30,8 @@ async def stop_task(task: asyncio.Task[Any], desc: str) -> None:
     """
     if task.done():
         return
-    task.cancel()
+    if not task.cancelling():
+        task.cancel()
     # wait_for waits for cancellation acknowledgement after its deadline.
     # Observe completion without cancelling again or awaiting a stubborn task.
     _, pending = await asyncio.wait({task}, timeout=TASK_STOP_SECONDS)

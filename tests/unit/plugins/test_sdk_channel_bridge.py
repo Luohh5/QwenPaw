@@ -52,14 +52,17 @@ plugin = Plugin()
     async with PluginTestHost(tmp_path / "host") as host:
         ctx = await host.load(
             make_plugin(
-                tmp_path, source, ["channels", "commands", "storage", "config"]
+                tmp_path,
+                source,
+                ["channels", "commands", "storage", "config"],
             ),
             config={"release": str(release)},
         )
         await host.start_channel("sync-send")
         workspace = await host._workspace("test")
         await host.receive_channel(
-            "sync-send", ChannelMessage("sender", (ContentBlock(text="/syncsend"),))
+            "sync-send",
+            ChannelMessage("sender", (ContentBlock(text="/syncsend"),)),
         )
         cancellation = None
         try:
@@ -67,7 +70,7 @@ plugin = Plugin()
             runs = await workspace.task_tracker.list_active_tasks()
             assert len(runs) == 1
             cancellation = asyncio.create_task(
-                workspace.task_tracker.request_stop(runs[0])
+                workspace.task_tracker.request_stop(runs[0]),
             )
             done, _ = await asyncio.wait({cancellation}, timeout=2)
             assert (
@@ -116,18 +119,27 @@ class Plugin:
             finally:
                 plugin.storage.write_json("model-stopped.json", True)
         plugin.register_channel(ChannelSpec("cancel-stream", "Cancel stream", Transport, streaming=True))
-        plugin.register_provider(ProviderSpec("cancel-provider", "Cancel provider", generate, models=(ModelInfo("cancel-model", "Cancel model"),), require_api_key=False))
+        plugin.register_provider(ProviderSpec(
+            "cancel-provider", "Cancel provider", generate,
+            models=(ModelInfo("cancel-model", "Cancel model"),),
+            require_api_key=False,
+        ))
 plugin = Plugin()
 """
     async with PluginTestHost(tmp_path / "host") as host:
         ctx = await host.load(
-            make_plugin(tmp_path, source, ["channels", "providers", "storage"])
+            make_plugin(
+                tmp_path,
+                source,
+                ["channels", "providers", "storage"],
+            ),
         )
         await host.configure_chat_model("cancel-provider", "cancel-model")
         await host.start_channel("cancel-stream")
         workspace = await host._workspace("test")
         await host.receive_channel(
-            "cancel-stream", ChannelMessage("sender", (ContentBlock(text="hello"),))
+            "cancel-stream",
+            ChannelMessage("sender", (ContentBlock(text="hello"),)),
         )
         try:
             await wait_flag(ctx, "delta.json")
@@ -147,6 +159,7 @@ plugin = Plugin()
 
 async def test_old_queued_channel_payload_cannot_run_on_replacement_generation(
     tmp_path,
+    monkeypatch,
 ):
     from qwenpaw.plugins.channels import ChannelMessage
     from qwenpaw.plugins.messages import ContentBlock
@@ -176,30 +189,48 @@ plugin = Plugin()
 """
     async with PluginTestHost(tmp_path / "host") as host:
         await host.load(
-            make_plugin(tmp_path, source, ["channels", "commands", "storage"])
+            make_plugin(tmp_path, source, ["channels", "commands", "storage"]),
         )
         await host.start_channel("queued-channel")
         workspace = await host._workspace("test")
         manager = workspace.channel_manager
+        old_channel = manager._find_channel("queued-channel")
+        close_ingress = manager._close_ingress
+        ingress_closed = asyncio.Event()
+
+        def observe_close_ingress(channel):
+            close_ingress(channel)
+            if channel is old_channel:
+                ingress_closed.set()
+
+        monkeypatch.setattr(manager, "_close_ingress", observe_close_ingress)
         gate = manager._queue_manager._lock
-        await gate.acquire()
+        reloading = None
         try:
-            await host.receive_channel(
-                "queued-channel",
-                ChannelMessage(
-                    "sender",
-                    (ContentBlock(text="/queueprobe stale"),),
-                    session_id="one-queue",
-                ),
-            )
-            for _ in range(100):
-                if manager._enqueue_tasks:
-                    break
-                await asyncio.sleep(0)
-            assert manager._enqueue_tasks and all(
-                not task.done() for task in manager._enqueue_tasks
-            )
-            assert (await host.reload("extension-contract")).ok
+            await gate.acquire()
+            try:
+                await host.receive_channel(
+                    "queued-channel",
+                    ChannelMessage(
+                        "sender",
+                        (ContentBlock(text="/queueprobe stale"),),
+                        session_id="one-queue",
+                    ),
+                )
+                for _ in range(100):
+                    if manager._enqueue_tasks:
+                        break
+                    await asyncio.sleep(0)
+                assert manager._enqueue_tasks and all(
+                    not task.done() for task in manager._enqueue_tasks
+                )
+                reloading = asyncio.create_task(
+                    host.reload("extension-contract"),
+                )
+                await asyncio.wait_for(ingress_closed.wait(), 3)
+            finally:
+                gate.release()
+            assert (await reloading).ok
             await host.receive_channel(
                 "queued-channel",
                 ChannelMessage(
@@ -208,9 +239,9 @@ plugin = Plugin()
                     session_id="one-queue",
                 ),
             )
-            await asyncio.sleep(0)
         finally:
-            gate.release()
+            if reloading is not None:
+                await asyncio.gather(reloading, return_exceptions=True)
         ctx = host.context("extension-contract")
         for _ in range(300):
             if ctx.storage.read_json("sent.json", []):
@@ -235,7 +266,7 @@ async def test_channel_uses_real_sender_access_policy_before_runtime(tmp_path):
     )
     async with PluginTestHost(tmp_path / "host") as host:
         ctx = await host.load(
-            make_plugin(tmp_path, source, ["channels", "commands", "storage"])
+            make_plugin(tmp_path, source, ["channels", "commands", "storage"]),
         )
         await host.start_channel(
             "sdk-contract-channel",
@@ -249,7 +280,10 @@ async def test_channel_uses_real_sender_access_policy_before_runtime(tmp_path):
         workspace = await host._workspace("test")
         store = get_access_control_store(Path(workspace.workspace_dir))
         store.add_to_whitelist("sdk-contract-channel", "approved")
-        for sender, argument in (("intruder", "blocked"), ("approved", "allowed")):
+        for sender, argument in (
+            ("intruder", "blocked"),
+            ("approved", "allowed"),
+        ):
             await host.receive_channel(
                 "sdk-contract-channel",
                 ChannelMessage(
@@ -276,16 +310,17 @@ async def test_real_channel_manager_clone_keeps_only_current_owner(tmp_path):
 
     async with PluginTestHost(tmp_path / "host") as host:
         ctx = await host.load(
-            make_plugin(tmp_path, SOURCE, ["channels", "commands", "storage"])
+            make_plugin(tmp_path, SOURCE, ["channels", "commands", "storage"]),
         )
         await host.start_channel(
-            "sdk-contract-channel", {"token": "test-channel-token"}
+            "sdk-contract-channel",
+            {"token": "test-channel-token"},
         )
         workspace = await host._workspace("test")
         for count in range(3):
             if count:
                 result = await workspace.channel_manager.restart_channel(
-                    "sdk-contract-channel"
+                    "sdk-contract-channel",
                 )
                 assert result["status"] == "restarted"
             await host.receive_channel(
@@ -304,7 +339,8 @@ async def test_real_channel_manager_clone_keeps_only_current_owner(tmp_path):
 
 
 async def test_stop_waits_for_invocation_not_long_lived_queue_worker(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
 ):
     from .test_sdk_channel_contract import SOURCE
     from qwenpaw.plugins.channels import ChannelMessage
@@ -313,24 +349,25 @@ async def test_stop_waits_for_invocation_not_long_lived_queue_worker(
 
     async with PluginTestHost(tmp_path / "host") as host:
         ctx = await host.load(
-            make_plugin(tmp_path, SOURCE, ["channels", "commands", "storage"])
+            make_plugin(tmp_path, SOURCE, ["channels", "commands", "storage"]),
         )
         await host.start_channel(
-            "sdk-contract-channel", {"token": "test-channel-token"}
+            "sdk-contract-channel",
+            {"token": "test-channel-token"},
         )
         workspace = await host._workspace("test")
         tracker = workspace.task_tracker
         attach = tracker.attach_or_start
         waiting = asyncio.Event()
         release = asyncio.Event()
-        workers = []
+        requests = []
 
         async def attach_with_queue_gate(*args, **kwargs):
             queue, fresh = await attach(*args, **kwargs)
             get = queue.get
 
             async def gated_get():
-                workers.append(asyncio.current_task())
+                requests.append(asyncio.current_task())
                 waiting.set()
                 await release.wait()
                 return await get()
@@ -341,26 +378,39 @@ async def test_stop_waits_for_invocation_not_long_lived_queue_worker(
         monkeypatch.setattr(tracker, "attach_or_start", attach_with_queue_gate)
         await host.receive_channel(
             "sdk-contract-channel",
-            ChannelMessage("sender", (ContentBlock(text="/channelprobe pending"),)),
+            ChannelMessage(
+                "sender",
+                (ContentBlock(text="/channelprobe pending"),),
+            ),
         )
         await asyncio.wait_for(waiting.wait(), 3)
+        (state,) = workspace.channel_manager._queue_manager._queues.values()
+        consumer = state.consumer_task
         try:
-            await asyncio.wait_for(host.stop_channel("sdk-contract-channel"), 10)
+            await asyncio.wait_for(
+                host.stop_channel("sdk-contract-channel"),
+                10,
+            )
             assert ctx.storage.read_json("stopped-test.json", False)
             host.assert_quiescent("extension-contract")
             # Host queue workers can survive a completed plugin invocation.
-            assert workers and all(not worker.done() for worker in workers)
-            assert all(worker.cancelling() == 0 for worker in workers)
+            assert requests and all(
+                request.cancelled() and request is not consumer
+                for request in requests
+            )
+            assert not consumer.done() and consumer.cancelling() == 0
             assert (await host.reload("extension-contract")).ok
             # A new generation reuses the same manager queue/session safely.
             monkeypatch.setattr(tracker, "attach_or_start", attach)
             await host.start_channel(
-                "sdk-contract-channel", {"token": "test-channel-token"}
+                "sdk-contract-channel",
+                {"token": "test-channel-token"},
             )
             await host.receive_channel(
                 "sdk-contract-channel",
                 ChannelMessage(
-                    "sender", (ContentBlock(text="/channelprobe replacement"),)
+                    "sender",
+                    (ContentBlock(text="/channelprobe replacement"),),
                 ),
             )
             current = host.context("extension-contract")
@@ -370,7 +420,9 @@ async def test_stop_waits_for_invocation_not_long_lived_queue_worker(
                     break
                 await asyncio.sleep(0.01)
             assert rows[-1]["text"] == "test:replacement"
-            assert current.storage.read_json("called-test.json") == "replacement"
+            assert (
+                current.storage.read_json("called-test.json") == "replacement"
+            )
             await host.stop_channel("sdk-contract-channel")
         finally:
             release.set()
