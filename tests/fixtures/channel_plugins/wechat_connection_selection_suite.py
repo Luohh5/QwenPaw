@@ -1,8 +1,4 @@
-"""Real manager/proxy construction against unit-local future catalog data.
-
-No worker is started and this does not claim official WeChat registration.
-Only catalog/builtin inventory data is scoped to a future assembly fixture.
-"""
+"""Real manager/proxy connection budgets with controlled catalog ownership."""
 
 import json
 import sys
@@ -46,7 +42,11 @@ def test_manager_selects_only_official_exact_owner_key_and_trusted_override(
     monkeypatch.setattr(
         catalog,
         "OFFICIAL_CHANNELS",
-        catalog.OFFICIAL_CHANNELS
+        tuple(
+            row for row in catalog.OFFICIAL_CHANNELS
+            if row["channel_key"] != "wechat"
+            and row["plugin_id"] != "wechat"
+        )
         + (
             ({"channel_key": "wechat", "plugin_id": "wechat"},)
             if official
@@ -54,6 +54,17 @@ def test_manager_selects_only_official_exact_owner_key_and_trusted_override(
         ),
     )
     source = sample_source(tmp_path / "incoming", key)
+    # The real WeChat host adds its retained auth fields before validating
+    # the closed descriptor. Keep that production schema in this fixture.
+    if key == "wechat":
+        descriptor_path = source / "channel.json"
+        descriptor = json.loads(descriptor_path.read_text())
+        official_descriptor = json.loads(
+            (ROOT / "plugins/channel/wechat/channel.json").read_text()
+        )
+        descriptor["config_schema"] = official_descriptor["config_schema"]
+        descriptor["config_fields"] = official_descriptor["config_fields"]
+        descriptor_path.write_text(json.dumps(descriptor))
     manifest = PluginManifest.from_dict(
         {**json.loads((source / "plugin.json").read_text()), "id": owner}
     )

@@ -1955,6 +1955,7 @@
     "selectAtLeastOneDay": "Select at least one day."
   },
   "channels": {
+    "qrcodeInstallRequired": "Install the plugin to scan a QR code",
     "manualCredentials": "Manual credentials",
     "deliverySettings": "Delivery options",
     "presentationSettings": "Message presentation",

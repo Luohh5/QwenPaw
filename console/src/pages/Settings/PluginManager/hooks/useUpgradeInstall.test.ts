@@ -11,7 +11,10 @@ const h = vi.hoisted(() => ({
   info: vi.fn(),
   message: { success: vi.fn(), error: vi.fn() },
 }));
-vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: h.t }) }));
+vi.mock("react-i18next", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("react-i18next")>()),
+  useTranslation: () => ({ t: h.t }),
+}));
 vi.mock("@/hooks/useAppMessage", () => ({
   useAppMessage: () => ({ message: h.message }),
 }));

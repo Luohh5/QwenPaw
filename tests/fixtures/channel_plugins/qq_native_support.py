@@ -15,6 +15,7 @@ import pytest
 import pytest_asyncio
 from websockets.sync.server import serve
 
+from g2_shared_response_suite import Peer
 from qwenpaw.channel_protocol.models import IdentityParams, SendParams
 from qwenpaw.channel_protocol.shared_worker import DriverContext
 
@@ -261,10 +262,11 @@ class QQExternal:
                 assert not thread.is_alive(), thread.name
 
 
-class HostBoundary:
+class HostBoundary(Peer):
     """Public state/admission fake; this is not Core or Agent evidence."""
 
     def __init__(self):
+        super().__init__()
         self.methods, self.state, self.batches, self.notifications = (
             {},
             {},
@@ -279,6 +281,8 @@ class HostBoundary:
         self.methods[name] = handler
 
     async def call(self, name, params):
+        if name.startswith("host.receipt."):
+            return await super().call(name, params)
         if name == "host.state.get":
             return {"value": self.state.get(params["key"])}
         if name == "host.state.put":

@@ -12,6 +12,8 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 import pytest_asyncio
 
+from g2_shared_response_suite import Peer
+
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "plugins/channel/xiaoyi"
 
@@ -129,12 +131,13 @@ async def modules(monkeypatch):
     return result
 
 
-class HostBoundary:
+class HostBoundary(Peer):
     """
     Only the real Driver's host RPC endpoint, not a Core/Agent substitute.
     """
 
     def __init__(self):
+        super().__init__()
         self.methods, self.state = {}, {}
         self.batches, self.notifications = [], []
         self.accept = True
@@ -143,6 +146,8 @@ class HostBoundary:
         self.methods[name] = handler
 
     async def call(self, method, params):
+        if method.startswith("host.receipt."):
+            return await super().call(method, params)
         if method == "host.state.get":
             return {"value": self.state.get(params["key"])}
         if method == "host.state.put":

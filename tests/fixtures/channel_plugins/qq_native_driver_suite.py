@@ -220,11 +220,16 @@ async def test_native_uncertainty_and_nonvalidation_errors_never_replay(
         }
     assert len(server.rows(path)) == 1
     if state == "unknown":
-        refs = driver._routes.snapshot(handle).resource_refs
+        from qwenpaw.channel_protocol.response_receipts import receipt_key
+
+        archived = (await peer.call("host.receipt.get", {
+            "key": receipt_key("qq.shared.responses", handle),
+        }))["value"]
+        assert archived["cleanup_state"] == "complete"
         assert any(
-            ref.kind == "qq.native"
-            and dict(ref.attributes)["body_sha256"] == attrs["body_sha256"]
-            for ref in refs
+            ref["kind"] == "qq.native"
+            and ref["attributes"]["body_sha256"] == attrs["body_sha256"]
+            for ref in archived["resource_refs"]
         )
 
 

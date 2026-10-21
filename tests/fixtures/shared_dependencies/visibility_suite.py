@@ -470,7 +470,7 @@ def test_worker_configure_keeps_explicit_sdk_ahead_of_inherited_addon(
         "sys.path.append(str(inherited))\n"
         "worker._configure(boot, {'code_root': str(code), 'support_ro"
         "ot': str(support),\n"
-        "    'dependency_paths': [str(explicit)]}, ())\n"
+        "    'dependency_paths': [str(explicit)], 'startup_timeout': 3}, ())\n"
         "import shared_priority_probe,colorsys\n"
         "print(json.dumps({'sdk': shared_priority_probe.VALUE,\n"
         "    'stdlib': str(Path(colorsys.__file__).resolve()), 'isola"
@@ -521,7 +521,7 @@ assert Path(sysconfig.get_path('stdlib')).resolve().is_relative_to(prefix)
 # CPython on Windows reports the installation prefix itself as a site root.
 site.getsitepackages = lambda: [str(prefix)]
 worker._configure(boot, {'code_root': str(code), 'support_root': str(support),
-    'dependency_paths': [str(explicit)]}, ())
+    'dependency_paths': [str(explicit)], 'startup_timeout': 3}, ())
 import colorsys
 print(json.dumps({'stdlib': str(Path(colorsys.__file__).resolve()),
     'isolated': sys.flags.isolated}))

@@ -9,6 +9,7 @@ import sys
 import aiohttp
 from aiohttp import web
 import pytest
+from g2_shared_response_suite import Peer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'plugins/channel/onebot'))
 from qwenpaw_channel_onebot.platform import OneBotPlatform, OneBotPlatformError
@@ -227,9 +228,10 @@ async def test_real_http_media_atomic_sniff_and_stream_limit(tmp_path, body, mim
         await runner.cleanup()
 
 
-class HostBoundary:
+class HostBoundary(Peer):
     """Only the not-yet-frozen host RPC endpoint, not a Core/Agent replacement."""
     def __init__(self):
+        super().__init__()
         self.methods, self.state = {}, {}
         self.batches, self.notifications, self.endpoints = [], [], []
         self.invalid_unregister = False
@@ -238,6 +240,8 @@ class HostBoundary:
     async def notify(self, method, params):
         self.notifications.append((method, params))
     async def call(self, method, params):
+        if method.startswith('host.receipt.'):
+            return await super().call(method, params)
         if method == 'host.state.get':
             return {'value': self.state.get(params['key'])}
         if method == 'host.state.put':

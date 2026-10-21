@@ -20,7 +20,7 @@ vi.mock("@agentscope-ai/design", async () => {
   return actual;
 });
 vi.mock("../../../hooks/useAppMessage", () => ({ useAppMessage: () => feedback }));
-vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key, i18n: { language: "en" } }) }));
+vi.mock("react-i18next", async (importOriginal) => ({ ...(await importOriginal<typeof import("react-i18next")>()), useTranslation: () => ({ t: (key: string) => key, i18n: { language: "en" } }) }));
 vi.mock("../../../contexts/ThemeContext", () => ({ useTheme: () => ({ isDark: false }) }));
 vi.mock("@/components/interaction/Cascade", () => ({ Cascade: ({ children }: { children: React.ReactNode }) => children }));
 vi.mock("@/components/PageHeader", () => ({ PageHeader: () => null }));
@@ -84,7 +84,15 @@ beforeEach(() => {
     if (path.endsWith("/qrcode")) return json({ qrcode_img: "cXI=", poll_token: "opaque-" + row.agent });
     if (path.endsWith("/channels")) return json({ [channel]: { isBuiltin: true, enabled, bot_token: "initial-" + row.agent, bot_prefix: "", base_url: "https://wx.test", ...extraConfig } });
     if (path.endsWith("/types")) return json([channel]);
-    if (path.endsWith("/schemas")) return json({});
+    if (path.endsWith("/schemas")) return json({
+      [channel]: {
+        label: channel,
+        description: "",
+        plugin_id: channel,
+        config_fields: [],
+        availability: "validated",
+      },
+    }); // Existing API schema without the optional qrcode_available field.
     return json([]); // unrelated ACL badge display
   });
 });

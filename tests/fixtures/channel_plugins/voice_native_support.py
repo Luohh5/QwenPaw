@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / "plugins/channel/voice"))
 from qwenpaw_channel_voice import driver as driver_module
 from qwenpaw_channel_voice.platform import VoicePlatform, TunnelInfo
 from qwenpaw_channel_voice.runner_twilio_manager import VoiceWebhookSnapshot
+from g2_shared_response_suite import Peer
 from qwenpaw.channel_protocol.models import (
     IdentityParams,
     EventBatchParams,
@@ -78,7 +79,7 @@ class Manager:
         self.closed += 1
 
 
-class HostBoundary:
+class HostBoundary(Peer):
     """A frozen A3 binding contract input, not a real host forwarding service."""
 
     def __init__(
@@ -90,6 +91,7 @@ class HostBoundary:
         lose_ack=False,
         block_events=None,
     ):
+        super().__init__()
         self.forwarding, self.fail_update, self.fail_connected = (
             forwarding,
             fail_update,
@@ -116,6 +118,8 @@ class HostBoundary:
             raise RuntimeError("independent connected notification failure")
 
     async def call(self, name, params):
+        if name.startswith("host.receipt."):
+            return await super().call(name, params)
         self.calls.append((name, params))
         if name == "host.state.get":
             return {"value": self.state.get(params["key"])}

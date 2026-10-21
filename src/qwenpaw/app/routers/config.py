@@ -135,6 +135,8 @@ def _validated_channel_config(name: str, values: dict):
             status_code=422,
             detail="Channel configuration must be an object",
         )
+    if name == "slack" and values.get("allow_from") is None:
+        values = {**values, "allow_from": []}
     row = PluginRegistry().get_channel_catalog_entry(name)
     try:
         schema = None
@@ -256,12 +258,14 @@ async def list_channel_types(request: Request) -> List[str]:
 
 @router.get("/channels/schemas", summary="Get editable channel schemas")
 async def list_channel_schemas(request: Request) -> dict:
+    from ...channel_protocol.management import MANAGEMENT_CAPABILITIES
     from ..agent_context import get_agent_for_request
 
     agent = await get_agent_for_request(request)
     saved = agent.config.channels.model_dump() if agent.config.channels else {}
     result = get_configurable_channel_catalog(saved)
     loader = getattr(request.app.state, "plugin_loader", None)
+    ready = set()
     if loader is not None:
         for key, row in result.items():
             record = loader.get_loaded_plugin(row.get("plugin_id", key))
@@ -276,6 +280,7 @@ async def list_channel_schemas(request: Request) -> dict:
                 and "channel_validation_passed" in record.diagnostics
             ):
                 row["availability"] = "validated"
+                ready.add(key)
     manager = getattr(agent, "channel_manager", None)
     if manager is not None:
         for key, row in result.items():
@@ -297,7 +302,34 @@ async def list_channel_schemas(request: Request) -> dict:
                     availability="failed",
                     diagnostic=health["last_error"],
                 )
-    for row in result.values():
+    registry = getattr(loader, "registry", None)
+    workspace_dir = getattr(agent, "workspace_dir", None)
+    if workspace_dir is not None:
+        workspace_dir = str(FilePath(workspace_dir).expanduser().resolve())
+    occupied = (
+        {
+            lease.key.name
+            for lease in registry.runtime_owners.leases()
+            if lease.key.kind == "channel"
+            and lease.key.scope_id == workspace_dir
+        }
+        if registry is not None
+        else set()
+    )
+    for key, row in result.items():
+        entry = (
+            registry.get_channel_catalog_entry(key)
+            if registry is not None and key in ready
+            else None
+        )
+        description = entry.description_record if entry is not None else None
+        row["qrcode_available"] = bool(
+            workspace_dir is not None
+            and description is not None
+            and MANAGEMENT_CAPABILITIES["qrcode.fetch"]
+            in description.descriptor.capabilities
+            and key not in occupied,
+        )
         if row.get("availability") in {"running", "validated"}:
             row.pop("repair", None)
     return result
@@ -514,9 +546,10 @@ def _managed_qrcode_sessions(request, channel):
 
 async def _qrcode_request(request, operation):
     """Disconnect cancels only this request's session waiter."""
+    finished = asyncio.Event()
 
     async def disconnected():
-        while not await request.is_disconnected():
+        while not finished.is_set() and not await request.is_disconnected():
             await asyncio.sleep(0.1)
 
     task = asyncio.create_task(operation)
@@ -539,6 +572,7 @@ async def _qrcode_request(request, operation):
             raise
         raise HTTPException(400, "QR session is no longer active") from None
     finally:
+        finished.set()
         watcher.cancel()
         if not task.done():
             task.cancel()

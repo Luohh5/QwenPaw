@@ -2279,6 +2279,14 @@ class BaseChannel(ABC):
     async def start(self) -> None:
         raise NotImplementedError
 
+    async def prepare_stop(self) -> bool:
+        """Settle owned calls before draining.
+
+        Return True when preparation requires ingress to remain closed, even
+        if draining fails. This default leaves legacy channels resumable.
+        """
+        return False
+
     async def stop(self) -> None:
         raise NotImplementedError
 

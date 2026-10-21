@@ -167,6 +167,7 @@ interface ChannelDrawerProps {
   initialValues: Record<string, unknown> | undefined;
   isBuiltin: boolean;
   channelSchema?: ChannelSchema;
+  channelSchemaLoading?: boolean;
   onRuntimeChange?: () => void | Promise<void>;
   onClose: () => void;
   onSubmit: (
@@ -183,6 +184,7 @@ export function ChannelDrawer({
   initialValues,
   isBuiltin,
   channelSchema,
+  channelSchemaLoading,
   onClose,
   onSubmit,
   onSubmitSnapshot,
@@ -233,6 +235,16 @@ export function ChannelDrawer({
     ? `${currentAgent.workspace_dir}/media`
     : "~/.qwenpaw/media";
   const currentLang = i18n.language?.startsWith("zh") ? "zh" : "en";
+  const qrcodeAuthProps = {
+    available:
+      !channelSchemaLoading &&
+      (channelSchema?.qrcode_available ??
+        !["running", "stopping"].includes(channelSchema?.availability ?? "")),
+    unavailableText:
+      !channelSchemaLoading && channelSchema?.availability === "missing_code"
+        ? t("channels.qrcodeInstallRequired")
+        : undefined,
+  };
   const label = activeKey ? getChannelLabel(activeKey, t) : activeLabel;
   const { message } = useAppMessage();
   useEffect(
@@ -485,6 +497,7 @@ export function ChannelDrawer({
               />
             </ConfigProvider>
             <QrcodeAuthBlock
+              {...qrcodeAuthProps}
               agentId={agentId}
               label={t("channels.dingtalkScanAuth")}
               buttonText={t("channels.dingtalkGetQrcode")}
@@ -683,6 +696,7 @@ export function ChannelDrawer({
               />
             </ConfigProvider>
             <QrcodeAuthBlock
+              {...qrcodeAuthProps}
               agentId={agentId}
               label={t("channels.feishuScanLogin")}
               buttonText={t("channels.feishuGetQrcode")}
@@ -761,6 +775,7 @@ export function ChannelDrawer({
               />
             </ConfigProvider>
             <QrcodeAuthBlock
+              {...qrcodeAuthProps}
               agentId={agentId}
               label={t("channels.qqScanAuth")}
               buttonText={t("channels.qqGetQrcode")}
@@ -1250,6 +1265,7 @@ export function ChannelDrawer({
               />
             </ConfigProvider>
             <QrcodeAuthBlock
+              {...qrcodeAuthProps}
               agentId={agentId}
               label={t("channels.wecomScanAuth")}
               buttonText={t("channels.loginWeCom")}
@@ -1397,6 +1413,7 @@ export function ChannelDrawer({
               />
             </ConfigProvider>
             <QrcodeAuthBlock
+              {...qrcodeAuthProps}
               agentId={agentId}
               label={t("channels.wechatScanLogin")}
               buttonText={t("channels.wechatGetQrcode")}

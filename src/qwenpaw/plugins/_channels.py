@@ -103,6 +103,7 @@ def register(plugin, spec):
             self._closed = False
             self._receiving = False
             self._stopping = False
+            self._prepare_stop_lock = asyncio.Lock()
             self._calls = {}
             self._call_done = {}
             self._call_cancels = {}
@@ -263,15 +264,18 @@ def register(plugin, spec):
                     task
                 ] = asyncio.get_running_loop().create_future()
             self._calls[task] = self._calls.get(task, 0) + 1
+            call = {"stop_cancelled": False}
             try:
-                yield
+                yield call
             finally:
                 self._calls[task] -= 1
                 if not self._calls[task]:
                     del self._calls[task]
                     # Only retract cancellation requests issued by our scoped
                     # stop. A shared queue worker may continue after this call.
-                    for _ in range(self._call_cancels.pop(task, 0)):
+                    cancellations = self._call_cancels.pop(task, 0)
+                    call["stop_cancelled"] = bool(cancellations)
+                    for _ in range(cancellations):
                         task.uncancel()
                     self._call_done.pop(task).set_result(None)
                     if propagate_cancel and task.cancelling():
@@ -489,19 +493,25 @@ def register(plugin, spec):
                 self._receiving = True
                 await plugin._call(self._backend.start, self._sdk_context)
 
-        # Keep related adapter declarations and lifecycle ordering together.
-        # pylint: disable-next=too-many-branches
-        async def stop(self):
-            if self._closed:
-                return
-            self._receiving = False
-            self._stopping = True
-            from .custody import stop_task, TASK_STOP_SECONDS
-
+        async def prepare_stop(self):
             if asyncio.current_task() in self._calls:
                 raise SDKError(
                     "A channel callback cannot stop its own active call",
                 )
+            # Concurrent stop paths must not cancel an invocation a second
+            # time while its first cancellation is running async cleanup.
+            async with self._prepare_stop_lock:
+                return await self._prepare_stop()
+
+        # Keep related adapter declarations and lifecycle ordering together.
+        # pylint: disable-next=too-many-branches
+        async def _prepare_stop(self):
+            if self._closed:
+                return True
+            self._receiving = False
+            self._stopping = True
+            from .custody import stop_task, TASK_STOP_SECONDS
+
             # A transport must stay usable for cancellation/final stream events
             # until its actual consumers and TaskTracker producers have
             # stopped.
@@ -546,6 +556,12 @@ def register(plugin, spec):
                                 f"Channel {spec.name!r} call has not "
                                 "stopped; retry is required",
                             )
+            return True
+
+        async def stop(self):
+            if self._closed:
+                return
+            await self.prepare_stop()
             if self._backend is not None:
                 result = await plugin._call(
                     self._backend.stop,
@@ -603,47 +619,57 @@ def register(plugin, spec):
                 if isinstance(payload, _Incoming)
                 else payload.session_id
             )
-            async with (
-                self._owned_call(propagate_cancel=True),
-                plugin._invocation(
-                    workspace_id=self._workspace.agent_id,
-                    session_id=session_id,
-                ),
-            ):
-                if isinstance(payload, _Incoming):
-                    allowed = []
-                    for request in payload.requests:
-                        if await self._access_control_gate(request):
-                            continue
-                        allowed.append(request)
-                    if not allowed:
-                        return
-                    payload = super().merge_requests(allowed)
-                    # Identity comes from the first accepted sender. Delivery
-                    # addresses may expire, so use the newest accepted
-                    # metadata.
-                    payload.channel_meta = {
-                        **allowed[0].channel_meta,
-                        **{
-                            key: allowed[-1].channel_meta[key]
-                            for key in (
-                                "conversation_id",
-                                "session_webhook",
-                                "session_webhook_expired_time",
-                                "conversation_type",
-                            )
-                            if key in allowed[-1].channel_meta
-                        },
-                        "_sdk_message_ids": tuple(
-                            mid
-                            for item in allowed
-                            for mid in item.channel_meta.get(
-                                "_sdk_message_ids",
-                                (),
-                            )
-                        ),
-                    }
-                await super()._consume_one_request(payload)
+            try:
+                async with (
+                    self._owned_call(propagate_cancel=True) as call,
+                    plugin._invocation(
+                        workspace_id=self._workspace.agent_id,
+                        session_id=session_id,
+                    ),
+                ):
+                    if isinstance(payload, _Incoming):
+                        allowed = []
+                        for request in payload.requests:
+                            if await self._access_control_gate(request):
+                                continue
+                            allowed.append(request)
+                        if not allowed:
+                            return
+                        payload = super().merge_requests(allowed)
+                        # Identity comes from the first accepted sender.
+                        # Delivery addresses may expire, so use the newest
+                        # accepted metadata.
+                        payload.channel_meta = {
+                            **allowed[0].channel_meta,
+                            **{
+                                key: allowed[-1].channel_meta[key]
+                                for key in (
+                                    "conversation_id",
+                                    "session_webhook",
+                                    "session_webhook_expired_time",
+                                    "conversation_type",
+                                )
+                                if key in allowed[-1].channel_meta
+                            },
+                            "_sdk_message_ids": tuple(
+                                mid
+                                for item in allowed
+                                for mid in item.channel_meta.get(
+                                    "_sdk_message_ids",
+                                    (),
+                                )
+                            ),
+                        }
+                    await super()._consume_one_request(payload)
+            except asyncio.CancelledError:
+                # Ownership cleanup has retracted only our stop requests. A
+                # finished SDK invocation must release its queue batch while
+                # cancellation from the manager or caller still propagates.
+                if (
+                    not call["stop_cancelled"]
+                    or asyncio.current_task().cancelling()
+                ):
+                    raise
 
         async def _stream_with_tracker(self, payload):
             if not self._receiving:

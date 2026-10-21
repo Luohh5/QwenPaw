@@ -15,6 +15,7 @@ RESPONSE_FIELDS = frozenset(
         "form_kind",
         "process_mode",
         "availability",
+        "qrcode_available",
         "global_enabled",
         "runtime_state",
         "repair",

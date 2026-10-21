@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 import json
 import os
 import sys
-from pathlib import Path
 import time
 from urllib.parse import urlsplit
 
@@ -31,7 +30,6 @@ __all__ = [
     "voice_host",
     "voice_host_guard",
 ]
-ROOT = Path(__file__).resolve().parents[3]
 
 
 @pytest.mark.asyncio
@@ -90,7 +88,7 @@ def process_observation(pid):
 
 @pytest.mark.asyncio
 async def test_owned_signature_and_ingress_fence_fail_closed_with_resources(
-    voice_host, voice_external, monkeypatch
+    voice_host, voice_external, monkeypatch, tmp_path
 ):
     gateway, external = voice_host, voice_external
     started = time.monotonic()
@@ -144,14 +142,7 @@ async def test_owned_signature_and_ingress_fence_fail_closed_with_resources(
     assert observation["tunnels"][0]["ppid"] == worker_pid
     assert observation["parent"]["rss_bytes"] > 0
     assert observation["worker"]["rss_bytes"] > 0
-    destination = (
-        ROOT
-        / ".superpowers"
-        / "sdd"
-        / "2026-10-14-official-channel-pluginization"
-        / "voice-closeout-test-evidence"
-        / "voice-active-owner-resource-observation.json"
-    )
+    destination = tmp_path / "voice-active-owner-resource-observation.json"
     destination.write_text(json.dumps(observation, indent=2) + "\n")
     headers = {
         "Host": urlsplit(PUBLIC).netloc,

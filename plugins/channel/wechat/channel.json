@@ -187,6 +187,7 @@
     "message_merge_delay_ms"
   ],
   "capabilities": [
+    "channel.auth.qrcode.v1",
     "channel.generic.v1",
     "channel.management.qrcode.v1",
     "channel.management.verify.v1",

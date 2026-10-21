@@ -9,11 +9,78 @@ from tests.contract.channels import ChannelContractTest  # noqa: E402
 from c6_artifacts import proxy  # noqa: E402
 
 
-class TestFeishuPluginContract(ChannelContractTest):
+class _OfficialPluginContract(ChannelContractTest):
     def create_instance(self):
-        return proxy("feishu", {"enabled": True})
+        return proxy(self.source_dir, {"enabled": True})
 
 
-class TestDingTalkPluginContract(ChannelContractTest):
-    def create_instance(self):
-        return proxy("dingtalk", {"enabled": True})
+class TestFeishuPluginContract(_OfficialPluginContract):
+    source_dir = "feishu"
+
+
+class TestDingTalkPluginContract(_OfficialPluginContract):
+    source_dir = "dingtalk"
+
+
+class TestTelegramPluginContract(_OfficialPluginContract):
+    source_dir = "telegram"
+
+
+class TestSlackPluginContract(_OfficialPluginContract):
+    source_dir = "slack"
+
+
+class TestDiscordPluginContract(_OfficialPluginContract):
+    source_dir = "discord"
+
+
+class TestMqttPluginContract(_OfficialPluginContract):
+    source_dir = "mqtt"
+
+
+class TestMattermostPluginContract(_OfficialPluginContract):
+    source_dir = "mattermost"
+
+
+class TestQQPluginContract(_OfficialPluginContract):
+    source_dir = "qq"
+
+
+class TestWecomPluginContract(_OfficialPluginContract):
+    source_dir = "wecom"
+
+
+class TestYuanbaoPluginContract(_OfficialPluginContract):
+    source_dir = "yuanbao"
+
+
+class TestXiaoyiPluginContract(_OfficialPluginContract):
+    source_dir = "xiaoyi"
+
+
+class TestWechatPluginContract(_OfficialPluginContract):
+    source_dir = "wechat"
+
+
+class TestMatrixPluginContract(_OfficialPluginContract):
+    source_dir = "matrix"
+
+
+class TestIMessagePluginContract(_OfficialPluginContract):
+    source_dir = "imessage"
+
+
+class TestOnebotPluginContract(_OfficialPluginContract):
+    source_dir = "onebot"
+
+
+class TestAzureBotPluginContract(_OfficialPluginContract):
+    source_dir = "azure_bot"
+
+
+class TestVoicePluginContract(_OfficialPluginContract):
+    source_dir = "voice"
+
+
+class TestSipPluginContract(_OfficialPluginContract):
+    source_dir = "sip"

@@ -52,6 +52,7 @@ export interface ChannelSchema {
   form_kind?: string;
   process_mode?: string;
   availability?: string;
+  qrcode_available?: boolean;
   global_enabled?: boolean;
   diagnostic?: string;
   repair?: {

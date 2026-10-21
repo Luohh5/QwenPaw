@@ -1,6 +1,8 @@
 """Public reply RPC contracts with a minimal non-card/editable platform."""
 
 import hashlib
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -110,11 +112,24 @@ class Peer:
     def __init__(self):
         self.methods, self.state, self.diagnostics = {}, {}, []
         self.batches, self.admissions = [], []
+        self._receipt_dir = tempfile.TemporaryDirectory()
 
     def register_method(self, name, handler):
         self.methods[name] = handler
 
     async def call(self, name, params):
+        if name.startswith("host.receipt."):
+            from qwenpaw.channel_protocol.response_receipts import (
+                ResponseReceiptStore,
+            )
+
+            store = ResponseReceiptStore(
+                Path(self._receipt_dir.name) / "receipts.sqlite3"
+            )
+            if name == "host.receipt.get":
+                return {"value": store.get(params["key"])}
+            store.put(params["key"], params["value"])
+            return {"stored": True}
         if name == "host.state.put":
             self.state[params["key"]] = params["value"]
             return {}
@@ -231,6 +246,38 @@ async def prepare(peer, identity, handle):
     )
 
 
+def send_params(identity, handle, delivery_id="delivery-one", text="answer"):
+    return SendParams.from_mapping(
+        {
+            **identity,
+            "delivery_id": delivery_id,
+            "to_handle": handle,
+            "operation": "message.create",
+            "content_parts": [{"type": "text", "text": text}],
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_completed_unknown_receipts_do_not_exhaust_new_response_quota():
+    driver, peer, identity = bound_driver()
+
+    async def uncertain_send(params):
+        driver.effects.append(("send", params.delivery_id))
+        raise TimeoutError("platform acknowledgement lost")
+
+    driver._perform_send = uncertain_send
+    for index in range(160):
+        handle = await open_route(peer, identity, f"plain:reply:{index}")
+        result = await peer.methods["channel.send"](
+            send_params(identity, handle, f"delivery-{index}"), None
+        )
+        assert result["state"] == "unknown"
+        await finish(peer, identity, handle)
+    assert len(driver.effects) == 160
+    assert await open_route(peer, identity, "plain:reply:next")
+
+
 @pytest.mark.asyncio
 async def test_noncard_finish_completes_after_disconnect_without_platform_effect():
     driver, peer, identity = bound_driver()
@@ -275,10 +322,18 @@ async def test_prepare_unknown_is_not_replayed_and_receipt_survives_finish():
         )
     assert driver.effects == [("prepare", handle)]
     await finish(peer, identity, handle)
-    snapshot = driver._routes.snapshot(handle)
-    assert snapshot.cleanup_state is ResponseCleanupState.COMPLETE
-    assert len(snapshot.resource_refs) == 1
-    assert dict(snapshot.resource_refs[0].attributes)["state"] == "unknown"
+    from qwenpaw.channel_protocol.response_receipts import receipt_key
+
+    snapshot = (
+        await peer.call(
+            "host.receipt.get", {"key": receipt_key("responses", handle)}
+        )
+    )["value"]
+    assert snapshot["cleanup_state"] == "complete"
+    assert len(snapshot["resource_refs"]) == 1
+    assert snapshot["resource_refs"][0]["attributes"]["state"] == "unknown"
+    assert (await prepare(peer, identity, handle))["state"] == "unknown"
+    assert driver.effects == [("prepare", handle)]
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,8 @@ const feedback = vi.hoisted(() => ({ error: vi.fn(), destroy: vi.fn() }));
 vi.mock("./useAppMessage", () => ({
   useAppMessage: () => ({ message: feedback }),
 }));
-vi.mock("react-i18next", () => ({
+vi.mock("react-i18next", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("react-i18next")>()),
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 

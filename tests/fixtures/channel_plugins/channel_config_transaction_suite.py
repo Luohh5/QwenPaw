@@ -177,6 +177,104 @@ def durable_fields(value):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["single", "bulk"])
+@pytest.mark.parametrize("legacy_null", [False, True])
+async def test_slack_null_roundtrip_edits_and_enable_toggles(
+    runtime,
+    monkeypatch,
+    kind,
+    legacy_null,
+):
+    from qwenpaw.plugins.official_channels import bundled_channel_description
+    from qwenpaw.plugins.registry import PluginRegistry
+
+    monkeypatch.setattr(PluginRegistry, "_instance", None)
+    if legacy_null:
+        # Exercise the installed descriptor path with the real packaged schema.
+        PluginRegistry().register_channel_descriptor(
+            "slack",
+            bundled_channel_description("slack"),
+        )
+        payload = disk(runtime)
+        payload["channels"]["slack"]["allow_from"] = None
+        CONFIG.write_json_atomic(runtime.path, payload)
+    before = disk(runtime)
+    response = await runtime.client.get("/config/channels/slack")
+    assert response.status_code == 200, response.text
+    values = response.json()
+    assert values["allow_from"] is None
+    for changes in (
+        {},
+        {"bot_token": "saved-bot", "app_token": "saved-app"},
+        {"enabled": True},
+        {"enabled": False},
+    ):
+        values.update(changes)
+        response = await put(runtime, kind, "slack", values)
+        assert response.status_code == 200, response.text
+        saved = response.json()
+        saved = saved if kind == "single" else saved["slack"]
+        assert saved == {**values, "allow_from": []}
+        assert disk(runtime) == {
+            **before,
+            "channels": {
+                **before["channels"],
+                "slack": durable_fields(saved),
+            },
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["single", "bulk"])
+@pytest.mark.parametrize(
+    "values, expected",
+    [({}, []), ({"allow_from": []}, []), ({"allow_from": ["U123"]}, ["U123"])],
+)
+async def test_slack_missing_or_list_allow_from_saves(
+    runtime,
+    kind,
+    values,
+    expected,
+):
+    response = await put(runtime, kind, "slack", values)
+    assert response.status_code == 200, response.text
+    saved = response.json()
+    saved = saved if kind == "single" else saved["slack"]
+    assert saved["allow_from"] == expected
+    assert disk(runtime)["channels"]["slack"]["allow_from"] == expected
+    assert_preserved(runtime)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["single", "bulk"])
+@pytest.mark.parametrize(
+    "channel, value",
+    [
+        ("slack", False),
+        ("slack", ""),
+        ("slack", 7),
+        ("slack", {}),
+        ("discord", None),
+    ],
+)
+async def test_allow_from_invalid_values_do_not_change_disk(
+    runtime,
+    kind,
+    channel,
+    value,
+):
+    before = runtime.path.read_bytes()
+    response = await put(runtime, kind, channel, {"allow_from": value})
+    assert response.status_code == 422, response.text
+    assert any(
+        error["loc"] == ["allow_from"] for error in response.json()["detail"]
+    )
+    assert runtime.path.read_bytes() == before
+    assert runtime.lifecycle.generations == 0
+    assert runtime.lifecycle.reload_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["single", "bulk"])
 @pytest.mark.parametrize("reload_fails", [False, True])
 async def test_sequential_saves_do_not_depend_on_runtime_rebuild(
     runtime,

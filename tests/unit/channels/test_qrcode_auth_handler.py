@@ -9,7 +9,7 @@ import sys
 
 def test_qrcode_descriptor_http_contracts(tmp_path):
     suite = (
-        Path(__file__).resolve().parents[3]
+        Path(__file__).resolve().parents[2]
         / "fixtures/channel_plugins/wechat_qr_retirement_boundary_suite.py"
     )
     result = subprocess.run(

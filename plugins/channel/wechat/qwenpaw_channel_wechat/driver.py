@@ -43,6 +43,7 @@ class WeChatDriver(SharedResponseDriver):
             self._config,
             self._message,
             self._state_changed,
+            on_auth_required=self._context.notify_auth_required,
         )
         await self._state_changed("connecting")
         try:

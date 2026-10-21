@@ -15,6 +15,7 @@ registry = core.registry
 def test_all18_actual_resources_are_exact_rebuild_and_requirement_union(
     tmp_path,
 ):
+    from qwenpaw.__version__ import __version__
     from qwenpaw.plugins.official_channel_catalog import OFFICIAL_CHANNELS
 
     assert len(OFFICIAL_CHANNELS) == 18
@@ -49,7 +50,7 @@ def test_all18_actual_resources_are_exact_rebuild_and_requirement_union(
     built = core.packager().build_official_channel_bundle(
         core.ROOT,
         tmp_path / "resources",
-        host_version="2.2.2b4",
+        host_version=__version__,
     )
     approved = core.ROOT / "src/qwenpaw/official_channels"
     assert built.read_bytes() == (approved / "index.json").read_bytes()

@@ -26,6 +26,7 @@ async def test_manager_waiting_qr_keeps_console_agent_then_connects_and_stops(
     qr_ilink,
     monkeypatch,
     tmp_path,
+    capfd,
 ):
     from qwenpaw.runtime._state_utils import StateProxy
     from qwenpaw.schemas import TextContent
@@ -70,6 +71,14 @@ async def test_manager_waiting_qr_keeps_console_agent_then_connects_and_stops(
         assert waiting_health["platform_state"] == "connecting"
         assert pending._launch_spec.startup_timeout == 5
         assert not fresh_auth.exists()
+        # The link must cross worker IPC before the same pending QR is scanned.
+        terminal = capfd.readouterr()
+        assert external.mock.base_url + "/scan" in terminal.err
+        assert "temporary-file-token" not in terminal.out + terminal.err
+        assert external.mock.base_url + "/scan" not in json.dumps(
+            rt.ws._config.model_dump(mode="json")
+        )
+        assert external.qr_fetches == 1
         console = await rt.manager.get_channel("console")
         assert console is not None
         frames = [
@@ -116,6 +125,10 @@ async def test_manager_waiting_qr_keeps_console_agent_then_connects_and_stops(
         assert fresh_auth.read_text() == "temporary-file-token"
         assert external.qr_fetches == 1
         assert external.qr_polls[-1]["status"] == "confirmed"
+        assert all(
+            row["qrcode"] == ["controlled-runtime-code"]
+            for row in external.qr_polls
+        )
         target = "after-qr@im.wechat"
         external.mock.push_text_message(
             text="native chat after QR confirmation",

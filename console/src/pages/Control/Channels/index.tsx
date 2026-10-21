@@ -45,6 +45,7 @@ function ChannelsPage() {
     channels,
     orderedKeys,
     channelSchemas,
+    schemasLoading,
     isBuiltin,
     loading,
     setChannels,
@@ -124,6 +125,7 @@ function ChannelsPage() {
 
   const handleCardClick = useCallback(
     (key: ChannelKey) => {
+      void fetchChannels(true);
       setActiveKey(key);
       setDrawerOpen(true);
       const channelConfig = keepConsoleEnabled(
@@ -149,7 +151,7 @@ function ChannelsPage() {
         show_thinking: channelConfig.show_thinking ?? true,
       });
     },
-    [channels, form],
+    [channels, form, fetchChannels],
   );
 
   const handleDrawerClose = () => {
@@ -381,6 +383,9 @@ function ChannelsPage() {
         initialValues={activeKey ? channels[activeKey] : undefined}
         isBuiltin={activeKey ? isBuiltin(activeKey) : true}
         channelSchema={activeKey ? channelSchemas[activeKey] : undefined}
+        channelSchemaLoading={
+          schemasLoading || (!!activeKey && !channelSchemas[activeKey])
+        }
         onClose={handleDrawerClose}
         onSubmit={handleSubmit}
         onSubmitSnapshot={handleSubmitSnapshot}

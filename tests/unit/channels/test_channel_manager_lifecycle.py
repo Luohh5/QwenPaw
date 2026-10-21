@@ -24,6 +24,7 @@ def _make_channel(name: str, *, uses_queue: bool = True) -> MagicMock:
     channel = MagicMock(name=f"channel_{name}")
     channel.channel = name
     channel.start = AsyncMock()
+    channel.prepare_stop = AsyncMock(return_value=False)
     channel.stop = AsyncMock()
     channel.set_enqueue = MagicMock()
     channel.uses_manager_queue = uses_queue

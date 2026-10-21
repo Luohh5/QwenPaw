@@ -10,6 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "plugins/channel/sip"))
 from qwenpaw_channel_sip.driver import SIPDriver
+from g2_shared_response_suite import Peer
 from qwenpaw.channel_protocol.models import (
     IdentityParams,
     SendParams,
@@ -39,10 +40,11 @@ def vendor(monkeypatch):
         boundary.tts_release.set()
 
 
-class HostBoundary:
+class HostBoundary(Peer):
     """RPC observation boundary; not a Core Agent or registry substitute."""
 
     def __init__(self):
+        super().__init__()
         self.methods, self.state, self.batches, self.notifications = (
             {},
             {},
@@ -59,6 +61,8 @@ class HostBoundary:
         self.notifications.append((method, params))
 
     async def call(self, method, params):
+        if method.startswith("host.receipt."):
+            return await super().call(method, params)
         if method == "host.state.get":
             return {"value": self.state.get(params["key"])}
         if method == "host.state.put":

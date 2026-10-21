@@ -873,7 +873,7 @@ class Workspace:
         if self.channel_manager is not None:
             from ...plugins.lifecycle import QuiescenceError
 
-            if not await self.channel_manager.quiesce():
+            if not await self.channel_manager.quiesce(for_stop=True):
                 raise QuiescenceError("CHANNEL_DRAIN_TIMEOUT")
         errors: list[tuple[str, Exception]] = []
         try:

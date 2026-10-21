@@ -17,11 +17,13 @@ from aiohttp.abc import AbstractResolver
 from google.protobuf import json_format
 import pytest_asyncio
 
+from g2_shared_response_suite import Peer
+
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "plugins/channel/yuanbao"))
 
-from qwenpaw_channel_yuanbao import codec
-from qwenpaw_channel_yuanbao.platform import YuanbaoPlatform
+from qwenpaw_channel_yuanbao import codec  # noqa: E402
+from qwenpaw_channel_yuanbao.platform import YuanbaoPlatform  # noqa: E402
 
 
 async def eventually(predicate, timeout=3):
@@ -231,9 +233,11 @@ async def external(tmp_path):
 @pytest_asyncio.fixture
 async def native_platform(external, tmp_path):
     events, states = [], []
+
     async def event(value):
         events.append(value)
         return True
+
     async def state(value):
         states.append(value)
     platform = YuanbaoPlatform({
@@ -249,10 +253,11 @@ async def native_platform(external, tmp_path):
         await platform.stop()
 
 
-class HostBoundary:
+class HostBoundary(Peer):
     """Controlled state/admission RPC endpoint; this is not a full Core proof."""
 
     def __init__(self):
+        super().__init__()
         self.methods, self.state = {}, {}
         self.batches, self.notifications = [], []
 
@@ -260,6 +265,8 @@ class HostBoundary:
         self.methods[name] = handler
 
     async def call(self, method, params):
+        if method.startswith("host.receipt."):
+            return await super().call(method, params)
         if method == "host.state.get":
             return {"value": self.state.get(params["key"])}
         if method == "host.state.put":

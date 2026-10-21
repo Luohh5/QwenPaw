@@ -11,11 +11,12 @@ export function useChannels() {
   const [channelSchemas, setChannelSchemas] = useState<
     Record<string, ChannelSchema>
   >({});
+  const [schemasLoading, setSchemasLoading] = useState(true);
   const [loading, setLoading] = useState(true);
   const generation = useRef(0);
   const controller = useRef<AbortController>();
 
-  const fetchChannels = useCallback(async () => {
+  const fetchChannels = useCallback(async (schemasOnly = false) => {
     const agentId = useAgentStore.getState().selectedAgent || "default";
     const requestGeneration = ++generation.current;
     controller.current?.abort();
@@ -26,20 +27,25 @@ export function useChannels() {
       requestGeneration === generation.current &&
       !currentController.signal.aborted &&
       (useAgentStore.getState().selectedAgent || "default") === agentId;
-    setLoading(true);
-    try {
-      const [data, types] = await Promise.all([
-        api.listChannels(scope),
-        api.listChannelTypes(scope),
-      ]);
-      if (!current()) return;
-      if (data)
-        setChannels(data as unknown as Record<string, Record<string, unknown>>);
-      if (types) setChannelTypes(types);
-    } catch (error) {
-      if (current()) console.error("❌ Failed to load channels:", error);
-    } finally {
-      if (current()) setLoading(false);
+    setSchemasLoading(true);
+    setLoading(!schemasOnly);
+    if (!schemasOnly) {
+      try {
+        const [data, types] = await Promise.all([
+          api.listChannels(scope),
+          api.listChannelTypes(scope),
+        ]);
+        if (!current()) return;
+        if (data)
+          setChannels(
+            data as unknown as Record<string, Record<string, unknown>>,
+          );
+        if (types) setChannelTypes(types);
+      } catch (error) {
+        if (current()) console.error("❌ Failed to load channels:", error);
+      } finally {
+        if (current()) setLoading(false);
+      }
     }
     if (!current()) return;
     // Fetch schemas separately so failures don't block core channel loading
@@ -48,6 +54,9 @@ export function useChannels() {
       if (current() && schemas) setChannelSchemas(schemas);
     } catch {
       // Plugin system may not be available; non-critical
+      if (current()) setChannelSchemas({});
+    } finally {
+      if (current()) setSchemasLoading(false);
     }
   }, []);
 
@@ -114,6 +123,7 @@ export function useChannels() {
     channels,
     channelTypes,
     channelSchemas,
+    schemasLoading,
     orderedKeys,
     isBuiltin,
     loading,

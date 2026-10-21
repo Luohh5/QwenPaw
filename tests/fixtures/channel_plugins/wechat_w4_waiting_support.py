@@ -1,7 +1,7 @@
 """Native QR GET responses on the existing external iLink HTTP mock."""
 
 import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest_asyncio
 
@@ -14,6 +14,7 @@ __all__ = ["native_ilink", "qr_ilink"]
 async def qr_ilink(native_ilink):
     state = native_ilink
     state.qr_confirmed = False
+    state.qr_expired = False
     state.qr_polls = []
     state.qr_fetches = 0
     server = state.mock._http_server
@@ -32,10 +33,18 @@ async def qr_ilink(native_ilink):
                 )
             if path.endswith("/get_qrcode_status"):
                 confirmed = state.qr_confirmed
+                status = (
+                    "expired"
+                    if state.qr_expired
+                    else "confirmed" if confirmed else "waiting"
+                )
                 state.qr_polls.append(
                     {
                         "time": time.monotonic(),
-                        "status": "confirmed" if confirmed else "waiting",
+                        "status": status,
+                        "qrcode": parse_qs(urlsplit(self.path).query).get(
+                            "qrcode", []
+                        ),
                     }
                 )
                 return self._json(
@@ -44,8 +53,8 @@ async def qr_ilink(native_ilink):
                         "bot_token": "temporary-file-token",
                         "baseurl": state.mock.base_url,
                     }
-                    if confirmed
-                    else {"status": "waiting"}
+                    if status == "confirmed"
+                    else {"status": status}
                 )
             return super().do_GET()
 

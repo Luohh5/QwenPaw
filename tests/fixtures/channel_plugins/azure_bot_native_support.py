@@ -21,6 +21,7 @@ import jwt
 import pytest
 import pytest_asyncio
 
+from g2_shared_response_suite import Peer
 from qwenpaw.channel_protocol.models import (
     IdentityParams,
     EventBatchParams,
@@ -215,10 +216,11 @@ async def connector(monkeypatch, rsa_material):
         await runner.cleanup()
 
 
-class HostBoundary:
+class HostBoundary(Peer):
     """Records only private context RPC; this is not an actual host/Agent test."""
 
     def __init__(self):
+        super().__init__()
         self.methods, self.state, self.events, self.calls, self.notifications = (
             {},
             {},
@@ -235,6 +237,8 @@ class HostBoundary:
         self.notifications.append((name, params))
 
     async def call(self, name, params):
+        if name.startswith("host.receipt."):
+            return await super().call(name, params)
         self.calls.append((name, params))
         if name == "host.state.get":
             return {"value": self.state.get(params["key"])}

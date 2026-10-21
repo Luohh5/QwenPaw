@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
+from .descriptor import _http_url
 from .errors import DescriptorValidationError, ProtocolValidationError
 from ..plugins.execution.models import (  # pylint: disable=unused-import
     _error,
@@ -36,9 +39,11 @@ RAW_COMPLETED_TEXT_CAPABILITY = "send.raw_completed_text.v1"
 UNKNOWN_ACTOR_CAPABILITY = "event.unknown_actor.v1"
 APPROVAL_RESOLUTION_CAPABILITY = "send.approval_resolution.v1"
 TEXT_MERGE_CAPABILITY = "channel.text_merge.v1"
+AUTH_QRCODE_CAPABILITY = "channel.auth.qrcode.v1"
 PROTOCOL_VERSION = 1
 MAX_METHOD_LENGTH = 128
 MAX_RESPONSE_HANDLE_LENGTH = 512
+MAX_AUTH_SCAN_URL_LENGTH = 4096
 
 
 def send_source_capability(source, capabilities):
@@ -282,6 +287,55 @@ def _identity_from_fields(data: Mapping[str, Any]) -> IdentityParams:
     return IdentityParams.from_mapping(
         {name: data[name] for name in _IDENTITY_FIELDS},
     )
+
+
+@dataclass(frozen=True)
+class AuthRequiredParams(IdentityParams):
+    """One current worker's terminal QR login prompt."""
+
+    scan_url: str
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "AuthRequiredParams":
+        data = _object(value)
+        _closed(data, {*_IDENTITY_FIELDS, "scan_url"})
+        identity = _identity_from_fields(data)
+        scan_url = _string(data.get("scan_url"), "scan_url")
+        if len(scan_url) > MAX_AUTH_SCAN_URL_LENGTH or any(
+            0x7F <= ord(character) < 0xA0 for character in scan_url
+        ):
+            raise _error("Invalid QR scan URL", path=("scan_url",))
+        try:
+            _http_url(scan_url, "scan_url")
+        except DescriptorValidationError as exc:
+            raise _error("Invalid QR scan URL", path=("scan_url",)) from exc
+        parts = urlsplit(scan_url)
+        if parts.username is not None:
+            raise _error("Invalid QR scan URL", path=("scan_url",))
+        host = parts.hostname or ""
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            try:
+                host = host.encode("idna").decode("ascii").removesuffix(".")
+            except UnicodeError as exc:
+                raise _error(
+                    "Invalid QR scan URL",
+                    path=("scan_url",),
+                ) from exc
+            if len(host) > 253 or any(
+                re.fullmatch(
+                    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",
+                    label,
+                )
+                is None
+                for label in host.split(".")
+            ):
+                raise _error("Invalid QR scan URL", path=("scan_url",))
+        return cls(**identity.__dict__, scan_url=scan_url)
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {**super().to_mapping(), "scan_url": self.scan_url}
 
 
 class ResponsePrepareKind(StrEnum):
@@ -1673,6 +1727,7 @@ class HostStateParams(IdentityParams):
 
 
 METHOD_SCHEMAS: dict[str, type[Any]] = {
+    "channel.auth.required": AuthRequiredParams,
     "channel.management.execute": ManagementRequest,
     "runner.hello": HelloParams,
     "channel.health": IdentityParams,
@@ -1690,6 +1745,8 @@ METHOD_SCHEMAS: dict[str, type[Any]] = {
     "host.state.get": HostStateParams,
     "host.state.put": HostStateParams,
     "host.state.delete": HostStateParams,
+    "host.receipt.get": HostStateParams,
+    "host.receipt.put": HostStateParams,
 }
 
 

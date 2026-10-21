@@ -5,12 +5,14 @@ from pathlib import Path
 import pytest_asyncio
 from matrix_native_support import BOT, ROOM, hs
 from qwenpaw_channel_matrix.driver import MatrixDriver
+from g2_shared_response_suite import Peer
 from qwenpaw.channel_protocol.models import IdentityParams, SendParams
 from qwenpaw.channel_protocol.shared_worker import DriverContext
 
 
-class HostBoundary:
+class HostBoundary(Peer):
     def __init__(self):
+        super().__init__()
         self.methods, self.state = {}, {}
         self.batches, self.notifications = [], []
         self.admission = "accepted"
@@ -19,6 +21,8 @@ class HostBoundary:
         self.methods[name] = handler
 
     async def call(self, method, params):
+        if method.startswith("host.receipt."):
+            return await super().call(method, params)
         if method == "host.state.get":
             return {"value": self.state.get(params["key"])}
         if method == "host.state.put":

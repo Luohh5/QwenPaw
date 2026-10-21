@@ -462,6 +462,7 @@ def validate_channel_contract(channel_key: str, capabilities) -> None:
         UNKNOWN_ACTOR_CAPABILITY,
         APPROVAL_RESOLUTION_CAPABILITY,
         TEXT_MERGE_CAPABILITY,
+        AUTH_QRCODE_CAPABILITY,
     )
 
     tags = set(capabilities)
@@ -472,6 +473,7 @@ def validate_channel_contract(channel_key: str, capabilities) -> None:
         UNKNOWN_ACTOR_CAPABILITY,
         APPROVAL_RESOLUTION_CAPABILITY,
         TEXT_MERGE_CAPABILITY,
+        AUTH_QRCODE_CAPABILITY,
     ):
         prefix = supported.rsplit(".", 1)[0] + "."
         claimed = {item for item in tags if item.startswith(prefix)}

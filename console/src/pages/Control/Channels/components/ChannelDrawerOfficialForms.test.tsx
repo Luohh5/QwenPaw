@@ -36,7 +36,8 @@ const h = vi.hoisted(() => ({
   } as Record<string, Record<string, string>>,
 }));
 vi.mock("@agentscope-ai/design", async () => vi.importActual("antd"));
-vi.mock("react-i18next", () => ({
+vi.mock("react-i18next", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("react-i18next")>()),
   useTranslation: () => ({ t: h.t, i18n: h.i18n }),
 }));
 vi.mock("../../../../hooks/useAppMessage", () => ({

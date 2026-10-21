@@ -58,11 +58,12 @@ def _copy_release_inputs(source: Path, destination: Path) -> None:
         destination / "packages" / "qwenpawmail-mcp" / "src",
         ignore=ignored,
     )
-    shutil.copytree(
-        source / "plugins" / "channel",
-        destination / "plugins" / "channel",
-        ignore=ignored,
-    )
+    for kind in ("channel", "hub"):
+        shutil.copytree(
+            source / "plugins" / kind,
+            destination / "plugins" / kind,
+            ignore=ignored,
+        )
     shutil.copytree(
         source / "scripts" / "pack",
         destination / "scripts" / "pack",

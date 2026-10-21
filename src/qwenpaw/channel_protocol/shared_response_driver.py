@@ -31,6 +31,7 @@ from qwenpaw.channel_protocol.models import (
     ResponseFinishResult,
     ResponsePrepareOperation,
 )
+from qwenpaw.channel_protocol.response_receipts import receipt_key
 from qwenpaw.channel_protocol.response_policy import ResponsePolicy
 from qwenpaw.channel_protocol.reliability import RetryPolicy, events_for_retry
 from qwenpaw.channel_protocol.response_lifecycle import (
@@ -105,37 +106,104 @@ class SharedResponseDriver:
         rows = (await self._state("get", self._state_key))["value"] or []
         if not isinstance(rows, list) or len(rows) > _MAX_ROUTES:
             raise ValueError("RESPONSE_STATE_INVALID")
+        migrated = False
         for row in rows:
             snapshot = ResponseRouteSnapshot.from_mapping(row)
+            if await self._archived(snapshot.response_handle):
+                migrated = True
+                continue
             if snapshot.cleanup_state is ResponseCleanupState.COMPLETE:
                 compact = self._compact_receipt(snapshot)
                 if compact != snapshot:
                     snapshot = replace(compact, version=snapshot.version + 1)
+                if not self._evictable(snapshot):
+                    await self._receipt(
+                        "put",
+                        snapshot.response_handle,
+                        snapshot,
+                    )
+                    migrated = True
+                    continue
             self._routes.restore(snapshot)
+        if migrated:
+            await self._checkpoint()
 
     async def _persist_route(self, handle, attrs):
-        rows = self._routes.snapshots()
-        if len(rows) >= _MAX_ROUTES:
-            completed = sorted(
-                (row for row in rows if self._evictable(row)),
-                key=lambda row: row.closed_at_ms,
+        # Serialize opening against archive publication and removal. A stale
+        # open must not race a durable closed-handle fence.
+        async with self._checkpoint_lock:
+            if await self._archived(handle):
+                raise ResponseStateError(
+                    "RESPONSE_CLOSED",
+                    "response route is closed",
+                )
+            rows = self._routes.snapshots()
+            if len(rows) >= _MAX_ROUTES:
+                completed = sorted(
+                    (row for row in rows if self._evictable(row)),
+                    key=lambda row: row.closed_at_ms,
+                )
+                if completed:
+                    self._evict(completed[0].response_handle)
+            for old in self._routes.expired_completed():
+                if self._evictable(old):
+                    self._routes.commit_gc(old)
+            snapshot, created = self._routes.open(
+                handle,
+                [
+                    ResponseResourceRef.create(
+                        self._kind + ".route",
+                        handle,
+                        attrs,
+                    ),
+                ],
             )
-            if completed:
-                self._evict(completed[0].response_handle)
-        for old in self._routes.expired_completed():
-            if self._evictable(old):
-                self._routes.commit_gc(old)
-        snapshot, created = self._routes.open(
-            handle,
-            [ResponseResourceRef.create(self._kind + ".route", handle, attrs)],
-        )
-        try:
-            await self._checkpoint()
-        except BaseException:
-            if created:
-                self._routes.rollback_open(handle, snapshot.version)
-            raise
+            try:
+                await self._write_checkpoint()
+            except BaseException:
+                if created:
+                    self._routes.rollback_open(handle, snapshot.version)
+                raise
         return handle
+
+    async def _receipt(self, operation, handle, snapshot=None):
+        return await self._context.peer.call(
+            "host.receipt." + operation,
+            HostStateParams(
+                **self._context.identity.to_mapping(),
+                key=receipt_key(self._state_key, handle),
+                value=snapshot.to_mapping() if snapshot is not None else None,
+            ).to_mapping(),
+        )
+
+    async def _archived(self, handle):
+        value = (await self._receipt("get", handle))["value"]
+        return ResponseRouteSnapshot.from_mapping(value) if value else None
+
+    async def _archive(self, candidate):
+        async with self._checkpoint_lock:
+            # Durable evidence must precede removal from both live budgets.
+            try:
+                await self._receipt(
+                    "put",
+                    candidate.response_handle,
+                    candidate,
+                )
+            except Exception:
+                # A lost RPC acknowledgement can still mean a committed put.
+                if (
+                    await self._archived(candidate.response_handle)
+                    != candidate
+                ):
+                    raise
+            self._evict(candidate.response_handle)
+            await self._write_checkpoint()
+
+    async def _retire_archived(self, handle):
+        async with self._checkpoint_lock:
+            if self._routes.snapshot(handle) is not None:
+                self._evict(handle)
+                await self._write_checkpoint()
 
     def bind(self, context):
         self._context = context
@@ -199,6 +267,11 @@ class SharedResponseDriver:
             raise ValueError("SCHEMA_MISMATCH")
         self._require_connected()
         handle = params["response_handle"]
+        if await self._archived(handle):
+            raise ResponseStateError(
+                "RESPONSE_CLOSED",
+                "response route is closed",
+            )
         async with self._lock(handle):
             self._route_attrs(handle)
             policy = self.response_policy(handle)
@@ -244,38 +317,44 @@ class SharedResponseDriver:
 
     async def _checkpoint(self, candidate=None, *, reserve_bytes=0):
         async with self._checkpoint_lock:
-            snapshots = {
-                row.response_handle: row.to_mapping()
-                for row in self._routes.snapshots()
-            }
-            if candidate is not None:
-                snapshots[candidate.response_handle] = candidate.to_mapping()
-            while (
-                len(
-                    json.dumps(
-                        list(snapshots.values()),
-                        ensure_ascii=False,
-                    ).encode(),
-                )
-                > 768 * 1024 - reserve_bytes
-            ):
-                completed = sorted(
-                    (
-                        row
-                        for row in self._routes.snapshots()
-                        if self._evictable(row)
-                        and (
-                            candidate is None
-                            or row.response_handle != candidate.response_handle
-                        )
-                    ),
-                    key=lambda row: row.closed_at_ms,
-                )
-                if not completed:
-                    raise ValueError("RESPONSE_STATE_CAPACITY")
-                self._evict(completed[0].response_handle)
-                snapshots.pop(completed[0].response_handle, None)
-            await self._state("put", self._state_key, list(snapshots.values()))
+            await self._write_checkpoint(
+                candidate,
+                reserve_bytes=reserve_bytes,
+            )
+
+    async def _write_checkpoint(self, candidate=None, *, reserve_bytes=0):
+        snapshots = {
+            row.response_handle: row.to_mapping()
+            for row in self._routes.snapshots()
+        }
+        if candidate is not None:
+            snapshots[candidate.response_handle] = candidate.to_mapping()
+        while (
+            len(
+                json.dumps(
+                    list(snapshots.values()),
+                    ensure_ascii=False,
+                ).encode(),
+            )
+            > 768 * 1024 - reserve_bytes
+        ):
+            completed = sorted(
+                (
+                    row
+                    for row in self._routes.snapshots()
+                    if self._evictable(row)
+                    and (
+                        candidate is None
+                        or row.response_handle != candidate.response_handle
+                    )
+                ),
+                key=lambda row: row.closed_at_ms,
+            )
+            if not completed:
+                raise ValueError("RESPONSE_STATE_CAPACITY")
+            self._evict(completed[0].response_handle)
+            snapshots.pop(completed[0].response_handle, None)
+        await self._state("put", self._state_key, list(snapshots.values()))
 
     def _lock(self, handle):
         if handle not in self._locks:
@@ -423,6 +502,9 @@ class SharedResponseDriver:
             ):
                 raise RpcError(-32602, "Send capability was not declared")
         handle = params.to_handle
+        archived = await self._archived(handle)
+        if archived:
+            return self._replay(params, archived)
         async with self._lock(handle):
             return await self._delivery(params, self._perform_send)
 
@@ -449,6 +531,9 @@ class SharedResponseDriver:
             delivery_id=params["delivery_id"],
             to_handle=params["response_handle"],
         )
+        archived = await self._archived(operation.to_handle)
+        if archived:
+            return self._replay(operation, archived)
         async with self._lock(operation.to_handle):
             return await self._delivery(operation, self._perform_prepare)
 
@@ -475,49 +560,60 @@ class SharedResponseDriver:
             ).encode(),
         ).hexdigest()
 
+    def _replay(self, params, snapshot):
+        delivery_id = params.delivery_id
+        fingerprint = self._operation_fingerprint(params)
+        previous = next(
+            (
+                ref
+                for ref in snapshot.resource_refs
+                if ref.kind == self._kind + ".attempt"
+                and ref.resource_id == delivery_id
+            ),
+            None,
+        )
+        if previous:
+            attrs = dict(previous.attributes)
+            legacy = (
+                self._legacy_prepare_operation(params)
+                if isinstance(params, ResponsePrepareOperation)
+                and attrs.get("operation") == "stream.start"
+                else None
+            )
+            if attrs["fingerprint"] != fingerprint and (
+                legacy is None
+                or attrs["fingerprint"] != self._operation_fingerprint(legacy)
+            ):
+                return self._result(
+                    delivery_id,
+                    "failed",
+                    "DELIVERY_CONFLICT",
+                )
+            return self._result(
+                delivery_id,
+                attrs["state"],
+                attrs.get("reason_code") or None,
+            )
+        if snapshot.cleanup_state is ResponseCleanupState.COMPLETE:
+            return self._result(delivery_id, "failed", "RESPONSE_CLOSED")
+        return None
+
     async def _delivery(self, params, perform):
         delivery_id, handle = params.delivery_id, params.to_handle
         try:
             snapshot = self._routes.snapshot(handle)
+            if snapshot is None:
+                snapshot = await self._archived(handle)
             if snapshot is None:
                 return self._result(
                     delivery_id,
                     "failed",
                     "RESPONSE_HANDLE_UNKNOWN",
                 )
+            replay = self._replay(params, snapshot)
+            if replay is not None:
+                return replay
             fingerprint = self._operation_fingerprint(params)
-            previous = next(
-                (
-                    ref
-                    for ref in self._routes.snapshot(handle).resource_refs
-                    if ref.kind == self._kind + ".attempt"
-                    and ref.resource_id == delivery_id
-                ),
-                None,
-            )
-            if previous:
-                attrs = dict(previous.attributes)
-                legacy = (
-                    self._legacy_prepare_operation(params)
-                    if isinstance(params, ResponsePrepareOperation)
-                    and attrs.get("operation") == "stream.start"
-                    else None
-                )
-                if attrs["fingerprint"] != fingerprint and (
-                    legacy is None
-                    or attrs["fingerprint"]
-                    != self._operation_fingerprint(legacy)
-                ):
-                    return self._result(
-                        delivery_id,
-                        "failed",
-                        "DELIVERY_CONFLICT",
-                    )
-                return self._result(
-                    delivery_id,
-                    attrs["state"],
-                    attrs.get("reason_code") or None,
-                )
             self._require_connected()
             self._routes.admit_operation(handle)
             intent = {
@@ -631,12 +727,39 @@ class SharedResponseDriver:
 
     async def _reaction(self, params, request):
         self._identity(params)
+        archived = await self._archived(params.to_handle)
+        if archived:
+            return self._replay(params, archived)
         async with self._lock(params.to_handle):
             return await self._delivery(params, self._perform_reaction)
 
     async def _finish(self, params, request):
         self._identity(params)
+        archived = await self._archived(params.response_handle)
+        if archived:
+            if archived.outcome is not params.outcome:
+                raise ResponseStateError(
+                    "RESPONSE_OUTCOME_CONFLICT",
+                    "response outcome conflicts",
+                )
+            await self._retire_archived(params.response_handle)
+            return ResponseFinishResult(
+                params.response_handle,
+                params.outcome,
+            ).to_mapping()
         async with self._lock(params.response_handle):
+            archived = await self._archived(params.response_handle)
+            if archived:
+                if archived.outcome is not params.outcome:
+                    raise ResponseStateError(
+                        "RESPONSE_OUTCOME_CONFLICT",
+                        "response outcome conflicts",
+                    )
+                await self._retire_archived(params.response_handle)
+                return ResponseFinishResult(
+                    params.response_handle,
+                    params.outcome,
+                ).to_mapping()
             snapshot = self._routes.begin_finish(
                 params.response_handle,
                 params.outcome,
@@ -660,7 +783,13 @@ class SharedResponseDriver:
         ).to_mapping()
 
     async def _cleanup(self, snapshot):
+        archived = await self._archived(snapshot.response_handle)
+        if archived:
+            await self._retire_archived(snapshot.response_handle)
+            return
         if snapshot.cleanup_state is ResponseCleanupState.COMPLETE:
+            if not self._evictable(snapshot):
+                await self._archive(self._compact_receipt(snapshot))
             return
         for ref in snapshot.resource_refs:
             resource = dict(ref.attributes)
@@ -725,8 +854,11 @@ class SharedResponseDriver:
             snapshot.outcome,
         )
         candidate = self._compact_receipt(candidate)
-        await self._checkpoint(candidate)
-        self._routes.commit_cleanup(candidate)
+        if not self._evictable(candidate):
+            await self._archive(candidate)
+        else:
+            await self._checkpoint(candidate)
+            self._routes.commit_cleanup(candidate)
 
     def _needs_stream_cleanup(self, ref):
         return False

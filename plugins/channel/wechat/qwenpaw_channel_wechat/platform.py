@@ -27,9 +27,10 @@ logger = logging.getLogger(__name__)
 
 
 class WeChatPlatform:
-    def __init__(self, config, on_message, on_state):
+    def __init__(self, config, on_message, on_state, on_auth_required=None):
         self._config = dict(config)
         self._on_message, self._on_state = on_message, on_state
+        self._on_auth_required = on_auth_required
         workspace = config.get("workspace_dir")
         media = config.get("media_dir")
         self._media_dir = Path(
@@ -107,6 +108,8 @@ class WeChatPlatform:
                 if not scan_url.startswith("http"):
                     scan_url = f"https://liteapp.weixin.qq.com/q/7GiQu1?qrcode={code}&bot_type=3"
                 logger.info("WeChat login: scan %s", scan_url)
+                if self._on_auth_required is not None:
+                    await self._on_auth_required(scan_url)
                 # The legacy helper counts poll intervals, not wall time.
                 # Keep its wire behavior but bound this owned login lifetime.
                 async with asyncio.timeout(300):

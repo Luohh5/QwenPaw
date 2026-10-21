@@ -12,6 +12,7 @@ import pytest
 @pytest.mark.parametrize(
     "suite,selection",
     [
+        ("qrcode_state_suite.py", ""),
         (
             "wechat_w3_router_suite.py",
             "actual_http or cancel_and_disconnect or actual_outer_http",

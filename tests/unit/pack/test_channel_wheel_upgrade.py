@@ -242,9 +242,22 @@ def test_missing_sdk_wheel_fails_explicit_upgrade_without_ensurepip_retry(
     assert result.returncode != 0
     assert "DEPENDENCY_PLAN_UNVERIFIED" in result.stderr
     assert not any("ensurepip" in command for command in commands)
-    assert (
-        sum("pip" in command and "wheel" in command for command in commands)
-        == 1
-    )
+    wheel_commands = [
+        command
+        for command in commands
+        if "pip" in command and "wheel" in command
+    ]
+    assert len(wheel_commands) == 2
+    planned, control = wheel_commands
+    assert "--constraint" in planned
+    assert "--constraint" not in control
+    staging = Path(planned[planned.index("--wheel-dir") + 1])
+    assert Path(planned[planned.index("--constraint") + 1]).parent == staging
+    assert Path(control[control.index("--wheel-dir") + 1]) != staging
+    for command in wheel_commands:
+        assert command[:5] == [str(python), "-I", "-m", "pip", "wheel"]
+        assert command[command.index("-r") + 1] == str(
+            config.parent / "plugins/mqtt/requirements.txt",
+        )
     assert not list((tmp_path / "host/plugin_runtime").rglob("*.dist-info"))
     assert_saved(config, values)

@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 
 import pytest
+from g2_shared_response_suite import Peer
 
 ROOT = Path(__file__).resolve().parents[3]
 for source in ("feishu", "dingtalk", "mqtt"):
@@ -35,16 +36,19 @@ from qwenpaw.channel_protocol.response_lifecycle import (
 from qwenpaw.channel_protocol.shared_worker import DriverContext
 
 
-class HostStateBoundary:
+class HostStateBoundary(Peer):
     """JSON-copy host state; the route aggregate and journal remain production."""
 
     def __init__(self):
+        super().__init__()
         self.methods, self.state, self.diagnostics = {}, {}, []
 
     def register_method(self, name, handler):
         self.methods[name] = handler
 
     async def call(self, name, params):
+        if name.startswith("host.receipt."):
+            return await super().call(name, params)
         if name == "host.state.put":
             # Require real typed restore compatibility on every checkpoint.
             for row in params["value"]:

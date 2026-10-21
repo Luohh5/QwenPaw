@@ -16,6 +16,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import sys
 import tempfile
 import uuid
 
@@ -43,6 +44,8 @@ from qwenpaw.channel_protocol.models import (
     UNKNOWN_ACTOR_CAPABILITY,
     APPROVAL_RESOLUTION_CAPABILITY,
     TEXT_MERGE_CAPABILITY,
+    AUTH_QRCODE_CAPABILITY,
+    AuthRequiredParams,
     ApprovalCardParams,
     ApprovalResolutionParams,
     validate_content_part,
@@ -306,6 +309,10 @@ class IsolatedChannelProxy(BaseChannel):
             "channel.diagnostic",
             self._diagnostic,
         )
+        self.channel_process.register_notification(
+            "channel.auth.required",
+            self._auth_required,
+        )
         self.channel_process.register_method("event.batch", self._event_batch)
         for operation in ("get", "put", "delete"):
 
@@ -315,6 +322,16 @@ class IsolatedChannelProxy(BaseChannel):
             self.channel_process.register_method(
                 "host.state." + operation,
                 handle,
+            )
+
+        for operation in ("get", "put"):
+
+            async def receipt(params, request, operation=operation):
+                return await self._host_receipt(operation, params)
+
+            self.channel_process.register_method(
+                "host.receipt." + operation,
+                receipt,
             )
 
     @classmethod
@@ -527,6 +544,27 @@ class IsolatedChannelProxy(BaseChannel):
             raise ValueError("DIAGNOSTIC_INVALID")
         self._record_diagnostic(reason)
 
+    async def _auth_required(self, params, notification):
+        if isinstance(params, AuthRequiredParams):
+            params = params.to_mapping()
+        params = AuthRequiredParams.from_mapping(params)
+        self._check_identity(params)
+        snapshot = self.channel_process.health_snapshot()
+        if (
+            AUTH_QRCODE_CAPABILITY not in self.descriptor.capabilities
+            or not self.enabled
+            or not self._ingress_open
+            or self._text_merge_stopping
+            or snapshot["state"] != "ready"
+            or snapshot["platform_state"] != "connecting"
+        ):
+            return
+        print(
+            f"{self.channel} login: scan {params.scan_url}",
+            file=sys.stderr,
+            flush=True,
+        )
+
     def _record_diagnostic(self, reason):
         self._last_diagnostic = reason
         logger.warning("Channel diagnostic: %s", reason)
@@ -691,6 +729,37 @@ class IsolatedChannelProxy(BaseChannel):
             except asyncio.CancelledError:
                 await asyncio.shield(task)
                 raise
+
+    async def _host_receipt(self, operation, params):
+        from ...utils.io_utils import run_sync_io
+
+        params = (
+            params
+            if isinstance(params, HostStateParams)
+            else HostStateParams.from_mapping(params)
+        )
+        self._check_identity(params)
+        if params.schema_version != 1 or operation not in {"get", "put"}:
+            raise ValueError("RESPONSE_RECEIPT_VERSION")
+        async with self._state_lock:
+            self._check_identity(params)
+            return await run_sync_io(
+                self._receipt_operation,
+                operation,
+                params,
+            )
+
+    def _receipt_operation(self, operation, params):
+        from ...channel_protocol.response_receipts import ResponseReceiptStore
+
+        path = self._state_path()
+        if path is None:
+            raise ValueError("WORKSPACE_IDENTITY_REQUIRED")
+        store = ResponseReceiptStore(path.with_suffix(".receipts.sqlite3"))
+        if operation == "get":
+            return {"value": store.get(params.key)}
+        store.put(params.key, params.value)
+        return {"stored": True}
 
     def _state_operation(self, operation, params):
         path = self._state_path()

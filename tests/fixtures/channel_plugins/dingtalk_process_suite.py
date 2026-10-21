@@ -556,10 +556,17 @@ async def test_unknown_webhook_never_falls_back_or_exposes_secrets(
     assert "test-only-secret" not in str(caught.value)
     assert len(deliveries(rt)) == 1
     assert rt.rows("group") == rt.rows("dm") == []
+    from qwenpaw.channel_protocol.response_receipts import ResponseReceiptStore
+
+    archived = [
+        row
+        for path in (rt.work / "channel_state").glob("*.receipts.sqlite3")
+        for row in ResponseReceiptStore(path).list(limit=100)
+    ]
     assert any(
         ref["attributes"].get("state") == "unknown"
-        for row in persisted_routes(rt).values()
-        for ref in row["resource_refs"]
+        for row in archived
+        for ref in row["value"]["resource_refs"]
     )
 
 

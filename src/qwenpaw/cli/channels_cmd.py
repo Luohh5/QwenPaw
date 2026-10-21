@@ -834,7 +834,19 @@ def configure_channels_interactive(config: Config) -> None:
 # ── CLI commands ───────────────────────────────────────────────────
 
 
-@click.group("channels")
+class _ChannelsGroup(click.Group):
+    def list_commands(self, ctx):
+        return sorted(set(super().list_commands(ctx)) | {"receipts"})
+
+    def get_command(self, ctx, name):
+        if name == "receipts":
+            from .receipts_cmd import receipts_group
+
+            return receipts_group
+        return super().get_command(ctx, name)
+
+
+@click.group("channels", cls=_ChannelsGroup)
 def channels_group() -> None:
     """Manage channel configuration
     (iMessage/Discord/DingTalk/Feishu/QQ/Console)."""

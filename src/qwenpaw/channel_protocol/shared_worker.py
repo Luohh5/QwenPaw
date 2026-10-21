@@ -19,6 +19,20 @@ class DriverContext:
         self.peer, self.identity = peer, identity
         self.capabilities = frozenset(capabilities)
 
+    async def notify_auth_required(self, scan_url: str) -> None:
+        from .errors import ProtocolValidationError
+        from .models import AUTH_QRCODE_CAPABILITY, AuthRequiredParams
+
+        if AUTH_QRCODE_CAPABILITY not in self.capabilities:
+            raise ProtocolValidationError(
+                "QR authentication capability was not declared",
+                reason_code="CAPABILITY_REQUIRED",
+            )
+        params = AuthRequiredParams.from_mapping(
+            {**self.identity.to_mapping(), "scan_url": scan_url},
+        )
+        await self.peer.notify("channel.auth.required", params.to_mapping())
+
     async def set_platform_state(self, state: str) -> None:
         if state not in {"connecting", "connected", "disconnected", "failed"}:
             raise ValueError("PLATFORM_STATE_INVALID")

@@ -475,6 +475,7 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
         self._lock = asyncio.Lock()
         self._channel_lifecycle_locks: dict[str, asyncio.Lock] = {}
         self._failed_channels: set[str] = set()
+        self._prepared_stop_channels: set[str] = set()
         self._stopping = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._process: ProcessHandler | None = None
@@ -703,6 +704,11 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
         return manager
 
     def _bind_enqueue(self, channel):
+        if (
+            channel.channel in self._failed_channels
+            or channel.channel in self._prepared_stop_channels
+        ):
+            return
         self._paused_channels.discard(channel.channel)
         if not getattr(channel, "uses_manager_queue", True):
             return
@@ -1087,6 +1093,7 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
             if (
                 self._stopping
                 or channel.channel in self._failed_channels
+                or channel.channel in self._prepared_stop_channels
                 or self._find_channel(channel.channel) is not channel
             ):
                 return
@@ -1165,14 +1172,48 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
             if channel.channel not in self._failed_channels:
                 self._bind_enqueue(channel)
 
-    async def quiesce(self, *, timeout=None) -> bool:
-        """Close admission and drain channel work without destroying owners."""
+    async def _prepare_channel_stop(self, channel):
+        """Retain owners whose preparation failed or cannot be resumed."""
+        key = channel.channel
+        if self._find_channel(key) is not channel:
+            return None
+        try:
+            # Legacy duck-typed channels may not implement the optional hook.
+            prepare = getattr(channel, "prepare_stop", None)
+            if (
+                prepare is not None
+                and await prepare()
+                and self._find_channel(key) is channel
+            ):
+                self._prepared_stop_channels.add(key)
+        except asyncio.CancelledError:
+            if self._find_channel(key) is channel:
+                self._failed_channels.add(key)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if self._find_channel(key) is not channel:
+                return None
+            logger.exception("Failed to prepare channel '%s'", key)
+            self._failed_channels.add(key)
+            return self._stop_receipt(channel, False, str(exc))
+        return None
+
+    async def quiesce(self, *, timeout=None, for_stop=False) -> bool:
+        """Close admission and drain; optionally prepare owners for stopping."""
         deadline = asyncio.get_running_loop().time() + (
             _CHANNEL_DRAIN_TIMEOUT if timeout is None else timeout
         )
         for channel in self.channels:
             self._close_ingress(channel)
         try:
+            if for_stop:
+                from ...plugins.lifecycle import QuiescenceError
+
+                self._stopping = True
+                for channel in list(self.channels):
+                    receipt = await self._prepare_channel_stop(channel)
+                    if receipt is not None:
+                        raise QuiescenceError(receipt.detail, receipt=receipt)
             if self._enqueue_tasks:
                 _, pending = await asyncio.wait(
                     list(self._enqueue_tasks),
@@ -1214,7 +1255,7 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
                 timeout=_CHANNEL_START_STOP_TIMEOUT,
             )
             self._start_tasks.difference_update(done)
-        if not await self.quiesce():
+        if not await self.quiesce(for_stop=True):
             raise QuiescenceError("CHANNEL_DRAIN_TIMEOUT")
         receipts = await asyncio.gather(
             *(self.stop_one(ch.channel) for ch in list(self.channels)),
@@ -1264,6 +1305,7 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
             and self._pending_channel_starts(existing)
             and not self._stopping
             and key not in self._failed_channels
+            and key not in self._prepared_stop_channels
         ):
             # Boot already owns this instance. Publish its token so unload can
             # cancel its tracked startup instead of waiting for SDK readiness.
@@ -1317,7 +1359,10 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
                 None,
             ) is not PluginRegistry().get_channel_registration(key):
                 raise RuntimeError("CHANNEL_ALREADY_OWNED")
-            if key in self._failed_channels:
+            if (
+                key in self._failed_channels
+                or key in self._prepared_stop_channels
+            ):
                 exc = RuntimeError(f"Channel '{key}' has not stopped")
                 exc.binding = self._channel_handle(existing)
                 raise exc
@@ -1446,6 +1491,9 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
                     detail="channel startup is still pending",
                 )
         self._close_ingress(channel)
+        receipt = await self._prepare_channel_stop(channel)
+        if receipt is not None:
+            return receipt
         if not await self._drain_channel(key, _CHANNEL_DRAIN_TIMEOUT):
             if not self._stopping:
                 self._bind_enqueue(channel)
@@ -1477,6 +1525,7 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
                 item for item in self.channels if item is not channel
             ]
         self._failed_channels.discard(key)
+        self._prepared_stop_channels.discard(key)
         self._started_channels.discard(id(channel))
         if (
             isinstance(channel, IsolatedChannelProxy)

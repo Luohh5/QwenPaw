@@ -6,6 +6,7 @@ eptance, actual A/child."""
 import hashlib
 import json
 from dataclasses import replace
+from pathlib import Path
 import platform
 import subprocess
 import sys
@@ -17,6 +18,15 @@ from starlette.requests import Request
 from c5_support import KEY, wheelhouse
 
 pytest_plugins = ["c5_support"]
+
+
+def configure_runtime(transaction, monkeypatch, runtime):
+    """Retain Loader's environment custody when replacing fixture settings."""
+    from qwenpaw.plugins.dependency_maintenance import lease_environment
+
+    lease_environment(runtime.dependency_paths)
+    monkeypatch.setattr(transaction.registry, "channel_runtime", None)
+    transaction.registry.configure_channel_runtime(runtime)
 
 
 @pytest.fixture
@@ -148,8 +158,7 @@ async def test_default_fresh_site_supports_existing_HTTP_local_wheel_pipeline(
     )
 
     runtime = resolve_default_channel_runtime()
-    monkeypatch.setattr(transaction.registry, "channel_runtime", None)
-    transaction.registry.configure_channel_runtime(runtime)
+    configure_runtime(transaction, monkeypatch, runtime)
     assert runtime.dependency_install_target.exists()
     assert not list(runtime.dependency_install_target.iterdir())
     monkeypatch.setattr(
@@ -162,8 +171,19 @@ async def test_default_fresh_site_supports_existing_HTTP_local_wheel_pipeline(
     driver = source / KEY / "c5_driver.py"
     driver.write_text(driver.read_text() + "\nimport c5_transaction_sdk\n")
 
-    def download(command, *, timeout, plugin_id):
-        assert "download" in command and "install" not in command
+    def build_wheels(command, *, timeout, plugin_id):
+        assert plugin_id == KEY
+        assert command[1:5] == ["-I", "-m", "pip", "wheel"]
+        assert not {"download", "install", "--dest", "--target"}.intersection(
+            command
+        )
+        staging = Path(command[command.index("--wheel-dir") + 1])
+        assert staging.is_dir()
+        assert not staging.is_relative_to(runtime.dependency_install_target)
+        assert Path(command[command.index("--constraint") + 1]).is_file()
+        assert Path(command[command.index("-r") + 1]).read_text() == (
+            "c5-transaction-sdk==1.0\n"
+        )
         return subprocess.run(
             [*command, "--no-index", "--find-links", str(local)],
             capture_output=True,
@@ -175,7 +195,7 @@ async def test_default_fresh_site_supports_existing_HTTP_local_wheel_pipeline(
     monkeypatch.setattr(
         transaction.loader,
         "_run_subprocess_with_streaming_log",
-        download,
+        build_wheels,
     )
     app = NS(state=NS(plugin_loader=transaction.loader))
     record = await install_plugin_source(
@@ -221,8 +241,9 @@ async def test_actual_child_identity_mismatch_blocks_before_dependency_write(
         "supported_tags": ["py3-none-any"],
     }
     runtime = resolve_default_channel_runtime()
-    monkeypatch.setattr(transaction.registry, "channel_runtime", None)
-    transaction.registry.configure_channel_runtime(
+    configure_runtime(
+        transaction,
+        monkeypatch,
         replace(runtime, runtime_identity=identity),
     )
     source = transaction.artifact()
@@ -252,8 +273,9 @@ def _offline_cli_case(transaction, monkeypatch):
         resolve_default_channel_runtime,
     )
 
-    monkeypatch.setattr(transaction.registry, "channel_runtime", None)
-    transaction.registry.configure_channel_runtime(
+    configure_runtime(
+        transaction,
+        monkeypatch,
         resolve_default_channel_runtime(),
     )
     monkeypatch.setattr(

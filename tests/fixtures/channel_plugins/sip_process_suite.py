@@ -1,6 +1,7 @@
 """Actual ChannelProcess/worker/Driver/native loop; no Core Agent claim."""
 import asyncio
 import hashlib
+from importlib.metadata import PackageNotFoundError, distribution
 import json
 import os
 from pathlib import Path
@@ -63,8 +64,17 @@ async def test_actual_worker_native_sender_retry_and_unknown_receipt(tmp_path):
     # Explicit installed substitute distributions; no dependency audit bypass.
     for name, version in [
         ("pyVoIP", "1.6.0"),
+        ("dashscope", "1.0.0"),
         ("dashscope-realtime", "0.1.0"),
     ]:
+        # The selected interpreter may already supply a real SDK. Retain
+        # that origin and its dependency closure instead of duplicating it.
+        try:
+            distribution(name)
+        except PackageNotFoundError:
+            pass
+        else:
+            continue
         metadata = site / (
             name.replace("-", "_") + "-" + version + ".dist-info"
         )
@@ -72,6 +82,10 @@ async def test_actual_worker_native_sender_retry_and_unknown_receipt(tmp_path):
         (metadata / "METADATA").write_text(
             f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
         )
+    # Audio conversion stays native in the selected interpreter. Never
+    # manufacture metadata for its conditional extension dependency.
+    if sys.version_info >= (3, 13):
+        assert distribution("audioop-lts").read_text("RECORD")
     config = {
         **CONFIG_DEFAULTS,
         "enabled": True,
@@ -115,6 +129,19 @@ async def test_actual_worker_native_sender_retry_and_unknown_receipt(tmp_path):
 
     process.register_method("host.state.get", get)
     process.register_method("host.state.put", put)
+    from qwenpaw.channel_protocol.response_receipts import ResponseReceiptStore
+
+    receipts = ResponseReceiptStore(tmp_path / "receipts.sqlite3")
+
+    async def get_receipt(params, request):
+        return {"value": receipts.get(params.key)}
+
+    async def put_receipt(params, request):
+        receipts.put(params.key, params.value)
+        return {"stored": True}
+
+    process.register_method("host.receipt.get", get_receipt)
+    process.register_method("host.receipt.put", put_receipt)
     process.register_method("event.batch", events)
 
     def rows(kind):
