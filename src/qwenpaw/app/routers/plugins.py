@@ -1051,7 +1051,7 @@ async def set_plugin_enabled(
     except Exception as exc:
         logger.error(
             "Failed to set enabled=%s for plugin '%s': %s",
-            body.enabled,
+            _log_safe(body.enabled),
             _log_safe(plugin_id),
             _log_safe(exc),
         )

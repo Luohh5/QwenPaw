@@ -12,10 +12,12 @@ from fastapi import HTTPException
 from qwenpaw.app.routers import plugins
 
 
+@pytest.mark.parametrize("enabled", [True, False])
 async def test_enable_failure_sanitizes_exception_in_rendered_log(
     tmp_path,
     monkeypatch,
     caplog,
+    enabled,
 ):
     plugin_id = "plug\r\nFORGED_PLUGIN"
     error = RuntimeError("disk\r\nFORGED_ERROR")
@@ -35,14 +37,15 @@ async def test_enable_failure_sanitizes_exception_in_rendered_log(
         with pytest.raises(HTTPException) as caught:
             await plugins.set_plugin_enabled(
                 plugin_id,
-                plugins.SetPluginEnabledRequest(enabled=True),
+                plugins.SetPluginEnabledRequest(enabled=enabled),
                 request,
             )
     assert caught.value.status_code == 500
-    lifecycle.set_enabled.assert_awaited_once_with(plugin_id, True)
+    lifecycle.set_enabled.assert_awaited_once_with(plugin_id, enabled)
     records = [r for r in caplog.records if r.name == plugins.__name__]
     assert len(records) == 1
     rendered = logging.Formatter("%(message)s").format(records[0])
+    assert f"enabled={enabled}" in rendered
     assert "plugFORGED_PLUGIN" in rendered
     assert "diskFORGED_ERROR" in rendered
     assert "\r" not in rendered
