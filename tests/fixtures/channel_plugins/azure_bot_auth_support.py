@@ -20,6 +20,8 @@ import jwt
 import pytest
 import pytest_asyncio
 
+from azure_bot_network_boundary import install_attachment_network
+
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "plugins/channel/azure_bot"))
 APP = "test-azure-application"
@@ -192,13 +194,18 @@ async def connector(monkeypatch, rsa_material):
     await site.start()
     boundary.port = site._server.sockets[0].getsockname()[1]
 
+    install_attachment_network(monkeypatch, boundary)
+
     def session(**kwargs):
-        return REAL_SESSION(
-            connector=aiohttp.TCPConnector(
+        supplied = kwargs.pop("connector", None)
+        if supplied is None:
+            supplied = aiohttp.TCPConnector(
                 resolver=LocalResolver(boundary.port), ssl=boundary.client_ssl
-            ),
-            **kwargs,
-        )
+            )
+        else:
+            # Retain the production DNS validator/connector and real TLS/SNI.
+            supplied._ssl = boundary.client_ssl
+        return REAL_SESSION(connector=supplied, **kwargs)
 
     monkeypatch.setattr(aiohttp, "ClientSession", session)
     try:

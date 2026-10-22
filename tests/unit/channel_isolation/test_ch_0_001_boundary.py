@@ -50,7 +50,7 @@ def test_registry_and_media_tables_cover_exact_builtin_baseline() -> None:
         json.loads(
             (
                 ROOT / "plugins/channel" / row["source_dir"] / "channel.json"
-            ).read_text(),
+            ).read_text(encoding="utf-8"),
         )["entrypoint"]["module"]
         for row in OFFICIAL_CHANNELS
     }
@@ -151,6 +151,7 @@ def test_media_path_rules_and_configuration_gaps_are_source_derived(
     child.mkdir()
     monkeypatch.chdir(child)
     monkeypatch.setenv("HOME", str(host))
+    monkeypatch.setenv("USERPROFILE", str(host))
     raw = {"media_dir": "link/../media", "db_path": "~/chat.db"}
     result = absolute_execution_paths(
         raw,

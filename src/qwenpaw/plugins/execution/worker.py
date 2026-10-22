@@ -383,17 +383,25 @@ def main(
             "probe",
         }:
             return 70
-        if mode in {"audit", "probe"}:
-            _guard_inspection(boot)
-        _configure(boot, packet, protected_namespaces)
-        from qwenpaw.plugins.execution.runtime import Runtime
 
-        run_component = importlib.import_module(
-            "qwenpaw.plugins.execution.worker",
-        ).run
+        async def enter() -> None:
+            # Windows builds the trusted loop's self-pipe with socketpair.
+            # Install the guard after that, but before candidate paths enter.
+            if mode in {"audit", "probe"}:
+                _guard_inspection(boot)
+            _configure(boot, packet, protected_namespaces)
+            from qwenpaw.plugins.execution.runtime import Runtime
 
-        runtime = Runtime() if runtime_factory is None else runtime_factory()
-        asyncio.run(run_component(boot, packet, output, runtime))
+            run_component = importlib.import_module(
+                "qwenpaw.plugins.execution.worker",
+            ).run
+
+            runtime = (
+                Runtime() if runtime_factory is None else runtime_factory()
+            )
+            await run_component(boot, packet, output, runtime)
+
+        asyncio.run(enter())
         return 0
     except BaseException as exc:
         reason = getattr(exc, "reason_code", None)

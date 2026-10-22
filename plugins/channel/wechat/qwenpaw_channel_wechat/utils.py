@@ -80,6 +80,8 @@ def aes_ecb_decrypt(data: bytes, key_b64: str) -> bytes:
         raise ValueError(
             f"Invalid AES key length: {len(key)} (from key_b64={raw[:20]!r})",
         )
+    # iLink CDN media uses ECB on the wire; another mode cannot decode it.
+    # This protocol adapter must not be used for local secret storage.
     cipher = AES.new(key, AES.MODE_ECB)
     decrypted = cipher.decrypt(data)
     # Remove PKCS7 padding using pycryptodome's validated unpad
@@ -108,6 +110,8 @@ def aes_ecb_encrypt(data: bytes, key_b64: str) -> bytes:
         ) from exc
 
     key = base64.b64decode(key_b64)
+    # Match the iLink CDN wire format. The upload caller creates a fresh
+    # random key for each media object; do not reuse this for secret storage.
     cipher = AES.new(key, AES.MODE_ECB)
     return cipher.encrypt(pad(data, AES.block_size))
 

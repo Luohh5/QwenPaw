@@ -710,7 +710,7 @@ class Workspace:
         if self._started:
             logger.warning(
                 f"Cannot set reusable components for already started "
-                f"workspace: {self.agent_id}",
+                f"workspace: {sanitize_log_value(self.agent_id)}",
             )
             return
 
@@ -744,7 +744,8 @@ class Workspace:
             ensure_skill_pool_initialized()
         except Exception as e:
             logger.warning(
-                f"Skill pool initialization failed (non-fatal): {e}",
+                "Skill pool initialization failed (non-fatal): "
+                f"{sanitize_log_value(e)}",
             )
 
         try:

@@ -923,13 +923,19 @@ def _write_additions(target: Path, files: dict[str, bytes]) -> None:
     """Publish the exact validated bytes while the site lock remains held."""
     for relative, content in files.items():
         path = target / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
+        missing_parents = []
+        parent = path.parent
+        while not parent.exists():
+            missing_parents.append(parent)
+            parent = parent.parent
+        for parent in reversed(missing_parents):
+            parent.mkdir(mode=0o755, exist_ok=True)
         if not path.resolve().is_relative_to(target) or path.is_symlink():
             raise RuntimeError("DEPENDENCY_REPAIR_REQUIRED")
         mode = (
-            0o777
+            0o755
             if relative in getattr(files, "executable_paths", ())
-            else 0o666
+            else 0o644
         )
         flags = (
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)

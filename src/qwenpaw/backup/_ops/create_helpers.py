@@ -168,7 +168,7 @@ def add_secrets(zf: zipfile.ZipFile, stop_event=None) -> bool:
     (cancelled), ``True`` otherwise.
     """
     if not SECRET_DIR.is_dir():
-        logger.warning("Secrets directory not found: %s", SECRET_DIR)
+        logger.warning("Secrets directory not found")
         return True
     file_count = 0
     for entry in sorted(SECRET_DIR.rglob("*")):
@@ -180,11 +180,7 @@ def add_secrets(zf: zipfile.ZipFile, stop_event=None) -> bool:
             )
             zf.write(entry, arcname)
             file_count += 1
-    logger.info(
-        "Secrets backed up: %d file(s) from %s",
-        file_count,
-        SECRET_DIR,
-    )
+    logger.info("Secrets backed up: %d file(s)", file_count)
     return True
 
 

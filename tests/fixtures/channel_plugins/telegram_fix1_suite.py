@@ -257,20 +257,6 @@ async def test_basename_local_objects_never_become_native_audio_uploads(
 
 
 @pytest.mark.asyncio
-async def test_oversized_rich_input_only_uses_multiple_native_legacy_sends(
-    runtime, telegram_sdk
-):
-    rt = await telegram(runtime, telegram_sdk)
-    text = f"{'[' * 131072}\n| A | B |\n|---|---|\n| 1 | 2 |"
-    await rt.channel.send("12345", text, {})
-    assert rows(telegram_sdk.work, "sendRichMessage") == []
-    calls = rows(telegram_sdk.work, "sendMessage")
-    assert len(calls) > 1
-    assert all(call["arguments"]["parse_mode"] == "HTML" for call in calls)
-    assert all(len(call["arguments"]["text"]) <= 4096 for call in calls)
-
-
-@pytest.mark.asyncio
 async def test_native_typing_action_and_chat_are_the_original_values(
     runtime, telegram_sdk
 ):

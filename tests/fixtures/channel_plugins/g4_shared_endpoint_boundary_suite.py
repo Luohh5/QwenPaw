@@ -132,7 +132,7 @@ async def test_actual_connecting_registration_waits_for_connected_resolution(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("gate", ["enabled", "ingress"])
-async def test_actual_host_gate_closes_synchronously_and_cannot_reopen_generation(  # noqa: E501
+async def test_actual_host_gate_closes_synchronously_with_distinct_resume_rules(  # noqa: E501
     runtime, gate
 ):
     from qwenpaw.channel_protocol.errors import RpcError
@@ -152,6 +152,9 @@ async def test_actual_host_gate_closes_synchronously_and_cannot_reopen_generatio
         channel.enabled = True
     else:
         channel._ingress_open = True
+        assert service.resolve() is reference
+        assert service.is_current(reference, forwarding=True)
+        return
     assert service.resolve() is None
     with pytest.raises(RpcError) as caught:
         await child_endpoint(rt)

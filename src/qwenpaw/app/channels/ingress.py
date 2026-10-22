@@ -265,7 +265,10 @@ class ChannelIngressService:
                 and getattr(proxy, "endpoint_service", None) is service
                 and getattr(proxy, "_registration", None) is row
                 and proxy.enabled
-                and service.authority.endpoint_snapshot(endpoint.generation)
+                and service.authority.endpoint_snapshot(
+                    endpoint.generation,
+                    allow_paused=True,
+                )
                 is not None
             ):
                 return lease
@@ -325,6 +328,11 @@ class ChannelIngressService:
                 name="channel-ingress-custody",
             )
         return binding.wire
+
+    def pause_endpoint(self, service):
+        binding = self._bindings.get(service)
+        if binding is not None:
+            self._cancel_revision(binding, binding.reference)
 
     def fence_endpoint(self, service):
         binding = self._bindings.get(service)

@@ -17,9 +17,21 @@ class _OfficialPluginContract(ChannelContractTest):
 class TestFeishuPluginContract(_OfficialPluginContract):
     source_dir = "feishu"
 
+    def test_channel_type_is_feishu(self, instance):
+        assert instance.channel == "feishu"
+
+    def test_construction_does_not_start_worker(self, instance):
+        assert instance.channel_process.health_snapshot()["pid"] is None
+
 
 class TestDingTalkPluginContract(_OfficialPluginContract):
     source_dir = "dingtalk"
+
+    def test_channel_type_is_dingtalk(self, instance):
+        assert instance.channel == "dingtalk"
+
+    def test_construction_does_not_start_worker(self, instance):
+        assert instance.channel_process.health_snapshot()["pid"] is None
 
 
 class TestTelegramPluginContract(_OfficialPluginContract):

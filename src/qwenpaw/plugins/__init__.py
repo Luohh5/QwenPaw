@@ -7,6 +7,12 @@ Legacy exports such as PluginApi and PluginLoader remain compatibility APIs.
 """
 
 from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Describe lazy exports for static analyzers without loading host modules.
+    from .api import get_tool_config
+    from .sdk import PluginContext
 
 _EXPORTS = {
     "Plugin": "sdk",

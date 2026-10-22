@@ -195,7 +195,7 @@ class SharedEndpointAuthority:
         self._pid = None
         self._run_id = None
 
-    def _current(self):
+    def _current(self, *, allow_paused=False):
         observation = self.process.endpoint_observation()
         generation = observation["generation"]
         if self._slot is not None:
@@ -220,8 +220,10 @@ class SharedEndpointAuthority:
                 self._slot = None
                 self._pid = None
                 self._run_id = None
-        if not self._enabled() or not self._ingress_open():
+        if not self._enabled():
             self.fence()
+            return None
+        if not allow_paused and not self._ingress_open():
             return None
         if (
             observation["mode"] != "run"
@@ -282,8 +284,8 @@ class SharedEndpointAuthority:
             ),
         )
 
-    def endpoint_snapshot(self, generation):
-        slot = self._current()
+    def endpoint_snapshot(self, generation, *, allow_paused=False):
+        slot = self._current(allow_paused=allow_paused)
         if slot is None or slot.generation != generation:
             return None
         if self.process.endpoint_observation()["platform_state"] not in {
@@ -502,6 +504,11 @@ class SharedEndpointService:
             self._revision += 1
             self._reference = None
         return {"status": "unregistered", "generation": identity.generation}
+
+    def pause(self):
+        """Close active forwards while retaining the current run's custody."""
+        if self.forwarder is not None:
+            self.forwarder.pause_endpoint(self)
 
     def fence(self):
         self.authority.fence()

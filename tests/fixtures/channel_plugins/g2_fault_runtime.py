@@ -14,11 +14,60 @@ import venv
 from packaging.markers import default_environment
 from packaging.requirements import Requirement
 import pytest
+import psutil
+
+
+def _cleanup_fault_runtime(root, site):
+    """Release only this temporary runtime after its owned children exit."""
+    from qwenpaw.plugins import dependency_maintenance
+
+    children = []
+    readers = (
+        dependency_maintenance.live_readers((site,), ignore_pid=os.getpid())
+        if site is not None
+        else ()
+    )
+    for reader in readers:
+        try:
+            child = psutil.Process(reader["pid"])
+            parent = child
+            owned = False
+            for _ in range(64):
+                parent_pid = parent.ppid()
+                if parent_pid == os.getpid():
+                    owned = True
+                    break
+                if parent_pid <= 1:
+                    break
+                parent = psutil.Process(parent_pid)
+            assert owned, "Unexpected process owns temporary runtime: " + str(
+                child.pid
+            )
+            children.append(child)
+        except psutil.NoSuchProcess:
+            continue
+    _, alive = psutil.wait_procs(children, timeout=5)
+    assert not alive, "Fault runtime children still own resources: " + str(
+        [child.pid for child in alive]
+    )
+    if site is not None:
+        # Loader intentionally holds host leases until process exit. This
+        # fixture owns a shorter-lived site, so close its exact lease before
+        # deleting the directory (Windows forbids removing the open file).
+        lease = dependency_maintenance._READERS.pop(
+            dependency_maintenance.canonical(site), None
+        )
+        if lease is not None:
+            descriptor, path = lease
+            os.close(descriptor)
+            path.unlink(missing_ok=True)
+    shutil.rmtree(root)
 
 
 @pytest.fixture(scope="session")
 def fault_runtime():
     root = Path(tempfile.mkdtemp(prefix="qwenpaw-g2-sdk-fault-")).resolve()
+    site = None
     try:
         builder = venv.EnvBuilder(with_pip=False, symlinks=os.name == "posix")
         context = builder.ensure_directories(str(root))
@@ -81,4 +130,4 @@ def fault_runtime():
             packages=copied,
         )
     finally:
-        shutil.rmtree(root)
+        _cleanup_fault_runtime(root, site)

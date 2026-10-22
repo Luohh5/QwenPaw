@@ -411,9 +411,7 @@ def _assert_restore_targets_available(targets: list[Path]) -> None:
             locked = find_busy_restore_paths(target)
             busy_paths.extend(locked or [target])
             logger.warning(
-                "Restore target is still in use and cannot be renamed: %s",
-                target,
-                exc_info=True,
+                "Restore target is still in use and cannot be renamed",
             )
     if busy_paths:
         locked_paths = [
@@ -511,18 +509,17 @@ def _commit_and_finalize(
         for d in staged_dirs:
             commit_tmp(d)
             committed.append(d)
-            logger.info("Committed restore for %s", d)
+            logger.info("Committed restore directory %d", len(committed))
     except Exception:
         remaining = [d for d in staged_dirs if d not in set(committed)]
         for d in remaining:
             discard_tmp(d)
-        logger.exception(
+        logger.error(
             "Phase 2 commit failed after committing %d/%d dirs. "
-            "Committed (already live): %s. Discarded (rolled back): %s.",
+            "Discarded %d uncommitted dirs.",
             len(committed),
             len(staged_dirs),
-            committed,
-            remaining,
+            len(remaining),
         )
         raise
 
@@ -595,14 +592,13 @@ def _restore_sync_locked(
         logger.info(
             "Starting restore: backup_id=%s name=%r mode=%s "
             "include_agents=%s agent_ids=%s "
-            "include_global_config=%s include_secrets=%s",
+            "include_global_config=%s",
             backup_id,
             meta.name,
             req.mode,
             req.include_agents,
             req.agent_ids,
             req.include_global_config,
-            req.include_secrets,
         )
 
         agent_ids, ws_agents = _collect_agent_ids(zf, req)

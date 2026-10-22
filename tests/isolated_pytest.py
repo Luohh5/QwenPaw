@@ -17,6 +17,7 @@ def run_isolated_pytest(
     asyncio_plugin=False,
     short_traceback=False,
     confcutdir=None,
+    test_filter=None,
 ):
     targets = [suite] if isinstance(suite, (str, Path)) else list(suite)
     targets = [FIXTURE / target for target in targets]
@@ -26,6 +27,8 @@ def run_isolated_pytest(
     cutoff = targets[0].parent if confcutdir is None else confcutdir
     command.extend(["--confcutdir", str(cutoff)])
     command.extend(str(target) for target in targets)
+    if test_filter is not None:
+        command.extend(["-k", test_filter])
     command.append("-q")
     if short_traceback:
         command.append("--tb=short")

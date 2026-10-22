@@ -303,10 +303,33 @@ class _AzureResolver(abc.AbstractResolver):
         return [dict(hostname=host, host="127.0.0.1", port={port}, family=_socket.AF_INET, proto=0, flags=0)]
     async def close(self):
         pass
+# Default DNS is an external boundary. The production attachment resolver still
+# validates these public answers and hands numeric addresses to its connector.
+from . import resolver as _azure_dns
+import asyncio.selector_events as _azure_events
+class _AzurePublicDNS(abc.AbstractResolver):
+    async def resolve(self, host, port=0, family=_socket.AF_INET):
+        assert host in {{"login.botframework.com", "connector.test", "media.test"}}, host
+        return [dict(hostname=host, host="93.184.216.34", port=port, family=_socket.AF_INET, proto=_socket.IPPROTO_TCP, flags=0)]
+    async def close(self):
+        pass
+_azure_dns.DefaultResolver = _AzurePublicDNS
+_AzureConnect = _azure_events.BaseSelectorEventLoop.sock_connect
+async def _azure_connect(self, sock, address):
+    if address[0] == "93.184.216.34":
+        assert address[1] == 443
+        address = ("127.0.0.1", {port})
+    return await _AzureConnect(self, sock, address)
+_azure_events.BaseSelectorEventLoop.sock_connect = _azure_connect
 _AzureSession = ClientSession
 def ClientSession(*args, **kwargs):
-    kwargs["connector"] = TCPConnector(resolver=_AzureResolver(), ssl=_ssl.create_default_context(cafile={ca!r}))
-    return _AzureSession(*args, **kwargs)
+    supplied = kwargs.pop("connector", None)
+    context = _ssl.create_default_context(cafile={ca!r})
+    if supplied is None:
+        supplied = TCPConnector(resolver=_AzureResolver(), ssl=context)
+    else:
+        supplied._ssl = context
+    return _AzureSession(*args, connector=supplied, **kwargs)
 """
     token = f"""
 # Test-only external MSAL issuance; real synchronous TLS socket to local issuer.

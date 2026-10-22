@@ -149,7 +149,7 @@ async def wecom_native(wecom_external, tmp_path, monkeypatch):
     from qwenpaw_channel_wecom.driver import WeComDriver
     driver, peer = WeComDriver(), HostBoundary()
     identity = IdentityParams("wecom", "native-wecom-A", 1)
-    capabilities = json.loads((ROOT / "plugins/channel/wecom/channel.json").read_text())["capabilities"]
+    capabilities = json.loads((ROOT / "plugins/channel/wecom/channel.json").read_text(encoding="utf-8"))["capabilities"]
     driver.bind(DriverContext(peer, identity, capabilities))
     try:
         await driver.start({

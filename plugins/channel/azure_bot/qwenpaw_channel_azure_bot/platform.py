@@ -15,6 +15,11 @@ from aiohttp import web
 import msal
 
 from .auth import AzureBotTokenValidator
+from .attachments import (
+    PublicAttachmentResolver,
+    attachment_url,
+    attachment_uses_token,
+)
 from .constants import FILE_TOO_LARGE, UPLOAD_MAX_BYTES
 from .state import AzureBotStateStore
 
@@ -82,6 +87,7 @@ class AzureBotPlatform:
             .resolve()
         )
         self.session = self.validator = self.runner = self.site = None
+        self._attachment_session = self._attachment_resolver = None
         self.watchdog = None
         self.connected = self.accepting = False
         self._tasks = set()
@@ -216,6 +222,12 @@ class AzureBotPlatform:
         if self.session is not None:
             await self.session.close()
             self.session = None
+        if self._attachment_session is not None:
+            await self._attachment_session.close()
+            self._attachment_session = None
+        if self._attachment_resolver is not None:
+            await self._attachment_resolver.close()
+            self._attachment_resolver = None
         await self.on_endpoint("stopped", True)
         self.store.close()
 
@@ -318,9 +330,12 @@ class AzureBotPlatform:
         )
         attachments = activity.get("attachments") or []
         if attachments:
-            token = await self._get_bot_token()
             for attachment in attachments:
-                part = await self._attachment(attachment, token)
+                part = await self._attachment(
+                    attachment,
+                    "",
+                    route["service_url"],
+                )
                 if part:
                     parts.append(part)
         await self._remember(activity)
@@ -334,7 +349,10 @@ class AzureBotPlatform:
         event_id = activity.get("id") or uuid.uuid4().hex
         return await self.on_message(
             {
-                "event_id": f"{route['azure_channel_id']}:{route['conversation_id']}:{event_id}",
+                "event_id": (
+                    f"{route['azure_channel_id']}:"
+                    f"{route['conversation_id']}:{event_id}"
+                ),
                 "sender_id": user,
                 "acl_sender_id": sender,
                 "sender_name": name,
@@ -351,34 +369,54 @@ class AzureBotPlatform:
             },
         )
 
-    async def _attachment(self, attachment, token):
+    async def _attachment(self, attachment, token, service_url=""):
         url = attachment.get("contentUrl")
         if not url:
             return None
         name = attachment.get("name") or "file"
         local = url
-        try:
-            async with self.session.get(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                allow_redirects=False,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as response:
-                if response.status == 200:
+        if not (isinstance(url, str) and url.startswith("data:")):
+            try:
+                url = attachment_url(url)
+                headers = {}
+                if attachment_uses_token(url, service_url):
+                    token = token or await self._get_bot_token()
+                    headers["Authorization"] = f"Bearer {token}"
+                if self._attachment_session is None:
+                    self._attachment_resolver = PublicAttachmentResolver()
+                    self._attachment_session = aiohttp.ClientSession(
+                        connector=aiohttp.TCPConnector(
+                            resolver=self._attachment_resolver,
+                        ),
+                        cookie_jar=aiohttp.DummyCookieJar(),
+                    )
+                async with self._attachment_session.get(
+                    url,
+                    headers=headers,
+                    allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as response:
+                    if response.status != 200:
+                        raise ValueError("AZURE_ATTACHMENT_DOWNLOAD_FAILED")
                     data = await response.read()
-                    if data:
-                        safe = (
-                            "".join(
-                                c for c in name if c.isalnum() or c in "-_."
-                            )
-                            or "file"
-                        )
-                        self.media_dir.mkdir(parents=True, exist_ok=True)
-                        path = self.media_dir / (uuid.uuid4().hex + "-" + safe)
-                        await self._thread(path.write_bytes, data)
-                        local = str(path)
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-            await self.on_diagnostic("AZURE_ATTACHMENT_DOWNLOAD_FAILED")
+                    if not data:
+                        raise ValueError("AZURE_ATTACHMENT_DOWNLOAD_FAILED")
+                    safe = (
+                        "".join(c for c in name if c.isalnum() or c in "-_.")
+                        or "file"
+                    )
+                    self.media_dir.mkdir(parents=True, exist_ok=True)
+                    path = self.media_dir / (uuid.uuid4().hex + "-" + safe)
+                    await self._thread(path.write_bytes, data)
+                    local = str(path)
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                OSError,
+                ValueError,
+            ):
+                await self.on_diagnostic("AZURE_ATTACHMENT_DOWNLOAD_FAILED")
+                return None
         mime = attachment.get("contentType", "")
         if mime.startswith("image/"):
             return {"type": "image", "image_url": local}

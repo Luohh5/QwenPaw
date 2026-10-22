@@ -223,7 +223,7 @@ async def test_mention_gate_precedes_download_and_hidden_mention_is_removed(
         assert image.is_relative_to(driver._platform.media_dir)
         assert image.read_bytes() == b"\x89PNG\r\n\x1a\nimage"
         assert connector.requests == [
-            ("download", "/download/image", "Bearer access-1")
+            ("download", "/download/image", None)
         ]
 
 

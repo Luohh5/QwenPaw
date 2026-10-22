@@ -178,6 +178,35 @@ async def test_unit_same_generation_new_run_cannot_reuse_previous_endpoint(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("retirement", ["disabled", "failed", "new_run"])
+async def test_unit_pause_cannot_restore_retired_endpoint_authority(
+    unit_service, retirement
+):
+    from qwenpaw.channel_protocol.errors import RpcError
+
+    service, process, gates = unit_service
+    await service.register(endpoint())
+    reference = service.resolve()
+    gates.ingress = False
+    assert service.resolve() is None
+    if retirement == "disabled":
+        gates.enabled = False
+    elif retirement == "failed":
+        process.value["state"] = "failed"
+    else:
+        process.value["run_id"] += 1
+    assert service.resolve() is None
+    gates.enabled = True
+    gates.ingress = True
+    process.value["state"] = "ready"
+    assert service.resolve() is None
+    assert not service.is_current(reference)
+    with pytest.raises(RpcError) as caught:
+        await service.register(endpoint())
+    assert caught.value.data["reason_code"] == "GENERATION_REVOKED"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "changes",
     [

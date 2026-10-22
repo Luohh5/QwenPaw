@@ -21,6 +21,8 @@ import jwt
 import pytest
 import pytest_asyncio
 
+from azure_bot_network_boundary import install_attachment_network
+
 from g2_shared_response_suite import Peer
 from qwenpaw.channel_protocol.models import (
     IdentityParams,
@@ -63,6 +65,11 @@ def rsa_material(tmp_path_factory):
                         "login.botframework.com",
                         "connector.test",
                         "media.test",
+                        "api.botframework.com",
+                        "smba.trafficmanager.net",
+                        "botapi.skype.com",
+                        "api.botframework.com.attacker.test",
+                        "tenant.blob.core.windows.net",
                     )
                 ]
             ),
@@ -152,6 +159,10 @@ class Connector:
             self.requests.append(
                 ("download", request.path, request.headers.get("Authorization"))
             )
+            if request.path == "/download/redirect":
+                raise web.HTTPFound("https://media.test/download/target")
+            if request.path == "/download/missing":
+                return web.Response(status=404)
             return web.Response(
                 body=b"\x89PNG\r\n\x1a\nimage", content_type="image/png"
             )
@@ -177,13 +188,18 @@ async def connector(monkeypatch, rsa_material):
     await site.start()
     boundary.port = site._server.sockets[0].getsockname()[1]
 
+    install_attachment_network(monkeypatch, boundary)
+
     def session(**kwargs):
-        return REAL_SESSION(
-            connector=aiohttp.TCPConnector(
+        supplied = kwargs.pop("connector", None)
+        if supplied is None:
+            supplied = aiohttp.TCPConnector(
                 resolver=LocalResolver(boundary.port), ssl=boundary.client_ssl
-            ),
-            **kwargs,
-        )
+            )
+        else:
+            # Retain the production DNS validator/connector and real TLS/SNI.
+            supplied._ssl = boundary.client_ssl
+        return REAL_SESSION(connector=supplied, **kwargs)
 
     monkeypatch.setattr(platform_module.aiohttp, "ClientSession", session)
 

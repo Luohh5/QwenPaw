@@ -1093,7 +1093,11 @@ if os.path.isdir(_CONSOLE_STATIC_DIR):
         if full_path and ".." not in full_path:
             # Security: Reject absolute paths to prevent path traversal bypass
             if not Path(full_path).is_absolute():
-                static_file = _console_path / full_path
+                static_file = (_console_path / full_path).resolve()
+                try:
+                    static_file.relative_to(_console_path.resolve())
+                except ValueError:
+                    return _serve_console_index()
                 if static_file.is_file():
                     return FileResponse(static_file)
 

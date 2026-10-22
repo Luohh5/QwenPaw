@@ -548,6 +548,7 @@ async def test_production_sdk_half_open_connection_wakes_disconnect() -> None:
     platform._ws_started.clear()
     with (
         patch.object(platform_module, "lark", fake_sdk),
+        patch.object(platform_module.lark_ws, "Client", HalfOpenClient),
         patch.object(platform_module, "_WS_HEALTH_CHECK_INTERVAL", 0.01),
         patch.object(platform_module, "FEISHU_WS_RECV_TIMEOUT", 0.01),
     ):
@@ -665,6 +666,7 @@ async def test_production_sdk_active_connection_auth_failure(
     )
     with (
         patch.object(platform_module, "lark", fake_sdk),
+        patch.object(platform_module.lark_ws, "Client", AuthFailureClient),
         patch.object(platform_module, "TokenManager", token_manager),
     ):
         await platform.prepare(
@@ -680,9 +682,15 @@ async def test_production_sdk_active_connection_auth_failure(
         async def noop(_value: object) -> None:
             return None
 
-        with pytest.raises(RuntimeError, match="connection failed"):
-            await platform.connect(noop, noop)
-        await platform.close()
+        try:
+            with pytest.raises(
+                RuntimeError, match="connection failed"
+            ) as caught:
+                await platform.connect(noop, noop)
+            assert str(caught.value.__cause__) == "invalid credentials"
+        finally:
+            await platform.close()
+        assert platform._ws_thread is None
 
 
 @pytest.mark.asyncio

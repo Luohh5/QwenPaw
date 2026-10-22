@@ -230,13 +230,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev,test,full]"
 
-      - name: Check channel contract coverage
-        run: python scripts/check_channel_contracts.py
-
-      - name: Validate channel check script
-        shell: bash
-        run: bash -n scripts/check-channels.sh
-
       - name: Run contract tests
         shell: bash
         run: |

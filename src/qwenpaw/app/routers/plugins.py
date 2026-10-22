@@ -1053,7 +1053,7 @@ async def set_plugin_enabled(
             "Failed to set enabled=%s for plugin '%s': %s",
             body.enabled,
             _log_safe(plugin_id),
-            exc,
+            _log_safe(exc),
             exc_info=True,
         )
         raise HTTPException(

@@ -5,7 +5,7 @@ from contextlib import AsyncExitStack, suppress
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path as FilePath
-from typing import Any, List, Optional
+from typing import Any, List, Optional, cast
 
 from fastapi import (
     APIRouter,
@@ -183,7 +183,8 @@ def _save_channel_updates(agent_id: str, updates: dict) -> ChannelConfig:
             status_code=422,
             detail=exc.errors(include_context=False),
         ) from exc
-    return saved.channels
+    # The mutator always assigns a validated ChannelConfig before saving.
+    return cast(ChannelConfig, saved.channels)
 
 
 _ALLOWED_ACP_TOOL_PARSE_MODES = {

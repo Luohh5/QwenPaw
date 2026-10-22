@@ -118,7 +118,7 @@ class MultiAgentManager:
         except BaseException:
             logger.warning(
                 "Failed to clean up uncommitted workspace candidate "
-                f"for {agent_id}",
+                f"for {sanitize_log_value(agent_id)}",
                 exc_info=True,
             )
 
@@ -145,7 +145,8 @@ class MultiAgentManager:
             if reusable:
                 await candidate.set_reusable_components(reusable)
                 logger.info(
-                    f"Set reusable components for {agent_id}: "
+                    "Set reusable components for "
+                    f"{sanitize_log_value(agent_id)}: "
                     f"{list(reusable.keys())}",
                 )
 
@@ -154,7 +155,9 @@ class MultiAgentManager:
         candidate.set_manager(self)
         await candidate.start()
         await self._setup_workspace_plugins(candidate, str(workspace_dir))
-        logger.info(f"New workspace instance started: {agent_id}")
+        logger.info(
+            f"New workspace instance started: {sanitize_log_value(agent_id)}",
+        )
         return reusable
 
     @staticmethod
@@ -166,12 +169,13 @@ class MultiAgentManager:
         """Log and stop a candidate rejected before the atomic swap."""
         if reason == "removed":
             logger.warning(
-                f"Agent {agent_id} was removed during reload, "
+                f"Agent {sanitize_log_value(agent_id)} "
+                "was removed during reload, "
                 "stopping new instance",
             )
         else:
             logger.info(
-                f"Discarding stale reload for {agent_id}: "
+                f"Discarding stale reload for {sanitize_log_value(agent_id)}: "
                 "configuration changed during rebuild",
             )
         await run_async_to_completion(
@@ -322,7 +326,9 @@ class MultiAgentManager:
         t0 = time.perf_counter()
         instance = None
         try:
-            logger.debug(f"Creating new workspace: {agent_id}")
+            logger.debug(
+                f"Creating new workspace: {sanitize_log_value(agent_id)}",
+            )
             instance = self._create_workspace(
                 agent_id=agent_id,
                 workspace_dir=agent_ref.workspace_dir,
@@ -398,7 +404,7 @@ class MultiAgentManager:
                 ] = AgentStartupStatus.FAILED
             logger.warning(
                 "Workspace startup cleanup retained owner for %s",
-                agent_id,
+                sanitize_log_value(agent_id),
                 exc_info=True,
             )
 
@@ -425,7 +431,7 @@ class MultiAgentManager:
                 logger.error(
                     f"Error in {hook_type} hook "
                     f"'{hook.hook_name}' for plugin "
-                    f"'{hook.plugin_id}': {exc}",
+                    f"'{hook.plugin_id}': {sanitize_log_value(exc)}",
                     exc_info=True,
                 )
 
@@ -558,7 +564,7 @@ class MultiAgentManager:
                 f"Old workspace instance has {len(active_tasks)} active "
                 f"task(s): {list(active_tasks)}. "
                 f"Scheduling delayed cleanup for "
-                f"{agent_id}.",
+                f"{sanitize_log_value(agent_id)}.",
             )
 
             async def delayed_cleanup():
@@ -576,18 +582,20 @@ class MultiAgentManager:
                             break
                         logger.warning(
                             f"Tasks are still active for old instance "
-                            f"{agent_id}. Keeping it alive until they finish.",
+                            f"{sanitize_log_value(agent_id)}. "
+                            "Keeping it alive until they finish.",
                         )
 
                     if completed:
                         logger.info(
                             f"All tasks completed for old instance "
-                            f"{agent_id}. Stopping now.",
+                            f"{sanitize_log_value(agent_id)}. Stopping now.",
                         )
                     else:
                         logger.error(
                             f"Tasks did not finish within 24 hours for old "
-                            f"instance {agent_id}. Forcing cleanup to prevent "
+                            f"instance {sanitize_log_value(agent_id)}. "
+                            "Forcing cleanup to prevent "
                             f"a resource leak.",
                         )
                     if not await self._stop_retired_instance(
@@ -599,12 +607,15 @@ class MultiAgentManager:
                             agent_id,
                         )
                     logger.info(
-                        f"Old workspace instance stopped: {agent_id}. "
+                        "Old workspace instance stopped: "
+                        f"{sanitize_log_value(agent_id)}. "
                         f"Delayed cleanup completed.",
                     )
                 except Exception as e:
                     logger.warning(
-                        f"Error during delayed cleanup for {agent_id}: {e}. "
+                        "Error during delayed cleanup for "
+                        f"{sanitize_log_value(agent_id)}: "
+                        f"{sanitize_log_value(e)}. "
                         f"New instance is serving requests.",
                     )
                     await self._retry_retired_instance(old_instance, agent_id)
@@ -612,7 +623,10 @@ class MultiAgentManager:
             cleanup = delayed_cleanup()
         else:
             if await self._stop_retired_instance(old_instance, agent_id):
-                logger.info("Old workspace instance stopped: %s", agent_id)
+                logger.info(
+                    "Old workspace instance stopped: %s",
+                    sanitize_log_value(agent_id),
+                )
                 return
             cleanup = self._retry_retired_instance(old_instance, agent_id)
 
@@ -624,19 +638,21 @@ class MultiAgentManager:
             self._cleanup_tasks.pop(task, None)
             if task.cancelled():
                 logger.info(
-                    f"Delayed cleanup task for {agent_id} was cancelled.",
+                    "Delayed cleanup task for "
+                    f"{sanitize_log_value(agent_id)} was cancelled.",
                 )
                 return
             exc = task.exception()
             if exc is not None:
                 logger.warning(
-                    f"Error in delayed cleanup task for {agent_id}: "
-                    f"{exc}.",
+                    "Error in delayed cleanup task for "
+                    f"{sanitize_log_value(agent_id)}: "
+                    f"{sanitize_log_value(exc)}.",
                 )
 
         cleanup_task.add_done_callback(_on_cleanup_done)
         logger.info(
-            f"Zero-downtime reload completed: {agent_id}. "
+            f"Zero-downtime reload completed: {sanitize_log_value(agent_id)}. "
             f"Old instance cleanup scheduled in background.",
         )
 
@@ -704,7 +720,9 @@ class MultiAgentManager:
         """
         async with self._lock:
             if agent_id not in self.agents:
-                logger.warning(f"Agent not running: {agent_id}")
+                logger.warning(
+                    f"Agent not running: {sanitize_log_value(agent_id)}",
+                )
                 return False
 
             instance = self.agents[agent_id]
@@ -755,7 +773,9 @@ class MultiAgentManager:
                     agent_id
                 ] = AgentStartupStatus.DISABLED
             self._agent_stop_tasks.pop(id(instance), None)
-        logger.info(f"Agent stopped and removed: {agent_id}")
+        logger.info(
+            f"Agent stopped and removed: {sanitize_log_value(agent_id)}",
+        )
         return True
 
     @staticmethod
@@ -799,7 +819,8 @@ class MultiAgentManager:
         except Exception as stop_err:
             logger.warning(
                 f"Failed to stop old AgentConfigWatcher for "
-                f"{agent_id}: {stop_err}.",
+                f"{sanitize_log_value(agent_id)}: "
+                f"{sanitize_log_value(stop_err)}.",
             )
 
     async def reload_agent(self, agent_id: str) -> bool:
@@ -857,12 +878,14 @@ class MultiAgentManager:
             if agent_id not in self.agents:
                 logger.debug(
                     f"Agent not running, will be loaded on next "
-                    f"request: {agent_id}",
+                    f"request: {sanitize_log_value(agent_id)}",
                 )
                 return False
             old_instance = self.agents[agent_id]
 
-        logger.info(f"Reloading agent (zero-downtime): {agent_id}")
+        logger.info(
+            f"Reloading agent (zero-downtime): {sanitize_log_value(agent_id)}",
+        )
 
         # Step 1.5: Stop old config watcher (no-op if it triggered
         # this reload, since it already disabled itself).
@@ -872,7 +895,8 @@ class MultiAgentManager:
         config = load_config()
         if agent_id not in config.agents.profiles:
             logger.error(
-                f"Agent '{agent_id}' not found in configuration "
+                f"Agent '{sanitize_log_value(agent_id)}' "
+                "not found in configuration "
                 f"during reload",
             )
             return False
@@ -881,7 +905,9 @@ class MultiAgentManager:
 
         # Step 3: Create and start new workspace instance (outside lock)
         # This is the slow part, but doesn't block other agents
-        logger.info(f"Creating new workspace instance: {agent_id}")
+        logger.info(
+            f"Creating new workspace instance: {sanitize_log_value(agent_id)}",
+        )
         new_instance = self._create_workspace(
             agent_id=agent_id,
             workspace_dir=agent_ref.workspace_dir,
@@ -972,7 +998,8 @@ class MultiAgentManager:
             if isinstance(error, Exception):
                 logger.exception(
                     "Failed to start new workspace instance for "
-                    f"{agent_id}: {error}",
+                    f"{sanitize_log_value(agent_id)}: "
+                    f"{sanitize_log_value(error)}",
                 )
 
             await self._cleanup_failed_reload_candidate(
@@ -1008,7 +1035,9 @@ class MultiAgentManager:
         finally:
             await handoff.aclose()
 
-        logger.info(f"Workspace instance replaced: {agent_id}")
+        logger.info(
+            f"Workspace instance replaced: {sanitize_log_value(agent_id)}",
+        )
 
         # A reusable service can be rejected during startup when its class no
         # longer matches the newly loaded configuration (for example, after a
@@ -1350,13 +1379,18 @@ class MultiAgentManager:
         async def start_single_agent(agent_id: str) -> tuple[str, bool]:
             """Start a single agent with error handling."""
             try:
-                logger.debug(f"Starting agent: {agent_id}")
+                logger.debug(f"Starting agent: {sanitize_log_value(agent_id)}")
                 await self.get_agent(agent_id)
-                logger.debug(f"Agent started successfully: {agent_id}")
+                logger.debug(
+                    "Agent started successfully: "
+                    f"{sanitize_log_value(agent_id)}",
+                )
                 return (agent_id, True)
             except Exception as e:
                 logger.error(
-                    f"Failed to start agent {agent_id}: {e}. "
+                    "Failed to start agent "
+                    f"{sanitize_log_value(agent_id)}: "
+                    f"{sanitize_log_value(e)}. "
                     f"Continuing with other agents...",
                 )
                 return (agent_id, False)

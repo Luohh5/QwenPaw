@@ -193,7 +193,7 @@ class IsolatedChannelProxy(BaseChannel):
         self._endpoint_ingress_open = bool(value)
         service = getattr(self, "endpoint_service", None)
         if not self._endpoint_ingress_open and service is not None:
-            service.fence()
+            service.pause()
 
     def __new__(cls, process, *, launch_spec, **kwargs):
         target_class = cls
@@ -501,6 +501,7 @@ class IsolatedChannelProxy(BaseChannel):
     async def stop(self):
         self.last_stop_result = None
         self._ingress_open = False
+        self.endpoint_service.fence()
         self._text_merge_stopping = True
         if self._admission_wakeup is not None:
             self._admission_wakeup()
