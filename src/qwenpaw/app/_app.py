@@ -5,6 +5,7 @@ import hmac
 import inspect
 import mimetypes
 import os
+import stat
 import sys
 import threading
 import time
@@ -1048,6 +1049,10 @@ app.include_router(voice_router, tags=["voice"])
 # Register these AFTER API routes to ensure proper routing priority
 if os.path.isdir(_CONSOLE_STATIC_DIR):
     _console_path = Path(_CONSOLE_STATIC_DIR)
+    _console_static = StaticFiles(
+        directory=str(_console_path),
+        check_dir=False,
+    )
 
     def _serve_console_index():
         if _CONSOLE_INDEX and _CONSOLE_INDEX.exists():
@@ -1091,14 +1096,11 @@ if os.path.isdir(_CONSOLE_STATIC_DIR):
         # favicons, images placed in public/).  Only serve regular files whose
         # path does not escape the console directory.
         if full_path and ".." not in full_path:
-            # Security: Reject absolute paths to prevent path traversal bypass
-            if not Path(full_path).is_absolute():
-                static_file = (_console_path / full_path).resolve()
-                try:
-                    static_file.relative_to(_console_path.resolve())
-                except ValueError:
-                    return _serve_console_index()
-                if static_file.is_file():
-                    return FileResponse(static_file)
+            try:
+                static_file, file_stat = _console_static.lookup_path(full_path)
+            except (OSError, ValueError):
+                return _serve_console_index()
+            if file_stat and stat.S_ISREG(file_stat.st_mode):
+                return FileResponse(static_file, stat_result=file_stat)
 
         return _serve_console_index()

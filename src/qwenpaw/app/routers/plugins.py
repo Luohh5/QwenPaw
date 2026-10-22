@@ -1054,7 +1054,6 @@ async def set_plugin_enabled(
             body.enabled,
             _log_safe(plugin_id),
             _log_safe(exc),
-            exc_info=True,
         )
         raise HTTPException(
             status_code=500,

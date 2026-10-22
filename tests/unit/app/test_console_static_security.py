@@ -18,6 +18,8 @@ def test_console_static_symlinks_stay_within_build(tmp_path):
     private.write_text("private credentials")
     (console / "public-link.svg").symlink_to(public)
     (console / "private-link.svg").symlink_to(private)
+    (console / "directory").mkdir()
+    (console / "loop.svg").symlink_to("loop.svg")
     env = {
         **os.environ,
         "QWENPAW_CONSOLE_STATIC_DIR": str(console),
@@ -43,7 +45,9 @@ def test_console_static_symlinks_stay_within_build(tmp_path):
                 for name in ("logo.svg", "public-link.svg"):
                     assert Path(endpoint(name).path).resolve() == root / "logo.svg"
                 assert Path(endpoint("private-link.svg").path) == root / "index.html"
-                assert Path(endpoint("../auth.json").path) == root / "index.html"
+                for name in ("../auth.json", "missing.svg", "directory", "loop.svg"):
+                    assert Path(endpoint(name).path) == root / "index.html"
+
                 """,
             ),
         ],

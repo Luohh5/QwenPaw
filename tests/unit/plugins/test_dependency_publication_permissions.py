@@ -156,3 +156,18 @@ print(json.dumps({
     ):
         assert modes[relative] == 0o755 & ~mask, relative
     assert modes["new/site/package/deep/module.py"] == 0o644 & ~mask
+
+
+def test_publication_checks_parent_containment_before_creating_directories(
+    tmp_path,
+):
+    from qwenpaw.plugins.dependency_gate import _write_additions
+
+    target, outside = tmp_path / "site", tmp_path / "outside"
+    target.mkdir()
+    outside.mkdir()
+    (target / "alias").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="DEPENDENCY_REPAIR_REQUIRED"):
+        _write_additions(target, {"alias/new/deep/module.py": b"validated"})
+    assert list(outside.iterdir()) == []
+    assert list(target.iterdir()) == [target / "alias"]

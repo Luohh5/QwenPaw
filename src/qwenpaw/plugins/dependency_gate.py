@@ -923,6 +923,8 @@ def _write_additions(target: Path, files: dict[str, bytes]) -> None:
     """Publish the exact validated bytes while the site lock remains held."""
     for relative, content in files.items():
         path = target / relative
+        if not path.resolve().is_relative_to(target) or path.is_symlink():
+            raise RuntimeError("DEPENDENCY_REPAIR_REQUIRED")
         missing_parents = []
         parent = path.parent
         while not parent.exists():
