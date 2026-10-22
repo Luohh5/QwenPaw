@@ -45,6 +45,7 @@ from qwenpaw.plugins.provision import (
     save_inventory,
     teardown_created_locations,
 )
+from qwenpaw.plugins.registry import MemoryBackendInUseError
 from qwenpaw.plugins.safe_fs import (
     ensure_deletable,
     parse_optional_absolute,
@@ -3337,7 +3338,7 @@ async def test_http_stop_unquiescent_is_409(
     if route.startswith("pawapps/"):
 
         async def _memory(*_args, **_kwargs):
-            raise RuntimeError("memory backend is in use")
+            raise MemoryBackendInUseError("memory backend is in use")
 
         monkeypatch.setattr(loader, "_unload_plugin_unlocked", _memory)
         memory_resp = client.delete(url)

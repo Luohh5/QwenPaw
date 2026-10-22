@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Synthetic transport via real ChannelManager/ACL/Runtime, no external sends."""
+"""Synthetic transport via real ChannelManager/ACL/Runtime, no external sends.
+"""
 
 import asyncio
 
@@ -12,32 +13,88 @@ from pathlib import Path
 from qwenpaw.plugins.channels import ChannelSpec
 from qwenpaw.plugins.commands import CommandSpec, CommandResult
 from qwenpaw.plugins.messages import ContentBlock, Message
+
+
 class Plugin:
     def register(self, plugin):
         class Transport:
             async def start(self, call):
-                assert not hasattr(call, "workspace") and not hasattr(call, "agent")
-                assert call.config.secret("token") == "test-channel-token"
-                plugin.storage.write_json(f"started-{call.workspace_id}.json", True)
+                assert not hasattr(
+                    call, "workspace"
+                ) and not hasattr(call, "agent")
+                assert (
+                    call.config.secret("token")
+                    == "test-channel-token"
+                )
+                plugin.storage.write_json(
+                    f"started-{call.workspace_id}.json", True
+                )
+
             async def stop(self, call):
                 directory = call.config.get("directory")
-                if directory and not (Path(directory) / "channel-stop-allowed").exists():
+                if (
+                    directory
+                    and not (
+                        Path(directory) / "channel-stop-allowed"
+                    ).exists()
+                ):
                     return False
-                plugin.storage.write_json(f"stopped-{call.workspace_id}.json", True)
+                plugin.storage.write_json(
+                    f"stopped-{call.workspace_id}.json", True
+                )
                 return True
+
             async def send(self, call, message):
                 key = f"sent-{call.workspace_id}.json"
                 rows = plugin.storage.read_json(key, [])
-                rows.append({"target":message.target, "text":"".join(block.text for block in message.content)})
+                rows.append(
+                    {
+                        "target": message.target,
+                        "text": "".join(
+                            block.text for block in message.content
+                        ),
+                    }
+                )
                 plugin.storage.write_json(key, rows)
+
         async def reply(call, args):
-            plugin.storage.write_json(f"called-{call.workspace_id}.json", args)
-            return CommandResult("reply", Message("assistant", (ContentBlock(text=call.workspace_id + ":" + args),)))
+            plugin.storage.write_json(
+                f"called-{call.workspace_id}.json", args
+            )
+            return CommandResult(
+                "reply",
+                Message(
+                    "assistant",
+                    (
+                        ContentBlock(
+                            text=call.workspace_id + ":" + args
+                        ),
+                    ),
+                ),
+            )
+
         plugin.register_command(CommandSpec("channelprobe", reply))
-        plugin.register_channel(ChannelSpec("sdk-contract-channel", "Test transport", Transport,
-            config_fields=(
-                {"name":"token", "type":"password", "label":"Token"},
-                {"name":"directory", "type":"text", "label":"Directory"})))
+        plugin.register_channel(
+            ChannelSpec(
+                "sdk-contract-channel",
+                "Test transport",
+                Transport,
+                config_fields=(
+                    {
+                        "name": "token",
+                        "type": "password",
+                        "label": "Token",
+                    },
+                    {
+                        "name": "directory",
+                        "type": "text",
+                        "label": "Directory",
+                    },
+                ),
+            )
+        )
+
+
 plugin = Plugin()
 """
 
@@ -58,18 +115,47 @@ async def test_channel_start_none_restores_persisted_settings_but_empty_resets(
 
     source = """
 from qwenpaw.plugins.channels import ChannelSpec
+
+
 class Plugin:
     def register(self, plugin):
         class Transport:
             async def start(self, call):
-                plugin.storage.write_json('settings.json', {
-                    'label':call.config.get('label'),
-                    'token':call.config.secret('token')})
-            async def stop(self, call): return True
-            async def send(self, call, message): pass
-        plugin.register_channel(ChannelSpec('persisted-channel', 'Persisted', Transport,
-            config_fields=({'name':'label','type':'text','label':'Label'},
-                           {'name':'token','type':'password','label':'Token'})))
+                plugin.storage.write_json(
+                    "settings.json",
+                    {
+                        "label": call.config.get("label"),
+                        "token": call.config.secret("token"),
+                    },
+                )
+
+            async def stop(self, call):
+                return True
+
+            async def send(self, call, message):
+                pass
+
+        plugin.register_channel(
+            ChannelSpec(
+                "persisted-channel",
+                "Persisted",
+                Transport,
+                config_fields=(
+                    {
+                        "name": "label",
+                        "type": "text",
+                        "label": "Label",
+                    },
+                    {
+                        "name": "token",
+                        "type": "password",
+                        "label": "Token",
+                    },
+                ),
+            )
+        )
+
+
 plugin = Plugin()
 """
     package = make_plugin(tmp_path, source, ["channels", "storage"])
@@ -207,31 +293,76 @@ async def test_channel_streaming_real_model_preserves_metadata_and_terminal(
     source = """
 import asyncio
 from qwenpaw.plugins.channels import ChannelSpec
-from qwenpaw.plugins.providers import ProviderSpec, ModelInfo, ModelChunk
+from qwenpaw.plugins.providers import (
+    ProviderSpec,
+    ModelInfo,
+    ModelChunk,
+)
 from qwenpaw.plugins.messages import ContentBlock
+
+
 class Plugin:
     def register(self, plugin):
         class Transport:
             async def start(self, call):
                 pass
+
             async def stop(self, call):
                 return True
+
             async def send(self, call, message):
-                raise AssertionError("Streaming transport must receive stream callbacks")
+                raise AssertionError(
+                    "Streaming transport must receive stream callbacks"
+                )
+
             async def on_stream(self, call, event):
-                assert not any(key.startswith("_") for key in event.metadata)
+                assert not any(
+                    key.startswith("_") for key in event.metadata
+                )
                 rows = plugin.storage.read_json("stream.json", [])
-                rows.append({"phase":event.phase,"text":event.text,"status":event.event.status,"target":event.target,"metadata":dict(event.metadata)})
+                rows.append(
+                    {
+                        "phase": event.phase,
+                        "text": event.text,
+                        "status": event.event.status,
+                        "target": event.target,
+                        "metadata": dict(event.metadata),
+                    }
+                )
                 plugin.storage.write_json("stream.json", rows)
+
         async def generate(call, request):
-            yield ModelChunk((ContentBlock(text="first"),), id="channel-answer")
+            yield ModelChunk(
+                (ContentBlock(text="first"),), id="channel-answer"
+            )
             await asyncio.sleep(0.2)
-            yield ModelChunk((ContentBlock(text=" second"),), id="channel-answer", is_last=True)
-        plugin.register_channel(ChannelSpec("stream-contract", "Streaming contract", Transport, streaming=True))
-        plugin.register_provider(ProviderSpec(
-            "channel-provider", "Channel model", generate,
-            models=(ModelInfo("channel-model", "Channel model"),),
-            require_api_key=False))
+            yield ModelChunk(
+                (ContentBlock(text=" second"),),
+                id="channel-answer",
+                is_last=True,
+            )
+
+        plugin.register_channel(
+            ChannelSpec(
+                "stream-contract",
+                "Streaming contract",
+                Transport,
+                streaming=True,
+            )
+        )
+        plugin.register_provider(
+            ProviderSpec(
+                "channel-provider",
+                "Channel model",
+                generate,
+                models=(
+                    ModelInfo("channel-model", "Channel model"),
+                ),
+                require_api_key=False,
+            )
+        )
+
+
 plugin = Plugin()
 """
     async with PluginTestHost(tmp_path / "host") as host:
@@ -279,6 +410,8 @@ async def test_channel_partial_start_failure_releases_owned_task(tmp_path):
 import asyncio
 from pathlib import Path
 from qwenpaw.plugins.channels import ChannelSpec
+
+
 class Plugin:
     def register(self, plugin):
         class Transport:
@@ -287,16 +420,34 @@ class Plugin:
                     try:
                         await asyncio.sleep(100)
                     finally:
-                        (Path(plugin.config.get("directory")) / "worker-stopped").touch()
-                call.resources.task(worker(), description="channel-partial-worker")
+                        (
+                            Path(plugin.config.get("directory"))
+                            / "worker-stopped"
+                        ).touch()
+
+                call.resources.task(
+                    worker(), description="channel-partial-worker"
+                )
                 await asyncio.sleep(0)
                 raise RuntimeError("partial channel activation")
+
             async def stop(self, call):
-                (Path(plugin.config.get("directory")) / "backend-stopped").touch()
+                (
+                    Path(plugin.config.get("directory"))
+                    / "backend-stopped"
+                ).touch()
                 return True
+
             async def send(self, call, message):
                 pass
-        plugin.register_channel(ChannelSpec("partial-channel", "Partial channel", Transport))
+
+        plugin.register_channel(
+            ChannelSpec(
+                "partial-channel", "Partial channel", Transport
+            )
+        )
+
+
 plugin = Plugin()
 """
     async with PluginTestHost(tmp_path / "host") as host:
@@ -328,25 +479,48 @@ import asyncio
 from qwenpaw.plugins.channels import ChannelSpec
 from qwenpaw.plugins.commands import CommandSpec, CommandResult
 from qwenpaw.plugins.messages import ContentBlock, Message
+
+
 class Plugin:
     def register(self, plugin):
         class Transport:
-            async def start(self, call): pass
+            async def start(self, call):
+                pass
+
             async def send(self, call, message):
                 plugin.storage.write_json("sending.json", True)
                 try:
                     await asyncio.Event().wait()
                 finally:
-                    plugin.storage.write_json("send-finished.json", True)
+                    plugin.storage.write_json(
+                        "send-finished.json", True
+                    )
+
             async def stop(self, call):
                 plugin.storage.write_json(
                     "stop-observed-finished.json",
-                    plugin.storage.read_json("send-finished.json", False))
-                return plugin.storage.read_json("allow-stop.json", False)
+                    plugin.storage.read_json(
+                        "send-finished.json", False
+                    ),
+                )
+                return plugin.storage.read_json(
+                    "allow-stop.json", False
+                )
+
         async def reply(call, args):
-            return CommandResult("reply", Message("assistant", (ContentBlock(text="answer"),)))
+            return CommandResult(
+                "reply",
+                Message(
+                    "assistant", (ContentBlock(text="answer"),)
+                ),
+            )
+
         plugin.register_command(CommandSpec("sendgate", reply))
-        plugin.register_channel(ChannelSpec("send-gate", "Send gate", Transport))
+        plugin.register_channel(
+            ChannelSpec("send-gate", "Send gate", Transport)
+        )
+
+
 plugin = Plugin()
 """
     async with PluginTestHost(tmp_path / "host") as host:

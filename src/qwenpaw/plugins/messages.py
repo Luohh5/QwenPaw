@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Public, host-independent message and attachment values."""
 
 from dataclasses import dataclass, field

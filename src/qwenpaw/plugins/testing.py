@@ -5,6 +5,9 @@ This host owns process-wide plugin registries. Use one host per process; run
 independent hosts in separate processes, just as independent QwenPaw instances.
 """
 
+# Host adapters access private ownership state behind the public SDK.
+# pylint: disable=protected-access
+
 from __future__ import annotations
 
 # Host bridges intentionally use private runtime seams. Local result imports
@@ -19,7 +22,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import AsyncGenerator, Sequence, Mapping, Any
 from .sdk import PluginContext
-from .messages import Message
+
+# Preserve the message types re-exported for plugin authors.
+# pylint: disable-next=unused-import
+from .messages import (
+    Message,
+    Attachment as Attachment,
+    ContentBlock as ContentBlock,
+)
 from .apps import ChatRequest
 from .events import ChatEvent
 from .hooks import HookPhase, HookResult
@@ -89,7 +99,9 @@ class TestApproval:
 
 
 class TestModel:
-    """A model built through the production formatter, usage and retry wrappers."""
+    """
+    A model built through the production formatter, usage and retry wrappers.
+    """
 
     def __init__(self, model, workspace, workspace_id):
         self._model, self._workspace = model, workspace
@@ -265,7 +277,8 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
                 timeout=5,
             ):
                 raise SDKError(
-                    f"Workspace {workspace_id!r} task completion has not stopped; retry close()",
+                    f"Workspace {workspace_id!r} task completion has not "
+                    f"stopped; retry close()",
                 )
             if "memory_manager" in workspace._service_manager.services:
                 await self.stop_memory(workspace_id=workspace_id)
@@ -352,7 +365,6 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         interrupt_tasks: bool = False,
     ) -> InstallResult:
         """Copy/install/activate through the real recovery transaction."""
-        from .results import InstallResult
 
         try:
             record = await self._loader.load_plugin_from_path(
@@ -391,8 +403,6 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         *,
         interrupt_tasks: bool = False,
     ) -> EnableResult:
-        from .results import EnableResult
-
         report = await self._loader.lifecycle.set_enabled(
             plugin_id,
             enabled,
@@ -420,7 +430,9 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         *,
         interrupt_tasks: bool = False,
     ) -> UnloadResult:
-        """Delete only installed copies owned by this host's plugins directory."""
+        """
+        Delete only installed copies owned by this host's plugins directory.
+        """
         async with self._loader.plugin_lifecycle(plugin_id):
             record = self._loader.get_loaded_plugin(plugin_id)
             destination = self.root / "plugins"
@@ -602,7 +614,7 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
     ) -> HookResult:
         from ..runtime.phases import Phase
         from ._messages import from_host
-        from .hooks import HookResult, ContextInjection
+        from .hooks import ContextInjection
 
         context = await self._request_context(
             workspace_id,
@@ -654,7 +666,9 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         *,
         workspace_id: str = "test",
     ) -> None:
-        """Start the real queue; None reuses saved settings, {} replaces them."""
+        """
+        Start the real queue; None reuses saved settings, {} replaces them.
+        """
         from ..app.channels.manager import ChannelManager
         from ..config.config import load_agent_config, save_agent_config
         from ..utils.io_utils import run_sync_io
@@ -740,7 +754,9 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         *,
         workspace_id: str = "test",
     ) -> None:
-        """Change the real workspace ACL, using the platform sender identity."""
+        """
+        Change the real workspace ACL, using the platform sender identity.
+        """
         from ..app.channels.access_control import get_access_control_store
         from ..utils.io_utils import run_sync_io
 
@@ -785,8 +801,6 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         *,
         workspace_id: str = "test",
     ) -> ChannelHealth:
-        from .channels import ChannelHealth
-
         workspace = await self._workspace(workspace_id)
         if workspace.channel_manager is None:
             raise SDKError("Channel manager is not running")
@@ -935,7 +949,7 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         limit: int = 10,
     ) -> SearchPage:
         from ..market.service import search_market
-        from .markets import SearchPage, MarketResult
+        from .markets import MarketResult
 
         results, errors, pagination = await search_market(
             query,
@@ -1051,7 +1065,6 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
 
     async def discover_models(self, provider_id: str) -> tuple[ModelInfo, ...]:
         from ..providers.provider_manager import ProviderManager
-        from .providers import ModelInfo
 
         provider = ProviderManager.get_instance().get_provider(provider_id)
         if provider is None:
@@ -1172,8 +1185,6 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         *,
         workspace_id: str = "test",
     ) -> tuple[MemoryTask, ...]:
-        from .memory import MemoryTask
-
         workspace = await self._workspace(workspace_id)
         service = workspace._service_manager.services.get("memory_manager")
         return (
@@ -1198,12 +1209,13 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         session_id: str = "test",
         user_id: str = "test",
     ) -> AsyncGenerator[ChatEvent, None]:
-        """Run the production Runtime, including registered command/hook routes."""
+        """
+        Run the production Runtime, including registered command/hook routes.
+        """
         from ..schemas import AgentRequest
         from ._events import chat_event, _observing
 
         workspace = await self._workspace(workspace_id)
-        from .apps import ChatRequest
 
         public = (
             text
@@ -1253,7 +1265,6 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         json=None,
     ) -> TestConnection:
         """Open an unbuffered ASGI response; use async with and chunks()."""
-        from ._testing_http import TestConnection
 
         if json is not None:
             import json as codec
@@ -1278,8 +1289,6 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         user_id="test",
         headers=None,
     ) -> TestConnection:
-        from ._testing_http import TestConnection
-
         return TestConnection(
             self,
             "GET",
@@ -1296,8 +1305,6 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         path: str,
         **kwargs,
     ) -> TestHttpResponse:
-        from ._testing_http import TestHttpResponse
-
         async with self.open_http(method, path, **kwargs) as stream:
             body = b"".join([chunk async for chunk in stream.chunks()])
             return TestHttpResponse(stream.status, stream.headers, body)
@@ -1367,7 +1374,8 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         invoke = getattr(tools, name, None)
         if invoke is None or invoke is not context._tools[name][2]:
             raise SDKError(f"Tool {name!r} is not registered in the runtime")
-        tool = PolicyGuardedTool(
+        # __new__ returns a dynamically constructed FunctionTool subclass.
+        tool: Any = PolicyGuardedTool(
             invoke,
             governor=governor,
             request_context={
@@ -1541,8 +1549,6 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         new_source: Path | None = None,
         config: dict | None = None,
     ) -> ReloadResult:
-        from .results import ReloadResult
-
         report = await self._loader.lifecycle.reload(
             plugin_id,
             new_source=new_source,
@@ -1565,8 +1571,6 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         *,
         interrupt_tasks: bool = False,
     ) -> ConfigUpdateResult:
-        from .results import ConfigUpdateResult
-
         report = await self._loader.lifecycle.update_config(
             plugin_id,
             config,
@@ -1598,8 +1602,6 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
 
     async def _unload(self, plugin_id, *, uninstall, interrupt_tasks):
         from .lifecycle import UnloadMode
-
-        from .results import UnloadResult
 
         report = await self._loader.lifecycle.unload(
             plugin_id,

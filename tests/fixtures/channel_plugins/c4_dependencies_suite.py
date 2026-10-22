@@ -907,6 +907,17 @@ async def test_generic_loader_boot_zero_download_and_explicit_staged_addition(
     try:
         loader = PluginLoader([source.parent])
 
+        audited = []
+        acquire = loader._acquire_dependency_wheels
+
+        async def acquire_audited(process, spec, snapshot, *args, **kwargs):
+            audited.append(snapshot)
+            return await acquire(process, spec, snapshot, *args, **kwargs)
+
+        monkeypatch.setattr(
+            loader, "_acquire_dependency_wheels", acquire_audited
+        )
+
         def stage_wheels(command, **kwargs):
             assert kwargs["plugin_id"] == "c4-legacy"
             assert command[command.index("-m") + 1] == "pip"
@@ -915,12 +926,11 @@ async def test_generic_loader_boot_zero_download_and_explicit_staged_addition(
             assert command[0] == str(python)
             assert "-I" in command
             constraints = Path(command[command.index("--constraint") + 1])
-            from importlib.metadata import version
-
-            assert (
-                f"packaging=={version('packaging')}"
-                in constraints.read_text().splitlines()
-            )
+            assert len(audited) == 1
+            assert set(constraints.read_text().splitlines()) == {
+                f"{name}=={row['version']}"
+                for name, row in audited[0].distributions.items()
+            }
             staging = Path(command[command.index("--wheel-dir") + 1])
             assert staging.is_dir()
             assert not staging.is_relative_to(target)

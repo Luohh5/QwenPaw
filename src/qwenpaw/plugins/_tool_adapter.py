@@ -1,4 +1,8 @@
+# -*- coding: utf-8 -*-
 """Internal SDK ToolChunk bridge; preserves ownership and generator close."""
+
+# Host adapters access private ownership state behind the public SDK.
+# pylint: disable=protected-access
 
 from ._workspace import workspace_id
 

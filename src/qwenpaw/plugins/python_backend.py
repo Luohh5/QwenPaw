@@ -137,11 +137,25 @@ class PythonBackend:
         self.services = services
 
     def describe(self, source_path, manifest):
+        from .dependency_gate import (
+            manifest_requirements,
+            parse_requirements_file,
+        )
+
+        requirements_path = Path(source_path) / "requirements.txt"
+        parsed = parse_requirements_file(requirements_path)
         return PluginDescription(
             manifest,
             Path(source_path),
-            Path(source_path) / "requirements.txt",
+            requirements_path,
             manifest.entry.backend,
+            requirements=tuple(
+                dict.fromkeys(
+                    [str(item) for item in parsed.requirements]
+                    + parsed.unsupported
+                    + manifest_requirements(manifest.model_dump(mode="json")),
+                ),
+            ),
         )
 
     @staticmethod
@@ -205,9 +219,7 @@ class PythonBackend:
                     from .errors import SDKRestartRequiredError
 
                     raise SDKRestartRequiredError(decision.reason)
-                if decision.reason_code:
-                    raise SharedDependencyError(decision)
-                raise RuntimeError(decision.reason)
+                raise SharedDependencyError(decision)
         if probe:
             entry = description.payload
             failed = await self.services.probe(

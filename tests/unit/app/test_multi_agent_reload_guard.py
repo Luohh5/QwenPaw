@@ -103,6 +103,33 @@ async def test_reload_swaps_when_no_write_intervenes(manager):
     assert await mgr.reload_agent("agent") is True
     assert mgr.agents["agent"] is new_instance
     assert mgr.agents["agent"] is not old_instance
+    new_instance.start.assert_awaited_once_with()
+    new_instance.set_manager.assert_called_once_with(mgr)
+
+
+async def test_reload_candidate_starts_once_with_crons_and_channels_deferred(
+    manager,
+):
+    mgr, old_instance = manager
+    candidate = _fake_workspace()
+    states = []
+
+    async def observe_start():
+        states.append(
+            (candidate.cron_start_paused, candidate._defer_channel_start),
+        )
+        candidate.set_manager.assert_called_once_with(mgr)
+        assert mgr.agents["agent"] is old_instance
+
+    candidate.start.side_effect = observe_start
+    mgr._create_workspace = lambda agent_id, workspace_dir: candidate
+    assert await mgr.reload_agent("agent")
+    assert states == [(True, True)]
+    candidate.start.assert_awaited_once_with()
+    assert mgr.agents["agent"] is candidate
+    candidate.cron_manager.handoff_from.assert_called_once_with(
+        old_instance.cron_manager,
+    )
 
 
 async def test_cancelled_plugin_setup_cleans_uncommitted_candidate(manager):
@@ -350,3 +377,77 @@ async def test_parallel_shutdown_retains_failed_current_and_retired():
         if not shutdown.done():
             shutdown.cancel()
         await asyncio.gather(shutdown, return_exceptions=True)
+
+
+async def test_stop_agent_retries_failed_retired_cleanup(monkeypatch):
+    """A failed old workspace remains owned without stopping another agent."""
+    mgr = MultiAgentManager()
+    old = _fake_workspace()
+    old.agent_id = "agent"
+    current, other = _fake_workspace(), _fake_workspace()
+    mgr.agents.update(agent=current, other=other)
+    old.stop.side_effect = [RuntimeError("busy"), RuntimeError("busy"), None]
+    monkeypatch.setattr(
+        "qwenpaw.app.multi_agent_manager._OLD_WORKSPACE_CLEANUP_RETRY_SECONDS",
+        60,
+    )
+    await mgr._graceful_stop_old_instance(old, "agent", active_tasks={})
+    try:
+        with pytest.raises(RuntimeError):
+            await asyncio.wait_for(mgr.stop_agent("agent"), 1)
+        assert mgr._retired_instances[id(old)] is old
+        assert mgr.agents["agent"] is current
+        current.stop.assert_not_awaited()
+        other.stop.assert_not_awaited()
+
+        assert await asyncio.wait_for(mgr.stop_agent("agent"), 1)
+        assert id(old) not in mgr._retired_instances
+        assert mgr.agents == {"other": other}
+        current.stop.assert_awaited_once_with()
+        other.stop.assert_not_awaited()
+        assert old.stop.await_count == 3
+    finally:
+        await mgr.cancel_all_cleanup_tasks()
+
+
+async def test_cancelled_stop_caller_keeps_retired_cleanup_owned(monkeypatch):
+    """Cancelled callers leave cleanup owned and the manager lock available."""
+    mgr = MultiAgentManager()
+    old = _fake_workspace()
+    old.agent_id = "agent"
+    current = _fake_workspace()
+    mgr.agents["agent"] = current
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def stop(**_kwargs):
+        if old.stop.await_count == 1:
+            raise RuntimeError("busy")
+        async with mgr._lock:
+            entered.set()
+            await release.wait()
+
+    old.stop.side_effect = stop
+    monkeypatch.setattr(
+        "qwenpaw.app.multi_agent_manager._OLD_WORKSPACE_CLEANUP_RETRY_SECONDS",
+        60,
+    )
+    await mgr._graceful_stop_old_instance(old, "agent", active_tasks={})
+    caller = asyncio.create_task(mgr.stop_agent("agent"))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        assert mgr._retired_instances[id(old)] is old
+        assert mgr.agents["agent"] is current
+        current.stop.assert_not_awaited()
+        release.set()
+        assert await asyncio.wait_for(mgr.stop_agent("agent"), 1)
+        assert not mgr._retired_instances
+        assert not mgr._agent_stop_tasks
+        assert not mgr.agents
+        assert old.stop.await_count == 2
+        current.stop.assert_awaited_once_with()
+    finally:
+        release.set()
+        await mgr.cancel_all_cleanup_tasks()

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Internal lossless conversion of SDK values and AgentScope messages."""
 
 from copy import deepcopy
@@ -35,7 +36,8 @@ def _walk_pairs(public_blocks, host_blocks, prefix=""):
         path = f"{prefix}{index}"
         yield public, host, path
         if public.type in {"hint", "tool_result"} and not isinstance(
-            public.output, str
+            public.output,
+            str,
         ):
             yield from _walk_pairs(
                 public.output,
@@ -72,6 +74,8 @@ def _with_previews(metadata, refs, blocks, block_metadata=None):
 def _take_previews(metadata, blocks):
     metadata = deepcopy(metadata or {})
     envelope = metadata.get(_PREVIEWS)
+    # Validate the envelope in short-circuit order before indexing fields.
+    # pylint: disable=too-many-boolean-expressions
     if (
         not isinstance(envelope, dict)
         or set(envelope)
@@ -109,13 +113,24 @@ def _preview_refs(public_blocks, host_blocks):
     refs, seen = {}, {}
     for public, host, path in _walk_pairs(public_blocks, host_blocks):
         if public.attachment:
-            _merge_refs(seen, {host.id: public.attachment.preview_url}, "preview URLs")
+            _merge_refs(
+                seen,
+                {host.id: public.attachment.preview_url},
+                "preview URLs",
+            )
             if public.attachment.preview_url:
                 refs[path] = public.attachment.preview_url
     return refs
 
 
-def _tool_metadata(metadata, blocks, event, is_error, refs, block_metadata=None):
+def _tool_metadata(
+    metadata,
+    blocks,
+    event,
+    is_error,
+    refs,
+    block_metadata=None,
+):
     encoded = _with_previews(metadata, refs, blocks, block_metadata)
     encoded["_sdk_tool_result"] = {
         "format": "qwenpaw-tool-result/1",
@@ -130,9 +145,12 @@ def _tool_metadata(metadata, blocks, event, is_error, refs, block_metadata=None)
 def _take_tool_metadata(metadata, blocks):
     decoded, previews, block_metadata = _take_previews(metadata, blocks)
     envelope = decoded.get("_sdk_tool_result")
+    # Validate the envelope in short-circuit order before indexing fields.
+    # pylint: disable=too-many-boolean-expressions
     if (
         isinstance(envelope, dict)
-        and set(envelope) == {"format", "shape", "event", "is_error", "original"}
+        and set(envelope)
+        == {"format", "shape", "event", "is_error", "original"}
         and envelope["format"] == "qwenpaw-tool-result/1"
         and envelope["shape"] == _block_shape(blocks)
         and envelope["event"] in ("start", "delta", "result", "end")
@@ -151,7 +169,9 @@ def _take_tool_metadata(metadata, blocks):
 
 def _to_block(block):
     if not isinstance(block, ContentBlock):
-        raise SDKError("Message content must contain public ContentBlock values")
+        raise SDKError(
+            "Message content must contain public ContentBlock values",
+        )
     try:
         return _build_block(block)
     except (ValueError, TypeError) as exc:
@@ -192,7 +212,7 @@ def _build_block(block):
                 "name": block.name,
                 "input": block.arguments,
                 "state": block.state or "pending",
-            }
+            },
         )
     if block.type == "tool_result":
         output = (
@@ -200,7 +220,11 @@ def _build_block(block):
             if isinstance(block.output, str)
             else [_to_block(item) for item in block.output]
         )
-        refs = {} if isinstance(output, str) else _preview_refs(block.output, output)
+        refs = (
+            {}
+            if isinstance(output, str)
+            else _preview_refs(block.output, output)
+        )
         metadata = deepcopy(block.metadata)
         if refs or _PREVIEWS in metadata or "_sdk_tool_result" in metadata:
             metadata = _tool_metadata(
@@ -218,7 +242,7 @@ def _build_block(block):
                 "output": output,
                 "state": block.state or "running",
                 "metadata": metadata,
-            }
+            },
         )
     if (
         block.type in {"image", "audio", "video", "file"}
@@ -231,15 +255,20 @@ def _build_block(block):
                 raise SDKError("Inline attachments must use base64 data URLs")
             source = Base64Source(data=data, media_type=attachment.mime_type)
         else:
-            source = URLSource(url=attachment.url, media_type=attachment.mime_type)
+            source = URLSource(
+                url=attachment.url,
+                media_type=attachment.mime_type,
+            )
         return DataBlock(
-            **{**values, "source": source, "name": attachment.name or None}
+            **{**values, "source": source, "name": attachment.name or None},
         )
     raise SDKError(f"Unsupported or incomplete message block: {block.type!r}")
 
 
 def _from_block(block, previews=None, block_metadata=None, path="0"):
-    values = block.model_dump(mode="json") if hasattr(block, "model_dump") else {}
+    values = (
+        block.model_dump(mode="json") if hasattr(block, "model_dump") else {}
+    )
     mapped = {
         "text": ("text",),
         "thinking": ("thinking",),
@@ -267,21 +296,31 @@ def _from_block(block, previews=None, block_metadata=None, path="0"):
         )
     if block.type == "tool_result":
         metadata, inner_previews, _, _, inner_metadata = _take_tool_metadata(
-            block.metadata, () if isinstance(block.output, str) else block.output
+            block.metadata,
+            () if isinstance(block.output, str) else block.output,
         )
         result_previews = {
-            **{f"{path}.{key}": value for key, value in inner_previews.items()},
+            **{
+                f"{path}.{key}": value for key, value in inner_previews.items()
+            },
             **(previews or {}),
         }
         result_metadata = {
-            **{f"{path}.{key}": value for key, value in inner_metadata.items()},
+            **{
+                f"{path}.{key}": value for key, value in inner_metadata.items()
+            },
             **(block_metadata or {}),
         }
         output = (
             block.output
             if isinstance(block.output, str)
             else tuple(
-                _from_block(item, result_previews, result_metadata, f"{path}.{index}")
+                _from_block(
+                    item,
+                    result_previews,
+                    result_metadata,
+                    f"{path}.{index}",
+                )
                 for index, item in enumerate(block.output)
             )
         )
@@ -302,7 +341,12 @@ def _from_block(block, previews=None, block_metadata=None, path="0"):
                 ()
                 if isinstance(block.hint, str)
                 else tuple(
-                    _from_block(item, previews, block_metadata, f"{path}.{index}")
+                    _from_block(
+                        item,
+                        previews,
+                        block_metadata,
+                        f"{path}.{index}",
+                    )
                     for index, item in enumerate(block.hint)
                 )
             ),
@@ -336,7 +380,8 @@ def to_host(message: Message):
         raise SDKError("Expected a public Message")
     if message.role not in {"user", "assistant", "system"}:
         raise SDKError(
-            "Messages use user, assistant or system roles; tool results are assistant content blocks"
+            "Messages use user, assistant or system roles; tool results are "
+            "assistant content blocks",
         )
     try:
         blocks = [_to_block(block) for block in message.content]
@@ -353,7 +398,7 @@ def to_host(message: Message):
                 "role": message.role,
                 "content": blocks,
                 "metadata": metadata,
-            }
+            },
         )
     except (ValueError, TypeError) as exc:
         raise SDKError(f"Invalid message: {exc}") from exc
@@ -362,7 +407,8 @@ def to_host(message: Message):
 def from_host(message) -> Message:
     content = message.content
     metadata, previews, block_metadata = _take_previews(
-        message.metadata, () if isinstance(content, str) else content
+        message.metadata,
+        () if isinstance(content, str) else content,
     )
     blocks = (
         (ContentBlock(text=content),)
@@ -373,7 +419,9 @@ def from_host(message) -> Message:
         )
     )
     attributes = (
-        message.model_dump(mode="json") if hasattr(message, "model_dump") else {}
+        message.model_dump(mode="json")
+        if hasattr(message, "model_dump")
+        else {}
     )
     for key in ("name", "role", "content", "metadata"):
         attributes.pop(key, None)

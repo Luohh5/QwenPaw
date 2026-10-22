@@ -1130,6 +1130,7 @@ async def test_official_async_template_keeps_loop_responsive(  # pylint: disable
     "owner",
     ["root-storage", "tool-storage", "root-media"],
 )
+@pytest.mark.usefixtures("short_interrupt_timeout")
 async def test_async_file_transaction_retains_owner_until_real_io_finishes(  # pylint: disable=too-many-statements  # noqa: E501
     tmp_path,
     monkeypatch,
@@ -1497,3 +1498,109 @@ def test_plugin_probe_discovers_new_module_after_cached_miss(
         )
     finally:
         importlib.invalidate_caches()
+
+
+async def test_app_repeated_cancel_finishes_provider_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    import sys
+    from types import SimpleNamespace
+
+    from qwenpaw.plugins.resources import ResourceScope
+    from qwenpaw.plugins.testing import PluginTestHost
+    from .sdk_author_fixture import make_plugin as make_extension
+
+    probe = SimpleNamespace(
+        ready=asyncio.Event(),
+        finish=asyncio.Event(),
+        scope=None,
+    )
+    entered, release = (asyncio.Event() for _ in range(2))
+    close = ResourceScope.close
+
+    async def delayed_close(scope):
+        if scope is probe.scope and not scope.closed:
+            entered.set()
+            await release.wait()
+        await close(scope)
+
+    monkeypatch.setattr(ResourceScope, "close", delayed_close)
+    monkeypatch.setitem(sys.modules, "sdk_close_probe", probe)
+    source = """
+import asyncio
+import sdk_close_probe as probe
+from qwenpaw.plugins.apps import PawApp
+from qwenpaw.plugins.messages import ContentBlock
+from qwenpaw.plugins.providers import ProviderSpec, ModelInfo, ModelChunk
+
+class Plugin:
+    def register(self, plugin):
+        async def generate(ctx, request):
+            probe.scope = ctx.resources
+            yield ModelChunk((ContentBlock(text="started"),))
+            probe.ready.set()
+            while not probe.finish.is_set():
+                try:
+                    await probe.finish.wait()
+                except asyncio.CancelledError:
+                    pass
+            yield ModelChunk((ContentBlock(text="finished"),), is_last=True)
+
+        plugin.register_provider(ProviderSpec(
+            "cleanup-probe", "Cleanup probe", generate,
+            models=(ModelInfo("probe", "Probe"),), require_api_key=False,
+        ))
+        app = PawApp(app_id="cleanup-probe").enable_standard_capabilities()
+
+        @app.route("/stop/{id}", methods=("POST",))
+        async def stop(ctx, request):
+            result = await ctx.cancel_task(
+                request.path_params["id"], timeout=0.05
+            )
+            return {"stopped": result.stopped}
+
+        plugin.register_app(app)
+
+plugin = Plugin()
+"""
+    async with PluginTestHost(tmp_path / "host") as host:
+        await host.load(
+            make_extension(tmp_path, source, ["apps", "providers"]),
+        )
+        await host.configure_chat_model("cleanup-probe", "probe")
+        started = await host.request(
+            "POST",
+            "/api/cleanup-probe/tasks",
+            json={"message": "start"},
+        )
+        assert started.status == 200
+        run_id = started.json()["run_id"]
+        stop = "/api/cleanup-probe/stop/" + run_id
+        status = "/api/cleanup-probe/tasks/" + run_id
+        try:
+            await asyncio.wait_for(probe.ready.wait(), 3)
+            assert not (await host.request("POST", stop)).json()["stopped"]
+            probe.finish.set()
+            await asyncio.wait_for(entered.wait(), 3)
+            assert not (await host.request("POST", stop)).json()["stopped"]
+            release.set()
+            # No further stop request may be needed once cleanup can finish.
+            async with asyncio.timeout(3):
+                while (await host.request("GET", status)).json()[
+                    "status"
+                ] == "running":
+                    await asyncio.sleep(0.01)
+                while host.resource_snapshot("extension-contract")[
+                    "active_calls"
+                ]:
+                    await asyncio.sleep(0.01)
+            assert (await host.request("GET", status)).json()[
+                "status"
+            ] == "cancelled"
+            assert probe.scope.closed
+        finally:
+            probe.finish.set()
+            release.set()
+            if host.resource_snapshot("extension-contract")["active_calls"]:
+                await host.request("POST", stop)

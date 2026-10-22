@@ -13,7 +13,7 @@ import subprocess
 import sys
 import threading
 import tempfile
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
@@ -38,6 +38,7 @@ from .api import PluginApi
 from .dependency_gate import (
     DependencyGate,
     GateDecision,
+    combined_requirements,
     is_requirement_satisfied,
 )
 from .lifecycle import (
@@ -598,8 +599,9 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         Boot paths pass ``allow_install=False`` (check only). User-facing
         install / update / repair pass ``True`` so the gate may install.
         """
+        from ..utils.io_utils import run_sync_io
+
         _ensure_plugin_site_on_path()
-        requirements_file = source_path / "requirements.txt"
         from .execution.dependencies import repair_marker
         from .dependency_maintenance import authorized
 
@@ -621,7 +623,41 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 already_satisfied=True,
                 reason="dependency env not owned by this process",
             )
-        decision = DependencyGate().evaluate(
+        cleanup = ExitStack()
+        try:
+            try:
+                requirements_file = await run_sync_io(
+                    cleanup.enter_context,
+                    combined_requirements(source_path),
+                )
+            except ValueError as exc:
+                return GateDecision(
+                    allow_install=False,
+                    already_satisfied=False,
+                    unsupported=[str(exc)],
+                    reason=str(exc),
+                )
+            return await self._ensure_requirements_installed(
+                requirements_file,
+                source_path,
+                plugin_id,
+                allow_install=allow_install,
+            )
+        finally:
+            await run_sync_io(cleanup.close)
+
+    async def _ensure_requirements_installed(
+        self,
+        requirements_file: Path,
+        source_path: Path,
+        plugin_id: str,
+        *,
+        allow_install: bool,
+    ) -> GateDecision:
+        from ..utils.io_utils import run_sync_io
+
+        decision = await run_sync_io(
+            DependencyGate().evaluate,
             requirements_file,
             allow_install=allow_install,
             plugin_id=plugin_id,
@@ -630,7 +666,6 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             return decision
         if decision.missing:
             from ._sdk_dependencies import loaded_sdk_conflicts
-            from ..utils.io_utils import run_sync_io
 
             conflicts = await run_sync_io(
                 loaded_sdk_conflicts,
@@ -660,8 +695,18 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             len(decision.missing),
             ", ".join(decision.missing),
         )
-        await self._prepare_python_dependencies(requirements_file, plugin_id)
-        recheck = DependencyGate().evaluate(
+        source = (
+            {"source_path": source_path}
+            if requirements_file.parent != source_path
+            else {}
+        )
+        await self._prepare_python_dependencies(
+            requirements_file,
+            plugin_id,
+            **source,
+        )
+        recheck = await run_sync_io(
+            DependencyGate().evaluate,
             requirements_file,
             allow_install=False,
             plugin_id=plugin_id,
@@ -694,6 +739,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         code_root,
         *,
         instance_id,
+        cleanup=None,
     ):
         """Reserve and bind custody before starting a preparation process."""
         owners = self.registry.runtime_owners
@@ -715,6 +761,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
 
         async def stop():
             result = await process.stop()
+            if result.exited and not result.residual and cleanup is not None:
+                from ..utils.io_utils import run_sync_io
+
+                await run_sync_io(cleanup)
             return RuntimeStopReceipt(
                 quiescent=result.exited and not result.residual,
                 detail=(
@@ -772,10 +822,16 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         self,
         requirements_file: Path,
         plugin_id: str,
+        *,
+        source_path: Path | None = None,
     ) -> None:
         """Compatibility sync entry; safe preparation owns site exclusion."""
         asyncio.run(
-            self._prepare_python_dependencies(requirements_file, plugin_id),
+            self._prepare_python_dependencies(
+                requirements_file,
+                plugin_id,
+                source_path=source_path,
+            ),
         )
 
     # Audit, source custody and cleanup form one shared dependency transaction.
@@ -784,6 +840,8 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         self,
         requirements_file: Path,
         plugin_id: str,
+        *,
+        source_path: Path | None = None,
     ):
         """Stage explicit legacy wheel installs through the shared gate."""
         from .dependency_gate import (
@@ -836,14 +894,37 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 target.mkdir(parents=True, exist_ok=True)
             target = target.resolve()
             paths = tuple(dict.fromkeys((*runtime.dependency_paths, target)))
-        root = requirements_file.parent.resolve()
+        root = (source_path or requirements_file.parent).resolve()
         await self._stop_preparation(plugin_id)
-        process, lease = self._own_preparation(
-            plugin_id,
-            PluginProcess,
-            root,
-            instance_id="dependency:" + plugin_id,
-        )
+        cleanup = ExitStack()
+        try:
+            if source_path is not None:
+                from ..utils.io_utils import run_sync_io
+
+                def stage_requirements():
+                    temporary = cleanup.enter_context(
+                        tempfile.TemporaryDirectory(
+                            prefix="qwenpaw-dependency-audit-",
+                        ),
+                    )
+                    staged = Path(temporary) / "requirements.txt"
+                    shutil.copyfile(requirements_file, staged)
+                    return staged
+
+                requirements_file = await run_sync_io(stage_requirements)
+            audit_root = requirements_file.parent.resolve()
+            process, lease = self._own_preparation(
+                plugin_id,
+                PluginProcess,
+                root,
+                instance_id="dependency:" + plugin_id,
+                cleanup=cleanup.close,
+            )
+        except BaseException:
+            from ..utils.io_utils import run_sync_io
+
+            await run_sync_io(cleanup.close)
+            raise
         usage = self.registry.dependency_usage
         token = None
         identity_error = None
@@ -851,8 +932,8 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             spec = PluginLaunchSpec(
                 python_executable=python,
                 support_root=support,
-                code_root=root,
-                source_revision=_hash_code_root(root),
+                code_root=audit_root,
+                source_revision=_hash_code_root(audit_root),
                 plugin_id=plugin_id,
                 instance_id="dependency:" + plugin_id,
                 generation=lease.generation,
@@ -938,6 +1019,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     target,
                     plugin_id,
                     requirements_file,
+                    source_path=root,
                 )
             if frozen:
                 _ensure_plugin_site_on_path(target)
@@ -965,6 +1047,8 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         target,
         plugin_id,
         requirements_file,
+        *,
+        source_path=None,
     ):
         """Build/stage wheels; the shared gate owns actual package writes."""
         import hashlib
@@ -1091,7 +1175,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 admission_token=current_admission_token(
                     usage,
                     plugin_id,
-                    spec.code_root,
+                    source_path or spec.code_root,
                 ),
                 install_target=target,
                 wheels=wheels,
@@ -1474,6 +1558,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         manifest = binding.description.manifest
         if activate:
             await binding.backend.before_activate(binding.description)
+        previous_instance = self.lifecycle.get_instance(plugin_id)
         instance = self.lifecycle.ensure_instance(
             plugin_id,
             generation=generation,
@@ -1501,6 +1586,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             )
             record.backend_binding = binding
             return record
+        definition_started = False
         try:
             static_discovery = not activate and discovers_disabled(binding)
             async with self._dependency_registration(
@@ -1523,6 +1609,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                         dependency_token,
                         snapshot,
                     )
+                definition_started = True
                 with registration_scope(binding):
                     result = await binding.backend.load_definition(
                         binding.description,
@@ -1544,6 +1631,32 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                         )
         except BaseException as exc:
             if isinstance(exc, _EntryPointNotFoundError):
+                raise
+            from .dependency_gate import SharedDependencyError
+            from .errors import SDKRestartRequiredError
+
+            if isinstance(exc, SDKRestartRequiredError) or (
+                binding.backend is self._python_backend
+                and not definition_started
+                and not isinstance(exc, SharedDependencyError)
+            ):
+                reclaimed = False
+                if (
+                    instance is not previous_instance
+                    and not instance.activated
+                    and not self._has_runtime_custody(plugin_id)
+                ):
+                    report = await instance.dispose(UnloadMode.UNLOAD)
+                    if report.clean and report.quiescent:
+                        self.lifecycle.drop_instance(plugin_id)
+                        reclaimed = True
+                if not reclaimed:
+                    record = self._record_failed_backend(
+                        manifest,
+                        source_path,
+                        exc,
+                    )
+                    record.backend_binding = binding
                 raise
             record = self._record_failed_backend(manifest, source_path, exc)
             record.backend_binding = binding
@@ -1826,9 +1939,15 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         self,
         requirements_file: Path,
         plugin_id: str,
+        *,
+        source_path: Path | None = None,
     ) -> None:
         """Explicit compatibility entry uses validated additive wheels only."""
-        self._install_requirements_locked(requirements_file, plugin_id)
+        self._install_requirements_locked(
+            requirements_file,
+            plugin_id,
+            source_path=source_path,
+        )
 
     def _install_requirements_frozen(
         self,

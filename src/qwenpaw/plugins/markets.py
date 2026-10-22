@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Search and download contracts; the host validates and installs bundles."""
 
 from dataclasses import dataclass, field
@@ -48,8 +49,14 @@ class SkillBundle:
 class MarketSpec:
     key: str
     label: str
-    search: Callable[[MarketContext, str, int, int], SearchPage | Awaitable[SearchPage]]
-    fetch: Callable[[MarketContext, str, str], SkillBundle | Awaitable[SkillBundle]]
+    search: Callable[
+        [MarketContext, str, int, int],
+        SearchPage | Awaitable[SearchPage],
+    ]
+    fetch: Callable[
+        [MarketContext, str, str],
+        SkillBundle | Awaitable[SkillBundle],
+    ]
     matches_url: Callable[[str], bool]
     available: Callable[[], Availability] = Availability
     supports_browse: bool = True

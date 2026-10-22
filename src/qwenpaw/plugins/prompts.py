@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Declarative system-prompt contributions with explicit workspace scope."""
 
 from dataclasses import dataclass

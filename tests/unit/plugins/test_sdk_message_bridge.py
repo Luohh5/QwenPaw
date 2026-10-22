@@ -16,7 +16,9 @@ def test_tool_call_round_trip_preserves_correlation_and_arguments():
         input='{"x":3}',
         state="allowed",
     )
-    public = from_host(Msg(name="assistant", role="assistant", content=[original]))
+    public = from_host(
+        Msg(name="assistant", role="assistant", content=[original]),
+    )
     assert len(public.content) == 1
     assert public.content[0].type == "tool_call"
     restored = to_host(public).content[0]
@@ -29,7 +31,13 @@ def test_tool_call_round_trip_preserves_correlation_and_arguments():
 
 
 def test_tool_result_round_trip_preserves_error_and_multimodal_output():
-    from agentscope.message import DataBlock, Msg, TextBlock, ToolResultBlock, URLSource
+    from agentscope.message import (
+        DataBlock,
+        Msg,
+        TextBlock,
+        ToolResultBlock,
+        URLSource,
+    )
     from qwenpaw.plugins._messages import from_host, to_host
 
     original = ToolResultBlock(
@@ -41,8 +49,9 @@ def test_tool_result_round_trip_preserves_error_and_multimodal_output():
             TextBlock(text="partial"),
             DataBlock(
                 source=URLSource(
-                    url="https://example.test/result.png", media_type="image/png"
-                )
+                    url="https://example.test/result.png",
+                    media_type="image/png",
+                ),
             ),
         ],
     )
@@ -51,9 +60,13 @@ def test_tool_result_round_trip_preserves_error_and_multimodal_output():
     assert public.content[0].type == "tool_result"
     restored = to_host(public).content[0]
     assert restored.id == original.id and restored.name == original.name
-    assert restored.state == "error" and restored.metadata == {"retryable": True}
+    assert restored.state == "error" and restored.metadata == {
+        "retryable": True,
+    }
     assert restored.output[0].text == "partial"
-    assert str(restored.output[1].source.url) == "https://example.test/result.png"
+    assert (
+        str(restored.output[1].source.url) == "https://example.test/result.png"
+    )
     assert restored.output[1].source.media_type == "image/png"
 
 
@@ -62,7 +75,12 @@ def test_unknown_host_block_is_rejected_instead_of_silently_removed():
     from qwenpaw.plugins._messages import from_host
 
     unknown = SimpleNamespace(type="future_block", value="must-not-disappear")
-    message = SimpleNamespace(role="user", content=[unknown], name="user", metadata={})
+    message = SimpleNamespace(
+        role="user",
+        content=[unknown],
+        name="user",
+        metadata={},
+    )
     with pytest.raises(SDKError):
         from_host(message)
 
@@ -96,7 +114,7 @@ def test_thinking_block_preserves_provider_extension_fields():
         name="trace",
     )
     restored = to_host(
-        from_host(Msg(name="assistant", role="assistant", content=[original]))
+        from_host(Msg(name="assistant", role="assistant", content=[original])),
     ).content[0]
     assert restored.model_dump() == original.model_dump()
 
@@ -112,16 +130,23 @@ def test_invalid_public_tool_state_raises_sdk_error():
                 "assistant",
                 (
                     ContentBlock(
-                        "tool_call", id="call", name="tool", state="invalid-state"
+                        "tool_call",
+                        id="call",
+                        name="tool",
+                        state="invalid-state",
                     ),
                 ),
-            )
+            ),
         )
 
 
 @pytest.mark.parametrize(
     "value",
-    [None, "author-value", {"format": "qwenpaw-attachment-previews/1", "refs": {}}],
+    [
+        None,
+        "author-value",
+        {"format": "qwenpaw-attachment-previews/1", "refs": {}},
+    ],
 )
 @pytest.mark.parametrize("with_preview", [False, True])
 def test_public_metadata_collision_survives_round_trip(value, with_preview):
@@ -141,8 +166,13 @@ def test_public_metadata_collision_survives_round_trip(value, with_preview):
         if with_preview
         else ContentBlock(text="unchanged")
     )
-    metadata = {"_sdk_attachment_previews": value, "author": {"nested": ["keep"]}}
-    restored = from_host(to_host(Message("assistant", (block,), metadata=metadata)))
+    metadata = {
+        "_sdk_attachment_previews": value,
+        "author": {"nested": ["keep"]},
+    }
+    restored = from_host(
+        to_host(Message("assistant", (block,), metadata=metadata)),
+    )
     assert restored.metadata == metadata
     if with_preview:
         assert restored.content[0].attachment == block.attachment
@@ -170,14 +200,17 @@ def test_ordinary_host_metadata_is_not_mistaken_for_sdk_envelope(value):
             DataBlock(
                 id="block",
                 source=URLSource(
-                    url="https://example.test/image.png", media_type="image/png"
+                    url="https://example.test/image.png",
+                    media_type="image/png",
                 ),
-            )
+            ),
         ],
     )
     restored = from_host(original)
     assert restored.metadata == metadata
-    assert restored.content[0].attachment.url == "https://example.test/image.png"
+    assert (
+        restored.content[0].attachment.url == "https://example.test/image.png"
+    )
 
 
 @pytest.mark.parametrize("kind", ["image", "tool_result", "hint"])
@@ -199,7 +232,12 @@ def test_preview_and_author_metadata_survive_host_json_history(kind):
     block = (
         image
         if kind == "image"
-        else ContentBlock(kind, id="result-id", name="generate", output=(image,))
+        else ContentBlock(
+            kind,
+            id="result-id",
+            name="generate",
+            output=(image,),
+        )
     )
     metadata = {
         "_sdk_attachment_previews": {
@@ -214,7 +252,9 @@ def test_preview_and_author_metadata_survive_host_json_history(kind):
     restored = from_host(Msg.model_validate_json(saved))
     assert restored.metadata == metadata
     restored_image = (
-        restored.content[0] if kind == "image" else restored.content[0].output[0]
+        restored.content[0]
+        if kind == "image"
+        else restored.content[0].output[0]
     )
     assert restored_image.attachment == image.attachment
 
@@ -237,8 +277,8 @@ def test_content_block_metadata_survives_json_history(kind):
     )
     restored = from_host(
         Msg.model_validate_json(
-            to_host(Message("assistant", (original,))).model_dump_json()
-        )
+            to_host(Message("assistant", (original,))).model_dump_json(),
+        ),
     ).content[0]
     assert restored.metadata == original.metadata
 
@@ -257,15 +297,21 @@ def test_duplicate_attachment_ids_never_silently_replace_preview_reference(
             "image",
             id="same",
             attachment=Attachment(
-                f"https://example.test/{name}.png", "image/png", preview_url=preview
+                f"https://example.test/{name}.png",
+                "image/png",
+                preview_url=preview,
             ),
         )
-        for name, preview in (("a", "/api/files/preview/a"), ("b", second_preview))
+        for name, preview in (
+            ("a", "/api/files/preview/a"),
+            ("b", second_preview),
+        )
     )
     try:
         saved = to_host(Message("assistant", images)).model_dump_json()
     except SDKError:
-        return  # Explicitly reject ambiguous IDs before publishing corrupt content.
+        # Reject ambiguous IDs before publishing corrupt content.
+        return
     restored = from_host(Msg.model_validate_json(saved))
     assert [block.attachment for block in restored.content] == [
         block.attachment for block in images
@@ -284,7 +330,7 @@ def test_author_tool_result_metadata_that_looks_like_full_codec_is_escaped():
             "event": "end",
             "is_error": False,
             "original": {"claimed": "original"},
-        }
+        },
     }
     block = ContentBlock(
         "tool_result",
@@ -295,8 +341,8 @@ def test_author_tool_result_metadata_that_looks_like_full_codec_is_escaped():
     )
     restored = from_host(
         Msg.model_validate_json(
-            to_host(Message("assistant", (block,))).model_dump_json()
-        )
+            to_host(Message("assistant", (block,))).model_dump_json(),
+        ),
     ).content[0]
     assert restored.metadata == metadata
 
@@ -344,9 +390,14 @@ def test_tool_call_and_result_may_share_correlation_id():
         ),
     )
     restored = from_host(
-        Msg.model_validate_json(to_host(Message("assistant", blocks)).model_dump_json())
+        Msg.model_validate_json(
+            to_host(Message("assistant", blocks)).model_dump_json(),
+        ),
     )
-    assert [block.id for block in restored.content] == ["correlation", "correlation"]
+    assert [block.id for block in restored.content] == [
+        "correlation",
+        "correlation",
+    ]
     assert [block.metadata for block in restored.content] == [
         {"call": True},
         {"result": True},

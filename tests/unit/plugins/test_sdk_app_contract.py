@@ -11,17 +11,32 @@ from .sdk_author_fixture import make_plugin
 SOURCE = """
 import asyncio
 from pathlib import Path
-from qwenpaw.plugins.apps import PawApp, HttpResponse, StreamingResponse
+from qwenpaw.plugins.apps import (
+    PawApp,
+    HttpResponse,
+    StreamingResponse,
+)
 from qwenpaw.plugins.commands import CommandSpec, CommandResult
 from qwenpaw.plugins.messages import ContentBlock, Message
+
+
 class Plugin:
     def register(self, plugin):
         app = PawApp("Author app", app_id="sdk-app")
         app.enable_standard_capabilities()
+
         @app.route("/identity")
         async def identity(ctx, request):
-            assert not hasattr(ctx, "workspace") and not hasattr(ctx, "agent")
-            return {"app":ctx.app_id, "workspace":ctx.workspace_id, "user":ctx.user_id, "channel":ctx.channel}
+            assert not hasattr(ctx, "workspace") and not hasattr(
+                ctx, "agent"
+            )
+            return {
+                "app": ctx.app_id,
+                "workspace": ctx.workspace_id,
+                "user": ctx.user_id,
+                "channel": ctx.channel,
+            }
+
         @app.route("/slow-stream")
         async def slow(ctx, request):
             async def chunks():
@@ -29,32 +44,63 @@ class Plugin:
                     yield "data: first\\n\\n"
                     await asyncio.sleep(100)
                 finally:
-                    plugin.storage.write_json("stream-closed.json", True)
+                    plugin.storage.write_json(
+                        "stream-closed.json", True
+                    )
+
             return StreamingResponse(chunks())
+
         @app.websocket("/socket")
         async def socket(ctx, connection):
             try:
-                while (message := await connection.receive()) is not None:
+                while (
+                    message := await connection.receive()
+                ) is not None:
                     await connection.send(message)
             finally:
-                plugin.storage.write_json("socket-closed.json", True)
+                plugin.storage.write_json(
+                    "socket-closed.json", True
+                )
+
         async def reply(ctx, args):
-            return CommandResult("reply", Message("assistant", (ContentBlock(text="app reply:" + args),)))
+            return CommandResult(
+                "reply",
+                Message(
+                    "assistant",
+                    (ContentBlock(text="app reply:" + args),),
+                ),
+            )
+
         async def wait(ctx, args):
             plugin.storage.write_json("task-entered.json", True)
             try:
-                while not (Path(plugin.config.get("directory")) / "task-release").exists():
+                while not (
+                    Path(plugin.config.get("directory"))
+                    / "task-release"
+                ).exists():
                     await asyncio.sleep(0.01)
             finally:
                 plugin.storage.write_json("task-stopped.json", True)
-            return CommandResult("reply", Message("assistant", (ContentBlock(text="released"),)))
+            return CommandResult(
+                "reply",
+                Message(
+                    "assistant", (ContentBlock(text="released"),)
+                ),
+            )
+
         @app.route("/need-approval", methods=("POST",))
         async def approval(ctx, request):
-            approved = await ctx.request_approval("app approval", session_id=request.json()["session_id"])
+            approved = await ctx.request_approval(
+                "app approval",
+                session_id=request.json()["session_id"],
+            )
             return {"approved": approved}
+
         plugin.register_command(CommandSpec("appwait", wait))
         plugin.register_command(CommandSpec("appprobe", reply))
         plugin.register_app(app)
+
+
 plugin = Plugin()
 """
 
@@ -69,7 +115,10 @@ async def test_app_http_identity_storage_and_reload(tmp_path):
     async with PluginTestHost(tmp_path / "host") as host:
         await host.load(app_plugin(tmp_path))
         identity = await host.request(
-            "GET", "/api/sdk-app/identity", workspace_id="one", user_id="alice"
+            "GET",
+            "/api/sdk-app/identity",
+            workspace_id="one",
+            user_id="alice",
         )
         assert identity.status == 200
         assert identity.json() == {
@@ -118,11 +167,16 @@ async def test_app_http_identity_storage_and_reload(tmp_path):
             assert value.json()["value"] is None
         assert (await host.reload("extension-contract")).ok
         value = await host.request(
-            "GET", "/api/sdk-app/storage/item.json", workspace_id="one", user_id="alice"
+            "GET",
+            "/api/sdk-app/storage/item.json",
+            workspace_id="one",
+            user_id="alice",
         )
         assert value.json()["value"] == "alice-one"
         await host.unload("extension-contract")
-        assert (await host.request("GET", "/api/sdk-app/identity")).status == 404
+        assert (
+            await host.request("GET", "/api/sdk-app/identity")
+        ).status == 404
 
 
 async def test_app_sessions_and_chat_use_real_scoped_services(tmp_path):
@@ -140,7 +194,11 @@ async def test_app_sessions_and_chat_use_real_scoped_services(tmp_path):
         session = created.json()
         assert session["name"] == "Author session"
         other_sessions = (
-            await host.request("GET", "/api/sdk-app/chat/sessions", user_id="bob")
+            await host.request(
+                "GET",
+                "/api/sdk-app/chat/sessions",
+                user_id="bob",
+            )
         ).json()["sessions"]
         assert all(row["id"] != session["id"] for row in other_sessions)
         assert all(row["name"] != "Author session" for row in other_sessions)
@@ -155,22 +213,38 @@ async def test_app_sessions_and_chat_use_real_scoped_services(tmp_path):
             "POST",
             "/api/sdk-app/chat",
             user_id="alice",
-            json={"message": "/appprobe hello", "session_id": session["session_id"]},
+            json={
+                "message": "/appprobe hello",
+                "session_id": session["session_id"],
+            },
         )
-        assert reply.status == 200 and reply.json()["text"] == "app reply:hello"
+        assert (
+            reply.status == 200 and reply.json()["text"] == "app reply:hello"
+        )
         assert (await host.reload("extension-contract")).ok
         rows = (
-            await host.request("GET", "/api/sdk-app/chat/sessions", user_id="alice")
+            await host.request(
+                "GET",
+                "/api/sdk-app/chat/sessions",
+                user_id="alice",
+            )
         ).json()["sessions"]
         assert any(
-            row["id"] == session["id"] and row["name"] == "Renamed" for row in rows
+            row["id"] == session["id"] and row["name"] == "Renamed"
+            for row in rows
         )
         deleted = await host.request(
-            "DELETE", f'/api/sdk-app/chat/sessions/{session["id"]}', user_id="alice"
+            "DELETE",
+            f'/api/sdk-app/chat/sessions/{session["id"]}',
+            user_id="alice",
         )
         assert deleted.status == 200 and deleted.json()["ok"] is True
         remaining = (
-            await host.request("GET", "/api/sdk-app/chat/sessions", user_id="alice")
+            await host.request(
+                "GET",
+                "/api/sdk-app/chat/sessions",
+                user_id="alice",
+            )
         ).json()["sessions"]
         assert all(row["id"] != session["id"] for row in remaining)
 
@@ -181,7 +255,10 @@ async def test_http_stream_holds_lifecycle_until_disconnect(tmp_path):
 
     async with PluginTestHost(tmp_path / "host") as host:
         ctx = await host.load(app_plugin(tmp_path))
-        async with host.open_http("GET", "/api/sdk-app/slow-stream") as response:
+        async with host.open_http(
+            "GET",
+            "/api/sdk-app/slow-stream",
+        ) as response:
             assert response.status == 200
             chunks = response.chunks()
             first = asyncio.create_task(anext(chunks))
@@ -190,11 +267,15 @@ async def test_http_stream_holds_lifecycle_until_disconnect(tmp_path):
             with pytest.raises(PluginBusyError):
                 await host.reload("extension-contract")
         assert ctx.storage.read_json("stream-closed.json") is True
-        assert host.resource_snapshot("extension-contract")["active_calls"] == 0
+        assert (
+            host.resource_snapshot("extension-contract")["active_calls"] == 0
+        )
         assert (await host.reload("extension-contract")).ok
 
 
-async def test_websocket_holds_lifecycle_and_releases_after_disconnect(tmp_path):
+async def test_websocket_holds_lifecycle_and_releases_after_disconnect(
+    tmp_path,
+):
     from qwenpaw.plugins import PluginBusyError
     from qwenpaw.plugins.testing import PluginTestHost
 
@@ -206,7 +287,9 @@ async def test_websocket_holds_lifecycle_and_releases_after_disconnect(tmp_path)
             with pytest.raises(PluginBusyError):
                 await host.reload("extension-contract")
         assert ctx.storage.read_json("socket-closed.json") is True
-        assert host.resource_snapshot("extension-contract")["active_calls"] == 0
+        assert (
+            host.resource_snapshot("extension-contract")["active_calls"] == 0
+        )
         assert (await host.reload("extension-contract")).ok
 
 
@@ -214,7 +297,10 @@ async def test_app_task_ownership_cancel_and_actual_callback_stop(tmp_path):
     from qwenpaw.plugins.testing import PluginTestHost
 
     async with PluginTestHost(tmp_path / "host") as host:
-        ctx = await host.load(app_plugin(tmp_path), config={"directory": str(tmp_path)})
+        ctx = await host.load(
+            app_plugin(tmp_path),
+            config={"directory": str(tmp_path)},
+        )
         started = await host.request(
             "POST",
             "/api/sdk-app/tasks",
@@ -224,7 +310,10 @@ async def test_app_task_ownership_cancel_and_actual_callback_stop(tmp_path):
         )
         assert started.status == 200
         task = started.json()
-        assert task["status"] == "running" and task["run_id"] != task["session_id"]
+        assert (
+            task["status"] == "running"
+            and task["run_id"] != task["session_id"]
+        )
         try:
             for _ in range(100):
                 if ctx.storage.read_json("task-entered.json", False):
@@ -262,14 +351,22 @@ async def test_app_task_ownership_cancel_and_actual_callback_stop(tmp_path):
         finally:
             (tmp_path / "task-release").touch()
             for _ in range(100):
-                if host.resource_snapshot("extension-contract")["active_calls"] == 0:
+                if (
+                    host.resource_snapshot("extension-contract")[
+                        "active_calls"
+                    ]
+                    == 0
+                ):
                     break
                 await asyncio.sleep(0.01)
         assert (await host.reload("extension-contract")).ok
 
 
 @pytest.mark.parametrize("approved", [False, True])
-async def test_app_approval_is_bound_to_authenticated_scope(tmp_path, approved):
+async def test_app_approval_is_bound_to_authenticated_scope(
+    tmp_path,
+    approved,
+):
     from qwenpaw.plugins.testing import PluginTestHost
 
     async with PluginTestHost(tmp_path / "host") as host:
@@ -278,7 +375,12 @@ async def test_app_approval_is_bound_to_authenticated_scope(tmp_path, approved):
         other_root.mkdir()
         other = make_plugin(
             other_root,
-            "from qwenpaw.plugins.apps import PawApp\nclass Plugin:\n    def register(self, ctx):\n        ctx.register_app(PawApp(app_id='sdk-other').enable_standard_capabilities())\nplugin = Plugin()\n",
+            (
+                "from qwenpaw.plugins.apps import PawApp\nclass "
+                "Plugin:\n    def register(self, ctx):\n        "
+                "ctx.register_app(PawApp(app_id='sdk-other').enable_s"
+                "tandard_capabilities())\nplugin = Plugin()\n"
+            ),
             ["apps"],
         )
         manifest = json.loads((other / "plugin.json").read_text())
@@ -292,7 +394,7 @@ async def test_app_approval_is_bound_to_authenticated_scope(tmp_path, approved):
                 workspace_id="one",
                 user_id="alice",
                 json={"session_id": "approval-session"},
-            )
+            ),
         )
         try:
             for _ in range(100):
@@ -355,8 +457,10 @@ async def test_app_approval_is_bound_to_authenticated_scope(tmp_path, approved):
                 workspace_id="one",
                 user_id="alice",
             )
-            assert [row["request_id"] for row in pending.json()["approvals"]] == [
-                request_id
+            assert [
+                row["request_id"] for row in pending.json()["approvals"]
+            ] == [
+                request_id,
             ]
             resolved = await host.request(
                 "POST",
@@ -365,7 +469,9 @@ async def test_app_approval_is_bound_to_authenticated_scope(tmp_path, approved):
                 user_id="alice",
                 json={"approved": approved},
             )
-            assert resolved.status == 200 and resolved.json()["resolved"] is True
+            assert (
+                resolved.status == 200 and resolved.json()["resolved"] is True
+            )
             answer = await asyncio.wait_for(waiting, 2)
             assert answer.json() == {"approved": approved}
         finally:
@@ -375,7 +481,9 @@ async def test_app_approval_is_bound_to_authenticated_scope(tmp_path, approved):
                     await waiting
 
 
-async def test_cancelled_app_approval_request_leaves_no_actionable_approval(tmp_path):
+async def test_cancelled_app_approval_request_leaves_no_actionable_approval(
+    tmp_path,
+):
     from qwenpaw.plugins.testing import PluginTestHost
 
     async with PluginTestHost(tmp_path / "host") as host:
@@ -386,7 +494,7 @@ async def test_cancelled_app_approval_request_leaves_no_actionable_approval(tmp_
                 "/api/sdk-app/need-approval",
                 user_id="alice",
                 json={"session_id": "cancelled-request"},
-            )
+            ),
         )
         try:
             for _ in range(100):
@@ -408,7 +516,10 @@ async def test_cancelled_app_approval_request_leaves_no_actionable_approval(tmp_
                 user_id="alice",
             )
             assert response.json()["approvals"] == []
-            assert host.resource_snapshot("extension-contract")["active_calls"] == 0
+            assert (
+                host.resource_snapshot("extension-contract")["active_calls"]
+                == 0
+            )
         finally:
             if not waiting.done():
                 waiting.cancel()
@@ -435,7 +546,9 @@ plugin = Plugin()
         async with host.websocket("/api/sdk-return-app/once") as socket:
             assert await socket.receive() == "done"
             assert await asyncio.wait_for(socket.receive(), 1) is None
-        assert host.resource_snapshot("extension-contract")["active_calls"] == 0
+        assert (
+            host.resource_snapshot("extension-contract")["active_calls"] == 0
+        )
 
 
 async def test_complete_http_response_waits_for_actual_scope_cleanup(tmp_path):
@@ -478,7 +591,9 @@ plugin = Plugin()
             response = await host.request("GET", "/api/cleanup/thread")
             assert response.status == 200 and response.json() == {"ok": True}
             assert (tmp_path / "stopping").exists()
-            assert (tmp_path / "finished").exists(), "Normal response cancelled cleanup"
+            assert (
+                tmp_path / "finished"
+            ).exists(), "Normal response cancelled cleanup"
             assert ctx.resources.snapshot()["resources"] == initial
         finally:
             release.touch()
@@ -486,7 +601,7 @@ plugin = Plugin()
             timer.join(1)
 
 
-async def test_http_cleanup_failure_is_reported_once_then_host_retries_resource(
+async def test_http_cleanup_failure_reported_once_then_host_retries(
     tmp_path,
 ):
     from qwenpaw.plugins import SDKError
@@ -528,6 +643,7 @@ plugin = Plugin()
         host.assert_quiescent(ctx.plugin_id)
     finally:
         await host.close()
-    # Successful close must restore global host ownership, not just drop the error.
+    # Successful close must restore global host ownership, not just drop the
+    # error.
     async with PluginTestHost(tmp_path / "another-host"):
         pass

@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """Internal production TaskTracker boundary for public Channel callbacks."""
 
+# Inspect host ownership and cleanup state at the tested bridge boundary.
+# pylint: disable=protected-access
+
 import asyncio
 
 import pytest
@@ -27,25 +30,45 @@ from pathlib import Path
 from qwenpaw.plugins.channels import ChannelSpec
 from qwenpaw.plugins.commands import CommandSpec, CommandResult
 from qwenpaw.plugins.messages import Message, ContentBlock
+
+
 class Plugin:
     def register(self, plugin):
         class Transport:
             async def start(self, call):
                 pass
+
             async def stop(self, call):
                 return True
+
             def send(self, call, message):
                 plugin.storage.write_json("entered.json", True)
                 try:
-                    while not call.cancelled and not Path(plugin.config.get("release")).exists():
+                    while (
+                        not call.cancelled
+                        and not Path(
+                            plugin.config.get("release")
+                        ).exists()
+                    ):
                         time.sleep(0.01)
-                    plugin.storage.write_json("observed-cancel.json", call.cancelled)
+                    plugin.storage.write_json(
+                        "observed-cancel.json", call.cancelled
+                    )
                 finally:
                     plugin.storage.write_json("stopped.json", True)
+
         async def reply(call, args):
-            return CommandResult("reply", Message("assistant", (ContentBlock(text="reply"),)))
+            return CommandResult(
+                "reply",
+                Message("assistant", (ContentBlock(text="reply"),)),
+            )
+
         plugin.register_command(CommandSpec("syncsend", reply))
-        plugin.register_channel(ChannelSpec("sync-send", "Sync send", Transport))
+        plugin.register_channel(
+            ChannelSpec("sync-send", "Sync send", Transport)
+        )
+
+
 plugin = Plugin()
 """
     release = tmp_path / "release"
@@ -95,35 +118,66 @@ async def test_cancelled_channel_stream_emits_one_cancelled_terminal(tmp_path):
     source = """
 import asyncio
 from qwenpaw.plugins.channels import ChannelSpec
-from qwenpaw.plugins.providers import ProviderSpec, ModelInfo, ModelChunk
+from qwenpaw.plugins.providers import (
+    ProviderSpec,
+    ModelInfo,
+    ModelChunk,
+)
 from qwenpaw.plugins.messages import ContentBlock
+
+
 class Plugin:
     def register(self, plugin):
         class Transport:
             async def start(self, call):
                 pass
+
             async def stop(self, call):
                 return True
+
             async def send(self, call, message):
                 pass
+
             async def on_stream(self, call, event):
                 rows = plugin.storage.read_json("events.json", [])
-                rows.append({"phase":event.phase,"status":event.event.status})
+                rows.append(
+                    {
+                        "phase": event.phase,
+                        "status": event.event.status,
+                    }
+                )
                 plugin.storage.write_json("events.json", rows)
                 if event.phase == "delta":
                     plugin.storage.write_json("delta.json", True)
+
         async def generate(call, request):
             try:
                 yield ModelChunk((ContentBlock(text="first"),))
                 await asyncio.sleep(100)
             finally:
-                plugin.storage.write_json("model-stopped.json", True)
-        plugin.register_channel(ChannelSpec("cancel-stream", "Cancel stream", Transport, streaming=True))
-        plugin.register_provider(ProviderSpec(
-            "cancel-provider", "Cancel provider", generate,
-            models=(ModelInfo("cancel-model", "Cancel model"),),
-            require_api_key=False,
-        ))
+                plugin.storage.write_json(
+                    "model-stopped.json", True
+                )
+
+        plugin.register_channel(
+            ChannelSpec(
+                "cancel-stream",
+                "Cancel stream",
+                Transport,
+                streaming=True,
+            )
+        )
+        plugin.register_provider(
+            ProviderSpec(
+                "cancel-provider",
+                "Cancel provider",
+                generate,
+                models=(ModelInfo("cancel-model", "Cancel model"),),
+                require_api_key=False,
+            )
+        )
+
+
 plugin = Plugin()
 """
     async with PluginTestHost(tmp_path / "host") as host:
@@ -169,22 +223,45 @@ async def test_old_queued_channel_payload_cannot_run_on_replacement_generation(
 from qwenpaw.plugins.channels import ChannelSpec
 from qwenpaw.plugins.commands import CommandSpec, CommandResult
 from qwenpaw.plugins.messages import Message, ContentBlock
+
+
 class Plugin:
     def register(self, plugin):
         class Transport:
             async def start(self, call):
                 pass
+
             async def stop(self, call):
                 return True
+
             async def send(self, call, message):
                 rows = plugin.storage.read_json("sent.json", [])
-                plugin.storage.write_json("sent.json", rows + ["".join(block.text for block in message.content)])
+                plugin.storage.write_json(
+                    "sent.json",
+                    rows
+                    + [
+                        "".join(
+                            block.text for block in message.content
+                        )
+                    ],
+                )
+
         async def reply(call, args):
             rows = plugin.storage.read_json("calls.json", [])
             plugin.storage.write_json("calls.json", rows + [args])
-            return CommandResult("reply", Message("assistant", (ContentBlock(text=args),)))
+            return CommandResult(
+                "reply",
+                Message("assistant", (ContentBlock(text=args),)),
+            )
+
         plugin.register_command(CommandSpec("queueprobe", reply))
-        plugin.register_channel(ChannelSpec("queued-channel", "Queued channel", Transport))
+        plugin.register_channel(
+            ChannelSpec(
+                "queued-channel", "Queued channel", Transport
+            )
+        )
+
+
 plugin = Plugin()
 """
     async with PluginTestHost(tmp_path / "host") as host:
@@ -261,8 +338,15 @@ async def test_channel_uses_real_sender_access_policy_before_runtime(tmp_path):
     from qwenpaw.plugins.testing import PluginTestHost
 
     source = SOURCE.replace(
-        'plugin.storage.write_json(f"called-{call.workspace_id}.json", args)',
-        'plugin.storage.write_json("calls.json", plugin.storage.read_json("calls.json", []) + [args])',
+        (
+            "plugin.storage.write_json(\n"
+            '                f"called-{call.workspace_id}.json", args\n'
+            "            )"
+        ),
+        (
+            'plugin.storage.write_json("calls.json", '
+            'plugin.storage.read_json("calls.json", []) + [args])'
+        ),
     )
     async with PluginTestHost(tmp_path / "host") as host:
         ctx = await host.load(

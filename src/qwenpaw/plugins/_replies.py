@@ -1,4 +1,8 @@
+# -*- coding: utf-8 -*-
 """Explicit SDK replies carried through the existing runtime envelope."""
+
+# Host adapters access private ownership state behind the public SDK.
+# pylint: disable=protected-access
 
 from copy import deepcopy
 from dataclasses import asdict
@@ -41,7 +45,9 @@ class _SDKReply(Msg):
                 "index": index,
             }
             if block.type == "text":
-                content = TextContent(**{**values, "type": "text", "text": block.text})
+                content = TextContent(
+                    **{**values, "type": "text", "text": block.text},
+                )
             elif block.type in media and block.attachment is not None:
                 cls, url_field = media[block.type]
                 attachment = asdict(block.attachment)
@@ -54,13 +60,13 @@ class _SDKReply(Msg):
                         "preview_url": attachment["preview_url"],
                         "filename": attachment["name"],
                         "mime_type": attachment["mime_type"],
-                    }
+                    },
                 )
             else:
                 # Structured reasoning/hints/tool calls remain complete JSON.
                 # The channel decides how to render these non-media blocks.
                 content = DataContent(
-                    **{**values, "type": "data", "data": asdict(block)}
+                    **{**values, "type": "data", "data": asdict(block)},
                 )
             result.append(content)
         return (

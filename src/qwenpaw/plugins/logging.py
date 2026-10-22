@@ -1,4 +1,8 @@
+# -*- coding: utf-8 -*-
 """Structured logging with host-owned plugin and invocation identity."""
+
+# Host adapters access private ownership state behind the public SDK.
+# pylint: disable=protected-access
 
 from __future__ import annotations
 
@@ -11,7 +15,9 @@ from .errors import SDKError
 
 
 class PluginLogger:
-    """Obtained from a plugin or callback context; identity is not caller input."""
+    """
+    Obtained from a plugin or callback context; identity is not caller input.
+    """
 
     def __init__(self, context):
         self._context = context
@@ -25,7 +31,10 @@ class PluginLogger:
         from ._models import json_mapping
 
         values = json_mapping({} if fields is None else fields)
-        identity = {"plugin_id": plugin.plugin_id, "generation": plugin.generation}
+        identity = {
+            "plugin_id": plugin.plugin_id,
+            "generation": plugin.generation,
+        }
         if context is not plugin:
             identity.update(
                 workspace_id=context.workspace_id,
@@ -43,26 +52,41 @@ class PluginLogger:
         )
 
     def debug(
-        self, message: str, *, fields: Mapping[str, JSONValue] | None = None
+        self,
+        message: str,
+        *,
+        fields: Mapping[str, JSONValue] | None = None,
     ) -> None:
         self._log(logging.DEBUG, message, fields)
 
     def info(
-        self, message: str, *, fields: Mapping[str, JSONValue] | None = None
+        self,
+        message: str,
+        *,
+        fields: Mapping[str, JSONValue] | None = None,
     ) -> None:
         self._log(logging.INFO, message, fields)
 
     def warning(
-        self, message: str, *, fields: Mapping[str, JSONValue] | None = None
+        self,
+        message: str,
+        *,
+        fields: Mapping[str, JSONValue] | None = None,
     ) -> None:
         self._log(logging.WARNING, message, fields)
 
     def error(
-        self, message: str, *, fields: Mapping[str, JSONValue] | None = None
+        self,
+        message: str,
+        *,
+        fields: Mapping[str, JSONValue] | None = None,
     ) -> None:
         self._log(logging.ERROR, message, fields)
 
     def exception(
-        self, message: str, *, fields: Mapping[str, JSONValue] | None = None
+        self,
+        message: str,
+        *,
+        fields: Mapping[str, JSONValue] | None = None,
     ) -> None:
         self._log(logging.ERROR, message, fields, exception=True)

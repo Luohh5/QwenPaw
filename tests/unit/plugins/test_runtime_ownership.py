@@ -561,12 +561,14 @@ def test_preparation_constructor_failure_releases_only_unstarted_resource(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stop_failure", [None, "residual", "exception"])
+@pytest.mark.parametrize("combined", [False, True])
 async def test_python_audit_uses_fresh_stop_evidence_before_releasing_preparation(  # noqa: E501
     ownership,
     loader,
     tmp_path,
     monkeypatch,
     stop_failure,
+    combined,
 ):
     from packaging.markers import default_environment
     from qwenpaw.plugins.execution import StopResult
@@ -574,7 +576,9 @@ async def test_python_audit_uses_fresh_stop_evidence_before_releasing_preparatio
 
     root = tmp_path / "candidate"
     root.mkdir()
-    requirements = root / "requirements.txt"
+    declaration_root = tmp_path / "combined" if combined else root
+    declaration_root.mkdir(exist_ok=True)
+    requirements = declaration_root / "requirements.txt"
     requirements.write_text("")
     owners = loader.registry.runtime_owners
     snapshot = DependencySnapshot(
@@ -587,6 +591,8 @@ async def test_python_audit_uses_fresh_stop_evidence_before_releasing_preparatio
         dependency_sites=(),
     )
     generations = []
+    staged_requirements = []
+    source = {"source_path": root} if combined else {}
 
     class AuditProcess:
         def __init__(self):
@@ -606,6 +612,12 @@ async def test_python_audit_uses_fresh_stop_evidence_before_releasing_preparatio
             assert held.instance_id == spec.instance_id == "dependency:indexer"
             assert owners.resource(held) is self
             assert loader.retains_preparation_source(root)
+            staged_requirements.append(spec.requirements_path)
+            assert spec.requirements_path.read_text() == ""
+            if combined:
+                assert spec.code_root != root
+                assert spec.requirements_path.parent == spec.code_root
+                assert spec.requirements_path != requirements
             generations.append(spec.generation)
             self.dependency_observer(snapshot)
             return SimpleNamespace(snapshot=snapshot)
@@ -624,14 +636,26 @@ async def test_python_audit_uses_fresh_stop_evidence_before_releasing_preparatio
     monkeypatch.setattr("qwenpaw.plugins.loader._is_frozen", lambda: False)
     if stop_failure:
         with pytest.raises(RuntimeError, match="needs_restart"):
-            await loader._prepare_python_dependencies(requirements, "indexer")
+            await loader._prepare_python_dependencies(
+                requirements,
+                "indexer",
+                **source,
+            )
         (held,) = owners.leases("indexer")
         assert held.code_root == root
         assert loader.retains_preparation_source(root)
+        if combined:
+            requirements.unlink()
+            assert staged_requirements[0].is_file()
         stop_failure = None
+        await loader._stop_preparation("indexer")
+        if combined:
+            assert not staged_requirements[0].parent.exists()
+            requirements.write_text("")
         result = await loader._prepare_python_dependencies(
             requirements,
             "indexer",
+            **source,
         )
         assert result.already_satisfied
         admissions = list(dict.fromkeys(generations))
@@ -640,9 +664,12 @@ async def test_python_audit_uses_fresh_stop_evidence_before_releasing_preparatio
         result = await loader._prepare_python_dependencies(
             requirements,
             "indexer",
+            **source,
         )
         assert result.already_satisfied
     assert owners.leases("indexer") == ()
+    if combined:
+        assert all(not path.parent.exists() for path in staged_requirements)
 
 
 @pytest.mark.asyncio

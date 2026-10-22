@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Tool declarations, per-call context and streaming result protocol."""
 
 from __future__ import annotations
@@ -14,14 +15,14 @@ from typing import (
     TYPE_CHECKING,
 )
 
+from .messages import ContentBlock
+from .resources import ResourceScope
+from .storage import PluginConfig, PluginStorage, MediaStore
+
 if TYPE_CHECKING:
     from .logging import PluginLogger
     from .models import ModelService
     from .sdk import PluginContext
-
-from .messages import ContentBlock
-from .resources import ResourceScope
-from .storage import PluginConfig, PluginStorage, MediaStore
 
 
 @dataclass(frozen=True)
@@ -71,10 +72,16 @@ class ToolContext:
     resources: ResourceScope
     deadline: float | None = None
     _is_cancelled: Callable[[], bool] = field(
-        default=lambda: False, repr=False, compare=False
+        default=lambda: False,
+        repr=False,
+        compare=False,
     )
 
-    _plugin: PluginContext | None = field(default=None, repr=False, compare=False)
+    _plugin: PluginContext | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     @property
     def logger(self) -> PluginLogger:

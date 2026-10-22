@@ -351,8 +351,10 @@ async def test_model_consumer_cancellation_owns_provider_cleanup(
 
     monkeypatch.setattr(activity, "INTERRUPT_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(custody, "TASK_STOP_SECONDS", 0.02)
+    finalizer = '                append("model-finished.json", text)'
+    assert model_source.count(finalizer) == 1
     source = model_source.replace(
-        "                append('model-finished.json',text)",
+        finalizer,
         """                plugin.storage.write_json('cleanup-entered.json',True)
                 try:
                     while plugin.storage.read_json('hold-cleanup.json',False):

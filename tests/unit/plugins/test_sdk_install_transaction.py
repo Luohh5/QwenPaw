@@ -6,16 +6,35 @@ import json
 import pytest
 
 from .sdk_author_fixture import make_plugin
+from .sdk_dependency_fixture import dependency_python
 
 SOURCE = """
 from qwenpaw.plugins.tools import ToolSpec, ToolResult
+
+
 class Plugin:
     def register(self, plugin):
         async def tool(call, args):
             count = plugin.storage.read_json("count.json", 0) + 1
             plugin.storage.write_json("count.json", count)
-            return ToolResult.text("__VERSION__:" + plugin.config.get("label", "") + ":" + str(count))
-        plugin.register_tool(ToolSpec("transaction_tool", "Transaction probe", {"type":"object"}, tool, enabled=True))
+            return ToolResult.text(
+                "__VERSION__:"
+                + plugin.config.get("label", "")
+                + ":"
+                + str(count)
+            )
+
+        plugin.register_tool(
+            ToolSpec(
+                "transaction_tool",
+                "Transaction probe",
+                {"type": "object"},
+                tool,
+                enabled=True,
+            )
+        )
+
+
 plugin = Plugin()
 """
 
@@ -38,7 +57,7 @@ async def text_result(host):
     return (await host.call_tool("transaction_tool", {})).content[0].text
 
 
-async def test_sdk_install_config_disable_upgrade_uninstall_preserves_user_data(
+async def test_install_config_disable_upgrade_uninstall_preserves_user_data(
     tmp_path,
 ):
     from qwenpaw.plugins import SDKError
@@ -159,7 +178,7 @@ async def test_sdk_dependency_restart_rejected_before_module_execution(
         await host.install(one, config={"label": "retained"})
         with pytest.raises(SDKRestartRequiredError):
             await host.install(two, replace=True)
-        assert installer_calls == []
+        assert not installer_calls
         assert not marker.exists()
         assert await text_result(host) == "1.0.0:retained:1"
         assert (
@@ -168,6 +187,71 @@ async def test_sdk_dependency_restart_rejected_before_module_execution(
             )["version"]
             == "1.0.0"
         )
+
+
+@pytest.mark.parametrize("declaration", ["file", "manifest", "combined"])
+async def test_initial_sdk_dependency_rejection_allows_repaired_retry(
+    tmp_path,
+    monkeypatch,
+    declaration,
+):
+    import importlib.metadata
+    import subprocess
+
+    import httpx
+
+    from qwenpaw.plugins import SDKRestartRequiredError
+    from qwenpaw.plugins.testing import PluginTestHost
+
+    assert httpx.__version__ != "0.0.1"
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("UV_NO_INDEX", "1")
+    source = package(tmp_path, "1.0.0")
+    marker = tmp_path / "module-executed"
+    entry = source / "main.py"
+    entry.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
+        + entry.read_text(),
+    )
+    manifest_path = source / "plugin.json"
+    manifest = json.loads(manifest_path.read_text())
+    if declaration in {"manifest", "combined"}:
+        manifest["dependencies"] = ["httpx==0.0.1"]
+        manifest_path.write_text(json.dumps(manifest))
+    requirements = source / "requirements.txt"
+    if declaration == "file":
+        requirements.write_text("httpx==0.0.1\n")
+    elif declaration == "combined":
+        requirements.write_text("packaging>=20\n")
+    calls = []
+    spawn = subprocess.Popen
+
+    def no_installer(args, *values, **kwargs):
+        if any(action in args for action in ("install", "wheel")):
+            calls.append(tuple(args))
+            raise AssertionError("Rejected load reached dependency installer")
+        return spawn(args, *values, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", no_installer)
+    async with PluginTestHost(tmp_path / "host") as host:
+        with pytest.raises(SDKRestartRequiredError):
+            await host.load(source)
+        assert not marker.exists()
+        assert not calls
+        assert (
+            host._loader.lifecycle.get_instance("extension-contract") is None
+        )
+        assert host._loader.get_loaded_plugin("extension-contract") is None
+        repaired = "httpx==" + importlib.metadata.version("httpx")
+        if declaration in {"manifest", "combined"}:
+            manifest["dependencies"] = [repaired]
+            manifest_path.write_text(json.dumps(manifest))
+        else:
+            requirements.write_text(repaired + "\n")
+        await host.load(source)
+        assert marker.exists()
+        assert await text_result(host) == "1.0.0::1"
+        assert not calls
 
 
 @pytest.mark.parametrize(
@@ -187,14 +271,8 @@ def test_sdk_transitive_dependency_cannot_replace_an_installed_distribution(
     """A real isolated resolver sees parent -> loaded child, without installation."""
     import base64
     import hashlib
-    from importlib.metadata import distribution
     import os
-    from pathlib import Path
-    import site
-    import shutil
     import subprocess
-    import sys
-    import venv
     import zipfile
 
     wheels = tmp_path / "wheels"
@@ -208,7 +286,10 @@ def test_sdk_transitive_dependency_cannot_replace_an_installed_distribution(
         files = {
             f"{name}/__init__.py": body or f"__version__ = {version!r}\n",
             f"{info}/METADATA": metadata,
-            f"{info}/WHEEL": "Wheel-Version: 1.0\nGenerator: sdk-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            f"{info}/WHEEL": (
+                "Wheel-Version: 1.0\nGenerator: "
+                "sdk-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+            ),
         }
         records = []
         for key, value in files.items():
@@ -226,47 +307,12 @@ def test_sdk_transitive_dependency_cannot_replace_an_installed_distribution(
 
     child = wheel("sdk_loaded_child", "1.0")
     wheel("sdk_loaded_child", "2.0")
-    environment = tmp_path / "venv"
-    venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
-    python = environment / (
-        "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    installer = (
+        "pip" if change in {"same-version-source", "pip-version"} else "uv"
     )
-    library = Path(
-        subprocess.check_output(
-            [
-                str(python),
-                "-I",
-                "-c",
-                "import site; print(site.getsitepackages()[0])",
-            ],
-            text=True,
-        ).strip(),
-    )
+    python, library = dependency_python(tmp_path / "venv", installer=installer)
     with zipfile.ZipFile(child) as archive:
         archive.extractall(library)
-    # The reused system site may not contain user-installed host dependencies.
-    # Copy the actual missing PDF dependency, without executing user .pth files.
-    pdf = distribution("pypdf")
-    pdf_root = Path(pdf.locate_file("")).resolve()
-    if pdf_root not in {
-        Path(path).resolve() for path in site.getsitepackages()
-    }:
-        pdf_info = next(
-            Path(pdf.locate_file(path)).parent
-            for path in pdf.files
-            if path.name == "METADATA"
-            and path.parent.name.endswith(".dist-info")
-        )
-        for source in (pdf_root / "pypdf", pdf_info):
-            shutil.copytree(source, library / source.name)
-    if change in {"same-version-source", "pip-version"}:
-        import ensurepip
-
-        bundled = next(
-            (Path(ensurepip.__file__).parent / "_bundled").glob("pip-*.whl"),
-        )
-        with zipfile.ZipFile(bundled) as archive:
-            archive.extractall(library)
     if change == "same-version-source":
         # Pip considers the installed same version satisfied: adding parent
         # is safe only if the differently sourced child bytes stay unchanged.
@@ -281,71 +327,128 @@ def test_sdk_transitive_dependency_cannot_replace_an_installed_distribution(
     else:
         requirement = "sdk-loaded-child>=2.0"
     wheel("sdk_new_parent", "1.0", requirement)
-    # Reuse the already installed host/dependencies, not repository fixtures.
-    (library / "host_dependencies.pth").write_text(
-        f"import site; site.addsitedir({site.getsitepackages()[0]!r})\n",
-    )
     one, two = package(tmp_path, "1.0.0"), package(tmp_path, "2.0.0")
     (two / "requirements.txt").write_text("sdk-new-parent==1.0\n")
-    code = r"""
-import asyncio,hashlib,importlib.metadata,json,subprocess,sys
+    code = """
+import asyncio, hashlib, importlib.metadata, json, subprocess, sys
 from pathlib import Path
 import mcp.types
 from qwenpaw.plugins import SDKRestartRequiredError
 from qwenpaw.plugins.testing import PluginTestHost
-root,one,two=map(Path,sys.argv[1:4])
-if sys.argv[4]!='not-imported':
+
+root, one, two = map(Path, sys.argv[1:4])
+if sys.argv[4] != "not-imported":
     import sdk_loaded_child
-    assert sdk_loaded_child.__version__=='1.0'
+
+    assert sdk_loaded_child.__version__ == "1.0"
 else:
-    assert 'sdk_loaded_child' not in sys.modules
-dist=importlib.metadata.distribution('sdk-loaded-child')
+    assert "sdk_loaded_child" not in sys.modules
+dist = importlib.metadata.distribution("sdk-loaded-child")
+
+
 def snapshot():
-    return {str(p):hashlib.sha256(Path(dist.locate_file(p)).read_bytes()).hexdigest() for p in dist.files}
-before=snapshot()
-spawn=subprocess.Popen
-mutations=[]
-resolutions=[]
-def guarded(args,*values,**kwargs):
-    if 'install' in args and ('pip' in args or 'uv' in str(args[0])):
+    return {
+        str(p): hashlib.sha256(
+            Path(dist.locate_file(p)).read_bytes()
+        ).hexdigest()
+        for p in dist.files
+    }
+
+
+before = snapshot()
+spawn = subprocess.Popen
+mutations = []
+resolutions = []
+
+
+def guarded(args, *values, **kwargs):
+    if "install" in args and (
+        "pip" in args or "uv" in str(args[0])
+    ):
         mutations.append(list(args))
-        raise AssertionError('SDK attempted a mutating dependency install')
-    if 'wheel' in args and 'pip' in args:
-        assert args[0]==sys.executable
-        resolutions.append({
-            'argv':list(args),
-            'constraints':Path(args[args.index('--constraint')+1]).read_text()
-                if '--constraint' in args else None,
-        })
-    return spawn(args,*values,**kwargs)
-subprocess.Popen=guarded
+        raise AssertionError(
+            "SDK attempted a mutating dependency install"
+        )
+    if "wheel" in args and "pip" in args:
+        assert args[0] == sys.executable
+        resolutions.append(
+            {
+                "argv": list(args),
+                "constraints": Path(
+                    args[args.index("--constraint") + 1]
+                ).read_text()
+                if "--constraint" in args
+                else None,
+            }
+        )
+    return spawn(args, *values, **kwargs)
+
+
+subprocess.Popen = guarded
+
+
 async def main():
     async with PluginTestHost(root) as host:
-        await host.install(one,config={'label':'retained'})
-        if sys.argv[4] in {'addition','same-version-source'}:
-            result=await host.install(two,replace=True)
+        await host.install(one, config={"label": "retained"})
+        if sys.argv[4] in {"addition", "same-version-source"}:
+            result = await host.install(two, replace=True)
             assert result.ok
-            assert importlib.metadata.version('sdk-new-parent')=='1.0'
+            assert (
+                importlib.metadata.version("sdk-new-parent")
+                == "1.0"
+            )
             import sdk_new_parent
-            assert sdk_new_parent.__version__=='1.0'
-            assert Path(sdk_new_parent.__file__).resolve().is_relative_to(Path(dist.locate_file('')).resolve())
+
+            assert sdk_new_parent.__version__ == "1.0"
+            assert (
+                Path(sdk_new_parent.__file__)
+                .resolve()
+                .is_relative_to(
+                    Path(dist.locate_file("")).resolve()
+                )
+            )
         else:
             try:
-                await host.install(two,replace=True)
+                await host.install(two, replace=True)
             except SDKRestartRequiredError:
                 pass
             else:
-                raise AssertionError('Transitive loaded dependency did not require restart')
-        assert not mutations,mutations
-        assert snapshot()==before
-        if sys.argv[4] in {'same-version-source','pip-version','addition'}:
-            assert resolutions,resolutions
-            assert 'sdk-loaded-child==1.0' in resolutions[0]['constraints']
-        assert importlib.metadata.version('sdk-loaded-child')=='1.0'
-        result=await host.call_tool('transaction_tool',{})
-        expected='2.0.0' if sys.argv[4] in {'addition','same-version-source'} else '1.0.0'
-        assert result.content[0].text==expected+':retained:1'
-    print(json.dumps({'mutations':mutations,'resolutions':resolutions,'unchanged':snapshot()==before}))
+                raise AssertionError(
+                    "Transitive loaded dependency did not require restart"
+                )
+        assert not mutations, mutations
+        assert snapshot() == before
+        if sys.argv[4] in {
+            "same-version-source",
+            "pip-version",
+            "addition",
+        }:
+            assert resolutions, resolutions
+            assert (
+                "sdk-loaded-child==1.0"
+                in resolutions[0]["constraints"]
+            )
+        assert (
+            importlib.metadata.version("sdk-loaded-child") == "1.0"
+        )
+        result = await host.call_tool("transaction_tool", {})
+        expected = (
+            "2.0.0"
+            if sys.argv[4] in {"addition", "same-version-source"}
+            else "1.0.0"
+        )
+        assert result.content[0].text == expected + ":retained:1"
+    print(
+        json.dumps(
+            {
+                "mutations": mutations,
+                "resolutions": resolutions,
+                "unchanged": snapshot() == before,
+            }
+        )
+    )
+
+
 asyncio.run(main())
 """
     env = {
@@ -385,6 +488,7 @@ asyncio.run(main())
         capture_output=True,
         text=True,
         timeout=90,
+        check=False,
     )
     (tmp_path / "transitive-result.log").write_text(
         result.stdout + result.stderr,
@@ -406,15 +510,35 @@ async def test_sdk_busy_stream_in_other_workspace_prevents_install_commit(
 import asyncio
 from qwenpaw.plugins.tools import ToolSpec, ToolEvent, ToolResult
 from qwenpaw.plugins.messages import ContentBlock
+
+
 class Plugin:
     def register(self, ctx):
         async def tool(call, args):
             try:
-                yield ToolEvent("delta", (ContentBlock(text="old:" + call.workspace_id),))
+                yield ToolEvent(
+                    "delta",
+                    (
+                        ContentBlock(
+                            text="old:" + call.workspace_id
+                        ),
+                    ),
+                )
                 await asyncio.sleep(100)
             finally:
                 ctx.storage.write_json("closed.json", True)
-        ctx.register_tool(ToolSpec("transaction_tool", "Busy", {"type":"object"}, tool, enabled=True))
+
+        ctx.register_tool(
+            ToolSpec(
+                "transaction_tool",
+                "Busy",
+                {"type": "object"},
+                tool,
+                enabled=True,
+            )
+        )
+
+
 plugin = Plugin()
 """,
     )
@@ -508,11 +632,13 @@ async def test_uninstall_refuses_external_source_tree_but_unload_is_allowed(
     import hashlib
     from qwenpaw.plugins import SDKError
     from qwenpaw.plugins.testing import PluginTestHost
-    from .sdk_author_fixture import make_plugin
 
     source = make_plugin(
         tmp_path,
-        "class Plugin:\n    def register(self, ctx): pass\nplugin = Plugin()\n",
+        (
+            "class Plugin:\n    def register(self, ctx): "
+            "pass\nplugin = Plugin()\n"
+        ),
         [],
     )
     before = {

@@ -1,4 +1,8 @@
+# -*- coding: utf-8 -*-
 """Controlled real TaskTracker cancellation; author callback remains public."""
+
+# Inspect host ownership and cleanup state at the tested bridge boundary.
+# pylint: disable=protected-access
 
 import asyncio
 
@@ -6,10 +10,15 @@ import pytest
 
 from qwenpaw.plugins import PluginBusyError
 from qwenpaw.plugins.testing import PluginTestHost
-from .test_sdk_channel_routing_contract import CHANNEL, incoming, setup, wait_for
+from .test_sdk_channel_routing_contract import (
+    CHANNEL,
+    incoming,
+    setup,
+    wait_for,
+)
 
 
-async def test_host_close_during_channel_model_run_finishes_real_queue_consumer(
+async def test_host_close_during_model_run_finishes_queue_consumer(
     tmp_path,
 ):
     import json
@@ -27,13 +36,15 @@ async def test_host_close_during_channel_model_run_finishes_real_queue_consumer(
         assert len(consumers) == 1
     assert all(task.done() for task in consumers), consumers
     assert json.loads(
-        (root / "plugin-data/extension-contract/model-finished.json").read_text()
+        (
+            root / "plugin-data/extension-contract/model-finished.json"
+        ).read_text(),
     ) == ["hold-first"]
     async with PluginTestHost(tmp_path / "next-host"):
         pass
 
 
-async def test_repeated_tracker_cancellation_preserves_queued_terminal_callback(
+async def test_repeated_cancellation_preserves_queued_terminal_callback(
     tmp_path,
 ):
     async with PluginTestHost(tmp_path / "host") as host:
@@ -50,7 +61,7 @@ async def test_repeated_tracker_cancellation_preserves_queued_terminal_callback(
             producer = next(iter(tasks.values()))
             producer.cancel()
             await wait_for(
-                lambda: bool(ctx.storage.read_json("model-finished.json", []))
+                lambda: bool(ctx.storage.read_json("model-finished.json", [])),
             )
             # First cancellation finishes the real model and queues end behind
             # the still-running start callback. Cancel the same native owner
@@ -64,7 +75,9 @@ async def test_repeated_tracker_cancellation_preserves_queued_terminal_callback(
         finally:
             ctx.storage.write_json("release.json", True)
             ctx.storage.write_json("callback-release.json", True)
-        await wait_for(lambda: len(ctx.storage.read_json("events.json", [])) == 2)
+        await wait_for(
+            lambda: len(ctx.storage.read_json("events.json", [])) == 2,
+        )
         events = ctx.storage.read_json("events.json")
         assert [(row["phase"], row["status"]) for row in events] == [
             ("start", "running"),
@@ -75,8 +88,11 @@ async def test_repeated_tracker_cancellation_preserves_queued_terminal_callback(
 
 
 async def test_stop_retains_terminal_task_queued_before_callback_admission(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
 ):
+    # Keep this ownership/cleanup scenario and its assertions together.
+    # pylint: disable=too-many-statements
     from qwenpaw.plugins.resources import ResourceScope
 
     queued, release = asyncio.Event(), asyncio.Event()
@@ -110,8 +126,10 @@ async def test_stop_retains_terminal_task_queued_before_callback_admission(
     monkeypatch.setattr(ResourceScope, "task", gate_terminal)
     async with PluginTestHost(tmp_path / "host") as host:
         ctx = await setup(host, tmp_path)
-        channel = await (await host._workspace("test")).channel_manager.get_channel(
-            CHANNEL
+        channel = await (
+            await host._workspace("test")
+        ).channel_manager.get_channel(
+            CHANNEL,
         )
         requests = []
         original_before = channel._before_consume_process
@@ -120,16 +138,21 @@ async def test_stop_retains_terminal_task_queued_before_callback_admission(
             requests.append(request)
             await original_before(request)
 
-        monkeypatch.setattr(channel, "_before_consume_process", remember_request)
+        monkeypatch.setattr(
+            channel,
+            "_before_consume_process",
+            remember_request,
+        )
         await host.receive_channel(CHANNEL, incoming("empty-output", "queued"))
         await asyncio.wait_for(queued.wait(), 5)
         assert len(notifications) == 2
         stopping = asyncio.create_task(host.stop_channel(CHANNEL))
         try:
             assert len(requests) == 1
-            assert (
-                id(requests[0]) in channel._run_states
-            ), "Pending terminal must retain the actual run state until delivery finishes"
+            assert id(requests[0]) in channel._run_states, (
+                "Pending terminal must retain the actual run state "
+                "until delivery finishes"
+            )
             await asyncio.wait_for(channel._end_run(requests[0]), 1)
             assert (
                 len(notifications) == 2
@@ -138,14 +161,15 @@ async def test_stop_retains_terminal_task_queued_before_callback_admission(
             assert (
                 not stopping.done()
             ), "Queued terminal custody must precede callback admission"
-            assert cancelled == []
+            assert not cancelled
             assert [
-                event["phase"] for event in ctx.storage.read_json("events.json")
+                event["phase"]
+                for event in ctx.storage.read_json("events.json")
             ] == ["start"]
         finally:
             release.set()
             await asyncio.wait_for(stopping, 7)
-        assert cancelled == []
+        assert not cancelled
         events = ctx.storage.read_json("events.json")
         assert [event["phase"] for event in events] == ["start", "end"]
         assert events[-1]["status"] == "completed"
@@ -156,11 +180,17 @@ async def test_stop_retains_terminal_task_queued_before_callback_admission(
 
 @pytest.mark.parametrize("timeout_then_retry", [False, True])
 async def test_host_close_retains_native_tracker_completion_callback(
-    tmp_path, monkeypatch, timeout_then_retry
+    tmp_path,
+    monkeypatch,
+    timeout_then_retry,
 ):
     from qwenpaw.plugins import SDKError
 
-    entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    entered, release, finished = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
     callback_tasks = []
     callback_results = []
     async with PluginTestHost(tmp_path / "host") as host:
@@ -175,8 +205,10 @@ async def test_host_close_retains_native_tracker_completion_callback(
                 try:
                     await release.wait()
                 except asyncio.CancelledError:
-                    # The controlled persistence operation is genuinely unfinished.
-                    # Keep the real native owner alive until explicitly released.
+                    # The controlled persistence operation is genuinely
+                    # unfinished.
+                    # Keep the real native owner alive until explicitly
+                    # released.
                     pass
             result = await original(chat_id, finished_at)
             callback_results.append(result)
@@ -184,12 +216,19 @@ async def test_host_close_retains_native_tracker_completion_callback(
             return result
 
         monkeypatch.setattr(
-            workspace.chat_manager, "mark_chat_finished", held_completion
+            workspace.chat_manager,
+            "mark_chat_finished",
+            held_completion,
         )
-        await host.receive_channel(CHANNEL, incoming("empty-output", "native-tail"))
+        await host.receive_channel(
+            CHANNEL,
+            incoming("empty-output", "native-tail"),
+        )
         await asyncio.wait_for(entered.wait(), 5)
         native = callback_tasks[0]
-        active = await workspace.task_tracker.snapshot_active_tasks(owner=workspace)
+        active = await workspace.task_tracker.snapshot_active_tasks(
+            owner=workspace,
+        )
         assert len(active) == 1 and native in active.values()
         assert "_producer" in native.get_coro().__qualname__
         closing = asyncio.create_task(host.close())
@@ -199,11 +238,13 @@ async def test_host_close_retains_native_tracker_completion_callback(
                     await asyncio.wait_for(asyncio.shield(closing), 7)
             else:
                 await asyncio.sleep(0.05)
-                assert (
-                    not closing.done()
-                ), "Host closed while its real tracker completion was still running"
+                assert not closing.done(), (
+                    "Host closed while its real tracker completion was "
+                    "still running"
+                )
             assert not native.done() and not finished.is_set()
-            # Environment ownership cannot transfer to a new host while cleanup remains.
+            # Environment ownership cannot transfer to a new host while cleanup
+            # remains.
             with pytest.raises(SDKError):
                 async with PluginTestHost(tmp_path / "premature-next"):
                     pass
@@ -219,40 +260,77 @@ async def test_host_close_retains_native_tracker_completion_callback(
         pass
 
 
-async def test_rejected_stream_admission_does_not_create_or_replace_state(tmp_path):
+async def test_rejected_stream_admission_does_not_create_or_replace_state(
+    tmp_path,
+):
     from qwenpaw.schemas import AgentRequest
     from .sdk_author_fixture import make_plugin
     from .test_sdk_channel_routing_contract import SOURCE
 
     source = SOURCE.replace(
         "            async def on_run(self, ctx, event):",
-        "            async def on_stream(self, ctx, event): pass\n            async def on_run(self, ctx, event):",
+        (
+            "            async def on_stream(self, ctx, event): "
+            "pass\n            async def on_run(self, ctx, event):"
+        ),
     )
     async with PluginTestHost(tmp_path / "host") as host:
         await host.load(
-            make_plugin(tmp_path, source, ["channels", "providers", "storage"])
+            make_plugin(
+                tmp_path,
+                source,
+                ["channels", "providers", "storage"],
+            ),
         )
         await host.start_channel(CHANNEL, {})
-        channel = await (await host._workspace("test")).channel_manager.get_channel(
-            CHANNEL
+        channel = await (
+            await host._workspace("test")
+        ).channel_manager.get_channel(
+            CHANNEL,
         )
-        activity = host._loader.lifecycle.get_instance("extension-contract").activity
+        activity = host._loader.lifecycle.get_instance(
+            "extension-contract",
+        ).activity
         first = AgentRequest(input=[], session_id="first", user_id="author")
-        rejected = AgentRequest(input=[], session_id="rejected", user_id="author")
+        rejected = AgentRequest(
+            input=[],
+            session_id="rejected",
+            user_id="author",
+        )
         event = {"object": "message", "status": "in_progress", "content": []}
-        await channel._stream("start", first, "original", event, {}, "text", "original")
+        await channel._stream(
+            "start",
+            first,
+            "original",
+            event,
+            {},
+            "text",
+            "original",
+        )
         key = (id(first), "text")
         original = channel._stream_contexts[key]
         try:
             async with activity.mutation():
                 with pytest.raises(PluginBusyError):
                     await channel._stream(
-                        "start", rejected, "new", event, {}, "text", "new"
+                        "start",
+                        rejected,
+                        "new",
+                        event,
+                        {},
+                        "text",
+                        "new",
                     )
                 assert (id(rejected), "text") not in channel._stream_contexts
                 with pytest.raises(PluginBusyError):
                     await channel._stream(
-                        "delta", first, "changed", event, {}, "text", "changed"
+                        "delta",
+                        first,
+                        "changed",
+                        event,
+                        {},
+                        "text",
+                        "changed",
                     )
                 assert channel._stream_contexts[key] is original
         finally:
@@ -269,17 +347,30 @@ async def test_rejected_stream_admission_does_not_create_or_replace_state(tmp_pa
 
 
 @pytest.mark.parametrize(
-    "boundary", ["normal", "call-recovery", "stream-recovery", "blocked-close"]
+    "boundary",
+    ["normal", "call-recovery", "stream-recovery", "blocked-close"],
 )
 async def test_channel_stop_closes_actual_overflow_stream_before_owner_exit(
-    tmp_path, monkeypatch, boundary
+    tmp_path,
+    monkeypatch,
+    boundary,
+    request,
 ):
+    # Keep this ownership/cleanup scenario and its assertions together.
+    # pylint: disable=too-many-statements
     from qwenpaw.agents import react_agent
     from .sdk_author_fixture import make_plugin
     from .test_sdk_channel_routing_contract import SOURCE
 
+    if boundary == "blocked-close":
+        request.getfixturevalue("short_interrupt_timeout")
+
     streams = []
-    closing, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    closing, release, closed = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
     recoveries = []
     original = react_agent.call_with_overflow_recovery
 
@@ -305,13 +396,14 @@ async def test_channel_stop_closes_actual_overflow_stream_before_owner_exit(
 
             return controlled_source()
 
-        async def failed_call(**arguments):
+        async def failed_call(**_arguments):
             if boundary == "call-recovery":
                 raise RuntimeError("controlled pre-output failure")
 
             async def failed_source():
                 raise RuntimeError("controlled pre-output failure")
-                yield  # async generator, no model output before recovery
+                # Required to model a stream that raises before its first item.
+                yield  # pylint: disable=unreachable
 
             return failed_source()
 
@@ -332,7 +424,9 @@ async def test_channel_stop_closes_actual_overflow_stream_before_owner_exit(
         return stream
 
     monkeypatch.setattr(
-        react_agent, "call_with_overflow_recovery", remember_actual_stream
+        react_agent,
+        "call_with_overflow_recovery",
+        remember_actual_stream,
     )
     source = SOURCE.replace(
         "            async def send(self, ctx, message):",
@@ -342,26 +436,50 @@ async def test_channel_stop_closes_actual_overflow_stream_before_owner_exit(
                     await asyncio.Event().wait()
             async def send(self, ctx, message):""",
     ).replace(
-        "'Routing contract',Backend)", "'Routing contract',Backend,streaming=True)"
+        '"Routing contract",\n                Backend,\n            )',
+        (
+            '"Routing contract",\n                Backend, '
+            "streaming=True,\n            )"
+        ),
     )
     async with PluginTestHost(tmp_path / "host") as host:
         ctx = await host.load(
-            make_plugin(tmp_path, source, ["channels", "providers", "storage"])
+            make_plugin(
+                tmp_path,
+                source,
+                ["channels", "providers", "storage"],
+            ),
         )
         await host.configure_chat_model("routing-provider", "routing-model")
         await host.start_channel(CHANNEL)
         try:
-            await host.receive_channel(CHANNEL, incoming("stop-at-content", "overflow"))
-            await wait_for(lambda: ctx.storage.read_json("stream-started.json", False))
+            await host.receive_channel(
+                CHANNEL,
+                incoming("stop-at-content", "overflow"),
+            )
+            await wait_for(
+                lambda: ctx.storage.read_json("stream-started.json", False),
+            )
             assert len(streams) == 1
             assert streams[0].ag_frame is not None
             if boundary == "blocked-close":
                 with pytest.raises(PluginBusyError):
-                    await host.reload("extension-contract", interrupt_tasks=True)
+                    await host.reload(
+                        "extension-contract",
+                        interrupt_tasks=True,
+                    )
                 assert closing.is_set() and not closed.is_set()
-                assert host.resource_snapshot("extension-contract")["active_calls"] > 0
+                assert (
+                    host.resource_snapshot("extension-contract")[
+                        "active_calls"
+                    ]
+                    > 0
+                )
                 release.set()
-                result = await host.reload("extension-contract", interrupt_tasks=True)
+                result = await host.reload(
+                    "extension-contract",
+                    interrupt_tasks=True,
+                )
                 assert result.ok
                 assert closed.is_set()
             else:
@@ -374,7 +492,10 @@ async def test_channel_stop_closes_actual_overflow_stream_before_owner_exit(
             assert (
                 streams[0].ag_frame is None
             ), "Run exited with its actual overflow stream still open"
-            assert host.resource_snapshot("extension-contract")["active_calls"] == 0
+            assert (
+                host.resource_snapshot("extension-contract")["active_calls"]
+                == 0
+            )
         finally:
             release.set()
             # Failed assertions still close the test-held real stream; this is

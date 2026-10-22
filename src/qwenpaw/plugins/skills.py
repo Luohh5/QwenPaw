@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Package-relative skill contribution with persistent provisioning."""
 
 from dataclasses import dataclass

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Memory backend values; construction and shutdown remain host-owned."""
 
 from dataclasses import dataclass, field
@@ -14,17 +15,26 @@ class MemoryContext(ToolContext):
 
 
 class MemoryBackend(Protocol):
-    async def start(self, context: MemoryContext) -> None: ...
+    async def start(self, context: MemoryContext) -> None:
+        ...
 
     async def search(
-        self, context: MemoryContext, query: str, max_results: int
-    ) -> ToolResult: ...
+        self,
+        context: MemoryContext,
+        query: str,
+        max_results: int,
+    ) -> ToolResult:
+        ...
 
     async def remember(
-        self, context: MemoryContext, messages: tuple[Message, ...]
-    ) -> str: ...
+        self,
+        context: MemoryContext,
+        messages: tuple[Message, ...],
+    ) -> str:
+        ...
 
-    async def close(self, context: MemoryContext) -> bool: ...
+    async def close(self, context: MemoryContext) -> bool:
+        ...
 
 
 @dataclass(frozen=True)
@@ -32,7 +42,9 @@ class MemorySpec:
     id: str
     label: str
     create: Callable[[], MemoryBackend]
-    config_schema: dict[str, Any] = field(default_factory=lambda: {"type": "object"})
+    config_schema: dict[str, Any] = field(
+        default_factory=lambda: {"type": "object"},
+    )
     secrets: tuple[str, ...] = ()
     prompt: str = ""
     auto_memory_interval: int = 0

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Public slash-command declarations and controlled input/reply results."""
 
 from dataclasses import dataclass
@@ -22,6 +23,9 @@ class CommandResult:
 @dataclass(frozen=True)
 class CommandSpec:
     name: str
-    handler: Callable[[CommandContext, str], CommandResult | Awaitable[CommandResult]]
+    handler: Callable[
+        [CommandContext, str],
+        CommandResult | Awaitable[CommandResult],
+    ]
     aliases: tuple[str, ...] = ()
     help_text: str = ""

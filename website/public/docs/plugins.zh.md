@@ -34,8 +34,8 @@ handler，报告中的未覆盖项仍需测试；检查器不是安全沙箱或�
   "id": "hello-sdk",
   "name": "Hello SDK",
   "version": "1.0.0",
-  "entry": {"backend": "main.py"},
-  "sdk": {"version": "1.0.0", "capabilities": ["tools", "storage"]}
+  "entry": { "backend": "main.py" },
+  "sdk": { "version": "1.0.0", "capabilities": ["tools", "storage"] }
 }
 ```
 
@@ -195,18 +195,18 @@ asyncio.run(main())
 
 ## 能力与公开模块
 
-| 能力 | 公开入口 |
-| --- | --- |
-| 声明与版本 | `PluginContext`、`SDK_VERSION`、`SDK_CAPABILITIES` |
-| 工具与配置字段 | `qwenpaw.plugins.tools` |
-| 配置、持久数据、媒体 | `qwenpaw.plugins.storage`，实例由上下文提供 |
-| 日志、已配置模型调用 | `qwenpaw.plugins.logging`、`qwenpaw.plugins.models` |
-| 消息、附件、运行与审批观察 | `qwenpaw.plugins.messages`、`qwenpaw.plugins.events` |
-| 命令、钩子、模式、提示词 | `commands`、`hooks`、`modes`、`prompts` |
-| 渠道、应用 | `channels`、`apps` |
-| 模型提供方、记忆、市场、技能 | `providers`、`memory`、`markets`、`skills` |
-| 资源、结果、测试 | `resources`、`results`、`testing` |
-| 异常 | 从 `qwenpaw.plugins` 导入 `SDKError`、`StaleContextError` 等公开异常 |
+| 能力                         | 公开入口                                                             |
+| ---------------------------- | -------------------------------------------------------------------- |
+| 声明与版本                   | `PluginContext`、`SDK_VERSION`、`SDK_CAPABILITIES`                   |
+| 工具与配置字段               | `qwenpaw.plugins.tools`                                              |
+| 配置、持久数据、媒体         | `qwenpaw.plugins.storage`，实例由上下文提供                          |
+| 日志、已配置模型调用         | `qwenpaw.plugins.logging`、`qwenpaw.plugins.models`                  |
+| 消息、附件、运行与审批观察   | `qwenpaw.plugins.messages`、`qwenpaw.plugins.events`                 |
+| 命令、钩子、模式、提示词     | `commands`、`hooks`、`modes`、`prompts`                              |
+| 渠道、应用                   | `channels`、`apps`                                                   |
+| 模型提供方、记忆、市场、技能 | `providers`、`memory`、`markets`、`skills`                           |
+| 资源、结果、测试             | `resources`、`results`、`testing`                                    |
+| 异常                         | 从 `qwenpaw.plugins` 导入 `SDKError`、`StaleContextError` 等公开异常 |
 
 后六行模块均位于 `qwenpaw.plugins` 下，具体公开符号以白名单为准。
 
@@ -240,8 +240,8 @@ SDK 检查不收紧旧 manifest 的宿主版本规则，也不自动迁移或禁
   "id": "hello-sdk",
   "name": "Hello SDK",
   "version": "1.0.0",
-  "entry": {"backend": "plugin.py"},
-  "sdk": {"version": "1.0.0", "capabilities": ["tools", "storage"]}
+  "entry": { "backend": "plugin.py" },
+  "sdk": { "version": "1.0.0", "capabilities": ["tools", "storage"] }
 }
 ```
 
@@ -289,27 +289,27 @@ plugin = Plugin()
 `API_EXPORTS` 为每个符号列出 `module/symbol/since/stability`；兼容入口单独标注。
 以下模块的列出类型属于 SDK 1.x 稳定契约；以下表格不能解释为允许模块所有属性。
 
-| 能力 | 公开声明 | 实际接入 |
-|---|---|---|
-| 插件 | `Plugin`, `PluginContext` | Loader / Lifecycle |
-| 工具 | `tools.ToolSpec`, `ToolContext`, `ToolResult`, `ToolEvent` | 原工具注册、JSON schema、治理、真实 FunctionTool |
-| 消息 | `messages.Message`, `ContentBlock`, `Attachment` | AgentScope 转换，未知块明确拒绝 |
-| 命令 | `commands.CommandSpec`, `CommandContext`, `CommandResult` | Workspace SlashCommandRegistry |
-| 钩子 | `hooks.HookSpec`, `HookPhase`, `HookResult`, `ContextInjection` | 原 Runtime 各阶段 |
-| 模式 | `modes.ModeSpec`, `ModeContext` | 每工作区 AgentMode 与工具模式过滤 |
-| 日志 | `logging.PluginLogger` | 宿主日志，固定插件及调用身份与独立作者字段 |
-| 模型调用 | `models.ModelService` | 当前工作区已配置模型，一次请求，沿原 factory/formatter/重试与计量 |
-| 模型提供方 | `providers.ProviderSpec`, `ModelInfo`, `ModelRequest`, `ModelChunk`, `ModelUsage` | ProviderManager / model_factory、formatter、token 计量与重试 |
-| 记忆 | `memory.MemorySpec`, `MemoryBackend`, `MemoryContext`, `MemoryTask` | 原 BaseMemoryManager / ServiceManager / shared worker |
-| 市场 | `markets.MarketSpec`, `SearchPage`, `MarketResult`, `SkillBundle`, `Availability` | 原 Market 搜索及 Hub 安装/扫描 |
-| 技能 | `skills.SkillSpec` | 原技能投影、inventory、三方合并 |
-| 提示词 | `prompts.PromptSpec` | PromptManager，真实 priority 排序 |
-| 渠道 | `channels.ChannelSpec`, `ChannelBackend`, `ChannelMessage`, `OutgoingMessage` | 原 ChannelManager 队列、ACL、TaskTracker、Runtime |
-| 应用 | `apps.PawApp`, `AppContext`, HTTP/流/WS DTO | 原 PawApp 聚合、身份与标准能力路由 |
-| 观察 | `events.EventSubscription`, `RunEvent`, `ApprovalEvent`, `SubscriptionGap` | 真实 Workspace.stream_query 和审批状态变更 |
-| 资源 | `resources.ResourceScope`, `Registration`, `ResourceOwner` | 原 custody 及生命周期清理账本 |
-| 数据 | `storage.PluginConfig`, `PluginStorage`, `MediaStore` | 所有权限定的持久配置/数据/实际文件预览 |
-| 测试 | `testing.PluginTestHost`、公开测试结果类型 | 真实 Loader / Lifecycle / Workspace / 治理与服务 |
+| 能力       | 公开声明                                                                          | 实际接入                                                          |
+| ---------- | --------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| 插件       | `Plugin`, `PluginContext`                                                         | Loader / Lifecycle                                                |
+| 工具       | `tools.ToolSpec`, `ToolContext`, `ToolResult`, `ToolEvent`                        | 原工具注册、JSON schema、治理、真实 FunctionTool                  |
+| 消息       | `messages.Message`, `ContentBlock`, `Attachment`                                  | AgentScope 转换，未知块明确拒绝                                   |
+| 命令       | `commands.CommandSpec`, `CommandContext`, `CommandResult`                         | Workspace SlashCommandRegistry                                    |
+| 钩子       | `hooks.HookSpec`, `HookPhase`, `HookResult`, `ContextInjection`                   | 原 Runtime 各阶段                                                 |
+| 模式       | `modes.ModeSpec`, `ModeContext`                                                   | 每工作区 AgentMode 与工具模式过滤                                 |
+| 日志       | `logging.PluginLogger`                                                            | 宿主日志，固定插件及调用身份与独立作者字段                        |
+| 模型调用   | `models.ModelService`                                                             | 当前工作区已配置模型，一次请求，沿原 factory/formatter/重试与计量 |
+| 模型提供方 | `providers.ProviderSpec`, `ModelInfo`, `ModelRequest`, `ModelChunk`, `ModelUsage` | ProviderManager / model_factory、formatter、token 计量与重试      |
+| 记忆       | `memory.MemorySpec`, `MemoryBackend`, `MemoryContext`, `MemoryTask`               | 原 BaseMemoryManager / ServiceManager / shared worker             |
+| 市场       | `markets.MarketSpec`, `SearchPage`, `MarketResult`, `SkillBundle`, `Availability` | 原 Market 搜索及 Hub 安装/扫描                                    |
+| 技能       | `skills.SkillSpec`                                                                | 原技能投影、inventory、三方合并                                   |
+| 提示词     | `prompts.PromptSpec`                                                              | PromptManager，真实 priority 排序                                 |
+| 渠道       | `channels.ChannelSpec`, `ChannelBackend`, `ChannelMessage`, `OutgoingMessage`     | 原 ChannelManager 队列、ACL、TaskTracker、Runtime                 |
+| 应用       | `apps.PawApp`, `AppContext`, HTTP/流/WS DTO                                       | 原 PawApp 聚合、身份与标准能力路由                                |
+| 观察       | `events.EventSubscription`, `RunEvent`, `ApprovalEvent`, `SubscriptionGap`        | 真实 Workspace.stream_query 和审批状态变更                        |
+| 资源       | `resources.ResourceScope`, `Registration`, `ResourceOwner`                        | 原 custody 及生命周期清理账本                                     |
+| 数据       | `storage.PluginConfig`, `PluginStorage`, `MediaStore`                             | 所有权限定的持久配置/数据/实际文件预览                            |
+| 测试       | `testing.PluginTestHost`、公开测试结果类型                                        | 真实 Loader / Lifecycle / Workspace / 治理与服务                  |
 
 根模块原有 `PluginApi/PluginLoader/PluginRegistry/PluginLifecycle` 导出仍保留，
 但属于 **legacy 兼容**，不进入新 SDK 白名单。`qwenpaw.pawapp.PawApp.sdk(...)`
@@ -495,10 +495,10 @@ SDK Command 与 Hook 的 reply 在真实 Runtime 中保留文本和附件的顺�
 作者同名属性不会覆盖传输协议。普通旧插件 Msg 回复仍沿原文本封装路径。
 Hook handler 为 `handler(context)`，允许字段随 phase 限定：
 
-| 改动 | 允许阶段 |
-|---|---|
-| replace_input | PRE_DISPATCH / POST_DISPATCH / PRE_AGENT_BUILD |
-| injections | 以上加 POST_AGENT_BUILD / PRE_EXECUTE |
+| 改动               | 允许阶段                                                     |
+| ------------------ | ------------------------------------------------------------ |
+| replace_input      | PRE_DISPATCH / POST_DISPATCH / PRE_AGENT_BUILD               |
+| injections         | 以上加 POST_AGENT_BUILD / PRE_EXECUTE                        |
 | reply / skip_agent | PRE_DISPATCH / POST_DISPATCH / PRE_AGENT_BUILD / PRE_EXECUTE |
 
 结果先完整校验再一次应用；无效结果不留下半截输入修改。错误被原 HookRegistry
@@ -742,7 +742,7 @@ my-plugin/
 | `author`          | `string`        | 否   | 作者或组织名称。                                                                                                                                                      |
 | `entry.backend`   | `string`        | 否\* | 相对插件目录的 Python 入口文件路径，需在其中导出 `plugin`。                                                                                                           |
 | `entry.frontend`  | `string`        | 否\* | 已构建的前端 bundle 路径（如 `dist/index.js`）。                                                                                                                      |
-| `dependencies`    | `string[]`      | 否   | Python 依赖列表，安装时通过 pip / uv 自动安装。                                                                                                                       |
+| `dependencies`    | `string[]`      | 否   | Python 包依赖，与 `requirements.txt` 合并检查；显式安装、更新或修复时安装缺失项，启动时只检查。                                                                       |
 | `qwenpaw_version` | `object`        | 否   | QwenPaw 版本约束（推荐）。包含 `min`（包含）和 `max`（不包含，可选）两个子字段，语义为 `>=min, <max`。省略 `max` 时默认取 `{major}.{minor+1}.0`。                     |
 | `min_version`     | `string`        | 否   | **遗留字段。** 需要的最低 QwenPaw 版本。当 `qwenpaw_version` 存在时被忽略，仅为兼容第三方旧插件保留。                                                                 |
 | `max_version`     | `string`        | 否   | **遗留字段。** 不兼容的第一个 QwenPaw 版本（不包含）。配合 `min_version` 使用；省略时从 `min_version` 推导。                                                          |
@@ -2471,14 +2471,27 @@ def register(self, api: PluginApi):
 
 ### 依赖管理
 
-#### 使用 requirements.txt
+#### 声明 Python 包依赖
 
-如果插件需要额外的 Python 包，创建 `requirements.txt`：
+可以在 `plugin.json` 中声明依赖，无需同时创建 `requirements.txt`：
+
+```json
+{
+  "dependencies": ["httpx>=0.24.0", "pydantic>=2.0.0"]
+}
+```
+
+也可以使用 `requirements.txt`：
 
 ```
 httpx>=0.24.0
 pydantic>=2.0.0
 ```
+
+两处声明会合并后进入同一依赖检查和安装流程，不存在覆盖优先级。例如清单声明
+`example-package>=1.0`、文件声明 `example-package<2.0`，环境必须同时满足两项约束；
+互相冲突的约束会使检查或依赖解析失败。建议只在一处维护同一项依赖，避免重复声明。
+这里的 `dependencies` 指 Python 包，不是其他插件 ID 或运行时服务依赖。
 
 显式安装、更新或修复时，框架检查并安装缺失依赖。开机只检查，不自动安装；缺失依赖会
 使该插件加载失败。可调用 `POST /api/plugins/{plugin_id}/repair-dependencies` 修复；
@@ -2494,6 +2507,8 @@ my-package>=1.0.0
 
 支持单独一行的 `--index-url URL` 或 `--index-url=URL`。源地址交给 pip / uv，
 依赖包仍接受版本和宿主包检查。其他选项、嵌套 `-r` 文件、extras 和直接 URL 依赖暂不支持。
+源配置只能写在 `requirements.txt` 中；manifest 的每个依赖项必须是一条包名及可选版本、
+环境条件声明，不能包含安装选项或多行文本。
 
 ### 最佳实践
 

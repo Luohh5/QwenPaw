@@ -19,6 +19,8 @@ from wechat_w2_session_suite import qr, qr_leases, narrow_legacy_test_guard
 from wechat_w2_scope_suite import request
 from wechat_w3_router_suite import api_http
 
+__all__ = ["api_http"]
+
 
 def scope_b(fixture):
     return fixture.qr.api.resolve_channel_management_scope(
@@ -27,24 +29,38 @@ def scope_b(fixture):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_caller", [False, True])
 async def test_unloaded_workspace_stop_revokes_a_and_holds_admission_during_await(
-    api_http, monkeypatch
+    api_http, monkeypatch, cancel_caller
 ):
     fixture = api_http
     await fixture.qr.sessions.fetch(fixture.qr.scope, {})
     b = await fixture.qr.sessions.fetch(scope_b(fixture), {})
     entered, release = asyncio.Event(), asyncio.Event()
     original = fixture.manager._stop_agent
+    calls = []
 
     async def gate(agent_id):
+        calls.append(agent_id)
         entered.set()
         await release.wait()
         return await original(agent_id)
 
     monkeypatch.setattr(fixture.manager, "_stop_agent", gate)
+    queued = None
+    operation_lock = asyncio.Lock()
+    if cancel_caller:
+        await operation_lock.acquire()
+        fixture.manager._operation_locks["A"] = operation_lock
     stopping = asyncio.create_task(fixture.manager.stop_agent("A"))
+    if cancel_caller:
+        queued = asyncio.create_task(fixture.manager.stop_agent("A"))
+        async with asyncio.timeout(1):
+            while len(fixture.manager._operations) != 2:
+                await asyncio.sleep(0)
+        operation_lock.release()
     try:
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), 3)
         assert not fixture.manager.agents
         assert len(qr_leases(fixture.qr)) == 1
         busy = await fixture.client.get(f"/config/channels/{KEY}/qrcode")
@@ -55,8 +71,18 @@ async def test_unloaded_workspace_stop_revokes_a_and_holds_admission_during_awai
         assert (
             await fixture.qr.sessions.poll(scope_b(fixture), b.poll_token)
         ).status == "confirmed"
+        if cancel_caller:
+            stopping.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(stopping, 1)
+            busy = await fixture.client.get(f"/config/channels/{KEY}/qrcode")
+            assert busy.status_code == 409
+            assert busy.json()["detail"] == "MANAGEMENT_BUSY"
+            assert queued is not None and not queued.done()
+            stopping = queued
         release.set()
         assert await stopping is False
+        assert calls == ["A"]
         reopened = await fixture.client.get(f"/config/channels/{KEY}/qrcode")
         assert reopened.status_code == 200, reopened.text
     finally:

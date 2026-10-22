@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Model-provider contracts independent of AgentScope and host internals."""
 
 from dataclasses import dataclass, field
@@ -90,7 +91,8 @@ class ProviderSpec:
     ) = None
     check_connection: (
         Callable[
-            [ProviderContext, float], ConnectionResult | Awaitable[ConnectionResult]
+            [ProviderContext, float],
+            ConnectionResult | Awaitable[ConnectionResult],
         ]
         | None
     ) = None

@@ -1,11 +1,20 @@
-"""Immutable observations; subscribers never participate in business decisions."""
+# -*- coding: utf-8 -*-
+"""
+Immutable observations; subscribers never participate in business decisions.
+"""
 
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Union, Awaitable
 from .tools import ToolContext
 
 JSONValue = Union[
-    None, bool, int, float, str, tuple["JSONValue", ...], Mapping[str, "JSONValue"]
+    None,
+    bool,
+    int,
+    float,
+    str,
+    tuple["JSONValue", ...],
+    Mapping[str, "JSONValue"],
 ]
 
 

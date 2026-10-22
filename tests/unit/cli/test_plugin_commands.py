@@ -927,11 +927,13 @@ def test_offline_force_dependency_failure_preserves_old(
         target,
         plugin_id,
         requirements_file,
+        *,
+        source_path,
     ):
         calls.append((requirements_file, plugin_id, target))
         assert requirements_file == source / "requirements.txt"
         assert plugin_id == "demo"
-        assert spec.code_root == source
+        assert spec.code_root == source_path == source
         assert (
             process is not None and snapshot is not None and target is not None
         )

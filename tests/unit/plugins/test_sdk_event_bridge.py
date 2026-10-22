@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Lossless immutable runtime event snapshots; no renderer-specific truncation."""
+"""Lossless immutable runtime event snapshots; no renderer-specific
+truncation.
+"""
 
 from copy import deepcopy
 
@@ -42,7 +44,7 @@ def test_runtime_snapshot_preserves_multimodal_tools_and_unknown_fields():
                 ],
                 "metadata": {"nested": {"values": [1, 2]}},
                 "provider_field": "retained",
-            }
+            },
         ],
         "usage": {"input_tokens": 5, "output_tokens": 3},
     }

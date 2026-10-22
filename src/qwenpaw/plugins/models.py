@@ -1,4 +1,8 @@
+# -*- coding: utf-8 -*-
 """Single model requests using the calling workspace's configured providers."""
+
+# Host adapters access private ownership state behind the public SDK.
+# pylint: disable=protected-access
 
 from __future__ import annotations
 
@@ -12,7 +16,8 @@ from .messages import Message
 from .providers import ModelChunk, ModelToolChoice
 from .errors import SDKError, StaleContextError
 
-# These are generation controls, never alternate credentials, endpoints or input.
+# These are generation controls, never alternate credentials, endpoints or
+# input.
 _OPTIONS = frozenset(
     {
         "temperature",
@@ -27,12 +32,14 @@ _OPTIONS = frozenset(
         "reasoning_effort",
         "thinking_budget",
         "enable_thinking",
-    }
+    },
 )
 
 
 class ModelService:
-    """Use context.models; each request remains owned by that callback scope."""
+    """
+    Use context.models; each request remains owned by that callback scope.
+    """
 
     def __init__(self, context):
         self._context = context
@@ -42,11 +49,17 @@ class ModelService:
         if context._plugin is None:
             raise SDKError("Model services are created by the host")
         context._plugin._guard()
-        if context.resources.closed or context.resources._closing or context.cancelled:
+        if (
+            context.resources.closed
+            or context.resources._closing
+            or context.cancelled
+        ):
             raise StaleContextError("The model caller's scope has ended")
         if not context.workspace_id:
             raise SDKError("Model requests require a workspace-bound context")
 
+    # Keep the ownership state machine in one scope.
+    # pylint: disable-next=too-many-statements
     async def stream(
         self,
         messages: Sequence[Message],
@@ -65,24 +78,39 @@ class ModelService:
             create_model_and_formatter,
             _model_creation_observer,
         )
-        from ..providers.provider_manager import ProviderManager, ModelSlotConfig
+        from ..providers.provider_manager import (
+            ProviderManager,
+            ModelSlotConfig,
+        )
         from ..utils.io_utils import run_sync_io
         import math
 
         self._guard()
-        if bool(provider_id) != bool(model_id) or provider_id == "" or model_id == "":
-            raise SDKError("provider_id and model_id must be supplied together")
+        if (
+            bool(provider_id) != bool(model_id)
+            or provider_id == ""
+            or model_id == ""
+        ):
+            raise SDKError(
+                "provider_id and model_id must be supplied together",
+            )
         values = json_mapping({} if options is None else options)
         if unknown := values.keys() - _OPTIONS:
-            raise SDKError(f"Unsupported model options: {', '.join(sorted(unknown))}")
-        if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
+            raise SDKError(
+                f"Unsupported model options: {', '.join(sorted(unknown))}",
+            )
+        if timeout is not None and (
+            not math.isfinite(timeout) or timeout <= 0
+        ):
             raise SDKError("Model timeout must be finite and positive")
         context = self._context
         plugin = context._plugin
         deadline = context.deadline
         if timeout is not None:
             requested = asyncio.get_running_loop().time() + timeout
-            deadline = requested if deadline is None else min(deadline, requested)
+            deadline = (
+                requested if deadline is None else min(deadline, requested)
+            )
         messages = deepcopy(tuple(messages))
         tools = tuple(json_mapping(tool) for tool in tools)
         names = set()
@@ -96,43 +124,62 @@ class ModelService:
                 or not isinstance(function.get("parameters", {}), dict)
             ):
                 raise SDKError(
-                    "Model tools require function declarations with a name and schema"
+                    "Model tools require function declarations with a name "
+                    "and schema",
                 )
             if function["name"] in names:
                 raise SDKError("Model tool names must be unique")
             names.add(function["name"])
         if tool_choice is not None:
-            selected = names if tool_choice.tools is None else set(tool_choice.tools)
+            selected = (
+                names if tool_choice.tools is None else set(tool_choice.tools)
+            )
             if not selected <= names or tool_choice.mode not in {
                 "auto",
                 "none",
                 "required",
                 *selected,
             }:
-                raise SDKError("Model tool choice refers to an undeclared tool")
+                raise SDKError(
+                    "Model tool choice refers to an undeclared tool",
+                )
             if tool_choice.mode == "required" and not selected:
-                raise SDKError("Required tool choice needs at least one declared tool")
+                raise SDKError(
+                    "Required tool choice needs at least one declared tool",
+                )
 
         def build():
             reference = load_config().agents.profiles.get(context.workspace_id)
             if reference is None or not reference.enabled:
-                raise SDKError("The calling workspace is not configured and enabled")
+                raise SDKError(
+                    "The calling workspace is not configured and enabled",
+                )
             workspace = Path(reference.workspace_dir).expanduser()
             override = None
             if provider_id is not None:
-                provider = ProviderManager.get_instance().get_provider(provider_id)
+                provider = ProviderManager.get_instance().get_provider(
+                    provider_id,
+                )
                 if (
                     provider is None
                     or not provider.enabled
                     or provider.get_model_info(model_id) is None
                 ):
                     raise SDKError(
-                        "The selected provider/model is not configured and enabled"
+                        "The selected provider/model is not configured and "
+                        "enabled",
                     )
-                override = ModelSlotConfig(provider_id=provider_id, model=model_id)
+                override = ModelSlotConfig(
+                    provider_id=provider_id,
+                    model=model_id,
+                )
             token = _model_creation_observer.set(lease)
             try:
-                with model_context(workspace, context.session_id, context.workspace_id):
+                with model_context(
+                    workspace,
+                    context.session_id,
+                    context.workspace_id,
+                ):
                     lease.model = create_model_and_formatter(
                         agent_id=context.workspace_id,
                         model_slot_override=override,
@@ -182,15 +229,20 @@ class ModelService:
                     if isinstance(exc, SDKError):
                         raise
                     raise SDKError(
-                        f"Configured model request failed: {type(exc).__name__}: {exc}"
+                        f"Configured model request failed: "
+                        f"{type(exc).__name__}: {exc}",
                     ) from exc
                 finally:
+                    from ..utils.io_utils import run_async_to_completion
+
                     owned.closing = True
                     _stream_observer.reset(observer_token)
                     _stream_tasks.reset(owner_token)
                     model_deadline.reset(deadline_token)
                     model_workspace_id.reset(workspace_token)
-                    while pending := {task for task in owned.tasks if not task.done()}:
+                    while pending := {
+                        task for task in owned.tasks if not task.done()
+                    }:
                         for task in pending:
                             task.cancel()
                         try:
@@ -199,8 +251,10 @@ class ModelService:
                             pass
                     while owned.streams or owned.scopes:
                         for close in owned.closers():
+                            closing = asyncio.create_task(close())
+                            plugin._instance.activity.retain_cleanup(closing)
                             try:
-                                await close()
+                                await run_async_to_completion(closing)
                             except (Exception, asyncio.CancelledError):
                                 pass
                         if owned.streams or owned.scopes:

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Compile standalone npm package as an external author in both module modes."""
 
 import argparse
@@ -31,7 +32,9 @@ environment = {
     "npm_config_cache": str(root / "npm-cache"),
     "npm_config_userconfig": str(root / "npmrc"),
 }
-(root / "package.json").write_text(json.dumps({"private": True, "type": "module"}))
+(root / "package.json").write_text(
+    json.dumps({"private": True, "type": "module"}),
+)
 packed = json.loads(
     subprocess.check_output(
         [
@@ -45,7 +48,7 @@ packed = json.loads(
         text=True,
         cwd=root,
         env=environment,
-    )
+    ),
 )[0]
 tarball = root / packed["filename"]
 subprocess.run(
@@ -63,8 +66,12 @@ subprocess.run(
 )
 for name in ("@types/react", "@types/prop-types", "csstype"):
     shutil.copytree(args.dependencies / name, root / "node_modules" / name)
-(root / "author.ts").write_text("""
-import { SDK_VERSION, getHost, forApp, tasks, capabilities, type TaskSnapshot, type CancelResult, type PluginRouteDeclaration } from "@qwenpaw/plugin-sdk";
+(root / "author.ts").write_text(
+    """
+import {
+  SDK_VERSION, getHost, forApp, tasks, capabilities,
+  type TaskSnapshot, type CancelResult, type PluginRouteDeclaration,
+} from "@qwenpaw/plugin-sdk";
 import "@qwenpaw/plugin-sdk/globals";
 const version: string = SDK_VERSION;
 const host = getHost();
@@ -93,7 +100,8 @@ async function watch() {
 }
 void check;
 void watch;
-""")
+""",
+)
 results = {}
 for mode, resolution in (("NodeNext", "NodeNext"), ("ESNext", "bundler")):
     options = {
@@ -117,6 +125,7 @@ for mode, resolution in (("NodeNext", "NodeNext"), ("ESNext", "bundler")):
             str(root / "tsconfig.json"),
         ],
         cwd=root,
+        check=False,
         capture_output=True,
         text=True,
     )
@@ -126,7 +135,8 @@ for mode, resolution in (("NodeNext", "NodeNext"), ("ESNext", "bundler")):
         "stderr": result.stderr,
     }
 (root / "results.json").write_text(json.dumps(results, indent=2))
-(root / "runtime.mjs").write_text("""
+(root / "runtime.mjs").write_text(
+    """
 import assert from "node:assert/strict";
 import {getHost, capabilities, tasks} from "@qwenpaw/plugin-sdk";
 assert.throws(() => getHost(), /unavailable/);
@@ -134,8 +144,23 @@ let declaration, requests = [], expectedOptions, failQuery = false, streamClosed
 globalThis.window = {QwenPaw: {paw: {forApp(appId) {
   assert.equal(appId, "author-app");
   return {api: {
-    async get(path, options) { if (expectedOptions) assert.equal(options, expectedOptions, "capability and task requests must keep scope and AbortSignal"); if (path === "/.sdk") { if (failQuery) throw new Error("offline"); return declaration; } requests.push(path); return {run_id:"run"}; },
-    async post(path, body, options) { if (expectedOptions) assert.equal(options, expectedOptions); requests.push([path, body]); return {run_id:"run"}; },
+    async get(path, options) {
+      if (expectedOptions) assert.equal(
+        options, expectedOptions,
+        "capability and task requests must keep scope and AbortSignal",
+      );
+      if (path === "/.sdk") {
+        if (failQuery) throw new Error("offline");
+        return declaration;
+      }
+      requests.push(path);
+      return {run_id:"run"};
+    },
+    async post(path, body, options) {
+      if (expectedOptions) assert.equal(options, expectedOptions);
+      requests.push([path, body]);
+      return {run_id:"run"};
+    },
     async *events(path, options) {
       assert.equal(path, "/tasks/run%2Fother/stream");
       assert.deepEqual(options, {...expectedOptions, method:"GET"});
@@ -150,7 +175,11 @@ assert.equal((await capabilities("author-app")).status, "unknown");
 await assert.rejects(api.start({message:"hello"}), /capability/);
 assert.equal(requests.length, 0);
 failQuery = false;
-for (const value of [undefined, {sdk_version:"2.0.0", capabilities:["tasks"]}, {sdk_version:"1.0.0", capabilities:[]}]) {
+for (const value of [
+  undefined,
+  {sdk_version:"2.0.0", capabilities:["tasks"]},
+  {sdk_version:"1.0.0", capabilities:[]},
+]) {
   declaration = value;
   await assert.rejects(api.start({message:"hello"}), /capability/);
   assert.equal(requests.length, 0);
@@ -160,8 +189,14 @@ assert.equal((await capabilities("author-app")).status, "supported");
 await api.start({message:"hello"});
 await api.get("run/other");
 await api.cancel("run/other");
-assert.deepEqual(requests, [["/tasks", {message:"hello"}], "/tasks/run%2Fother", ["/tasks/run%2Fother/cancel", {}]]);
-expectedOptions = {signal: new AbortController().signal, query: {agent_id:"isolated-workspace", session_id:"author-session"}};
+assert.deepEqual(requests, [
+  ["/tasks", {message:"hello"}],
+  "/tasks/run%2Fother", ["/tasks/run%2Fother/cancel", {}],
+]);
+expectedOptions = {
+  signal: new AbortController().signal,
+  query: {agent_id:"isolated-workspace", session_id:"author-session"},
+};
 await api.start({message:"scoped", session_id:"author-session"}, expectedOptions);
 await api.get("scoped-run", expectedOptions);
 await api.cancel("scoped-run", expectedOptions);
@@ -172,9 +207,14 @@ await stream.return();
 assert.equal(streamClosed, true);
 assert.equal(requests.length, requestCount, "Disconnect must not cancel the owned task");
 console.log("standalone runtime capability gates and encoded task routes passed");
-""")
+""",
+)
 runtime = subprocess.run(
-    ["node", "runtime.mjs"], cwd=root, capture_output=True, text=True
+    ["node", "runtime.mjs"],
+    cwd=root,
+    check=False,
+    capture_output=True,
+    text=True,
 )
 results["runtime"] = {
     "returncode": runtime.returncode,

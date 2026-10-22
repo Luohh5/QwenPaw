@@ -20,7 +20,7 @@ def make_plugin(tmp_path, body):
                 "version": "1.0.0",
                 "entry": {"backend": "main.py"},
                 "sdk": {"version": "1.0", "capabilities": ["resources"]},
-            }
+            },
         ),
         encoding="utf-8",
     )
@@ -47,13 +47,16 @@ plugin = Plugin()
     async with PluginTestHost(tmp_path / "host") as host:
         with pytest.raises(RuntimeError, match="activation broke"):
             await host.load(
-                make_plugin(tmp_path, source), config={"marker": str(marker)}
+                make_plugin(tmp_path, source),
+                config={"marker": str(marker)},
             )
         assert marker.read_text() == "closed"
         host.assert_quiescent("resource-contract")
 
 
-async def test_close_failure_blocks_replacement_and_remains_retryable(tmp_path):
+async def test_close_failure_blocks_replacement_and_remains_retryable(
+    tmp_path,
+):
     from qwenpaw.plugins.testing import PluginTestHost
 
     source = """
@@ -77,7 +80,8 @@ plugin = Plugin()
     blocked.touch()
     async with PluginTestHost(tmp_path / "host") as host:
         await host.load(
-            make_plugin(tmp_path, source), config={"directory": str(tmp_path)}
+            make_plugin(tmp_path, source),
+            config={"directory": str(tmp_path)},
         )
         before = host.resource_snapshot("resource-contract")
         try:
@@ -87,7 +91,9 @@ plugin = Plugin()
             assert (tmp_path / "close-attempted").exists()
             failed = host.resource_snapshot("resource-contract")
             assert failed["owner"] == before["owner"]
-            assert failed["resources"], "Failed close must retain resource ownership"
+            assert failed[
+                "resources"
+            ], "Failed close must retain resource ownership"
             with pytest.raises(AssertionError):
                 host.assert_quiescent("resource-contract")
         finally:
@@ -101,17 +107,22 @@ async def test_child_scope_release_is_idempotent_and_instance_local(tmp_path):
     from qwenpaw.plugins.testing import PluginTestHost
 
     source = (
-        "class Plugin:\n    def register(self, ctx):\n        pass\nplugin = Plugin()\n"
+        "class Plugin:\n    def register(self, ctx):\n        "
+        "pass\nplugin = Plugin()\n"
     )
     closed, scopes = [], []
     async with PluginTestHost(tmp_path / "host") as host:
         ctx = await host.load(make_plugin(tmp_path, source))
         for workspace, instance in [("one", "a"), ("one", "b"), ("two", "a")]:
-            scope = ctx.resources.child(workspace_id=workspace, instance_id=instance)
+            scope = ctx.resources.child(
+                workspace_id=workspace,
+                instance_id=instance,
+            )
             scope.defer(lambda key=(workspace, instance): closed.append(key))
             scopes.append(scope)
         assert [
-            (scope.owner.workspace_id, scope.owner.instance_id) for scope in scopes
+            (scope.owner.workspace_id, scope.owner.instance_id)
+            for scope in scopes
         ] == [
             ("one", "a"),
             ("one", "b"),
@@ -144,7 +155,8 @@ plugin = Plugin()
     async with PluginTestHost(tmp_path / "host") as host:
         with pytest.raises(SDKError):
             await host.load(
-                make_plugin(tmp_path, source), config={"marker": str(marker)}
+                make_plugin(tmp_path, source),
+                config={"marker": str(marker)},
             )
         assert not marker.exists()
         host.assert_quiescent("resource-contract")
@@ -154,7 +166,8 @@ async def test_synchronous_cleanup_does_not_block_host_event_loop(tmp_path):
     from qwenpaw.plugins.testing import PluginTestHost
 
     source = (
-        "class Plugin:\n    def register(self, ctx):\n        pass\nplugin = Plugin()\n"
+        "class Plugin:\n    def register(self, ctx):\n        "
+        "pass\nplugin = Plugin()\n"
     )
     release = threading.Event()
     timer = threading.Timer(0.3, release.set)
@@ -162,11 +175,16 @@ async def test_synchronous_cleanup_does_not_block_host_event_loop(tmp_path):
         async with PluginTestHost(tmp_path / "host") as host:
             ctx = await host.load(make_plugin(tmp_path, source))
             heartbeat = asyncio.Event()
-            handle = ctx.resources.defer(lambda: release.wait(2), "blocking-close")
+            handle = ctx.resources.defer(
+                lambda: release.wait(2),
+                "blocking-close",
+            )
             asyncio.get_running_loop().call_later(0.02, heartbeat.set)
             timer.start()
             await handle.close()
-            assert heartbeat.is_set(), "Synchronous cleanup blocked unrelated host work"
+            assert (
+                heartbeat.is_set()
+            ), "Synchronous cleanup blocked unrelated host work"
             assert handle.closed
     finally:
         release.set()
@@ -174,11 +192,14 @@ async def test_synchronous_cleanup_does_not_block_host_event_loop(tmp_path):
             timer.join(timeout=1)
 
 
-async def test_cancelling_close_waiter_retains_underlying_sync_cleanup(tmp_path):
+async def test_cancelling_close_waiter_retains_underlying_sync_cleanup(
+    tmp_path,
+):
     from qwenpaw.plugins.testing import PluginTestHost
 
     source = (
-        "class Plugin:\n    def register(self, ctx):\n        pass\nplugin = Plugin()\n"
+        "class Plugin:\n    def register(self, ctx):\n        "
+        "pass\nplugin = Plugin()\n"
     )
     entered, release = threading.Event(), threading.Event()
     calls = []
@@ -216,7 +237,8 @@ async def test_unstoppable_thread_prevents_successful_unload(tmp_path):
     from qwenpaw.plugins.testing import PluginTestHost
 
     source = (
-        "class Plugin:\n    def register(self, ctx):\n        pass\nplugin = Plugin()\n"
+        "class Plugin:\n    def register(self, ctx):\n        "
+        "pass\nplugin = Plugin()\n"
     )
     stop, release = threading.Event(), threading.Event()
     async with PluginTestHost(tmp_path / "host") as host:
@@ -227,9 +249,16 @@ async def test_unstoppable_thread_prevents_successful_unload(tmp_path):
             description="ignores-stop",
         )
         try:
-            report = await asyncio.wait_for(host.unload("resource-contract"), 8)
+            report = await asyncio.wait_for(
+                host.unload("resource-contract"),
+                8,
+            )
             assert stop.is_set() and worker.is_alive()
-            assert not report.clean and not report.quiescent and report.needs_restart
+            assert (
+                not report.clean
+                and not report.quiescent
+                and report.needs_restart
+            )
             assert (
                 "ignores-stop"
                 in host.resource_snapshot("resource-contract")["resources"]
@@ -242,26 +271,35 @@ async def test_unstoppable_thread_prevents_successful_unload(tmp_path):
         assert report.clean and report.quiescent
 
 
-async def test_finished_managed_tasks_do_not_accumulate_live_resources(tmp_path):
+async def test_finished_managed_tasks_do_not_accumulate_live_resources(
+    tmp_path,
+):
     from qwenpaw.plugins.testing import PluginTestHost
 
     source = (
-        "class Plugin:\n    def register(self, ctx):\n        pass\nplugin = Plugin()\n"
+        "class Plugin:\n    def register(self, ctx):\n        "
+        "pass\nplugin = Plugin()\n"
     )
     async with PluginTestHost(tmp_path / "host") as host:
         ctx = await host.load(make_plugin(tmp_path, source))
         for _ in range(100):
-            await ctx.resources.task(asyncio.sleep(0), description="short-lived")
+            await ctx.resources.task(
+                asyncio.sleep(0),
+                description="short-lived",
+            )
         await asyncio.sleep(0)
         assert host.resource_snapshot("resource-contract")["resources"] == ()
         host.assert_quiescent("resource-contract")
 
 
-async def test_owned_process_stops_without_touching_independent_process(tmp_path):
+async def test_owned_process_stops_without_touching_independent_process(
+    tmp_path,
+):
     from qwenpaw.plugins.testing import PluginTestHost
 
     source = (
-        "class Plugin:\n    def register(self, ctx):\n        pass\nplugin = Plugin()\n"
+        "class Plugin:\n    def register(self, ctx):\n        "
+        "pass\nplugin = Plugin()\n"
     )
     command = [sys.executable, "-c", "import time; time.sleep(10)"]
     independent = subprocess.Popen(command)
@@ -283,7 +321,8 @@ async def test_finished_background_failure_remains_diagnosable(tmp_path):
     from qwenpaw.plugins.testing import PluginTestHost
 
     source = (
-        "class Plugin:\n    def register(self, ctx):\n        pass\nplugin = Plugin()\n"
+        "class Plugin:\n    def register(self, ctx):\n        "
+        "pass\nplugin = Plugin()\n"
     )
 
     async def fail():
@@ -297,7 +336,8 @@ async def test_finished_background_failure_remains_diagnosable(tmp_path):
         snapshot = host.resource_snapshot("resource-contract")
         assert snapshot["resources"] == ()
         assert any(
-            "background-contract-failure" in error for error in snapshot["errors"]
+            "background-contract-failure" in error
+            for error in snapshot["errors"]
         )
 
 
@@ -306,7 +346,8 @@ async def test_closed_child_scopes_release_parent_registration(tmp_path):
     from qwenpaw.plugins.testing import PluginTestHost
 
     source = (
-        "class Plugin:\n    def register(self, ctx):\n        pass\nplugin = Plugin()\n"
+        "class Plugin:\n    def register(self, ctx):\n        "
+        "pass\nplugin = Plugin()\n"
     )
     async with PluginTestHost(tmp_path / "host") as host:
         ctx = await host.load(make_plugin(tmp_path, source))
@@ -332,7 +373,9 @@ async def test_closed_child_scopes_release_parent_registration(tmp_path):
         with pytest.raises(SDKError, match="still owns"):
             await child.close()
         assert not child.closed
-        assert ctx.resources.snapshot()["resources"] == initial + ("scope::retry",)
+        assert ctx.resources.snapshot()["resources"] == initial + (
+            "scope::retry",
+        )
         blocked = False
         await child.close()
         assert child.closed
@@ -343,7 +386,8 @@ async def test_child_release_preserves_same_owner_siblings(tmp_path):
     from qwenpaw.plugins.testing import PluginTestHost
 
     source = (
-        "class Plugin:\n    def register(self, ctx):\n        pass\nplugin = Plugin()\n"
+        "class Plugin:\n    def register(self, ctx):\n        "
+        "pass\nplugin = Plugin()\n"
     )
     async with PluginTestHost(tmp_path / "host") as host:
         ctx = await host.load(make_plugin(tmp_path, source))
@@ -360,11 +404,14 @@ async def test_child_release_preserves_same_owner_siblings(tmp_path):
         assert ctx.resources.snapshot()["resources"] == ()
 
 
-async def test_parent_and_child_concurrent_close_wait_for_one_real_cleanup(tmp_path):
+async def test_parent_and_child_concurrent_close_wait_for_one_real_cleanup(
+    tmp_path,
+):
     from qwenpaw.plugins.testing import PluginTestHost
 
     source = (
-        "class Plugin:\n    def register(self, ctx):\n        pass\nplugin = Plugin()\n"
+        "class Plugin:\n    def register(self, ctx):\n        "
+        "pass\nplugin = Plugin()\n"
     )
     entered, release = asyncio.Event(), asyncio.Event()
     calls = []
@@ -385,7 +432,9 @@ async def test_parent_and_child_concurrent_close_wait_for_one_real_cleanup(tmp_p
         try:
             await asyncio.sleep(0.02)
             assert not direct.done() and not parent.done()
-            assert ctx.resources.snapshot()["resources"] == ("scope::concurrent",)
+            assert ctx.resources.snapshot()["resources"] == (
+                "scope::concurrent",
+            )
         finally:
             release.set()
             await asyncio.wait_for(asyncio.gather(direct, parent), 2)

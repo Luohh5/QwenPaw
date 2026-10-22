@@ -37,7 +37,7 @@ repos:
     hooks:
       - id: mypy
         # The author fixture is checked strictly against the installed SDK by
-        # scripts/check_plugin_sdk_artifacts.py in CI.
+        # scripts/check_plugin_sdk_artifacts.py during manual artifact validation.
         exclude:
           (?x)(
           pb2\.py$

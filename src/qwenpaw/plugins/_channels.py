@@ -167,6 +167,10 @@ def register(plugin, spec):
                             status = "failed"
                             raise
                         finally:
+                            from ..utils.io_utils import (
+                                run_async_to_completion,
+                            )
+
                             owned.closing = True
                             _stream_observer.reset(observer_token)
                             _stream_tasks.reset(owner_token)
@@ -188,8 +192,14 @@ def register(plugin, spec):
                                     status = "cancelled"
                             while owned.streams or owned.scopes:
                                 for close_scope in owned.closers():
+                                    closing = asyncio.create_task(
+                                        close_scope(),
+                                    )
+                                    plugin._instance.activity.retain_cleanup(
+                                        closing,
+                                    )
                                     try:
-                                        await close_scope()
+                                        await run_async_to_completion(closing)
                                     except asyncio.CancelledError:
                                         status = "cancelled"
                                     except Exception as exc:

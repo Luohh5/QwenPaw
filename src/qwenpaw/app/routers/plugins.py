@@ -26,6 +26,7 @@ from ...plugins.dependency_upgrade import (
 from ...plugins.dependency_gate import SharedDependencyError
 from ...market.registry import MarketProviderBusyError
 from ...plugins.activity import PluginBusyError
+from ...plugins.registry import MemoryBackendInUseError
 
 logger = logging.getLogger(__name__)
 
@@ -685,24 +686,15 @@ async def uninstall_plugin(
                 loaded=exc.loaded,
             ),
         ) from exc
-    except RuntimeError as exc:
-        if "memory backend is in use" in str(exc):
-            still_loaded = loader.get_loaded_plugin(plugin_id) is not None
-            raise HTTPException(
-                status_code=409,
-                detail=memory_in_use_detail(
-                    plugin_id,
-                    exc,
-                    loaded=still_loaded,
-                ),
-            ) from exc
-        logger.error(
-            f"Plugin uninstall failed for '{_log_safe(plugin_id)}': {exc}",
-            exc_info=True,
-        )
+    except MemoryBackendInUseError as exc:
+        still_loaded = loader.get_loaded_plugin(plugin_id) is not None
         raise HTTPException(
-            status_code=500,
-            detail=f"Plugin uninstallation failed: {exc}",
+            status_code=409,
+            detail=memory_in_use_detail(
+                plugin_id,
+                exc,
+                loaded=still_loaded,
+            ),
         ) from exc
     except Exception as exc:
         logger.error(
@@ -754,18 +746,16 @@ async def unload_plugin_keep_config(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PluginBusyError as exc:
         raise HTTPException(status_code=409, detail=exc.detail) from exc
-    except RuntimeError as exc:
-        if "memory backend is in use" in str(exc):
-            still_loaded = loader.get_loaded_plugin(plugin_id) is not None
-            raise HTTPException(
-                status_code=409,
-                detail=memory_in_use_detail(
-                    plugin_id,
-                    exc,
-                    loaded=still_loaded,
-                ),
-            ) from exc
-        raise
+    except MemoryBackendInUseError as exc:
+        still_loaded = loader.get_loaded_plugin(plugin_id) is not None
+        raise HTTPException(
+            status_code=409,
+            detail=memory_in_use_detail(
+                plugin_id,
+                exc,
+                loaded=still_loaded,
+            ),
+        ) from exc
     still_loaded = loader.get_loaded_plugin(plugin_id) is not None
     payload = unload_http_detail(
         plugin_id,
