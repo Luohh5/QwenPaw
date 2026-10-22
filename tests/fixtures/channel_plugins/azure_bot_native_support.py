@@ -123,6 +123,8 @@ class Connector:
         self.upload_body = {"id": "attachment/id"}
         self.token_calls, self.token_apps = 0, []
         self.reads = []
+        self.download_handler = None
+        self.download_headers = []
         key = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(self.key.public_key()))
         self.keys = [
             {
@@ -156,9 +158,12 @@ class Connector:
         if request.path == "/keys":
             return web.json_response({"keys": self.keys})
         if request.path.startswith("/download/"):
+            self.download_headers.append(request.headers.copy())
             self.requests.append(
                 ("download", request.path, request.headers.get("Authorization"))
             )
+            if self.download_handler is not None:
+                return await self.download_handler(request)
             if request.path == "/download/redirect":
                 raise web.HTTPFound("https://media.test/download/target")
             if request.path == "/download/missing":

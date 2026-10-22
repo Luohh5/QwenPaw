@@ -2,7 +2,10 @@
 # flake8: noqa: F811
 
 from pathlib import Path
+import asyncio
+import gzip
 
+from aiohttp import web
 import pytest
 
 from azure_bot_native_support import (  # noqa: F401
@@ -11,6 +14,204 @@ from azure_bot_native_support import (  # noqa: F401
     rsa_material,
 )
 
+
+def streamed_download(body, framing, *, declared_length=None, encoding=None):
+    """Serve actual HTTP framing through the fixture's trusted TLS boundary."""
+
+    async def handle(request):
+        headers = {"Content-Type": "application/octet-stream"}
+        if encoding is not None:
+            headers["Content-Encoding"] = encoding
+        response = web.StreamResponse(headers=headers)
+        if framing == "length":
+            response.content_length = (
+                len(body) if declared_length is None else declared_length
+            )
+            if declared_length is not None:
+                response.force_close()
+        elif framing == "chunked":
+            response.enable_chunked_encoding()
+        else:
+            assert framing == "eof"
+            # HTTP/1.1 close-delimited bodies have neither length nor chunks.
+            response._length_check = False
+            response.force_close()
+        await response.prepare(request)
+        for offset in range(0, len(body), 7):
+            await response.write(body[offset : offset + 7])
+        await response.write_eof()
+        return response
+
+    return handle
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("framing", ["length", "chunked", "eof"])
+@pytest.mark.parametrize("size", [31, 32, 33])
+async def test_download_byte_limit_accepts_boundary_and_rejects_overflow(
+    azure, connector, monkeypatch, framing, size
+):
+    from azure_bot_native_support import platform_module
+
+    monkeypatch.setattr(
+        platform_module, "DOWNLOAD_MAX_BYTES", 32, raising=False
+    )
+    body = b"x" * size
+    connector.download_handler = streamed_download(body, framing)
+    async with azure() as (driver, _):
+        media = driver._platform.media_dir
+        before = set(media.rglob("*"))
+        part = await driver._platform._attachment(
+            {
+                "contentUrl": "https://media.test/download/size",
+                "contentType": "image/png",
+            },
+            "secret",
+        )
+        if size <= 32:
+            assert part is not None
+            assert Path(part["image_url"]).read_bytes() == body
+        else:
+            assert part is None
+            assert set(media.rglob("*")) == before
+        assert (
+            connector.download_headers[0].get("Accept-Encoding") == "identity"
+        )
+
+
+@pytest.mark.asyncio
+async def test_truncated_declared_download_leaves_no_file(
+    azure, connector, monkeypatch
+):
+    from azure_bot_native_support import platform_module
+
+    monkeypatch.setattr(
+        platform_module, "DOWNLOAD_MAX_BYTES", 32, raising=False
+    )
+    # A smaller declared length defines the body boundary in HTTP; a larger
+    # false length is truncated and must never publish the partial body.
+    connector.download_handler = streamed_download(
+        b"short", "length", declared_length=16
+    )
+    async with azure() as (driver, _):
+        media = driver._platform.media_dir
+        before = set(media.rglob("*"))
+        part = await driver._platform._attachment(
+            {
+                "contentUrl": "https://media.test/download/truncated",
+                "contentType": "image/png",
+            },
+            "secret",
+        )
+        assert part is None
+        assert set(media.rglob("*")) == before
+
+
+@pytest.mark.asyncio
+async def test_declared_overflow_rejected_without_waiting_for_body(
+    azure, connector, monkeypatch
+):
+    from azure_bot_native_support import platform_module
+
+    monkeypatch.setattr(
+        platform_module, "DOWNLOAD_MAX_BYTES", 32, raising=False
+    )
+    release_body = asyncio.Event()
+
+    async def headers_only(request):
+        response = web.StreamResponse(headers={"Content-Length": "33"})
+        await response.prepare(request)
+        await release_body.wait()
+        return response
+
+    connector.download_handler = headers_only
+    async with azure() as (driver, _):
+        media = driver._platform.media_dir
+        before = set(media.rglob("*"))
+        try:
+            part = await asyncio.wait_for(
+                driver._platform._attachment(
+                    {
+                        "contentUrl": "https://media.test/download/headers-only",
+                        "contentType": "image/png",
+                    },
+                    "secret",
+                ),
+                timeout=2,
+            )
+            assert part is None
+            assert set(media.rglob("*")) == before
+        finally:
+            release_body.set()
+
+
+@pytest.mark.asyncio
+async def test_http_compression_rejected_before_eager_decompression(
+    azure, connector, monkeypatch
+):
+    from aiohttp.compression_utils import ZLibDecompressor
+    from azure_bot_native_support import platform_module
+
+    # The encoded body fits the cap, so checking its wire size alone cannot
+    # satisfy the refusal of compressed HTTP representations.
+    monkeypatch.setattr(
+        platform_module, "DOWNLOAD_MAX_BYTES", 64, raising=False
+    )
+    decompressed = []
+    real_decompress = ZLibDecompressor.decompress_sync
+
+    def observed_decompress(self, *args, **kwargs):
+        decompressed.append(len(args[0]))
+        return real_decompress(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        ZLibDecompressor, "decompress_sync", observed_decompress
+    )
+    body = gzip.compress(b"x" * 4096)
+    assert len(body) < 64
+    connector.download_handler = streamed_download(
+        body, "length", encoding="gzip"
+    )
+    async with azure() as (driver, _):
+        media = driver._platform.media_dir
+        before = set(media.rglob("*"))
+        part = await driver._platform._attachment(
+            {
+                "contentUrl": "https://media.test/download/compressed",
+                "contentType": "image/png",
+            },
+            "secret",
+        )
+        assert (part, decompressed) == (None, [])
+        assert set(media.rglob("*")) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encoding", [None, "identity"])
+async def test_gzip_file_bytes_are_allowed_without_http_compression(
+    azure, connector, monkeypatch, encoding
+):
+    from azure_bot_native_support import platform_module
+
+    body = gzip.compress(b"archive contents")
+    monkeypatch.setattr(
+        platform_module, "DOWNLOAD_MAX_BYTES", 128, raising=False
+    )
+    connector.download_handler = streamed_download(
+        body, "length", encoding=encoding
+    )
+    async with azure() as (driver, _):
+        part = await driver._platform._attachment(
+            {
+                "contentUrl": "https://media.test/download/archive",
+                "contentType": "application/gzip",
+                "name": "archive.gz",
+            },
+            "secret",
+        )
+        assert part["type"] == "file"
+        assert part["filename"] == "archive.gz"
+        assert Path(part["file_url"]).read_bytes() == body
 
 @pytest.mark.asyncio
 async def test_unsafe_attachment_never_falls_back_to_untrusted_url(azure):

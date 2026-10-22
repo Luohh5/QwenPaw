@@ -154,6 +154,8 @@ def _hash_password(
 
 def verify_password(password: str, stored_hash: str, salt: str) -> bool:
     """Verify *password* against a stored hash."""
+    if not isinstance(stored_hash, str) or not isinstance(salt, str):
+        return False
     if stored_hash.startswith("pbkdf2_sha256$"):
         try:
             _, rounds, expected = stored_hash.split("$")
@@ -170,6 +172,8 @@ def verify_password(password: str, stored_hash: str, salt: str) -> bool:
             return False
     # Read-only compatibility for existing accounts. Successful authentication
     # immediately replaces this legacy digest with PBKDF2; never store it anew.
+    if re.fullmatch(r"[0-9a-f]{64}", stored_hash) is None:
+        return False
     legacy = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
     return hmac.compare_digest(legacy, stored_hash)
 

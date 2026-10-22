@@ -20,7 +20,7 @@ from .attachments import (
     attachment_url,
     attachment_uses_token,
 )
-from .constants import FILE_TOO_LARGE, UPLOAD_MAX_BYTES
+from .constants import DOWNLOAD_MAX_BYTES, FILE_TOO_LARGE, UPLOAD_MAX_BYTES
 from .state import AzureBotStateStore
 
 
@@ -378,7 +378,7 @@ class AzureBotPlatform:
         if not (isinstance(url, str) and url.startswith("data:")):
             try:
                 url = attachment_url(url)
-                headers = {}
+                headers = {"Accept-Encoding": "identity"}
                 if attachment_uses_token(url, service_url):
                     token = token or await self._get_bot_token()
                     headers["Authorization"] = f"Bearer {token}"
@@ -394,11 +394,31 @@ class AzureBotPlatform:
                     url,
                     headers=headers,
                     allow_redirects=False,
+                    auto_decompress=False,
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as response:
                     if response.status != 200:
                         raise ValueError("AZURE_ATTACHMENT_DOWNLOAD_FAILED")
-                    data = await response.read()
+                    if any(
+                        encoding.strip().lower() != "identity"
+                        for encoding in response.headers.getall(
+                            "Content-Encoding",
+                            [],
+                        )
+                    ) or (
+                        response.content_length is not None
+                        and response.content_length > DOWNLOAD_MAX_BYTES
+                    ):
+                        raise ValueError("AZURE_ATTACHMENT_DOWNLOAD_FAILED")
+                    data = bytearray()
+                    async for chunk in response.content.iter_chunked(
+                        64 * 1024,
+                    ):
+                        if len(data) + len(chunk) > DOWNLOAD_MAX_BYTES:
+                            raise ValueError(
+                                "AZURE_ATTACHMENT_DOWNLOAD_FAILED",
+                            )
+                        data.extend(chunk)
                     if not data:
                         raise ValueError("AZURE_ATTACHMENT_DOWNLOAD_FAILED")
                     safe = (

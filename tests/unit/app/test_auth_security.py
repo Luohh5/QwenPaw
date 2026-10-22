@@ -43,9 +43,16 @@ def test_new_passwords_use_work_factored_hashes():
     assert other_hash != stored
 
 
-def test_legacy_password_migrates_only_after_valid_login(auth_store):
-    salt = "0123456789abcdef"
-    legacy_hash = hashlib.sha256((salt + "password").encode()).hexdigest()
+@pytest.mark.parametrize(
+    "password, salt",
+    [("password", "0123456789abcdef"), ("旧密码 🔑", "任意盐🧂")],
+)
+def test_legacy_password_migrates_only_after_valid_login(
+    auth_store,
+    password,
+    salt,
+):
+    legacy_hash = hashlib.sha256((salt + password).encode()).hexdigest()
     auth_store.write_text(
         json.dumps(
             {
@@ -62,14 +69,14 @@ def test_legacy_password_migrates_only_after_valid_login(auth_store):
     before = auth_store.read_bytes()
     assert auth.authenticate("alice", "wrong") is None
     assert auth_store.read_bytes() == before
-    token = auth.authenticate("alice", "password")
+    token = auth.authenticate("alice", password)
     assert token is not None
     assert auth.verify_token(token) == "alice"
     migrated = json.loads(auth_store.read_text())["user"]
     assert migrated["password_hash"].startswith("pbkdf2_sha256$")
     assert migrated["password_salt"] != salt
     assert auth.verify_password(
-        "password",
+        password,
         migrated["password_hash"],
         migrated["password_salt"],
     )
@@ -109,6 +116,48 @@ def test_user_and_untrusted_token_logs_escape_line_breaks(auth_store, caplog):
 )
 def test_malformed_or_unsafe_password_hash_fails_closed(stored):
     assert auth.verify_password("password", stored, "salt") is False
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        None,
+        123,
+        b"a" * 64,
+        [],
+        {},
+        "",
+        "a" * 63,
+        "a" * 65,
+        "A" * 64,
+        "g" * 64,
+        "é" * 64,
+        "０" * 64,
+        "a" * 63 + "\n",
+        " a" * 32,
+        "sha256$" + "a" * 64,
+        "pbkdf2_sha512$600000$" + "a" * 64,
+    ],
+)
+def test_invalid_legacy_hash_rejected_before_sha256(stored, monkeypatch):
+    calls = []
+    real_sha256 = hashlib.sha256
+
+    def observed_sha256(*args, **kwargs):
+        calls.append(args)
+        return real_sha256(*args, **kwargs)
+
+    monkeypatch.setattr(auth.hashlib, "sha256", observed_sha256)
+    assert auth.verify_password("password", stored, "salt") is False
+    assert calls == []
+
+
+@pytest.mark.parametrize("salt", ["", "任意盐🧂", "x" * 257])
+def test_valid_legacy_unicode_password_keeps_arbitrary_salts(salt):
+    password = "旧密码 🔑"
+    stored = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    assert auth.verify_password(password, stored, salt) is True
+    assert auth.verify_password("wrong", stored, salt) is False
 
 
 def test_concurrent_registration_preserves_single_account(
