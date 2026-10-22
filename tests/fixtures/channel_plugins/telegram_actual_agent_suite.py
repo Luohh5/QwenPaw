@@ -21,7 +21,6 @@ from telegram_support import (
 )
 from g2_lifecycle_suite import official_zip_source
 from telegram_support import bind_telegram_runtime
-from extension_sample import ROOT
 
 
 @pytest.mark.asyncio
@@ -110,14 +109,6 @@ async def test_formal_zip_core_agent_model_pid_sdk_reply_and_public_session(
         "parent_threads": parent.num_threads(),
         "worker_count": 0,
     }
-    path = (
-        ROOT
-        / ".superpowers/sdd/2026-10-14-official-channel-pluginization"
-        / "scratch/telegram-local-worker-metrics.jsonl"
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as output:
-        output.write(json.dumps(metrics) + "\n")
 
 
 @pytest.mark.asyncio

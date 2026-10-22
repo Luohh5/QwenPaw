@@ -271,13 +271,6 @@ def record_worker_metrics(rt, started):
         + sum(worker["rss_bytes"] for worker in workers),
         "worker_count": len(workers),
     }
-    path = (
-        ROOT
-        / ".superpowers/sdd/2026-10-14-official-channel-pluginization/scratch/g2-local-worker-metrics.jsonl"
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as stream:
-        stream.write(json.dumps(row, ensure_ascii=False) + "\n")
     return row
 
 
@@ -728,41 +721,6 @@ async def test_official_zip_update_and_activation_rollback_recover_business(
             )
         )
     report = await rt.loader.lifecycle.reload(key, new_source=extracted / key)
-    if not activation_fails and not report.ok:
-        # Preserve unexpected evidence before pytest's temp retention removes it.
-        evidence = (
-            ROOT
-            / ".superpowers/sdd/2026-10-14-official-channel-pluginization/scratch"
-            / ("g2-update-failure-" + str(time.time_ns()))
-        )
-        evidence.mkdir(parents=True)
-        shutil.copy2(archive, evidence / "candidate.zip")
-        hashes = {}
-        for label, directory in (
-            ("candidate", extracted / key),
-            ("installed-after-rollback", rt.source),
-        ):
-            hashes[label] = {
-                file.relative_to(directory)
-                .as_posix(): hashlib.sha256(file.read_bytes())
-                .hexdigest()
-                for file in directory.rglob("*")
-                if file.is_file() and "__pycache__" not in file.parts
-            }
-        (evidence / "metadata.json").write_text(
-            json.dumps(
-                {
-                    "key": key,
-                    "errors": report.errors,
-                    "observations": observations,
-                    "old_pid": old_pid,
-                    "old_identity": identity(rt),
-                    "scope": "retained sources after failed reload; not failed worker observed bytes",
-                    "file_hashes": hashes,
-                },
-                indent=2,
-            )
-        )
     assert report.ok is not activation_fails, report.errors
     if activation_fails:
         assert report.errors and not report.needs_restart

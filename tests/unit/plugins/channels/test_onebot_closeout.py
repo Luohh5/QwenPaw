@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
 """Retained OneBot responsibilities at the actual v2 plugin boundary.
-
-Original assertions and contract changes: onebot-oracle-status.json.
 """
 
 import pytest

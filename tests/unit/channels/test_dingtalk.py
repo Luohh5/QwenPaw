@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Preserved DingTalk delivery/store/media behaviors on the artifact transport.
 
-Host session/ACL/Agent behaviors moved to B147/C2/C3 real worker tests;
-see c6-tests-report.md. The fixture has no old Channel implementation.
+Host session/ACL/Agent behaviors moved to B147/C2/C3 real worker tests.
+The fixture has no old Channel implementation.
 """
 # pylint: disable=protected-access,redefined-outer-name,unused-argument
 from __future__ import annotations

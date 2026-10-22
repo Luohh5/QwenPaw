@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
 """Retained QQ responsibilities on the private driver / official host.
-
-Original records and source hashes: qq-closeout-oracle-map.json.
 Native transport and lifecycle proofs retain their existing normal entries.
 """
 import pytest

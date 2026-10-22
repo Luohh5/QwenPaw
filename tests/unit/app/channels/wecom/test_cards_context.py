@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """Retained WeCom duties on the isolated official plugin boundaries.
 
-Original sources/assertions and intentional contract changes are retained in
-wecom-old-oracle-map.json. This entry never imports a retired Core channel.
+This entry never imports a retired Core channel.
 """
 
 import pytest

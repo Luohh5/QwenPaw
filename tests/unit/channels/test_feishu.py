@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Preserved official artifact helpers; runtime behaviors use B147 workers.
 
-Migration map: c6-tests-report.md. No legacy channel class is retained.
+No legacy channel class is retained.
 """
 # pylint: disable=protected-access
 import json

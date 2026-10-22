@@ -2,7 +2,7 @@
 """Preserved CH-0-007 actual SDK/platform cases after host driver retirement.
 
 Generic runner ownership/checkpoint cases migrated to B147/C2/C3 and protocol
-lifecycle suites; see c6-tests-report.md for the explicit behavior map.
+lifecycle suites.
 """
 # pylint: disable=protected-access,redefined-outer-name,wrong-import-position
 from __future__ import annotations

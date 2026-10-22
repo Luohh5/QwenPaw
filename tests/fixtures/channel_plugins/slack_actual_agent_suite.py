@@ -8,7 +8,6 @@ import time
 import psutil
 import pytest
 
-from extension_sample import ROOT
 from slack_suite import forbid_host_sdk
 from slack_support import (
     eventually,
@@ -113,10 +112,3 @@ async def test_zip_real_agent_session_and_all_worker_metrics(
         "former_worker_alive": psutil.pid_exists(worker.pid),
     }
     assert metrics["after_workspace_disabled"]["former_worker_alive"] is False
-    path = ROOT / (
-        ".superpowers/sdd/2026-10-14-official-channel-plugi"
-        "nization/scratch/slack-local-worker-metrics.jsonl"
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as output:
-        output.write(json.dumps(metrics) + "\n")

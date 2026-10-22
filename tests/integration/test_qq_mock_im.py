@@ -16,8 +16,7 @@ Wiring:
 
 Historical App HTTP oracle bodies retained; current implementation is
 ``plugins/channel/qq/qwenpaw_channel_qq/{driver,platform,media}.py``.
-Current composed evidence is in qq-closeout-oracle-map.json; these old
-App fixtures have not been rerun as part of the scoped retirement.
+These old App fixtures have not been rerun as part of the scoped retirement.
 
 Coverage responsibilities:
   start/_run_ws_forever/_ws_connect_once/_handle_ws_payload/

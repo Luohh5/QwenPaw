@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """Isolated official iMessage tests after moving platform code out of Core.
 
-Original 37 direct / 19 inherited oracles are retained in the scoped suites;
-see imessage-closeout-oracle-map.json in the pluginization evidence directory.
+Original 37 direct / 19 inherited oracles are retained in the scoped suites.
 No legacy Channel compatibility class or global SDK mocks are used.
 """
 import os

@@ -2,8 +2,7 @@
 """Original mqtt tests now exercise Reader/Platform and the host proxy.
 
 Original runtime behavior is verified by g2_official_process_suite,
-g2_business_suite, g2_lifecycle_suite and g2_legacy_process_suite. The
-per-function migration evidence is in g2-legacy-tests-inventory.json.
+g2_business_suite, g2_lifecycle_suite and g2_legacy_process_suite.
 """
 
 import os

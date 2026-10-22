@@ -145,13 +145,6 @@ async def test_actual_official_zip_roundtrip_records_parent_and_all_workers(
     data["parent_plus_workers_rss_bytes"] = data["parent_rss_bytes"] + sum(
         row["rss_bytes"] for row in data["workers"]
     )
-    path = (
-        ROOT
-        / ".superpowers/sdd/2026-10-14-official-channel-pluginization/scratch/discord-local-worker-metrics.jsonl"
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as output:
-        output.write(json.dumps(data) + "\n")
     assert data["parent_plus_workers_rss_bytes"] > data["parent_rss_bytes"]
 
 

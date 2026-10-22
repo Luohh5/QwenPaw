@@ -1,38 +1,15 @@
 # -*- coding: utf-8 -*-
 """Exact historical Voice method excerpts for AST-only compatibility oracles.
 
-Provenance and original full-file digest: legacy_channel_baselines.json.
 Never import this fixture as a runtime implementation.
 """
 
 from typing import Any
 
-from qwenpaw.schemas import ContentType, MessageType
+from qwenpaw.schemas import ContentType
 
 
 class ConversationRelayBaseline:
-    def _build_agent_request(self, text: str) -> Any:
-        """Build an AgentRequest from user speech text."""
-        from qwenpaw.schemas import (
-            AgentRequest,
-            Message,
-            Role,
-            TextContent,
-        )
-
-        msg = Message(
-            type=MessageType.MESSAGE,
-            role=Role.USER,
-            content=[TextContent(type=ContentType.TEXT, text=text)],
-        )
-        return AgentRequest(
-            session_id=f"voice:{self.call_sid}",
-            user_id=self.caller_info.get("from", ""),
-            input=[msg],
-            channel=self._channel_type,
-        )
-
-
     @staticmethod
     def _extract_text_from_event(event: Any) -> str:
         """Extract plain text from a completed message event."""
