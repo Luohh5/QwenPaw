@@ -1043,12 +1043,18 @@ async def test_tracker_unknown_send_does_not_emit_second_error_message(
 async def test_bound_workspace_dispatch_uses_real_tracker_and_closes_response(
     runtime,
     outcome,
+    monkeypatch,
 ):
     """Workspace dispatch must preserve response cleanup and unknown
     handling.
     """
     from unittest.mock import AsyncMock
     from qwenpaw.app.task_tracker import TaskTracker
+    from qwenpaw.channel_protocol.models import SendParams
+    from qwenpaw.channel_protocol.response_receipts import (
+        ResponseReceiptStore,
+        receipt_key,
+    )
     from qwenpaw.schemas import Message, RunStatus
 
     async def blocked_agent(_request):
@@ -1065,6 +1071,18 @@ async def test_bound_workspace_dispatch_uses_real_tracker_and_closes_response(
         agent=blocked_agent if outcome == "cancelled" else None,
         streaming_enabled=outcome == "cancelled",
     )
+    sends = []
+    call = rt.process.call
+
+    async def capture_send(method, params=None, **kwargs):
+        result = await call(method, params, **kwargs)
+        if method == "channel.send":
+            sends.append(
+                (SendParams.from_mapping(params).to_mapping(), result)
+            )
+        return result
+
+    monkeypatch.setattr(rt.process, "call", capture_send)
     tracker = TaskTracker()
     chat_manager = NS(
         get_or_create_chat=AsyncMock(return_value=NS(id="real-chat")),
@@ -1085,7 +1103,46 @@ async def test_bound_workspace_dispatch_uses_real_tracker_and_closes_response(
             assert await tracker.request_stop("real-chat")
         await asyncio.wait_for(task, 6)
         assert len(rt.rows("create")) == 1
-        receipt = persisted_routes(rt)[payload["meta"]["response_handle"]]
+        handle = payload["meta"]["response_handle"]
+        if outcome == "unknown":
+            assert len(sends) == 1
+            params, result = sends[0]
+            assert params["to_handle"] == handle
+            assert result["state"] == "unknown"
+            assert result["reason_code"] == "MESSAGE_RESULT_UNKNOWN"
+            store = ResponseReceiptStore(
+                rt.channel._state_path().with_suffix(".receipts.sqlite3"),
+            )
+            key = receipt_key("feishu.shared.responses", handle)
+            receipt = store.get(key)
+            assert receipt["cleanup_state"] == "complete"
+            assert receipt["route_refs"] == []
+            assert handle not in persisted_routes(rt)
+            attempts = [
+                ref
+                for ref in receipt["resource_refs"]
+                if ref["kind"] == "feishu.attempt"
+                and ref["resource_id"] == params["delivery_id"]
+            ]
+            assert len(attempts) == 1
+            attrs = attempts[0]["attributes"]
+            assert attrs["state"] == result["state"]
+            assert attrs["reason_code"] == result["reason_code"]
+            intent = {k: v for k, v in params.items() if k != "generation"}
+            fingerprint = hashlib.sha256(
+                json.dumps(intent, sort_keys=True).encode(),
+            ).hexdigest()
+            assert attrs["fingerprint"] == fingerprint
+            old_pid = rt.process.health_snapshot()["pid"]
+            await restart(rt)
+            assert rt.process.health_snapshot()["pid"] != old_pid
+            replay = {**params, "generation": rt.spec.generation}
+            assert await rt.process.call("channel.send", replay) == result
+            assert len(rt.rows("create")) == 1
+            assert store.get(key) == receipt
+            assert handle not in persisted_routes(rt)
+        else:
+            receipt = persisted_routes(rt)[handle]
         assert receipt["kind"] == "terminal"
         if outcome == "cancelled":
             assert receipt["outcome"] == "cancelled"

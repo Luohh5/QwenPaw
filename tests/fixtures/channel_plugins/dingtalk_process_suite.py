@@ -1548,9 +1548,15 @@ async def test_agent_unknown_send_emits_one_response_no_second_error(
 async def test_bound_workspace_dispatch_uses_real_task_tracker_and_cleanup(
     runtime,
     outcome,
+    monkeypatch,
 ):
     from unittest.mock import AsyncMock
     from qwenpaw.app.task_tracker import TaskTracker
+    from qwenpaw.channel_protocol.models import SendParams
+    from qwenpaw.channel_protocol.response_receipts import (
+        ResponseReceiptStore,
+        receipt_key,
+    )
     from qwenpaw.schemas import Message, RunStatus
 
     async def blocked_agent(_request):
@@ -1569,6 +1575,18 @@ async def test_bound_workspace_dispatch_uses_real_task_tracker_and_cleanup(
         card_template_id="template",
         streaming_enabled=outcome == "cancelled",
     )
+    sends = []
+    call = rt.process.call
+
+    async def capture_send(method, params=None, **kwargs):
+        result = await call(method, params, **kwargs)
+        if method == "channel.send":
+            sends.append(
+                (SendParams.from_mapping(params).to_mapping(), result)
+            )
+        return result
+
+    monkeypatch.setattr(rt.process, "call", capture_send)
     tracker = TaskTracker()
     chats = NS(
         get_or_create_chat=AsyncMock(return_value=NS(id="real-chat")),
@@ -1588,7 +1606,45 @@ async def test_bound_workspace_dispatch_uses_real_task_tracker_and_cleanup(
             await eventually(lambda: len(rt.rows("update")) == 1)
             assert await tracker.request_stop("real-chat")
         await asyncio.wait_for(task, 6)
-        receipt = persisted_routes(rt)[payload["meta"]["response_handle"]]
+        handle = payload["meta"]["response_handle"]
+        if outcome == "unknown":
+            assert len(sends) == 1
+            params, result = sends[0]
+            assert params["to_handle"] == handle
+            assert result["state"] == "unknown"
+            assert result["reason_code"] == "PLATFORM_RESULT_UNKNOWN"
+            store = ResponseReceiptStore(
+                rt.channel._state_path().with_suffix(".receipts.sqlite3"),
+            )
+            key = receipt_key("dingtalk.shared.responses", handle)
+            receipt = store.get(key)
+            assert receipt["cleanup_state"] == "complete"
+            assert receipt["route_refs"] == []
+            assert handle not in persisted_routes(rt)
+            attempts = [
+                ref
+                for ref in receipt["resource_refs"]
+                if ref["kind"] == "dingtalk.attempt"
+                and ref["resource_id"] == params["delivery_id"]
+            ]
+            assert len(attempts) == 1
+            attrs = attempts[0]["attributes"]
+            assert attrs["state"] == result["state"]
+            assert attrs["reason_code"] == result["reason_code"]
+            intent = {k: v for k, v in params.items() if k != "generation"}
+            fingerprint = hashlib.sha256(
+                json.dumps(intent, sort_keys=True).encode(),
+            ).hexdigest()
+            assert attrs["fingerprint"] == fingerprint
+            old_pid = rt.process.health_snapshot()["pid"]
+            await restart(rt)
+            assert rt.process.health_snapshot()["pid"] != old_pid
+            replay = {**params, "generation": rt.spec.generation}
+            assert await rt.process.call("channel.send", replay) == result
+            assert store.get(key) == receipt
+            assert handle not in persisted_routes(rt)
+        else:
+            receipt = persisted_routes(rt)[handle]
         assert receipt["kind"] == "terminal"
         if outcome == "cancelled":
             assert receipt["outcome"] == "cancelled"
@@ -1975,12 +2031,15 @@ async def test_local_checkpoint_capacity_rejection_leaves_no_unknown_attempts(
     rejected = []
     for index in range(30):
         delivery_id = "capacity-" + str(index)
+        effects_before = len(deliveries(rt))
         result = await rt.process.call(
             "channel.send",
             {**params, "delivery_id": delivery_id},
         )
         if result["state"] == "failed":
-            assert result["reason_code"] == "LOCAL_ADMISSION_FAILED"
+            assert result["reason_code"] == "RESPONSE_STATE_CAPACITY"
+            assert result["retryable"] is False
+            assert len(deliveries(rt)) == effects_before
             rejected.append(delivery_id)
             break
         assert result["state"] == "acknowledged"
@@ -1993,9 +2052,16 @@ async def test_local_checkpoint_capacity_rejection_leaves_no_unknown_attempts(
             {**params, "delivery_id": delivery_id},
         )
         assert result["state"] == "failed"
-        assert result["reason_code"] == "LOCAL_ADMISSION_FAILED"
+        assert result["reason_code"] == "RESPONSE_STATE_CAPACITY"
+        assert result["retryable"] is False
         rejected.append(delivery_id)
     assert len(deliveries(rt)) == effects
+    assert rt.rows("group") == rt.rows("dm") == []
+    assert not any(
+        row["resource_id"] in rejected
+        or row["attributes"].get("state") == "unknown"
+        for row in persisted_routes(rt)[handle]["resource_refs"]
+    )
     result = await rt.process.call(
         "channel.response.finish",
         {**finish_params(rt, handle), "outcome": "completed"},
