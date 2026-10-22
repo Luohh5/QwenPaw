@@ -10,37 +10,6 @@ Two ways to configure channels:
 
 Below is how to get credentials and fill config for each channel.
 
-## Feishu and DingTalk installation presets
-
-A fresh `pip install qwenpaw` is light: it includes small, dormant official
-channel ZIPs, but does not install the exclusive Feishu/DingTalk SDKs or enable
-these plugins. Install channel dependencies and select the full channel preset:
-
-```sh
-pip install 'qwenpaw[channels]'
-qwenpaw plugins preset apply channels-full --offline
-```
-
-Restart QwenPaw to publish the bundled sources into the current working
-directory. `qwenpaw[full]` also includes these dependencies; selecting pip extras
-alone does not select a preset. The install scripts do both when their extras
-include `channels` or `full`. Desktop includes the full channel preset; Docker
-always installs the full channel dependencies and uses `channels-full`.
-Docker seeds the mounted working directory at runtime.
-
-Existing saved enabled Feishu/DingTalk channels are migrated once using the
-bundled source, preserving credentials and switches. Existing sources are not
-overwritten; explicitly uninstalled plugins stay uninstalled across upgrades.
-Boot never downloads SDKs. Missing dependencies remain visible with an explicit
-install/repair action in Console. The `--offline` preset supplies channel code,
-not missing SDK wheels. Use an available local wheelhouse for offline dependency
-installation. Pip upgrades do not automatically uninstall SDKs already present.
-
-Channel packaging acceptance uses real local wheel/sdist/resources and child
-processes with controlled vendor responses and simulated Desktop/Docker paths.
-Live robots and native Windows/macOS Desktop behavior still require prerelease
-checks. Import/size reductions here concern Feishu and DingTalk; total process
-memory is measured rather than assumed to decrease.
 
 ---
 

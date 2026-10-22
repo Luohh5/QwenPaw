@@ -9,30 +9,6 @@
 
 下面按频道说明如何获取凭证并填写配置。
 
-## 飞书、钉钉安装预设
-
-全新 `pip install qwenpaw` 使用轻量安装：包含少量未启用的官方频道 ZIP，
-但不安装飞书、钉钉专用 SDK，也不自动启用插件。需要这两个频道时：
-
-```sh
-pip install 'qwenpaw[channels]'
-qwenpaw plugins preset apply channels-full --offline
-```
-
-重启 QwenPaw 后，宿主会把内置源码安装到当前工作目录。`qwenpaw[full]`
-也包含这些依赖，但仅选择 pip extras 不会保存预设意图。安装脚本的 extras
-包含 `channels` 或 `full` 时会同时保存预设。Desktop 自带完整频道预设；
-Docker 始终安装完整频道依赖并使用 `channels-full`，
-频道源码在启动时安装到实际挂载的工作目录。
-
-升级时，旧配置中已启用的飞书、钉钉会执行一次离线源码迁移，保留凭证和开关。
-已有源码不会被覆盖，明确卸载的插件不会被预设或后续升级恢复。启动过程不下载 SDK；
-缺失依赖时，控制台会显示安装或修复入口。`--offline` 只保证使用内置频道源码，
-不会补齐缺失的 SDK；离线依赖安装需要本地 wheelhouse。pip 升级也不会自动卸载原有 SDK。
-
-本轮发行验收使用真实本地 wheel、sdist、可读运行资源及子进程，平台响应和
-Desktop/Docker 路径采用受控模拟。真实机器人及原生 Windows/macOS 桌面效果仍需
-发布前检查。依赖和导入减负仅针对飞书、钉钉；进程合计内存以测量结果为准。
 
 ---
 
