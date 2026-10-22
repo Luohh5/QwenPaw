@@ -1955,6 +1955,9 @@
     "selectAtLeastOneDay": "Select at least one day."
   },
   "channels": {
+    "runtime": {
+      "missing_code": "Plugin not installed"
+    },
     "qrcodeInstallRequired": "Install the plugin to scan a QR code",
     "manualCredentials": "Manual credentials",
     "deliverySettings": "Delivery options",
