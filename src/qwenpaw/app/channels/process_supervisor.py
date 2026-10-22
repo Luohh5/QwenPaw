@@ -14,6 +14,12 @@ from ...plugins.execution.process import (  # pylint: disable=unused-import
     StopResult as _StopResult,
 )
 from ...channel_protocol.models import IdentityParams
+from ...channel_protocol.outbound_budget import (
+    DEFAULT_SEND_TIMEOUT,
+    OUTBOUND_METHODS,
+    SEND_RECEIPT_MARGIN,
+    validate_send_timeout,
+)
 from ...channel_protocol.rpc import RpcPeer
 from ...channel_protocol.shared import (
     SharedChannelDescriptor,
@@ -46,8 +52,10 @@ class LaunchSpec:
     plugin_id: str | None = None
     workspace_id: str | None = None
     private_env: Mapping[str, str] = field(default_factory=dict, repr=False)
+    send_timeout: float = DEFAULT_SEND_TIMEOUT
 
     def __post_init__(self):
+        validate_send_timeout(self.send_timeout)
         object.__setattr__(
             self,
             "private_env",
@@ -141,7 +149,14 @@ class ChannelProcess(PluginProcess):
             mode="manage",
         )
 
-    async def call(self, method, params=None, *, timeout=5.0):
+    async def call(self, method, params=None, *, timeout=None):
+        if timeout is None:
+            timeout = (
+                getattr(self._spec, "send_timeout", DEFAULT_SEND_TIMEOUT)
+                + SEND_RECEIPT_MARGIN
+                if method in OUTBOUND_METHODS and self._spec is not None
+                else 5.0
+            )
         if self._mode == "manage":
             from ...channel_protocol.management import (
                 MANAGEMENT_CAPABILITIES,
@@ -224,6 +239,7 @@ class ChannelProcess(PluginProcess):
                 "generation",
                 "qwenpaw_version",
                 "startup_timeout",
+                "send_timeout",
             )
         }
         packet.update(

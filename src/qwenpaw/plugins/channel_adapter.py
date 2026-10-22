@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import os
 from pathlib import Path
@@ -13,6 +13,11 @@ from contextlib import asynccontextmanager, nullcontext
 from .execution_backend import DefinitionResult, PluginDescription
 
 from ..channel_protocol.artifacts import code_root_digest
+from ..channel_protocol.outbound_budget import (
+    DEFAULT_SEND_TIMEOUT,
+    validate_send_timeout,
+    validate_send_timeouts,
+)
 from ..channel_protocol.requirements import canonicalize_requirements
 from ..channel_protocol.shared import (
     SharedChannelDescriptor,
@@ -62,8 +67,16 @@ class ChannelRuntimeSettings:
     dependency_install_target: Path | None = None
     runtime_identity: Mapping[str, Any] | None = None
     connection_timeout: float | None = None
+    send_timeout: float = DEFAULT_SEND_TIMEOUT
+    send_timeouts: Mapping[str, float] = field(default_factory=dict)
 
     def __post_init__(self):
+        validate_send_timeout(self.send_timeout)
+        object.__setattr__(
+            self,
+            "send_timeouts",
+            validate_send_timeouts(self.send_timeouts),
+        )
         if self.connection_timeout is not None and (
             type(self.connection_timeout) not in (int, float)
             or not math.isfinite(self.connection_timeout)
@@ -79,6 +92,9 @@ class ChannelRuntimeSettings:
             <= 0
         ):
             raise ValueError("Channel timeouts must be positive")
+
+    def send_timeout_for(self, channel_key: str) -> float:
+        return self.send_timeouts.get(channel_key, self.send_timeout)
 
     def allows(self, channel_key: str) -> bool:
         """None admits descriptors; an explicit collection is a whitelist."""
@@ -123,6 +139,7 @@ class ChannelDescription:
         shutdown_timeout: float = 2.0,
         config_source: str = "config",
         connection_timeout: float | None = None,
+        send_timeout: float = DEFAULT_SEND_TIMEOUT,
         private_env: Mapping[str, str] | None = None,
         legacy_references: Mapping | None = None,
     ):
@@ -203,6 +220,7 @@ class ChannelDescription:
             enabled=values["enabled"],
             startup_timeout=startup_timeout,
             shutdown_timeout=shutdown_timeout,
+            send_timeout=send_timeout,
             private_env=environment,
             plugin_id=self.plugin_id,
             workspace_id=(

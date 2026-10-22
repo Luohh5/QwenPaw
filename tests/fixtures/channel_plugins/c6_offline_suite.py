@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Finite C6 offline policy/resource/A-publication an
 d trusted runtime tests."""
+
 # pylint: disable=protected-access,redefined-outer-name,unused-argument
 
 import hashlib
@@ -64,10 +65,14 @@ def offline(tmp_path, monkeypatch):
 def bundle(case):
     """Construct real fixture ZIP bytes with exact C7 index v1 identity."""
     from qwenpaw.__version__ import __version__
+    from qwenpaw.plugins.official_channel_catalog import OFFICIAL_CHANNELS
 
     rows = []
-    for key in ("dingtalk", "feishu"):
-        source = ROOT / "plugins/channel" / key
+    for official in sorted(
+        OFFICIAL_CHANNELS, key=lambda row: row["plugin_id"]
+    ):
+        key = official["plugin_id"]
+        source = ROOT / "plugins/channel" / official["source_dir"]
         manifest = json.loads((source / "plugin.json").read_text())
         filename = key + "-" + manifest["version"] + ".zip"
         archive = case.resources / filename
@@ -316,7 +321,7 @@ def test_c6_bundled_integrity_rejects_corrupt_bytes_before_source(
 ):
     bundle(offline)
     index = json.loads((offline.resources / "index.json").read_text())
-    row = index["plugins"][1]
+    row = next(row for row in index["plugins"] if row["plugin_id"] == "feishu")
     if corrupt == "zip":
         (offline.resources / row["filename"]).write_bytes(b"bad zip")
     elif corrupt == "descriptor":

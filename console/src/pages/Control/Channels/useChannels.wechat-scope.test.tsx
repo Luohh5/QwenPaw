@@ -69,17 +69,23 @@ it("keeps B's actual list source when the earlier A GET resolves last", async ()
 it.each(["types", "schemas"])(
   "fences late A %s and clears old source while B is loading",
   async (kind) => {
-    const waiting: { agent: string | null; resolve: (r: Response) => void }[] = [];
-    vi.stubGlobal("fetch", async (input: string | URL | Request, init: RequestInit = {}) => {
-      const path = new URL(String(input), "https://console.test").pathname;
-      const agent = new Headers(init.headers).get("X-Agent-Id");
-      if (path.endsWith("/" + kind)) {
-        return new Promise<Response>((resolve) => waiting.push({ agent, resolve }));
-      }
-      if (path.endsWith("/types")) return json(["wechat"]);
-      if (path.endsWith("/schemas")) return json({});
-      return json({ wechat: { enabled: false, bot_token: agent } });
-    });
+    const waiting: { agent: string | null; resolve: (r: Response) => void }[] =
+      [];
+    vi.stubGlobal(
+      "fetch",
+      async (input: string | URL | Request, init: RequestInit = {}) => {
+        const path = new URL(String(input), "https://console.test").pathname;
+        const agent = new Headers(init.headers).get("X-Agent-Id");
+        if (path.endsWith("/" + kind)) {
+          return new Promise<Response>((resolve) =>
+            waiting.push({ agent, resolve }),
+          );
+        }
+        if (path.endsWith("/types")) return json(["wechat"]);
+        if (path.endsWith("/schemas")) return json({});
+        return json({ wechat: { enabled: false, bot_token: agent } });
+      },
+    );
     const view = renderHook(() => useChannels());
     await act(async () => {});
     expect(waiting[0].agent).toBe("A");
@@ -91,12 +97,22 @@ it.each(["types", "schemas"])(
     expect(view.result.current.loading).toBe(true);
     await act(async () => {});
     expect(waiting[1].agent).toBe("B");
-    const resultB = kind === "types" ? ["wechat", "B_type"] : { B_schema: { label: "B", config_fields: [] } };
+    const resultB =
+      kind === "types"
+        ? ["wechat", "B_type"]
+        : { B_schema: { label: "B", config_fields: [] } };
     await act(async () => waiting[1].resolve(json(resultB)));
-    const stale = kind === "types" ? ["A_type"] : { A_schema: { label: "A", config_fields: [] } };
+    const stale =
+      kind === "types"
+        ? ["A_type"]
+        : { A_schema: { label: "A", config_fields: [] } };
     await act(async () => waiting[0].resolve(json(stale)));
     expect(view.result.current.channels.wechat.bot_token).toBe("B");
-    expect(kind === "types" ? view.result.current.channelTypes : view.result.current.channelSchemas).toEqual(resultB);
+    expect(
+      kind === "types"
+        ? view.result.current.channelTypes
+        : view.result.current.channelSchemas,
+    ).toEqual(resultB);
     expect(view.result.current.loading).toBe(false);
   },
 );
@@ -108,14 +124,18 @@ it("fences batched ABA and same-scope refresh generations", async () => {
     useAgentStore.setState({ selectedAgent: "A" });
   });
   expect(lists.map((row) => row.agentId)).toEqual(["A", "B", "A"]);
-  await act(async () => lists[2].resolve(json({ wechat: { bot_token: "fresh-A" } })));
+  await act(async () =>
+    lists[2].resolve(json({ wechat: { bot_token: "fresh-A" } })),
+  );
   await act(async () => {
     lists[0].resolve(json({ wechat: { bot_token: "old-A" } }));
     lists[1].resolve(json({ wechat: { bot_token: "B" } }));
   });
   expect(view.result.current.channels.wechat.bot_token).toBe("fresh-A");
   let refresh!: Promise<void>;
-  act(() => { refresh = view.result.current.fetchChannels(); });
+  act(() => {
+    refresh = view.result.current.fetchChannels();
+  });
   expect(lists[3].agentId).toBe("A");
   await act(async () => {
     lists[3].resolve(json({ wechat: { bot_token: "refreshed-A" } }));

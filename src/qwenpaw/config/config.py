@@ -3407,6 +3407,8 @@ class Config(BaseModel):
     channel_plugin_state: ChannelPluginState = Field(
         default_factory=ChannelPluginState,
     )
+    channel_send_timeouts: Dict[str, float] = Field(default_factory=dict)
+
     mcp: MCPConfig = MCPConfig()
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     last_api: LastApiConfig = LastApiConfig()
@@ -3434,6 +3436,13 @@ class Config(BaseModel):
         "Skills found here are read-only (no edit/create); they can be "
         "listed, downloaded to a workspace, and deleted.",
     )
+
+    @field_validator("channel_send_timeouts", mode="before")
+    @classmethod
+    def _validate_channel_send_timeouts(cls, value):
+        from ..channel_protocol.outbound_budget import validate_send_timeouts
+
+        return validate_send_timeouts(value)
 
 
 ChannelConfigUnion = Union[

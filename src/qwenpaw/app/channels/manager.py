@@ -291,6 +291,7 @@ def instantiate_channel(
                 startup_timeout=settings.startup_timeout,
                 connection_timeout=connection_timeout,
                 shutdown_timeout=settings.shutdown_timeout,
+                send_timeout=settings.send_timeout_for(key),
                 config_source=config_source,
             )
         except BaseException:

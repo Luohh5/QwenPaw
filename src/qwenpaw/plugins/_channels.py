@@ -542,6 +542,7 @@ def register(plugin, spec):
                             f"Channel {spec.name!r} call has not "
                             "stopped; retry is required",
                         )
+            await self._stop_stream_flushes()
             return True
 
         async def stop(self):

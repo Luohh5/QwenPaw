@@ -32,6 +32,11 @@ from qwenpaw.channel_protocol.models import (
     ResponsePrepareOperation,
 )
 from qwenpaw.channel_protocol.response_receipts import receipt_key
+from qwenpaw.channel_protocol.outbound_budget import (
+    DEFAULT_SEND_TIMEOUT,
+    await_send,
+    send_budget,
+)
 from qwenpaw.channel_protocol.response_policy import ResponsePolicy
 from qwenpaw.channel_protocol.reliability import RetryPolicy, events_for_retry
 from qwenpaw.channel_protocol.response_lifecycle import (
@@ -43,6 +48,8 @@ from qwenpaw.channel_protocol.response_lifecycle import (
 )
 
 _MAX_ROUTES = 128
+_STREAM_RECEIPTS = 4
+_CHECKPOINT_BYTES = 768 * 1024
 
 
 class SharedResponseDriver:
@@ -65,6 +72,7 @@ class SharedResponseDriver:
         self._routes = ResponseRouteAggregate(max_entries=_MAX_ROUTES)
         self._locks = {}
         self._checkpoint_lock = asyncio.Lock()
+        self._inflight_admissions = {}
         self._connected = False
         self._stopping = False
         self._connection_generation = 0
@@ -109,6 +117,10 @@ class SharedResponseDriver:
         migrated = False
         for row in rows:
             snapshot = ResponseRouteSnapshot.from_mapping(row)
+            compact = self._compact_stream_attempts(snapshot)
+            if compact != snapshot:
+                snapshot = replace(compact, version=snapshot.version + 1)
+                migrated = True
             if await self._archived(snapshot.response_handle):
                 migrated = True
                 continue
@@ -215,7 +227,24 @@ class SharedResponseDriver:
             ("channel.response.finish", self._finish),
             ("channel.response.describe", self._describe),
         ):
-            context.peer.register_method(name, handler)
+            context.peer.register_method(
+                name,
+                (
+                    handler
+                    if name == "channel.response.describe"
+                    else self._outbound_handler(handler)
+                ),
+            )
+
+    def _outbound_handler(self, handler):
+        async def execute(params, request):
+            with send_budget(
+                getattr(self._context, "send_timeout", DEFAULT_SEND_TIMEOUT),
+            ):
+                return await handler(params, request)
+
+        execute._channel_effect_budget = True
+        return execute
 
     def response_policy(self, response_handle: str) -> ResponsePolicy:
         """Read route policy; subclasses may narrow optional operations."""
@@ -315,28 +344,225 @@ class SharedResponseDriver:
             },
         )
 
-    async def _checkpoint(self, candidate=None, *, reserve_bytes=0):
+    async def _checkpoint(
+        self,
+        candidate=None,
+        *,
+        reserve_bytes=0,
+        admission=None,
+    ):
         async with self._checkpoint_lock:
             await self._write_checkpoint(
                 candidate,
                 reserve_bytes=reserve_bytes,
+                admission=admission,
             )
 
-    async def _write_checkpoint(self, candidate=None, *, reserve_bytes=0):
+    @staticmethod
+    def _json_bytes(value):
+        return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+    def _compact_stream_attempts(self, snapshot):
+        resources = {
+            ref.resource_id: ref
+            for ref in snapshot.resource_refs
+            if ref.kind == self._kind + ".delivery"
+        }
+        removable = set()
+        for target, resource in tuple(resources.items()):
+            attrs = dict(resource.attributes)
+            if (
+                attrs.get("unsettled") == "true"
+                or attrs.get("cleanup") == "unknown"
+            ):
+                continue
+            confirmed = int(attrs.get("sequence", "0"))
+            receipts = sorted(
+                (
+                    (int(dict(ref.attributes).get("sequence", "0")), ref)
+                    for ref in snapshot.resource_refs
+                    if ref.kind == self._kind + ".attempt"
+                    and dict(ref.attributes).get("operation") == "stream.delta"
+                    and dict(ref.attributes).get("state") == "acknowledged"
+                    and dict(ref.attributes).get("target_delivery_id")
+                    == target
+                    and int(dict(ref.attributes).get("sequence", "0"))
+                    <= confirmed
+                ),
+                reverse=True,
+            )
+            old = receipts[_STREAM_RECEIPTS:]
+            if old:
+                removable.update(ref for _, ref in old)
+                attrs["compacted_sequence"] = str(
+                    max(
+                        int(attrs.get("compacted_sequence", "0")),
+                        max(sequence for sequence, _ in old),
+                    ),
+                )
+                resources[target] = ResponseResourceRef.create(
+                    resource.kind,
+                    target,
+                    attrs,
+                )
+        if not removable:
+            return snapshot
+        return replace(
+            snapshot,
+            resource_refs=tuple(
+                sorted(
+                    (
+                        resources.get(ref.resource_id, ref)
+                        if ref.kind == self._kind + ".delivery"
+                        else ref
+                    )
+                    for ref in snapshot.resource_refs
+                    if ref not in removable
+                ),
+            ),
+        )
+
+    def _checkpoint_reserve(self, snapshots):
+        reserve = 0
+        for snapshot in snapshots:
+            if snapshot.cleanup_state is ResponseCleanupState.COMPLETE:
+                continue
+            mapping = snapshot.to_mapping()
+            terminal = dict(
+                mapping,
+                kind="terminal",
+                outcome="completed",
+                cleanup_state="complete",
+                closed_at_ms=2**63 - 1,
+                cleanup_completed_at_ms=2**63 - 1,
+                expires_at_ms=2**63 - 1,
+            )
+            reserve += max(
+                256 if snapshot.cleanup_state is None else 0,
+                self._json_bytes(terminal) - self._json_bytes(mapping),
+            )
+            attempts = [
+                dict(ref.attributes)
+                for ref in snapshot.resource_refs
+                if ref.kind == self._kind + ".attempt"
+            ]
+            streams = {
+                ref.resource_id: dict(ref.attributes)
+                for ref in snapshot.resource_refs
+                if ref.kind == self._kind + ".delivery"
+                and dict(ref.attributes).get("stream_type")
+                and dict(ref.attributes).get("final") != "true"
+            }
+            for ref in snapshot.resource_refs:
+                attrs = dict(ref.attributes)
+                if (
+                    ref.kind == self._kind + ".attempt"
+                    and attrs.get("operation") == "stream.start"
+                    and attrs.get("state") != "failed"
+                    and not any(
+                        resource.kind == self._kind + ".delivery"
+                        and resource.resource_id == ref.resource_id
+                        for resource in snapshot.resource_refs
+                    )
+                ):
+                    attrs = {
+                        "sequence": "0",
+                        "stream_type": "reasoning",
+                        "final": "false",
+                    }
+                    streams[ref.resource_id] = attrs
+                    reserve += self._json_bytes(
+                        ResponseResourceRef.create(
+                            self._kind + ".delivery",
+                            ref.resource_id,
+                            attrs,
+                        ).to_mapping(),
+                    )
+            for target, attrs in streams.items():
+                ending = snapshot.cleanup_state is not None or any(
+                    row.get("operation") == "stream.end"
+                    and row.get("target_delivery_id") == target
+                    and row.get("state") == "unknown"
+                    for row in attempts
+                )
+                intent = ResponseResourceRef.create(
+                    self._kind + ".attempt",
+                    "0" * 32,
+                    {
+                        "fingerprint": "0" * 64,
+                        "operation": "stream.end",
+                        "state": "unknown",
+                        "reason_code": "PLATFORM_RESULT_UNKNOWN",
+                        "target_delivery_id": target,
+                        "sequence": str(int(attrs.get("sequence", "0")) + 1),
+                    },
+                )
+                cleanup = dict(
+                    attrs,
+                    final="true",
+                    cleanup="unknown",
+                    sequence=str(int(attrs.get("sequence", "0")) + 1),
+                )
+                growth = max(
+                    0,
+                    self._json_bytes(cleanup) - self._json_bytes(attrs),
+                )
+                reserve += (
+                    max(256, growth)
+                    if ending
+                    else max(
+                        1024,
+                        self._json_bytes(intent.to_mapping()) + growth,
+                    )
+                )
+                for admission in self._inflight_admissions.values():
+                    if (
+                        admission.to_handle == snapshot.response_handle
+                        and getattr(admission, "target_delivery_id", None)
+                        == target
+                        and getattr(admission, "accumulated_text", None)
+                        is not None
+                        and "text" in attrs
+                    ):
+                        reserve += max(
+                            0,
+                            self._json_bytes(admission.accumulated_text)
+                            - self._json_bytes(attrs["text"]),
+                        )
+        return reserve
+
+    async def _write_checkpoint(
+        self,
+        candidate=None,
+        *,
+        reserve_bytes=0,
+        admission=None,
+    ):
+        originals = {
+            row.response_handle: row for row in self._routes.snapshots()
+        }
         snapshots = {
-            row.response_handle: row.to_mapping()
-            for row in self._routes.snapshots()
+            handle: (
+                replace(compact, version=row.version + 1)
+                if compact != row
+                else row
+            )
+            for handle, row in originals.items()
+            for compact in (self._compact_stream_attempts(row),)
         }
         if candidate is not None:
-            snapshots[candidate.response_handle] = candidate.to_mapping()
+            snapshots[candidate.response_handle] = candidate
+        if admission is not None:
+            # Other responses must see this growth while native I/O awaits.
+            self._inflight_admissions[
+                admission.to_handle,
+                admission.delivery_id,
+            ] = admission
         while (
-            len(
-                json.dumps(
-                    list(snapshots.values()),
-                    ensure_ascii=False,
-                ).encode(),
-            )
-            > 768 * 1024 - reserve_bytes
+            self._json_bytes([row.to_mapping() for row in snapshots.values()])
+            + self._checkpoint_reserve(snapshots.values())
+            + reserve_bytes
+            > _CHECKPOINT_BYTES
         ):
             completed = sorted(
                 (
@@ -354,7 +580,17 @@ class SharedResponseDriver:
                 raise ValueError("RESPONSE_STATE_CAPACITY")
             self._evict(completed[0].response_handle)
             snapshots.pop(completed[0].response_handle, None)
-        await self._state("put", self._state_key, list(snapshots.values()))
+        await self._state(
+            "put",
+            self._state_key,
+            [row.to_mapping() for row in snapshots.values()],
+        )
+        for handle, row in snapshots.items():
+            if row != originals.get(handle) and self._routes.snapshot(
+                handle,
+            ) == originals.get(handle):
+                if candidate is None or handle != candidate.response_handle:
+                    self._routes.restore(row)
 
     def _lock(self, handle):
         if handle not in self._locks:
@@ -596,9 +832,32 @@ class SharedResponseDriver:
             )
         if snapshot.cleanup_state is ResponseCleanupState.COMPLETE:
             return self._result(delivery_id, "failed", "RESPONSE_CLOSED")
+        target = getattr(params, "target_delivery_id", None)
+        sequence = getattr(params, "sequence", None)
+        if (
+            target
+            and sequence is not None
+            and any(
+                ref.kind == self._kind + ".delivery"
+                and ref.resource_id == target
+                and sequence
+                <= int(dict(ref.attributes).get("compacted_sequence", "0"))
+                for ref in snapshot.resource_refs
+            )
+        ):
+            return self._result(delivery_id, "failed", "STREAM_SEQUENCE_STALE")
         return None
 
     async def _delivery(self, params, perform):
+        try:
+            return await self._delivery_attempt(params, perform)
+        finally:
+            self._inflight_admissions.pop(
+                (params.to_handle, params.delivery_id),
+                None,
+            )
+
+    async def _delivery_attempt(self, params, perform):
         delivery_id, handle = params.delivery_id, params.to_handle
         try:
             snapshot = self._routes.snapshot(handle)
@@ -644,13 +903,24 @@ class SharedResponseDriver:
                 ],
             )
             try:
-                # Reserve room for the acknowledged receipt and finish fence.
-                await self._checkpoint(reserve_bytes=1024)
+                await self._checkpoint(
+                    reserve_bytes=(
+                        0
+                        if intent["operation"].startswith("stream.")
+                        else 1024
+                    ),
+                    admission=params,
+                )
             except ValueError as exc:
                 if str(exc) == "RESPONSE_STATE_CAPACITY":
                     current = self._routes.snapshot(handle)
                     self._routes.restore(
                         replace(snapshot, version=current.version + 1),
+                    )
+                    return self._result(
+                        delivery_id,
+                        "failed",
+                        "RESPONSE_STATE_CAPACITY",
                     )
                 raise
         except ResponseStateError as exc:
@@ -667,7 +937,10 @@ class SharedResponseDriver:
             )
         result = None
         try:
-            resource = await perform(params)
+            with send_budget(
+                getattr(self._context, "send_timeout", DEFAULT_SEND_TIMEOUT),
+            ):
+                resource = await await_send(perform(params))
             if resource:
                 self._routes.record_delivery(handle, [resource])
             result = self._result(delivery_id, "acknowledged")
@@ -783,6 +1056,12 @@ class SharedResponseDriver:
         ).to_mapping()
 
     async def _cleanup(self, snapshot):
+        with send_budget(
+            getattr(self._context, "send_timeout", DEFAULT_SEND_TIMEOUT),
+        ):
+            return await self._cleanup_effects(snapshot)
+
+    async def _cleanup_effects(self, snapshot):
         archived = await self._archived(snapshot.response_handle)
         if archived:
             await self._retire_archived(snapshot.response_handle)
@@ -830,7 +1109,9 @@ class SharedResponseDriver:
             )
             await self._checkpoint()
             try:
-                await self._perform_stream_cleanup(ref, resource, sequence)
+                await await_send(
+                    self._perform_stream_cleanup(ref, resource, sequence),
+                )
             except self.delivery_error as exc:
                 if not exc.side_effect_possible:
                     resource["cleanup"] = "failed"
@@ -848,7 +1129,7 @@ class SharedResponseDriver:
                 resource,
             )
             await self._checkpoint()
-        snapshot = await self._before_cleanup_complete(snapshot)
+        snapshot = await await_send(self._before_cleanup_complete(snapshot))
         candidate = self._routes.cleanup_candidate(
             snapshot.response_handle,
             snapshot.outcome,

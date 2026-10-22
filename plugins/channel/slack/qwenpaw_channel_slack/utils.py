@@ -13,6 +13,11 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from qwenpaw.channel_protocol.outbound_budget import (
+    await_send,
+    retry_delay_fits,
+)
+
 # ── Session identifiers ──
 
 
@@ -107,7 +112,7 @@ async def with_retry(func, *args, retries=3, backoff=1.5, **kwargs):
     last_exc = None
     for attempt in range(retries):
         try:
-            return await func(*args, **kwargs)
+            return await await_send(func(*args, **kwargs))
         except Exception as exc:
             last_exc = exc
             if attempt == retries - 1:
@@ -117,10 +122,14 @@ async def with_retry(func, *args, retries=3, backoff=1.5, **kwargs):
 
             # Prefer Slack's Retry-After header
             retry_after = _extract_retry_after(exc)
-            if retry_after is not None:
-                await asyncio.sleep(retry_after)
-            else:
-                await asyncio.sleep(backoff * (attempt + 1))
+            delay = (
+                retry_after
+                if retry_after is not None
+                else backoff * (attempt + 1)
+            )
+            if not retry_delay_fits(delay):
+                raise
+            await await_send(asyncio.sleep(delay))
     raise last_exc
 
 

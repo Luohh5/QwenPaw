@@ -11,7 +11,6 @@ from typing import Any
 
 from .models import ResponseOutcome, validate_response_handle
 
-
 RESPONSE_RECEIPT_TTL_MS = 24 * 60 * 60 * 1000
 
 
@@ -19,7 +18,7 @@ class ResponseCheckpointUnknownError(RuntimeError):
     """Report a checkpoint mutation with unknown remote settlement."""
 
 
-@dataclass(frozen=True)
+@dataclass
 class ResponseStateError(Exception):
     """Describe one stable response-state violation."""
 

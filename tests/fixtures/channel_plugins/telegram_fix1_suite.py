@@ -2,6 +2,7 @@
 
 import asyncio
 from copy import deepcopy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -48,14 +49,27 @@ def persisted_attempt(rt, params):
     from qwenpaw.channel_protocol.response_lifecycle import (
         ResponseRouteSnapshot,
     )
+    from qwenpaw.channel_protocol.response_receipts import (
+        ResponseReceiptStore,
+        receipt_key,
+    )
 
     state = json.loads(rt.channel._state_path().read_text())
-    snapshots = state["telegram.shared.responses"]["value"]
-    snapshot = next(
+    archive = ResponseReceiptStore(
+        rt.channel._state_path().with_suffix(".receipts.sqlite3"),
+    ).get(receipt_key("telegram.shared.responses", params["to_handle"]))
+    snapshots = (
+        [archive]
+        if archive is not None
+        else state["telegram.shared.responses"]["value"]
+    )
+    matching = [
         ResponseRouteSnapshot.from_mapping(row)
         for row in snapshots
         if row["response_handle"] == params["to_handle"]
-    )
+    ]
+    assert len(matching) == 1, "uncertain delivery lost durable route custody"
+    snapshot = matching[0]
     matches = [
         ref
         for ref in snapshot.resource_refs
@@ -66,7 +80,36 @@ def persisted_attempt(rt, params):
         "uncertain delivery lost journal custody",
         state,
     )
-    return dict(matches[0].attributes)
+    attempt = dict(matches[0].attributes)
+    assert (
+        attempt["fingerprint"]
+        == hashlib.sha256(
+            json.dumps(
+                {
+                    key: value
+                    for key, value in params.items()
+                    if key != "generation"
+                },
+                sort_keys=True,
+            ).encode(),
+        ).hexdigest()
+    )
+    return attempt
+
+
+async def restart_and_replay_unknown(rt, params, result):
+    """Read the durable receipt in a fresh worker and never repeat SDK effects."""
+    receipt = persisted_attempt(rt, params)
+    old_pid = rt.process.health_snapshot()["pid"]
+    await rt.loader.lifecycle.set_enabled("telegram", False)
+    await rt.loader.lifecycle.set_enabled("telegram", True)
+    rt.channel = await rt.manager.get_channel("telegram")
+    rt.process = rt.channel.channel_process
+    assert rt.process.health_snapshot()["pid"] != old_pid
+    replay = {**params, **identity(rt)}
+    assert persisted_attempt(rt, replay) == receipt
+    assert await rt.process.call("channel.send", replay) == result
+    assert persisted_attempt(rt, replay) == receipt
 
 
 @pytest.mark.asyncio
@@ -89,6 +132,7 @@ async def test_media_notice_rejection_keeps_operation_unknown_and_no_replay(
     assert len(rows(telegram_sdk.work, "sendMessage")) == 2
     assert len(rows(telegram_sdk.work, "message-effect")) == 1
     assert rows(telegram_sdk.work, "sendPhoto") == []
+
     assert result["state"] == "unknown", (result, meta)
     assert persisted_attempt(rt, params)["state"] == "unknown"
     assert meta["_reply_unknown"] is True
@@ -104,6 +148,10 @@ async def test_media_notice_rejection_keeps_operation_unknown_and_no_replay(
             "12345", [{"type": "text", "text": "changed"}], meta
         )
     assert changed.value.state == "unknown"
+    assert len(rows(telegram_sdk.work, "sendMessage")) == 2
+    assert len(rows(telegram_sdk.work, "message-effect")) == 1
+
+    await restart_and_replay_unknown(rt, params, result)
     assert len(rows(telegram_sdk.work, "sendMessage")) == 2
     assert len(rows(telegram_sdk.work, "message-effect")) == 1
     assert rows(telegram_sdk.work, "sendPhoto") == []
@@ -145,6 +193,11 @@ async def test_final_send_rejection_after_delete_keeps_unknown_no_replay(
         )
     assert repeated.value.state == "unknown"
     assert meta["_pending_delivery"] == pending
+    assert len(rows(telegram_sdk.work, "sendMessage")) == 2
+    assert len(rows(telegram_sdk.work, "deleteMessage")) == 1
+    assert len(rows(telegram_sdk.work, "message-effect")) == 1
+
+    await restart_and_replay_unknown(rt, params, result)
     assert len(rows(telegram_sdk.work, "sendMessage")) == 2
     assert len(rows(telegram_sdk.work, "deleteMessage")) == 1
     assert len(rows(telegram_sdk.work, "message-effect")) == 1

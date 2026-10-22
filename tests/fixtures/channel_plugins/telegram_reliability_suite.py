@@ -163,9 +163,11 @@ async def test_first_native_send_rpc_cancel_keeps_public_pending_custody(
         rt.channel.send("12345", "uncertain first", meta)
     )
     await eventually(lambda: bool(rows(telegram_sdk.work, "message-effect")))
+    started = asyncio.get_running_loop().time()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert asyncio.get_running_loop().time() - started < 8
     assert meta["response_handle"]
     assert meta["_pending_delivery"]["delivery_id"]
     assert meta["_reply_unknown"] is True

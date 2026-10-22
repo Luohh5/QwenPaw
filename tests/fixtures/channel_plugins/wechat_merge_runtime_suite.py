@@ -310,33 +310,101 @@ async def test_actual_agent_completion_callback_observes_flushed_platform_effect
 
 
 @pytest.mark.asyncio
-async def test_smaller_actual_transport_frame_rejects_batch_without_effect(
+async def test_smaller_actual_transport_frame_spills_complete_batch_once(
     runtime, monkeypatch
 ):
     from dataclasses import replace
-    from qwenpaw.plugins.execution.framing import FrameLimitError
 
     rt = await merge_runtime(runtime)
     target, meta = await route(rt)
-    await rt.channel.send(target, "a" * 600, meta)
-    await rt.channel.send(target, "b" * 600, meta)
+    first, second = "甲" * 600, "乙" * 600
+    await rt.channel.send(target, first, meta)
+    await rt.channel.send(target, second, meta)
     assert await sends(rt) == []
     transport = rt.process._peer._transport
     original = transport._limits
     monkeypatch.setattr(
         transport, "_limits", replace(original, max_frame_bytes=1024)
     )
+    staged = []
+    stage = transport._payloads.stage
+
+    async def observe_stage(message, **kwargs):
+        reference, token = await stage(message, **kwargs)
+        if token is not None:
+            staged.append((message, reference, token))
+        return reference, token
+
+    monkeypatch.setattr(transport._payloads, "stage", observe_stage)
+    await rt.channel._flush_response_text(meta["response_handle"])
+    rows = await sends(rt)
+    assert len(rows) == 1
+    assert rows[0]["content_parts"] == [
+        {"type": "text", "text": first + "\n" + second}
+    ]
+    assert rows[0]["delivery_id"] == meta["_last_delivery_id"]
+    assert len(staged) == 1
+    message, reference, token = staged[0]
+    assert len(message.encode()) > 1024 >= len(reference.encode())
+    assert token and "$qwenpaw_payload" in reference
+    await rt.channel._flush_response_text(meta["response_handle"])
+    await rt.channel._finish_route(meta, "completed")
+    assert await sends(rt) == rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", ["logical-limit", "replaced-spill-directory"]
+)
+async def test_smaller_actual_transport_rejects_unsafe_spill_before_effect(
+    runtime, monkeypatch, failure
+):
+    from dataclasses import replace
+    from qwenpaw.plugins.execution.errors import (
+        FrameLimitError,
+        FrameProtocolError,
+    )
+
+    rt = await merge_runtime(runtime)
+    target, meta = await route(rt)
+    await rt.channel.send(target, "a" * 600, meta)
+    await rt.channel.send(target, "b" * 600, meta)
+    transport = rt.process._peer._transport
+    monkeypatch.setattr(
+        transport, "_limits", replace(transport._limits, max_frame_bytes=1024)
+    )
+    payloads = transport._payloads
+    original_limits = payloads.limits
+    directory = payloads.root / "h2w"
+    saved = payloads.root / "original-h2w"
+    if failure == "logical-limit":
+        monkeypatch.setattr(
+            payloads,
+            "limits",
+            replace(original_limits, max_message_bytes=1024),
+        )
+        expected = FrameLimitError
+    else:
+        directory.rename(saved)
+        directory.mkdir()
+        expected = FrameProtocolError
     try:
-        with pytest.raises(FrameLimitError):
+        with pytest.raises(expected):
             await rt.channel._flush_response_text(meta["response_handle"])
         assert await sends(rt) == []
         assert "_last_delivery_id" not in meta
-        with pytest.raises(FrameLimitError):
+        with pytest.raises(expected):
             await rt.channel._finish_route(meta, "completed")
         assert await sends(rt) == []
+        assert "_last_delivery_id" not in meta
     finally:
-        monkeypatch.setattr(transport, "_limits", original)
-        await rt.channel._cancel_response_text(meta["response_handle"])
+        if saved.exists():
+            directory.rmdir()
+            saved.rename(directory)
+        monkeypatch.setattr(payloads, "limits", original_limits)
+    assert await sends(rt) == []
+    await rt.channel._cancel_response_text(meta["response_handle"])
+    assert await sends(rt) == []
 
 
 @pytest.mark.asyncio

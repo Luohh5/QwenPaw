@@ -16,6 +16,11 @@ from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.app.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
 
+from qwenpaw.channel_protocol.outbound_budget import (
+    await_send,
+    retry_delay_fits,
+)
+
 from .constants import (
     SLACK_RECONNECT_FACTOR,
     SLACK_RECONNECT_INITIAL_S,
@@ -354,7 +359,7 @@ class SlackPlatform:
     async def effect_call(self, function, **kwargs):
         for attempt in range(3):
             try:
-                result = await function(**kwargs)
+                result = await await_send(function(**kwargs))
                 if result.get("ok") is False:
                     raise SlackDeliveryError("SLACK_REJECTED")
                 return result
@@ -365,10 +370,10 @@ class SlackPlatform:
                 status = getattr(response, "status_code", None)
                 if status == 429 and attempt < 2:
                     delay = _extract_retry_after(exc)
-                    await asyncio.sleep(
-                        1.5 * (attempt + 1) if delay is None else delay,
-                    )
-                    continue
+                    delay = 1.5 * (attempt + 1) if delay is None else delay
+                    if retry_delay_fits(delay):
+                        await await_send(asyncio.sleep(delay))
+                        continue
                 rejected = isinstance(status, int) and (
                     400 <= status < 500
                     or status < 500

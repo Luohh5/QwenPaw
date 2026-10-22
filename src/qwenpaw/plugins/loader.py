@@ -28,7 +28,11 @@ from .execution_backend import (
     probes_before_activation,
     registration_scope,
 )
-from .python_backend import PythonBackend, PythonServices
+from .python_backend import (
+    PythonBackend,
+    PythonServices,
+    _EntryPointNotFoundError,
+)
 from .python_backend import _probe_incoming as _probe_python_incoming
 from .api import PluginApi
 from .dependency_gate import (
@@ -1539,6 +1543,8 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                             dependency_token=dependency_token,
                         )
         except BaseException as exc:
+            if isinstance(exc, _EntryPointNotFoundError):
+                raise
             record = self._record_failed_backend(manifest, source_path, exc)
             record.backend_binding = binding
             if isinstance(exc, asyncio.CancelledError):
@@ -2379,7 +2385,6 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 staging,
                 backup,
             ):
-                _mark_phase("staging")
                 await run_sync_io(_swap)
         except asyncio.CancelledError:
             # The worker completed, but its backup was not returned. Restore
@@ -2962,18 +2967,29 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
 
         old_source = live_prepared_backup(plugin_id) or target_dir
         if await asyncio.to_thread((old_source / "plugin.json").is_file):
-            _, target_manifest = await asyncio.to_thread(
-                self._read_source_manifest,
+            target_manifest_path = await asyncio.to_thread(
+                resolved_plugin_manifest_path,
                 old_source,
             )
-            old_binding = self.backend_resolver.resolve(
-                old_source,
-                target_manifest,
-            )
-            old_binding.validate_update(
-                candidate_binding,
-                in_place=same_location(source_path, target_dir),
-            )
+            try:
+                target_manifest = await asyncio.to_thread(
+                    self._load_manifest,
+                    target_manifest_path,
+                )
+            except ValueError:
+                if candidate_binding.backend is not self._python_backend:
+                    raise
+                # Malformed Python remnants still follow the existing
+                # no-force refusal or quiescent backup-preservation path.
+            else:
+                old_binding = self.backend_resolver.resolve(
+                    old_source,
+                    target_manifest,
+                )
+                old_binding.validate_update(
+                    candidate_binding,
+                    in_place=same_location(source_path, target_dir),
+                )
 
         await self._stop_preparation(plugin_id)
         if self._has_runtime_custody(plugin_id):

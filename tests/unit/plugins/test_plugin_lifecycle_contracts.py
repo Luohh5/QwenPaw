@@ -327,7 +327,14 @@ async def _load(
     return loader, workspace, installed
 
 
-async def _load_busy_command(tmp_path, registry, kind, *, ignore_cancel=False):
+async def _load_busy_command(
+    tmp_path,
+    registry,
+    kind,
+    *,
+    ignore_cancel=False,
+    exit_release=None,
+):
     from qwenpaw.runtime.commands.control import handle_control_command
 
     entered, release, cancelled = (
@@ -347,6 +354,8 @@ async def _load_busy_command(tmp_path, registry, kind, *, ignore_cancel=False):
                 raise
             await release.wait()
         finally:
+            if exit_release is not None:
+                await exit_release.wait()
             calls.append("command-exit")
         return "ok"
 
@@ -480,7 +489,7 @@ async def test_busy_command_blocks_lifecycle(
 ):
     from qwenpaw.plugins.activity import PluginBusyError
 
-    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
+    _isolate_working_dir(tmp_path, monkeypatch)
     (
         loader,
         installed,
@@ -547,11 +556,18 @@ async def test_interrupt_waits_for_actual_command_exit(
     from qwenpaw.plugins.activity import PluginBusyError
     from qwenpaw.runtime.commands.control import handle_control_command
 
-    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
-    monkeypatch.setattr(
-        "qwenpaw.plugins.activity.INTERRUPT_TIMEOUT_SECONDS",
-        0.01,
+    config_path = _isolate_working_dir(tmp_path, monkeypatch) / "config.json"
+    config_path.write_text(
+        '{"plugins": {"busy-probe": {"enabled": true}, '
+        '"unrelated": {"enabled": false}}}',
+        encoding="utf-8",
     )
+    if ignore_cancel:
+        monkeypatch.setattr(
+            "qwenpaw.plugins.activity.INTERRUPT_TIMEOUT_SECONDS",
+            0.01,
+        )
+    exit_release = asyncio.Event()
     (
         loader,
         installed,
@@ -564,6 +580,7 @@ async def test_interrupt_waits_for_actual_command_exit(
         fresh_registry,
         kind,
         ignore_cancel=ignore_cancel,
+        exit_release=None if ignore_cancel else exit_release,
     )
     try:
         unload = asyncio.create_task(
@@ -575,7 +592,7 @@ async def test_interrupt_waits_for_actual_command_exit(
             ),
         )
         if ignore_cancel:
-            await asyncio.wait_for(cancelled.wait(), 0.5)
+            await asyncio.wait_for(cancelled.wait(), 10)
             workspace = fresh_registry.get_workspace_manager().agents["talk"]
             dispatch = (
                 handle_control_command
@@ -614,14 +631,26 @@ async def test_interrupt_waits_for_actual_command_exit(
                 delete_files=True,
             )
         else:
-            report = await asyncio.wait_for(unload, 0.5)
+            await asyncio.wait_for(cancelled.wait(), 10)
+            await asyncio.sleep(0)
+            assert not command.done()
+            assert not unload.done()
+            assert not calls
+            assert installed.is_dir()
+            exit_release.set()
+            # The deadline guards deadlocks, not config and disk performance.
+            report = await asyncio.wait_for(unload, 10)
             assert command.cancelled()
         assert report.clean and report.quiescent
         assert calls == ["command-exit", "teardown"]
         assert not installed.exists()
+        assert json.loads(config_path.read_text(encoding="utf-8"))[
+            "plugins"
+        ] == {"unrelated": {"enabled": False}}
     finally:
+        exit_release.set()
         release.set()
-        await asyncio.gather(command, return_exceptions=True)
+        await asyncio.gather(command, unload, return_exceptions=True)
         if loader.get_loaded_plugin("busy-probe") is not None:
             await loader.lifecycle.unload("busy-probe", UnloadMode.UNLOAD)
 

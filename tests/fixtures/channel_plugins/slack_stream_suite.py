@@ -302,6 +302,11 @@ async def test_public_cancel_same_meta_retains_unknown_no_replay_after_restart(
     runtime, slack_sdk, entry
 ):
     from qwenpaw.app.channels.isolated_proxy import ChannelDeliveryError
+    from qwenpaw.channel_protocol.response_receipts import (
+        ResponseReceiptStore,
+        receipt_key,
+        receipt_path,
+    )
     from qwenpaw.plugins.execution.errors import RpcError
 
     rt = await slack(runtime, slack_sdk)
@@ -320,6 +325,24 @@ async def test_public_cancel_same_meta_retains_unknown_no_replay_after_restart(
     assert first.value.data["reason_code"] == "REQUEST_CANCELLED"
     assert len(rows(slack_sdk.work, "chat.postMessage")) == 1
     custody = (meta.get("response_handle"), dict(meta["_pending_delivery"]))
+    store = ResponseReceiptStore(receipt_path(rt.ws.workspace_dir, "slack"))
+    archive_key = receipt_key("slack.shared.responses", custody[0])
+    original = store.get(archive_key)
+    if original is None:
+        live = json.loads(rt.channel._state_path().read_text())
+        original = next(
+            row
+            for row in live["slack.shared.responses"]["value"]
+            if row["response_handle"] == custody[0]
+        )
+    original_unknown = next(
+        ref
+        for ref in original["resource_refs"]
+        if ref["kind"] == "slack.attempt"
+        and ref["resource_id"] == custody[1]["delivery_id"]
+    )
+    assert original_unknown["attributes"]["state"] == "unknown"
+    assert len(original_unknown["attributes"]["fingerprint"]) == 64
     set_mode(slack_sdk.work, "")
     try:
         await public_send(rt.channel)
@@ -343,15 +366,12 @@ async def test_public_cancel_same_meta_retains_unknown_no_replay_after_restart(
     assert (meta["response_handle"], meta["_pending_delivery"]) == custody
     persisted = json.loads(current._state_path().read_text())
     snapshots = persisted["slack.shared.responses"]["value"]
-    snapshot = next(
-        row for row in snapshots if row["response_handle"] == custody[0]
-    )
+    assert all(row["response_handle"] != custody[0] for row in snapshots)
+    snapshot = store.get(archive_key)
+    assert snapshot["response_handle"] == custody[0]
     assert snapshot["kind"] == "terminal"
     assert snapshot["cleanup_state"] == "complete"
-    assert any(
-        ref["attributes"].get("state") == "unknown"
-        for ref in snapshot["resource_refs"]
-    )
+    assert original_unknown in snapshot["resource_refs"]
 
 
 @pytest.mark.asyncio

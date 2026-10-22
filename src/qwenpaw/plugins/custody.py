@@ -107,11 +107,18 @@ async def stop_subprocess(proc: Any, desc: str) -> None:
 class ConnectionCloser:
     """Retain a close operation across teardown retries."""
 
-    def __init__(self, client: Any, desc: str) -> None:
+    def __init__(
+        self,
+        client: Any,
+        desc: str,
+        *,
+        cancel_on_interrupt: bool = True,
+    ) -> None:
         self.client = client
         self.desc = desc
         self.task: asyncio.Future[Any] | None = None
-        self._cancel_task = True
+        self._cancel_on_interrupt = cancel_on_interrupt
+        self._cancel_task = cancel_on_interrupt
 
     @staticmethod
     def _observe(task: asyncio.Future[Any]) -> None:
@@ -124,7 +131,7 @@ class ConnectionCloser:
         return await result if inspect.isawaitable(result) else result
 
     async def _start(self) -> None:
-        self._cancel_task = True
+        self._cancel_task = self._cancel_on_interrupt
         closer = getattr(self.client, "aclose", None)
         if callable(closer):
             result = closer()

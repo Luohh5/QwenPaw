@@ -227,6 +227,13 @@ async def test_failed_or_unknown_final_edit_never_creates_fallback(
 async def test_unknown_delivery_duplicate_and_restart_never_replays_effect(
     runtime, discord_sdk
 ):
+    from extension_process_suite import durable_snapshot
+    from qwenpaw.channel_protocol.response_receipts import (
+        ResponseReceiptStore,
+        receipt_key,
+        receipt_path,
+    )
+
     rt = await discord(runtime, discord_sdk)
     handle = await route(rt)
     set_mode(discord_sdk.work, "send-unknown")
@@ -239,6 +246,14 @@ async def test_unknown_delivery_duplicate_and_restart_never_replays_effect(
         )
         assert result["state"] == "unknown"
     assert len(rows(discord_sdk.work, "send")) == 1
+    original = durable_snapshot(rt, handle)
+    original_unknown = next(
+        ref
+        for ref in original["resource_refs"]
+        if ref["kind"] == "discord.attempt" and ref["resource_id"] == "unknown"
+    )
+    assert original_unknown["attributes"]["state"] == "unknown"
+    assert len(original_unknown["attributes"]["fingerprint"]) == 64
     await finish(rt, handle)
     await rt.loader.lifecycle.set_enabled("discord", False)
     set_mode(discord_sdk.work, "")
@@ -253,11 +268,18 @@ async def test_unknown_delivery_duplicate_and_restart_never_replays_effect(
     )
     assert result["state"] == "unknown"
     assert len(rows(discord_sdk.work, "send")) == 1
-    persisted = "\n".join(
-        path.read_text()
-        for path in (rt.ws.workspace_dir / "channel_state").glob("*.json")
+    persisted = json.loads(rt.channel._state_path().read_text())
+    assert all(
+        row["response_handle"] != handle
+        for row in persisted["discord.shared.responses"]["value"]
     )
-    assert "unknown" in persisted
+    snapshot = ResponseReceiptStore(
+        receipt_path(rt.ws.workspace_dir, "discord")
+    ).get(receipt_key("discord.shared.responses", handle))
+    assert snapshot["response_handle"] == handle
+    assert snapshot["kind"] == "terminal"
+    assert snapshot["cleanup_state"] == "complete"
+    assert snapshot["resource_refs"] == [original_unknown]
 
 
 @pytest.mark.asyncio

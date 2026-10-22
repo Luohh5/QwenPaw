@@ -15,9 +15,19 @@ from typing import Any
 class DriverContext:
     """Preserve the Channel context and platform state wire contract."""
 
-    def __init__(self, peer: Any, identity: Any, capabilities=()) -> None:
+    def __init__(
+        self,
+        peer: Any,
+        identity: Any,
+        capabilities=(),
+        *,
+        send_timeout=120.0,
+    ) -> None:
+        from .outbound_budget import validate_send_timeout
+
         self.peer, self.identity = peer, identity
         self.capabilities = frozenset(capabilities)
+        self.send_timeout = validate_send_timeout(send_timeout)
 
     async def notify_auth_required(self, scan_url: str) -> None:
         from .errors import ProtocolValidationError
@@ -59,9 +69,40 @@ class ChannelRuntime:
         )
 
     def peer(self, transport):
+        from .errors import RPC_LIFECYCLE_ERROR, RpcError
+        from .outbound_budget import (
+            OUTBOUND_METHODS,
+            await_send,
+            send_budget,
+        )
         from .rpc import RpcPeer
 
-        return RpcPeer(transport, params_validator=self._validate_params)
+        runtime = self
+
+        class ChannelPeer(RpcPeer):
+            def register_method(self, method, handler):
+                if method not in OUTBOUND_METHODS:
+                    return super().register_method(method, handler)
+
+                async def execute(params, request):
+                    with send_budget(getattr(runtime, "_send_timeout", 120.0)):
+                        if getattr(handler, "_channel_effect_budget", False):
+                            return await handler(params, request)
+                        try:
+                            return await await_send(handler(params, request))
+                        except TimeoutError as exc:
+                            raise RpcError(
+                                RPC_LIFECYCLE_ERROR,
+                                "outbound result unknown",
+                                data={
+                                    "reason_code": "PLATFORM_RESULT_UNKNOWN",
+                                    "retryable": False,
+                                },
+                            ) from exc
+
+                return super().register_method(method, execute)
+
+        return ChannelPeer(transport, params_validator=self._validate_params)
 
     def _validate_params(self, method, params):
         from .models import (
@@ -91,7 +132,12 @@ class ChannelRuntime:
         return parsed
 
     def context(self, peer, identity):
-        return DriverContext(peer, identity, self._capabilities)
+        return DriverContext(
+            peer,
+            identity,
+            self._capabilities,
+            send_timeout=getattr(self, "_send_timeout", 120.0),
+        )
 
     async def state(self, context, state):
         await context.set_platform_state(state)
@@ -237,7 +283,14 @@ class ChannelRuntime:
     def verify(self, boot, packet, identity):
         from .runner_host import RunnerProtocolHost
         from .shared import SharedChannelDescriptor
+        from .outbound_budget import (
+            DEFAULT_SEND_TIMEOUT,
+            validate_send_timeout,
+        )
 
+        self._send_timeout = validate_send_timeout(
+            packet.get("send_timeout", DEFAULT_SEND_TIMEOUT),
+        )
         root = Path(packet["code_root"])
         if boot._hash_code_root(root) != packet["source_revision"]:
             raise boot.BootstrapError(

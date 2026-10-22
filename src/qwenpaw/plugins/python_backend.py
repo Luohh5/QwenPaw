@@ -22,12 +22,17 @@ from .module_isolation import (
     probe_plugin_source,
     restore_plugin_import_state,
     snapshot_plugin_import_state,
+    source_only_loader,
     strip_plugin_sys_path,
     sweep_bare_tree_modules,
     unregister_namespace,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _EntryPointNotFoundError(FileNotFoundError):
+    """Missing declared source, distinct from failures inside plugin code."""
 
 
 def _norm_realpath(path):
@@ -398,7 +403,7 @@ class PythonBackend:
             FileNotFoundError: If no entry points declared or files missing.
         """
         if backend_entry_file is None and frontend_entry_file is None:
-            raise FileNotFoundError(
+            raise _EntryPointNotFoundError(
                 f"Plugin '{plugin_id}' has no entry points declared "
                 f"(entry.backend or entry.frontend)",
             )
@@ -416,7 +421,7 @@ class PythonBackend:
                 missing.append(str(backend_entry_file))
             if frontend_entry_file:
                 missing.append(str(frontend_entry_file))
-            raise FileNotFoundError(
+            raise _EntryPointNotFoundError(
                 f"Plugin '{plugin_id}' entry point files not found: "
                 + ", ".join(missing),
             )
@@ -448,6 +453,7 @@ class PythonBackend:
                 f"Failed to load module spec for {backend_entry_file}",
             )
 
+        spec.loader = source_only_loader(spec.loader)
         module = importlib.util.module_from_spec(spec)
 
         # Redirect the plugin's bare absolute imports (``import utils``)

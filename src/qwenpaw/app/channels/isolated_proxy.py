@@ -18,9 +18,11 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import uuid
 
 from qwenpaw.channel_protocol.errors import (
+    RPC_LIFECYCLE_ERROR,
     RPC_RESPONSE_OPEN_FAILED,
     RpcError,
     ProtocolValidationError,
@@ -75,6 +77,15 @@ _STATE_MAX_BYTES = 1024 * 1024
 _STATE_MAX_KEYS = 64
 _TEXT_MERGE_MAX_RESPONSES = 128
 _TEXT_MERGE_MAX_BYTES = 768 * 1024
+
+
+def _rpc_result_unknown(error):
+    if not isinstance(error.data, dict):
+        return False
+    return (error.code, error.data.get("reason_code")) in {
+        (RPC_LIFECYCLE_ERROR, "PLATFORM_RESULT_UNKNOWN"),
+        (JSONRPC_INTERNAL_ERROR, "REQUEST_CANCELLED"),
+    }
 
 
 def _approval_card_params(metadata):
@@ -497,6 +508,7 @@ class IsolatedChannelProxy(BaseChannel):
 
     async def _stop(self):
         async with self._lifecycle_lock:
+            await self._stop_stream_flushes()
             # Cancel owned requests before retiring their process generation.
             for state in self._text_merge.values():
                 if state.timer is not None:
@@ -1067,6 +1079,15 @@ class IsolatedChannelProxy(BaseChannel):
         except RpcError as exc:
             if exc.code == RPC_RESPONSE_OPEN_FAILED:
                 raise _ResponseOpenDeliveryError(exc) from exc
+            if _rpc_result_unknown(exc):
+                meta["_reply_unknown"] = True
+                raise ChannelDeliveryError(
+                    OutboundResult(
+                        "unroutable",
+                        DeliveryState.UNKNOWN,
+                        "PLATFORM_RESULT_UNKNOWN",
+                    ),
+                ) from exc
             if (
                 isinstance(exc.data, dict)
                 and exc.data.get("reason_code") == "OUTBOUND_TARGET_UNKNOWN"
@@ -1312,11 +1333,7 @@ class IsolatedChannelProxy(BaseChannel):
             meta["_reply_unknown"] = True
             raise
         except RpcError as exc:
-            if (
-                exc.code == JSONRPC_INTERNAL_ERROR
-                and isinstance(exc.data, dict)
-                and exc.data.get("reason_code") == "REQUEST_CANCELLED"
-            ):
+            if _rpc_result_unknown(exc):
                 meta["_reply_unknown"] = True
             raise
         meta.pop("_pending_delivery", None)
@@ -1616,6 +1633,9 @@ class IsolatedChannelProxy(BaseChannel):
                         "response_handle": handle,
                         "outcome": outcome,
                     },
+                    # Cancellation closeout retains its control allowance;
+                    # ordinary finish may perform a full native cleanup.
+                    **({"timeout": 5.0} if outcome == "cancelled" else {}),
                 )
                 await self._cancel_response_text(handle)
             except Exception as exc:
@@ -1918,6 +1938,10 @@ class IsolatedChannelProxy(BaseChannel):
         except (ChannelCallUnknown, asyncio.CancelledError):
             meta["_reply_unknown"] = True
             raise
+        except RpcError as exc:
+            if _rpc_result_unknown(exc):
+                meta["_reply_unknown"] = True
+            raise
 
     def _stream_text(self, stream_type, text, meta, send_format=None):
         if stream_type == "reasoning" and text:
@@ -1928,6 +1952,11 @@ class IsolatedChannelProxy(BaseChannel):
             else ""
         )
         return prefix + "  " + text if prefix and text else text
+
+    def _stream_flush_timeout(self):
+        # The supervisor bounds each outbound RPC by the selected send budget
+        # plus receipt margin. Base must join that same operation unchanged.
+        return None
 
     async def on_streaming_start(
         self,
@@ -1962,6 +1991,7 @@ class IsolatedChannelProxy(BaseChannel):
         send_meta.setdefault("_isolated_streams", {})[stream_type] = {
             "delivery_id": delivery,
             "sequence": 0,
+            "last_preview_at": None,
         }
 
     async def on_streaming_delta(
@@ -1975,22 +2005,39 @@ class IsolatedChannelProxy(BaseChannel):
     ):
         state = send_meta.get("_isolated_streams", {}).get(stream_type)
         if state:
+            now = time.monotonic()
+            previous = state.get("last_preview_at")
+            if (
+                state.get("preview_full")
+                or previous is not None
+                and now - previous < 0.2
+            ):
+                return
+            state["last_preview_at"] = now
             policy = await self._response_policy(to_handle, send_meta)
             state["sequence"] += 1
-            await self._send_operation(
-                to_handle,
-                send_meta,
-                "stream.delta",
-                stream_type=stream_type,
-                target_delivery_id=state["delivery_id"],
-                sequence=state["sequence"],
-                accumulated_text=self._stream_text(
-                    stream_type,
-                    accumulated_text,
+            try:
+                await self._send_operation(
+                    to_handle,
                     send_meta,
-                    policy.send_format,
-                ),
-            )
+                    "stream.delta",
+                    stream_type=stream_type,
+                    target_delivery_id=state["delivery_id"],
+                    sequence=state["sequence"],
+                    accumulated_text=self._stream_text(
+                        stream_type,
+                        accumulated_text,
+                        send_meta,
+                        policy.send_format,
+                    ),
+                )
+            except ChannelDeliveryError as exc:
+                if (
+                    exc.state != "failed"
+                    or exc.reason_code != "RESPONSE_STATE_CAPACITY"
+                ):
+                    raise
+                state["preview_full"] = True
 
     async def on_streaming_end(
         self,
@@ -2393,6 +2440,10 @@ class IsolatedChannelProxy(BaseChannel):
                 raise error
         except (ChannelCallUnknown, asyncio.CancelledError):
             send_meta["_reply_unknown"] = True
+            raise
+        except RpcError as exc:
+            if _rpc_result_unknown(exc):
+                send_meta["_reply_unknown"] = True
             raise
 
     @asynccontextmanager

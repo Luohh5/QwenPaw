@@ -163,7 +163,7 @@ def default_channel_preset():
 def resolve_default_channel_runtime():
     """Provision an empty managed site under the environment lock."""
     from ..__version__ import __version__
-    from ..config.utils import get_config_path
+    from ..config.utils import get_config_path, _read_config_data
     from .install_lock import (
         environment_install_lock_path,
         plugin_install_lock,
@@ -189,7 +189,10 @@ def resolve_default_channel_runtime():
         f"py{major}.{minor}-{identity['system'].lower()}-"
         f"{identity['machine'].lower()}"
     )
-    target = get_config_path().parent / "plugin_runtime" / bucket / "site"
+    config_path = get_config_path()
+    data = _read_config_data(config_path) if config_path.exists() else {}
+    send_timeouts = (data or {}).get("channel_send_timeouts", {})
+    target = config_path.parent / "plugin_runtime" / bucket / "site"
     with plugin_install_lock(environment_install_lock_path(target)):
         if target.is_symlink():
             raise ValueError("CHANNEL_RUNTIME_TARGET_INVALID")
@@ -202,6 +205,7 @@ def resolve_default_channel_runtime():
         dependency_paths=tuple(dict.fromkeys((*sites, target.resolve()))),
         dependency_install_target=target.resolve(),
         runtime_identity=identity if getattr(sys, "frozen", False) else None,
+        send_timeouts=send_timeouts,
     )
 
 

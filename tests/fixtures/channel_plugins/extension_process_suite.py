@@ -77,6 +77,8 @@ async def runtime(tmp_path, monkeypatch):
         workspace_name=None,
         python_executable=None,
         runtime_identity=None,
+        runtime_settings=None,
+        agent_content=None,
         **settings,
     ):
         if existing_loader is None:
@@ -96,6 +98,7 @@ async def runtime(tmp_path, monkeypatch):
                 dependency_paths=dependency_paths,
                 startup_timeout=5,
                 shutdown_timeout=1,
+                **(runtime_settings or {}),
             ),
         )
         if existing_loader is None:
@@ -128,7 +131,11 @@ async def runtime(tmp_path, monkeypatch):
                 object="message",
                 status=RunStatus.Completed,
                 role="assistant",
-                content=[TextContent(text="host answer")],
+                content=(
+                    agent_content
+                    if agent_content is not None
+                    else [TextContent(text="host answer")]
+                ),
             )
 
         ws.stream_query = agent
