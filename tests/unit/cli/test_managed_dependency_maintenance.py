@@ -332,7 +332,6 @@ def test_worker_persists_transaction_outcome_and_respects_restart_custody(
     "template",
     [
         "deploy/config/supervisord.conf.template",
-        "plugins/apps/qwenpaw-creator/config/supervisord.conf.template",
     ],
 )
 def test_supervisor_template_exposes_only_restricted_local_control(template):

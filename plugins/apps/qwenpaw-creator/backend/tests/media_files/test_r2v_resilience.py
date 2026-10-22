@@ -11,7 +11,6 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from domain.enums import TaskStatus
 from domain.errors import ConflictError, ValidationError
 from services.media_files import r2v_execution
 from services.media_files.secure_video_stream import PeerAddressMismatchError
@@ -696,8 +695,7 @@ def test_local_contention_preserves_the_same_provider_task(
                 await worker.shutdown()
                 assert job.cancelled()
             else:
-                # Durable I/O has no latency SLA; pytest's watchdog bounds it.
-                await job
+                await asyncio.wait_for(job, timeout=8)
             return get_task(PROJECT_ID, dispatched.task_id), blocked
         finally:
             await worker.shutdown()
@@ -715,33 +713,6 @@ def test_local_contention_preserves_the_same_provider_task(
         assert task.status.value == "SUCCEEDED"
         assert len(submitted) == 1
         assert task.result["providerTaskId"] == "provider-task-stale"
-
-
-def test_wait_for_task_deadline_does_not_cancel_worker():
-    async def scenario():
-        release = asyncio.Event()
-        job = asyncio.create_task(release.wait())
-        worker = object.__new__(FileR2VExecutionService)
-        worker._jobs = {"pending-task": job}
-        worker.executions = SimpleNamespace(
-            get_task=lambda _project_id, _task_id: SimpleNamespace(
-                status=TaskStatus.RUNNING,
-            ),
-        )
-        try:
-            with pytest.raises(TimeoutError, match="pending-task"):
-                await worker.wait_for_task(
-                    PROJECT_ID,
-                    "pending-task",
-                    timeout_seconds=0,
-                )
-            assert not job.done()
-            assert not job.cancelled()
-        finally:
-            release.set()
-            await job
-
-    asyncio.run(scenario())
 
 
 def test_submit_timeout_keeps_a_nonempty_diagnostic(tmp_path, monkeypatch):

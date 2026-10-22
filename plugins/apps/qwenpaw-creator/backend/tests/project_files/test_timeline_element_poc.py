@@ -242,25 +242,19 @@ def test_storyboard_and_r2v_publish_named_element_outputs(
             poll_interval_seconds=0.01,
             poll_lease_seconds=0.1,
         )
-        try:
-            dispatched = await worker.dispatch(
-                project_id="r2v-project",
-                target_ref="element:r2v-1",
-                arguments={},
-                idempotency_key="video-1",
-                start=False,
-            )
-            job = worker.start_task("r2v-project", dispatched.task_id)
-            assert job is not None
-            # Durable I/O has no latency SLA; pytest's watchdog bounds it.
-            await job
-            return await asyncio.to_thread(
-                worker.executions.get_task,
-                "r2v-project",
-                dispatched.task_id,
-            )
-        finally:
-            await worker.shutdown()
+        dispatched = await worker.dispatch(
+            project_id="r2v-project",
+            target_ref="element:r2v-1",
+            arguments={},
+            idempotency_key="video-1",
+        )
+        task = await worker.wait_for_task(
+            "r2v-project",
+            dispatched.task_id,
+            timeout_seconds=3,
+        )
+        await worker.shutdown()
+        return task
 
     task = asyncio.run(generate())
     assert task.status.value == "SUCCEEDED"
