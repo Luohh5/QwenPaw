@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 """Exercise release dependency commands with a real, offline pip resolver."""
 
+import base64
+import csv
+import hashlib
+import importlib.metadata
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -138,6 +143,92 @@ def test_wheel_metadata_rejects_multiple_root_distributions(
             )
     with pytest.raises(ValueError, match="Wheel must have one METADATA"):
         runtime_stager._wheel_metadata(wheel)
+
+
+@pytest.mark.parametrize("library", ["purelib", "platlib"])
+def test_extract_wheel_relocates_libraries_and_record(
+    tmp_path,
+    runtime_stager,
+    library,
+):
+    wheel = tmp_path / "relocation_demo-1.0-py3-none-any.whl"
+    info = "relocation_demo-1.0.dist-info"
+    source = f"relocation_demo-1.0.data/{library}/relocation_demo/native.py"
+    relocated = "relocation_demo/native.py"
+    files = {
+        "relocation_demo/__init__.py": b"ROOT = True\n",
+        source: b"NATIVE = True\n",
+        f"{info}/METADATA": b"Name: relocation-demo\nVersion: 1.0\n",
+    }
+    rows = [
+        [
+            name,
+            "sha256="
+            + base64.urlsafe_b64encode(hashlib.sha256(data).digest())
+            .rstrip(b"=")
+            .decode(),
+            str(len(data)),
+        ]
+        for name, data in files.items()
+    ]
+    record = f"{info}/RECORD"
+    rows.append([record, "", ""])
+    stream = io.StringIO(newline="")
+    csv.writer(stream).writerows(rows)
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, data in files.items():
+            archive.writestr(name, data)
+        archive.writestr(record, stream.getvalue())
+
+    site = tmp_path / "site"
+    runtime_stager._extract_wheel(wheel, site)
+
+    expected = [
+        [relocated if name == source else name, digest, size]
+        for name, digest, size in rows
+    ]
+    with (site / record).open(newline="") as installed_record:
+        assert list(csv.reader(installed_record)) == expected
+    distribution = next(importlib.metadata.distributions(path=[str(site)]))
+    assert distribution.metadata["Name"] == "relocation-demo"
+    assert {str(path) for path in distribution.files} == {
+        row[0] for row in expected
+    }
+    for name, data in files.items():
+        destination = relocated if name == source else name
+        assert distribution.locate_file(destination).read_bytes() == data
+    assert not (site / "relocation_demo-1.0.data").exists()
+
+
+def test_extract_wheel_relocated_library_cannot_replace_existing_file(
+    tmp_path,
+    runtime_stager,
+):
+    wheel = tmp_path / "example-1.0-py3-none-any.whl"
+    site = tmp_path / "site"
+    target = site / "example.py"
+    site.mkdir()
+    target.write_bytes(b"original")
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("example-1.0.data/platlib/example.py", b"replacement")
+    with pytest.raises(ValueError, match="Overlapping wheel payload"):
+        runtime_stager._extract_wheel(wheel, site)
+    assert target.read_bytes() == b"original"
+
+
+def test_extract_wheel_without_relocation_preserves_record_bytes(
+    tmp_path,
+    runtime_stager,
+):
+    wheel = tmp_path / "example-1.0-py3-none-any.whl"
+    site = tmp_path / "site"
+    record = "example-1.0.dist-info/RECORD"
+    original = b'"example.py",sha256=unchanged,4\r\n'
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("example.py", b"data")
+        archive.writestr(record, original)
+    runtime_stager._extract_wheel(wheel, site)
+    assert (site / record).read_bytes() == original
 
 
 @pytest.fixture

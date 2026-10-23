@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import csv
 from email.parser import BytesParser
 import hashlib
 import io
@@ -128,9 +129,10 @@ def _wheel_metadata(path: Path):
 
 
 def _extract_wheel(path: Path, site: Path) -> None:
-    """Extract only wheel library payloads, keeping genuine dist-info/RECORD."""
+    """Extract wheel libraries and preserve RECORD ownership after relocation."""
     with zipfile.ZipFile(path) as archive:
         seen = set()
+        relocated = {}
         for info in archive.infolist():
             relative = PurePosixPath(info.filename)
             if (
@@ -147,11 +149,11 @@ def _extract_wheel(path: Path, site: Path) -> None:
             parts = relative.parts
             if parts[0].endswith(".data"):
                 if len(parts) >= 3 and parts[1] in {"purelib", "platlib"}:
-                    raise ValueError(
-                        f"Unsupported wheel library relocation: {path.name}",
-                    )
-                # Channel support needs libraries, not entrypoint scripts.
-                continue
+                    parts = parts[2:]
+                    relocated[info.filename] = PurePosixPath(*parts).as_posix()
+                else:
+                    # Channel support needs libraries, not entrypoint scripts.
+                    continue
             # Keep ordinary .pth bytes for RECORD integrity. This explicit
             # site is added only to sys.path, never via site.addsitedir, so
             # startup hooks stay inert. Editable providers still fail audit.
@@ -160,6 +162,20 @@ def _extract_wheel(path: Path, site: Path) -> None:
                 raise ValueError(f"Overlapping wheel payload: {target.name}")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(archive.read(info))
+        if relocated:
+            metadata = next(
+                name
+                for name in archive.namelist()
+                if name.endswith(".dist-info/METADATA")
+                and len(PurePosixPath(name).parts) == 2
+            )
+            record = site / PurePosixPath(metadata).with_name("RECORD")
+            with record.open(encoding="utf-8", newline="") as stream:
+                rows = list(csv.reader(stream))
+            for row in rows:
+                row[0] = relocated.get(row[0], row[0])
+            with record.open("w", encoding="utf-8", newline="") as stream:
+                csv.writer(stream).writerows(rows)
 
 
 def _validate_closure(snapshot: dict, host_version: str) -> None:
