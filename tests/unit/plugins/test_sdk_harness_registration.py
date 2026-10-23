@@ -68,7 +68,12 @@ async def test_register_does_not_call_factory(tmp_path, loader):
         assert record.instance.factories == 0
     finally:
         await loader.unload_plugin(declaration.id)
-    assert not any(row.id == "test-backend" for row in registry.descriptors())
+    assert registry.get("test-backend") is None
+    remaining = next(
+        row for row in registry.descriptors() if row.id == "test-backend"
+    )
+    assert remaining.plugin_id == declaration.id and not remaining.registered
+    assert record.instance.factories == 0
 
 
 async def test_duplicate_backend_names_occupant(tmp_path, loader):

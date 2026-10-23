@@ -12,6 +12,7 @@ from typing import Callable
 from ...plugins.errors import SDKError, StaleContextError
 from ...plugins.harnesses import HarnessCapabilities, HarnessSpec
 from ...plugins.resources import Registration, ResourceOwner
+from ...plugins.activity import PluginBusyError
 
 
 @dataclass(frozen=True)
@@ -29,9 +30,15 @@ class _BackendRegistration:
     spec: HarnessSpec
     _registry: BackendRegistry = field(repr=False)
     _guard: Callable[[], None] | None = field(default=None, repr=False)
+    _context: object = field(default=None, repr=False)
+    _runtimes: set = field(default_factory=set, repr=False)
+    _admitted: bool = True
 
     def assert_active(self):
-        if self._registry._entries.get(self.spec.id) is not self:
+        if (
+            not self._admitted
+            or self._registry._entries.get(self.spec.id) is not self
+        ):
             raise StaleContextError(
                 f"Harness {self.spec.id!r} has been released",
             )
@@ -62,6 +69,13 @@ class BackendRegistry:
 
         async def release():
             if self._entries.get(spec.id) is entry:
+                if entry._context is not None:
+                    pending = entry._context._instance.activity._pending()
+                    if pending:
+                        raise PluginBusyError(owner.plugin_id, len(pending))
+                entry._admitted = False
+                for runtime in tuple(entry._runtimes):
+                    await runtime._close_entry(entry)
                 del self._entries[spec.id]
 
         return Registration(
@@ -71,10 +85,16 @@ class BackendRegistry:
             _bounded=False,
         )
 
-    def _bind_owner(self, owner: ResourceOwner, guard: Callable[[], None]):
+    def _bind_owner(
+        self,
+        owner: ResourceOwner,
+        guard: Callable[[], None],
+        context=None,
+    ):
         for entry in self._entries.values():
             if entry.owner == owner:
                 entry._guard = guard
+                entry._context = context
 
     def get(self, backend_id: str) -> _BackendRegistration | None:
         entry = self._entries.get(backend_id)
@@ -94,7 +114,15 @@ class BackendRegistry:
             for entry in self._entries.values()
         }
         for plugin_id, manifest in self._manifests().items():
-            for declared in (manifest.get("meta") or {}).get("harnesses", []):
+            declarations = (manifest.get("meta") or {}).get("harnesses")
+            if not isinstance(declarations, list):
+                continue
+            for declared in declarations:
+                if not isinstance(declared, dict) or not isinstance(
+                    declared.get("id"),
+                    str,
+                ):
+                    continue
                 rows.setdefault(
                     declared["id"],
                     BackendDescriptor(

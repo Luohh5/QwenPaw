@@ -163,6 +163,8 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
         self._channels: Dict[str, ChannelRegistration] = {}
         self._runtime_helpers = None
         self._plugin_manifests: Dict[str, Dict[str, Any]] = {}
+        self._harness_manifests: Dict[str, Dict[str, Any]] = {}
+        self._harness_states: Dict[str, str] = {}
         self._middleware_registrations: List[MiddlewareRegistration] = []
         self._plugin_http_app: Optional[Any] = None
         self._http_router_registrations: List[HttpRouterRegistration] = []
@@ -190,7 +192,7 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
             from ..runtime.backends.registry import BackendRegistry
 
             self._backend_registry = BackendRegistry(
-                self.get_all_plugin_manifests,
+                self.get_harness_manifests,
             )
         return self._backend_registry
 
@@ -1127,11 +1129,37 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
             manifest: Plugin manifest dictionary
         """
         self._plugin_manifests[plugin_id] = manifest
+        self.remember_harness_manifest(plugin_id, manifest)
         logger.debug(f"Registered manifest for plugin '{plugin_id}'")
 
     def drop_plugin_manifest(self, plugin_id: str) -> None:
         """Remove a stored manifest if present."""
         self._plugin_manifests.pop(plugin_id, None)
+        if plugin_id in self._harness_states:
+            self._harness_states[plugin_id] = "disabled"
+
+    def remember_harness_manifest(
+        self,
+        plugin_id,
+        manifest,
+        status="disabled",
+    ):
+        """Retain discovery metadata without granting runtime admission."""
+        if (manifest.get("meta") or {}).get("harnesses") is not None:
+            self._harness_manifests[plugin_id] = manifest
+            self._harness_states[plugin_id] = status
+        else:
+            self.forget_harness_manifest(plugin_id)
+
+    def forget_harness_manifest(self, plugin_id):
+        self._harness_manifests.pop(plugin_id, None)
+        self._harness_states.pop(plugin_id, None)
+
+    def get_harness_manifests(self):
+        return {**self._harness_manifests, **self._plugin_manifests}
+
+    def get_harness_states(self):
+        return self._harness_states.copy()
 
     def get_all_plugin_manifests(self) -> Dict[str, Dict[str, Any]]:
         """Get all plugin manifests.
@@ -1200,7 +1228,7 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
                 exc_info=True,
             )
 
-        self._plugin_manifests.pop(plugin_id, None)
+        self.drop_plugin_manifest(plugin_id)
 
         providers_to_remove = [
             pid

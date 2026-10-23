@@ -992,6 +992,11 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             status="failed",
         )
         self._loaded_plugins[plugin_id] = record
+        self.registry.remember_harness_manifest(
+            plugin_id,
+            _manifest_as_dict(manifest),
+            "failed",
+        )
         return record
 
     def _cleanup_failed_load(
@@ -1396,9 +1401,15 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             Dictionary of plugin_id -> PluginRecord
         """
         await self._recover_startup_transactions()
-        discovered = self.discover_plugins()
+        from ..utils.io_utils import run_sync_io
+
+        discovered = await run_sync_io(self.discover_plugins)
 
         for manifest, plugin_dir in discovered:
+            self.registry.remember_harness_manifest(
+                manifest.id,
+                _manifest_as_dict(manifest),
+            )
             if types is not None and manifest.plugin_type not in types:
                 continue
             from .settings import is_plugin_enabled, runtime_config
@@ -1412,13 +1423,24 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 continue
 
             try:
-                await self.load_plugin(
+                record = await self.load_plugin(
                     manifest,
                     plugin_dir,
                     runtime_config(config),
                     activate=activate,
                 )
+                if record.status == "failed":
+                    self.registry.remember_harness_manifest(
+                        manifest.id,
+                        _manifest_as_dict(manifest),
+                        "failed",
+                    )
             except Exception as e:
+                self.registry.remember_harness_manifest(
+                    manifest.id,
+                    _manifest_as_dict(manifest),
+                    "failed",
+                )
                 logger.error(f"Failed to load plugin '{manifest.id}': {e}")
 
         return self._loaded_plugins
@@ -3256,6 +3278,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 logger.info(
                     f"Deleted plugin files at {source_path}",
                 )
+            self.registry.forget_harness_manifest(plugin_id)
 
         if mode is not UnloadMode.SHUTDOWN:
             self.lifecycle.drop_instance(plugin_id)
@@ -3641,6 +3664,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 source_path,
                 purpose="uninstall plugin directory",
             )
+        self.registry.forget_harness_manifest(plugin_id)
         self.lifecycle.drop_instance(plugin_id)
         if cloudpaw_cleanup is not None and report.clean:
             from .legacy_cloudpaw import finish_uninstall

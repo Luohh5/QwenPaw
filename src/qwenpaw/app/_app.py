@@ -524,6 +524,7 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
             plugin_loader = PluginLoader(plugin_dirs)
 
             plugin_loader.registry.set_plugin_http_app(app)
+            app.state.plugin_registry = plugin_loader.registry
 
             config = load_config(get_config_path())
             plugin_configs = (

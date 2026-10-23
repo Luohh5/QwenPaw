@@ -5,6 +5,7 @@
 # pylint: disable=protected-access
 
 from .errors import SDKAccessError, StaleContextError
+from .resources import Registration
 
 
 def register(context, spec):
@@ -16,7 +17,7 @@ def register(context, spec):
         )
     registry = context._api._registry.backend_registry
     owner = context.resources.owner
-    handle = registry.register(owner, spec)
+    declaration_handle = registry.register(owner, spec)
 
     def guard():
         context._guard()
@@ -25,7 +26,28 @@ def register(context, spec):
                 f"Harness plugin {context.plugin_id!r} is not activated",
             )
 
-    registry._bind_owner(owner, guard)
+    registry._bind_owner(owner, guard, context)
+
+    def activate(_context):
+        if not handle.closed:
+            from ._harness_http import activate_gateway
+
+            activate_gateway(context, spec.id)
+
+    context.on_activate(activate)
+
+    async def release():
+        await declaration_handle.close()
+        from ._harness_http import release_gateway
+
+        release_gateway(context, spec.id)
+
+    handle = Registration(
+        release,
+        owner=owner,
+        description=declaration_handle.description,
+        _bounded=False,
+    )
     context._instance.record_runtime(
         handle.description,
         handle.close,

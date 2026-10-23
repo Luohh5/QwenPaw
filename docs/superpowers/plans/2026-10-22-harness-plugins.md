@@ -136,14 +136,14 @@
 - Workspace 增加懒属性 `backend_runtime`，原生路径不访问它；API 目录为 `GET /api/agents/backends`，置于动态 Agent 路由前，字段与状态值按设计 §5.1。
 - 管理网关首个 active contribution 激活时挂载、最后一个释放时移除；沿旧 `/api/harnesses` 路径。期间旧路由只在旧内置路径有效时存在，测试应用不能同时挂两套相同 URL。
 
-- [ ] **Step 1：写假后端运行失败测试。** 覆盖正文/推理/工具流、附件、命令、清空、已物化历史与补全、错误/取消终态；断言与当前 QwenPaw AgentResponse/ChatHistory 协议一致。
-- [ ] **Step 2：写身份与能力失败测试。** `test_call_context_uses_host_identity`、`test_same_session_id_isolated_by_workspace_and_user`、`test_capability_snapshot_respects_channel_and_policy`；插件提交伪造身份不能改变审批归属，秘密不进入日志/目录 DTO。
-- [ ] **Step 3：写并发生命周期失败测试。** `test_unload_busy_during_stream`、`test_cancel_waits_for_terminal_save`、`test_failed_close_blocks_new_generation`、`test_workspace_close_only_closes_own_backend`、`test_config_rebuild_revokes_old_context`。
-- [ ] **Step 4：写目录/路由失败测试。** `test_catalog_does_not_create_backends`、`test_gateway_removed_after_last_owner`、`test_gateway_preserves_other_owner`、`test_matched_old_handler_cannot_bypass_generation`；保留原鉴权和 Agent 访问规则。
-- [ ] **Step 5：运行红灯。** Run: `python -m pytest tests/unit/plugins/test_sdk_harness_bridge.py tests/unit/plugins/test_sdk_harness_lifecycle.py tests/unit/app/routers/test_backend_catalog.py -q`。
-- [ ] **Step 6：实现按需桥接和受限上下文。** 将现有会话桥接接入新的后端执行模块，不新增独立历史层；旧内置路径暂保留。只在运行调用解析有效能力，管理调用传 None；所有客户端和 producer 归受管资源，整个消费流到终态保存前保持活动门禁。
-- [ ] **Step 7：实现注册激活、按需路由和工作区关闭。** 注册声明与 activated 分开；所有操作复查 owner；普通忙碌返回既有 plugin_busy；失败资源保留到可重试清理完成。
-- [ ] **Step 8：验证并提交。** 重跑 Step 5，再跑 `python -m pytest tests/unit/plugins/test_sdk_context_lifecycle.py tests/unit/plugins/test_plugin_lifecycle_unload.py tests/unit/harnesses/test_workspace_routing.py -q`；预期 PASS，原生路径未改变。建议提交：`feat(sdk): bridge harness execution and lifecycle`。
+- [x] **Step 1：写假后端运行失败测试。** 覆盖正文/推理/工具流、附件、命令、清空、已物化历史与补全、错误/取消终态；断言与当前 QwenPaw AgentResponse/ChatHistory 协议一致。
+- [x] **Step 2：写身份与能力失败测试。** `test_call_context_uses_host_identity`、`test_same_session_id_isolated_by_workspace_and_user`、`test_capability_snapshot_respects_channel_and_policy`；插件提交伪造身份不能改变审批归属，秘密不进入日志/目录 DTO。
+- [x] **Step 3：写并发生命周期失败测试。** `test_unload_busy_during_stream`、`test_cancel_waits_for_terminal_save`、`test_failed_close_blocks_new_generation`、`test_workspace_close_only_closes_own_backend`、`test_config_rebuild_revokes_old_context`。
+- [x] **Step 4：写目录/路由失败测试。** `test_catalog_does_not_create_backends`、`test_gateway_removed_after_last_owner`、`test_gateway_preserves_other_owner`、`test_matched_old_handler_cannot_bypass_generation`；保留原鉴权和 Agent 访问规则。
+- [x] **Step 5：运行红灯。** Run: `python -m pytest tests/unit/plugins/test_sdk_harness_bridge.py tests/unit/plugins/test_sdk_harness_lifecycle.py tests/unit/app/routers/test_backend_catalog.py -q`。
+- [x] **Step 6：实现按需桥接和受限上下文。** 将现有会话桥接接入新的后端执行模块，不新增独立历史层；旧内置路径暂保留。只在运行调用解析有效能力，管理调用传 None；所有客户端和 producer 归受管资源，整个消费流到终态保存前保持活动门禁。
+- [x] **Step 7：实现注册激活、按需路由和工作区关闭。** 注册声明与 activated 分开；所有操作复查 owner；普通忙碌返回既有 plugin_busy；失败资源保留到可重试清理完成。
+- [x] **Step 8：验证并提交。** 重跑 Step 5，再跑 `python -m pytest tests/unit/plugins/test_sdk_context_lifecycle.py tests/unit/plugins/test_plugin_lifecycle_unload.py tests/unit/harnesses/test_workspace_routing.py -q`；预期 PASS，原生路径未改变。建议提交：`feat(sdk): bridge harness execution and lifecycle`。
 
 ### B3 前端公开契约、作者测试与文档
 

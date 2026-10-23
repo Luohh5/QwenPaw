@@ -194,6 +194,7 @@ class Workspace:
         self._task_tracker = TaskTracker()
         self._app_services: Any = None
         self._harness_runtime = None
+        self._backend_runtime = None
 
         # Register all services
         self._register_services()
@@ -283,6 +284,20 @@ class Workspace:
     def local_workspace(self) -> QwenPawLocalWorkspace:
         """AgentScope LocalWorkspace routing tools to ToolRegistry."""
         return self._local_workspace
+
+    @property
+    def backend_runtime(self):
+        """Create plugin backend execution for an actual operation."""
+        if self._backend_runtime is None:
+            from ...runtime.backends.execution import BackendExecution
+
+            self._backend_runtime = BackendExecution(
+                self.workspace_dir,
+                self.session,
+                self.agent_id,
+                self,
+            )
+        return self._backend_runtime
 
     @property
     def harness_runtime(self):
@@ -477,7 +492,7 @@ class Workspace:
                     await stream.aclose()
             return
 
-        from ...runtime import Runtime
+        from ...runtime.runtime import Runtime
 
         rt = Runtime(workspace=self, app_services=self._app_services)
         stream = rt.run(request)
@@ -901,6 +916,14 @@ class Workspace:
                 errors.append(("harness", exc))
             else:
                 self._harness_runtime = None
+
+        if self._backend_runtime is not None:
+            try:
+                await self._backend_runtime.close()
+            except Exception as exc:
+                errors.append(("plugin backends", exc))
+            else:
+                self._backend_runtime = None
 
         if len(errors) == 1:
             raise errors[0][1]

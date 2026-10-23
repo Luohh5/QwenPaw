@@ -69,6 +69,16 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/agents", tags=["agents"])
 
 
+@router.get("/backends")
+async def list_backends(request: Request) -> dict:
+    """Describe registered backends using metadata only."""
+    from ...plugins._harness_http import backend_catalog
+    from ...plugins.registry import PluginRegistry
+
+    registry = getattr(request.app.state, "plugin_registry", None)
+    return {"backends": backend_catalog(registry or PluginRegistry())}
+
+
 @router.get("/memory/backends")
 async def list_memory_backends() -> list[dict[str, Any]]:
     """Describe memory backends registered by core and preloaded plugins."""
