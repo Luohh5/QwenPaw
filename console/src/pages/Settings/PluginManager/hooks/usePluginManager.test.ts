@@ -13,6 +13,8 @@ const hoisted = vi.hoisted(() => ({
   fetchMarketPluginsMock: vi.fn(),
   installPluginMock: vi.fn(),
   uninstallPluginMock: vi.fn(),
+  setPluginEnabledMock: vi.fn(),
+  repairPluginDependenciesMock: vi.fn(),
   // Captured Modal.confirm options; initialized per-test in beforeEach.
   modalConfirmMock: vi.fn(),
   refreshMock: vi.fn(),
@@ -33,6 +35,8 @@ vi.mock("@/api/modules/plugin", () => ({
   fetchPluginCatalog: hoisted.fetchPluginCatalogMock,
   installPlugin: hoisted.installPluginMock,
   uninstallPlugin: hoisted.uninstallPluginMock,
+  setPluginEnabled: hoisted.setPluginEnabledMock,
+  repairPluginDependencies: hoisted.repairPluginDependenciesMock,
 }));
 
 vi.mock("@/api/modules/pluginMarket", () => ({
@@ -81,6 +85,8 @@ describe("usePluginManager", () => {
     refreshMock.mockReset();
     hoisted.installPluginMock.mockReset();
     uninstallPluginMock.mockReset();
+    hoisted.setPluginEnabledMock.mockReset();
+    hoisted.repairPluginDependenciesMock.mockReset();
     hoisted.fetchPluginCatalogMock
       .mockReset()
       .mockResolvedValue({ plugins: [] });
@@ -135,6 +141,83 @@ describe("usePluginManager", () => {
       "pluginManager.uninstallSuccess",
     );
     expect(refreshMock).toHaveBeenCalled();
+  });
+
+  it("enables disabled plugins and explicitly repairs failed plugins with honest results", async () => {
+    const target = { ...makePlugin(), enabled: false, loaded: false };
+    hoisted.setPluginEnabledMock.mockResolvedValueOnce({
+      id: target.id,
+      enabled: true,
+      loaded: true,
+    });
+    const { result } = renderHook(() => usePluginManager());
+
+    await act(async () => {
+      await result.current.enableOne(target);
+    });
+    expect(hoisted.setPluginEnabledMock).toHaveBeenCalledWith(target.id, true);
+    expect(refreshMock).toHaveBeenCalled();
+    expect(messageMock.success).toHaveBeenCalled();
+
+    hoisted.setPluginEnabledMock.mockRejectedValueOnce(
+      new Error("activation refused"),
+    );
+    await act(async () => {
+      await result.current.enableOne(target);
+    });
+    expect(messageMock.error).toHaveBeenCalledWith("activation refused");
+
+    hoisted.setPluginEnabledMock.mockResolvedValueOnce({
+      id: target.id,
+      enabled: true,
+      loaded: true,
+      status: "failed",
+    });
+    await act(async () => {
+      await result.current.enableOne(target);
+    });
+    expect(messageMock.error).toHaveBeenCalledWith(
+      "pluginManager.enableFailed",
+    );
+    expect(messageMock.success).toHaveBeenCalledTimes(1);
+
+    const failed = {
+      ...makePlugin(),
+      enabled: true,
+      loaded: true,
+      status: "failed",
+    };
+    const refreshedBeforeRepair = refreshMock.mock.calls.length;
+    hoisted.repairPluginDependenciesMock.mockResolvedValueOnce({
+      id: failed.id,
+      enabled: true,
+      status: "active",
+      diagnostics: [],
+    });
+    await act(async () => {
+      await result.current.repairOne(failed);
+    });
+    expect(hoisted.repairPluginDependenciesMock).toHaveBeenCalledWith(
+      failed.id,
+    );
+    expect(hoisted.setPluginEnabledMock).toHaveBeenCalledTimes(3);
+    expect(refreshMock).toHaveBeenCalledTimes(refreshedBeforeRepair + 1);
+    expect(messageMock.success).toHaveBeenCalledTimes(2);
+
+    hoisted.repairPluginDependenciesMock.mockResolvedValueOnce({
+      id: failed.id,
+      enabled: true,
+      status: "failed",
+      diagnostics: ["Backend restart required to finish repair"],
+    });
+    await act(async () => {
+      await result.current.repairOne(failed);
+    });
+    expect(messageMock.error).toHaveBeenCalledWith(
+      expect.stringContaining("Backend restart required"),
+    );
+    expect(messageMock.success).toHaveBeenCalledTimes(2);
+    expect(refreshMock).toHaveBeenCalledTimes(refreshedBeforeRepair + 2);
   });
 
   it("detects official updates and updates one plugin without reloading", async () => {

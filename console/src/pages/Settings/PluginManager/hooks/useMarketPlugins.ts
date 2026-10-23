@@ -14,6 +14,7 @@ import { isMarketPluginCompatible } from "@/utils/pluginCompatibility";
 export { isMarketPluginCompatible } from "@/utils/pluginCompatibility";
 
 interface UseMarketPluginsOptions {
+  initialSearch?: string;
   onInstalled: (result: InstallPluginResult) => void | Promise<void>;
 }
 
@@ -21,7 +22,10 @@ const MARKET_PAGE_SIZE = 20;
 
 export type MarketPluginHighlightFilter = "featured" | "trending" | undefined;
 
-export function useMarketPlugins({ onInstalled }: UseMarketPluginsOptions) {
+export function useMarketPlugins({
+  onInstalled,
+  initialSearch = "",
+}: UseMarketPluginsOptions) {
   const { t } = useTranslation();
   const { message } = useAppMessage();
   const tRef = useRef(t);
@@ -32,7 +36,7 @@ export function useMarketPlugins({ onInstalled }: UseMarketPluginsOptions) {
   const [plugins, setPlugins] = useState<MarketPluginEntry[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState(initialSearch);
   const [category, setCategory] = useState<string | undefined>(undefined);
   const [highlightFilter, setHighlightFilter] =
     useState<MarketPluginHighlightFilter>(undefined);

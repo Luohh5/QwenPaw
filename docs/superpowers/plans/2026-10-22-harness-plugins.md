@@ -194,11 +194,11 @@
 - 历史 DTO 改为公开 SDK 类型、原写入桥接使用 B2 的 `runtime/backends/session.py`。这些仅为删除旧运行包所需的路径调整，不扩展迁移架构。
 - 对应插件可用后保留原来的本地/在线迁移算法；已完成任务报告、已导入聊天的读取不加此门禁。
 
-- [ ] **Step 1：写依赖门禁失败测试。** `test_missing_or_disabled_plugin_blocks_import_before_scan`、`test_explicit_source_home_cannot_bypass_plugin_requirement`、`test_multi_source_request_checks_all_plugins_before_scan`、`test_start_and_retry_recheck_plugin_state`、`test_source_listing_does_not_load_provider_or_probe_cli`；失败时断言 provider 工厂/扫描调用数为 0。
-- [ ] **Step 2：运行红灯。** Run: `python -m pytest tests/unit/portability/test_harness_plugin_requirement.py -q`。
-- [ ] **Step 3：增加检查与界面提示。** 创建/开始/重试前检查已安装且激活；缺失、禁用或失败返回 HTTP 409 和 plugin_id/state，前端提供对应安装/启用入口。多来源先完整检查，不启动部分扫描；不自动安装。
-- [ ] **Step 4：只调整必要导入路径。** provider 由工厂在检查后按需导入，原会话桥接在写入函数中导入；将 rollout reader 移到迁移目录并保留算法。SDK 历史 DTO 本身无厂商副作用，允许作为轻量类型导入；不建立独立 history 包或无插件降级。
-- [ ] **Step 5：验证并提交。** 重跑 Step 2 及 `python -m pytest tests/unit/portability tests/unit/harnesses/test_session.py tests/unit/harnesses/test_session_gap_paths.py -q`；原迁移功能测试先注册 fake 对应插件，再验证原算法。建议提交：`refactor(portability): require matching harness plugin for imports`。
+- [x] **Step 1：写依赖门禁失败测试。** `test_missing_or_disabled_plugin_blocks_import_before_scan`、`test_explicit_source_home_cannot_bypass_plugin_requirement`、`test_multi_source_request_checks_all_plugins_before_scan`、`test_start_and_retry_recheck_plugin_state`、`test_source_listing_does_not_load_provider_or_probe_cli`；失败时断言 provider 工厂/扫描调用数为 0。
+- [x] **Step 2：运行红灯。** Run: `python -m pytest tests/unit/portability/test_harness_plugin_requirement.py -q`。
+- [x] **Step 3：增加检查与界面提示。** 创建/开始/重试前检查已安装且激活；缺失、禁用或失败返回 HTTP 409 和 plugin_id/state，前端提供对应安装/启用入口。多来源先完整检查，不启动部分扫描；不自动安装。
+- [x] **Step 4：只调整必要导入路径。** provider 由工厂在检查后按需导入，原会话桥接在写入函数中导入；将 rollout reader 移到迁移目录并保留算法。SDK 历史 DTO 本身无厂商副作用，允许作为轻量类型导入；不建立独立 history 包或无插件降级。
+- [x] **Step 5：验证并提交。** 重跑 Step 2 及 `python -m pytest tests/unit/portability tests/unit/harnesses/test_session.py tests/unit/harnesses/test_session_gap_paths.py -q`；原迁移功能测试先注册 fake 对应插件，再验证原算法。建议提交：`refactor(portability): require matching harness plugin for imports`。
 
 ### A2 迁出 Codex
 

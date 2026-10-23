@@ -17,9 +17,12 @@ import {
   uploadPlugin,
   uninstallPlugin,
   fetchPluginStatus,
+  setPluginEnabled,
+  repairPluginDependencies,
 } from "./plugin";
 import { getApiUrl } from "../config";
 import { buildAuthHeaders } from "../authHeaders";
+import { subscribeToPluginChanges } from "../../utils/pluginChangeEvents";
 
 interface MockResponseOptions {
   ok: boolean;
@@ -211,6 +214,48 @@ describe("plugin module", () => {
       method: "DELETE",
       headers: {},
     });
+  });
+
+  it("enables or explicitly repairs a plugin and announces each change", async () => {
+    const enabled = { id: "harness/codex", enabled: true, loaded: true };
+    const repaired = {
+      id: "harness/codex",
+      status: "active",
+      enabled: true,
+      diagnostics: [],
+    };
+    global.fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        mockResponse({ ok: true, status: 200, json: enabled }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({ ok: true, status: 200, json: repaired }),
+      );
+    const changed = vi.fn();
+    const unsubscribe = subscribeToPluginChanges(changed);
+    try {
+      await expect(setPluginEnabled("harness/codex", true)).resolves.toEqual(
+        enabled,
+      );
+      await expect(repairPluginDependencies("harness/codex")).resolves.toEqual(
+        repaired,
+      );
+    } finally {
+      unsubscribe();
+    }
+    expect(fetch).toHaveBeenCalledWith(
+      "http://test/plugins/harness%2Fcodex/enabled",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ enabled: true }),
+      }),
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      "http://test/plugins/harness%2Fcodex/repair-dependencies",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(changed).toHaveBeenCalledTimes(2);
   });
 
   it("uninstallPlugin throws fallback message on failure", async () => {

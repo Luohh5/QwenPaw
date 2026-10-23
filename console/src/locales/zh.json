@@ -175,6 +175,12 @@
     "cliAuthenticated": "{{type}} CLI 已认证"
   },
   "portabilityImport": {
+    "harnessRequired": "导入需要 {{plugin}} 插件（{{state}}）。",
+    "pluginStates": {
+      "missing": "未安装",
+      "disabled": "已禁用",
+      "failed": "激活失败"
+    },
     "qwenpawOnly": "导入仅适用于使用 QwenPaw 原生后端的智能体。请选择 QwenPaw 智能体后继续。",
     "title": "导入",
     "description": "将其他应用的数据导入 QwenPaw。选择来源应用后，可预览并选择要导入的内容；只有确认开始导入后才会写入 QwenPaw。",
@@ -5290,6 +5296,10 @@
     "details": "详细信息"
   },
   "pluginManager": {
+    "repair": "修复并重试",
+    "repairFailed": "插件修复后仍未激活。请查看诊断与应用日志。",
+    "enableSuccess": "插件已激活。",
+    "enableFailed": "插件激活失败。请检查依赖与应用日志后重试。",
     "busyTitle": "插件正在执行任务",
     "busy": {
       "update": {

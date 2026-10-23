@@ -7,8 +7,8 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
-from ...harnesses.events import HarnessHistoryItem, HarnessHistoryKind
-from ...harnesses.codex.rollout_reader import (
+from ...plugins.harnesses import HarnessHistoryItem, HarnessHistoryKind
+from .codex_rollout_reader import (
     CodexRolloutReader,
     codex_non_root_session_kind,
 )

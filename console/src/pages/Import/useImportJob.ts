@@ -1,6 +1,9 @@
+import { useTranslation } from "react-i18next";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { parseErrorDetail } from "../../utils/error";
 import { portabilityImportApi } from "../../api/modules/import";
 import type {
+  HarnessPluginRequirement,
   ImportJobEvent,
   ImportJobSnapshot,
   ImportSelection,
@@ -69,12 +72,34 @@ const message = (reason: unknown) =>
   reason instanceof Error ? reason.message : String(reason);
 
 export function useImportJob() {
+  const { t } = useTranslation();
+  const [requirement, setRequirement] =
+    useState<HarnessPluginRequirement | null>(null);
   const { selectedAgent } = useAgentStore();
   const [sources, setSources] = useState<ImportSourceProbe[]>([]);
   const [job, setJob] = useState<ImportJobSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [streamError, setStreamError] = useState("");
+  const failure = useCallback(
+    (reason: unknown) => {
+      const parsed = parseErrorDetail(reason);
+      const detail =
+        parsed?.code === "harness_plugin_required"
+          ? (parsed as HarnessPluginRequirement)
+          : undefined;
+      setRequirement(detail ?? null);
+      setError(
+        detail
+          ? t("portabilityImport.harnessRequired", {
+              plugin: detail.plugin_id,
+              state: t(`portabilityImport.pluginStates.${detail.state}`),
+            })
+          : message(reason),
+      );
+    },
+    [t],
+  );
   const selectedRef = useRef(selectedAgent);
   const mounted = useRef(true);
   const latest = useRef<ImportJobSnapshot | null>(null);
@@ -163,6 +188,7 @@ export function useImportJob() {
     if (idle) {
       setLoading(true);
       setError("");
+      setRequirement(null);
     }
     try {
       const result = await portabilityImportApi.sources(agentId);
@@ -177,7 +203,7 @@ export function useImportJob() {
         selectedRef.current === agentId &&
         !view.current.jobId
       ) {
-        setError(message(reason));
+        failure(reason);
       }
       throw reason;
     } finally {
@@ -190,13 +216,14 @@ export function useImportJob() {
         setLoading(false);
       }
     }
-  }, [selectedAgent]);
+  }, [failure, selectedAgent]);
 
   const scan = useCallback(
     async (selected: ImportSource[]) => {
       const agentId = selectedAgent;
       setLoading(true);
       setError("");
+      setRequirement(null);
       try {
         const created = await portabilityImportApi.create(agentId, selected);
         saveActiveJob(agentId, created.job_id);
@@ -206,7 +233,7 @@ export function useImportJob() {
         return created;
       } catch (reason) {
         if (mounted.current && selectedRef.current === agentId) {
-          setError(message(reason));
+          failure(reason);
         }
         throw reason;
       } finally {
@@ -215,7 +242,7 @@ export function useImportJob() {
         }
       }
     },
-    [isCurrent, selectedAgent, show],
+    [failure, isCurrent, selectedAgent, show],
   );
 
   const start = useCallback(
@@ -229,6 +256,7 @@ export function useImportJob() {
       }
       setLoading(true);
       setError("");
+      setRequirement(null);
       try {
         const started = await portabilityImportApi.start(
           selectedAgent,
@@ -242,14 +270,13 @@ export function useImportJob() {
         });
         return started;
       } catch (reason) {
-        if (isCurrent(selectedAgent, snapshot.job_id))
-          setError(message(reason));
+        if (isCurrent(selectedAgent, snapshot.job_id)) failure(reason);
         throw reason;
       } finally {
         if (isCurrent(selectedAgent, snapshot.job_id)) setLoading(false);
       }
     },
-    [accept, isCurrent, selectedAgent],
+    [failure, accept, isCurrent, selectedAgent],
   );
 
   const retry = useCallback(
@@ -263,6 +290,7 @@ export function useImportJob() {
       }
       setLoading(true);
       setError("");
+      setRequirement(null);
       try {
         const retried = await portabilityImportApi.retry(
           selectedAgent,
@@ -274,8 +302,7 @@ export function useImportJob() {
         if (isCurrent(selectedAgent, snapshot.job_id)) show(retried);
         return retried;
       } catch (reason) {
-        if (isCurrent(selectedAgent, snapshot.job_id))
-          setError(message(reason));
+        if (isCurrent(selectedAgent, snapshot.job_id)) failure(reason);
         throw reason;
       } finally {
         if (mounted.current && selectedRef.current === selectedAgent) {
@@ -283,7 +310,7 @@ export function useImportJob() {
         }
       }
     },
-    [isCurrent, selectedAgent, show],
+    [failure, isCurrent, selectedAgent, show],
   );
 
   const cancel = useCallback(async () => {
@@ -293,6 +320,7 @@ export function useImportJob() {
     }
     setLoading(true);
     setError("");
+    setRequirement(null);
     try {
       const interrupted = await portabilityImportApi.cancel(
         selectedAgent,
@@ -304,12 +332,12 @@ export function useImportJob() {
       });
       return interrupted;
     } catch (reason) {
-      if (isCurrent(selectedAgent, snapshot.job_id)) setError(message(reason));
+      if (isCurrent(selectedAgent, snapshot.job_id)) failure(reason);
       throw reason;
     } finally {
       if (isCurrent(selectedAgent, snapshot.job_id)) setLoading(false);
     }
-  }, [accept, isCurrent, selectedAgent]);
+  }, [failure, accept, isCurrent, selectedAgent]);
 
   const reset = useCallback(() => {
     const agentId = selectedAgent;
@@ -320,6 +348,7 @@ export function useImportJob() {
     saveActiveJob(agentId);
     setJob(null);
     setError("");
+    setRequirement(null);
     setStreamError("");
   }, [selectedAgent]);
 
@@ -329,6 +358,7 @@ export function useImportJob() {
     latest.current = null;
     setJob(null);
     setError("");
+    setRequirement(null);
     setStreamError("");
     const jobId = activeJobs()[selectedAgent] ?? "";
     view.current = { agentId: selectedAgent, jobId };
@@ -367,7 +397,7 @@ export function useImportJob() {
         view.current = { agentId: selectedAgent, jobId: "" };
         latest.current = null;
         saveActiveJob(selectedAgent);
-        setError(message(reason));
+        failure(reason);
         setLoading(false);
       })
       .finally(() => {
@@ -379,7 +409,7 @@ export function useImportJob() {
       controller.current?.abort();
       controller.current = null;
     };
-  }, [isCurrent, selectedAgent, watch]);
+  }, [failure, isCurrent, selectedAgent, watch]);
 
   useEffect(() => {
     mounted.current = true;
@@ -395,6 +425,7 @@ export function useImportJob() {
     selectedAgent,
     loading,
     error: error || streamError,
+    requirement,
     detect,
     scan,
     start,

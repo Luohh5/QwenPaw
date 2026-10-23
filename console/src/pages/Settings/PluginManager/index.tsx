@@ -17,6 +17,7 @@ export default function PluginManagerPage() {
   const { t } = useTranslation();
   const [searchParams, setSearchParams] = useSearchParams();
   const viewParam = searchParams.get("view");
+  const targetPlugin = searchParams.get("plugin") ?? "";
   const activeTab =
     viewParam === "official" || viewParam === "market"
       ? viewParam
@@ -29,6 +30,9 @@ export default function PluginManagerPage() {
     refreshUpdates,
     uninstallingId,
     handleUninstall,
+    enablingId,
+    enableOne,
+    repairOne,
     updates,
     updatesLoading,
     updatingId,
@@ -60,11 +64,16 @@ export default function PluginManagerPage() {
       ),
       children: (
         <InstalledPluginList
+          key={targetPlugin}
+          initialSearch={targetPlugin}
           plugins={plugins}
           loading={loading}
           uninstallingId={uninstallingId}
           onRefresh={refreshUpdates}
           onUninstall={handleUninstall}
+          enablingId={enablingId}
+          onEnable={enableOne}
+          onRepair={repairOne}
           updates={updates}
           updatesLoading={updatesLoading}
           updatingId={updatingId}
@@ -84,6 +93,8 @@ export default function PluginManagerPage() {
       label: t("pluginManager.marketTitle"),
       children: (
         <MarketPluginList
+          key={targetPlugin}
+          initialSearch={targetPlugin}
           onInstalled={handleInstalled}
           installedPlugins={plugins ?? []}
         />

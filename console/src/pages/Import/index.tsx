@@ -195,6 +195,7 @@ function ImportWorkflow() {
     selectedAgent,
     loading,
     error,
+    requirement,
     detect,
     scan,
     start,
@@ -202,6 +203,12 @@ function ImportWorkflow() {
     cancel,
     reset,
   } = useImportJob();
+  const manageHarness = (pluginId: string, state: string) =>
+    navigate(
+      `/market?tab=plugins&view=${
+        state === "missing" ? "market" : "installed"
+      }&plugin=${encodeURIComponent(pluginId)}`,
+    );
   const [sourceSelections, setSourceSelections] = useState<
     Record<string, ImportSource[]>
   >({});
@@ -246,7 +253,9 @@ function ImportWorkflow() {
     if (!job && sources.length && !sourceSelections[selectedAgent]) {
       updateSources(() =>
         sources
-          .filter((source) => source.detected)
+          .filter(
+            (source) => source.detected && source.plugin_state === "available",
+          )
           .map((source) => source.source),
       );
     }
@@ -511,7 +520,30 @@ function ImportWorkflow() {
             </span>
           </div>
         </section>
-        {error && <Alert type="error" showIcon message={error} />}
+        {error && (
+          <Alert
+            type="error"
+            showIcon
+            message={error}
+            action={
+              requirement && (
+                <Button
+                  onClick={() =>
+                    manageHarness(requirement.plugin_id, requirement.state)
+                  }
+                >
+                  {t(
+                    requirement.state === "missing"
+                      ? "pluginManager.installBtn"
+                      : requirement.state === "failed"
+                      ? "pluginManager.repair"
+                      : "common.enable",
+                  )}
+                </Button>
+              )
+            }
+          />
+        )}
         {job && !isDone && (
           <div className={styles.actions}>
             <Button
@@ -547,7 +579,9 @@ function ImportWorkflow() {
                   <Card key={source.source} className={styles.sourceCard}>
                     <Checkbox
                       checked={selectedSources.includes(source.source)}
-                      disabled={!source.detected}
+                      disabled={
+                        !source.detected || source.plugin_state !== "available"
+                      }
                       onChange={(event) =>
                         updateSources((selected) =>
                           event.target.checked
@@ -558,6 +592,31 @@ function ImportWorkflow() {
                     >
                       <strong>{source.name}</strong>
                     </Checkbox>
+                    {source.plugin_state !== "available" && (
+                      <div>
+                        <p>
+                          {t("portabilityImport.harnessRequired", {
+                            plugin: source.plugin_id,
+                            state: t(
+                              `portabilityImport.pluginStates.${source.plugin_state}`,
+                            ),
+                          })}
+                        </p>
+                        <Button
+                          onClick={() =>
+                            manageHarness(source.plugin_id, source.plugin_state)
+                          }
+                        >
+                          {t(
+                            source.plugin_state === "missing"
+                              ? "pluginManager.installBtn"
+                              : source.plugin_state === "failed"
+                              ? "pluginManager.repair"
+                              : "common.enable",
+                          )}
+                        </Button>
+                      </div>
+                    )}
                     <Tag color={source.detected ? "success" : "default"}>
                       {t(
                         source.detected

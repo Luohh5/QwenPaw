@@ -26,6 +26,10 @@ const { Text } = Typography;
 
 interface InstalledPluginListProps {
   plugins?: PluginInfo[];
+  initialSearch?: string;
+  enablingId: string | null;
+  onEnable: (plugin: PluginInfo) => void;
+  onRepair: (plugin: PluginInfo) => void;
   loading: boolean;
   uninstallingId: string | null;
   onRefresh: () => void;
@@ -40,6 +44,10 @@ interface InstalledPluginListProps {
 
 export function InstalledPluginList({
   plugins = [],
+  initialSearch = "",
+  enablingId,
+  onEnable,
+  onRepair,
   loading,
   uninstallingId,
   onRefresh,
@@ -52,16 +60,37 @@ export function InstalledPluginList({
   onUpdateAll,
 }: InstalledPluginListProps) {
   const { t } = useTranslation();
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState(initialSearch);
   const [viewMode, setViewMode] = useState<PluginViewMode>("card");
   const isMobile = useIsMobile();
 
-  const columns = usePluginColumns({ uninstallingId, onUninstall });
+  const renderActivation = (plugin: PluginInfo) =>
+    !plugin.enabled || !plugin.loaded || plugin.status === "failed" ? (
+      <Button
+        loading={enablingId === plugin.id}
+        disabled={enablingId !== null && enablingId !== plugin.id}
+        onClick={() =>
+          plugin.status === "failed" ? onRepair(plugin) : onEnable(plugin)
+        }
+      >
+        {t(
+          plugin.status === "failed" ? "pluginManager.repair" : "common.enable",
+        )}
+      </Button>
+    ) : null;
+  const columns = usePluginColumns({
+    uninstallingId,
+    onUninstall,
+    renderActivation,
+  });
 
   const filteredPlugins = useMemo(() => {
     const keyword = search.trim().toLocaleLowerCase();
     return plugins.filter(
-      (plugin) => !keyword || plugin.name.toLocaleLowerCase().includes(keyword),
+      (plugin) =>
+        !keyword ||
+        plugin.name.toLocaleLowerCase().includes(keyword) ||
+        plugin.id.toLocaleLowerCase().includes(keyword),
     );
   }, [plugins, search]);
 
@@ -175,6 +204,7 @@ export function InstalledPluginList({
                   </span>
                 </div>
                 <div className={cardStyles.cardActions}>
+                  {renderActivation(plugin)}
                   {renderUpdateAction(plugin)}
                   <Button
                     danger
@@ -227,6 +257,7 @@ export function InstalledPluginList({
                     </div>
                   </div>
                   <div className={rowStyles.catalogActions}>
+                    {renderActivation(plugin)}
                     {renderUpdateAction(plugin)}
                     <Button
                       danger

@@ -7,7 +7,7 @@ import {
   within,
 } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { useAgentStore } from "@/stores/agentStore";
 import { useImportJob } from "./useImportJob";
 import ImportPage from ".";
@@ -39,8 +39,20 @@ const actions = {
 function state(overrides = {}) {
   return {
     sources: [
-      { source: "codex", name: "Codex", detected: true },
-      { source: "qoder", name: "Qoder", detected: true },
+      {
+        source: "codex",
+        name: "Codex",
+        detected: true,
+        plugin_id: "qwenpaw-harness-codex",
+        plugin_state: "available",
+      },
+      {
+        source: "qoder",
+        name: "Qoder",
+        detected: true,
+        plugin_id: "qwenpaw-harness-qoder",
+        plugin_state: "available",
+      },
     ],
     job: null,
     selectedAgent: "agent",
@@ -52,9 +64,18 @@ function state(overrides = {}) {
 }
 
 function renderPage() {
+  function Location() {
+    const location = useLocation();
+    return (
+      <output data-testid="location">
+        {location.pathname + location.search}
+      </output>
+    );
+  }
   return render(
     <MemoryRouter>
       <ImportPage />
+      <Location />
     </MemoryRouter>,
   );
 }
@@ -108,6 +129,77 @@ describe("ImportPage", () => {
     );
     expect(actions.scan).toHaveBeenCalledWith(["codex", "qoder"]);
   });
+
+  it.each(["missing", "disabled", "failed"] as const)(
+    "keeps %s Harness sources inert and opens plugin management",
+    (pluginState) => {
+      vi.mocked(useImportJob).mockReturnValue(
+        state({
+          sources: [
+            {
+              source: "codex",
+              name: "Codex",
+              detected: true,
+              plugin_id: "qwenpaw-harness-codex",
+              plugin_state: pluginState,
+            },
+          ],
+        }) as never,
+      );
+      renderPage();
+      expect(screen.getByRole("checkbox", { name: "Codex" })).toBeDisabled();
+      fireEvent.click(
+        screen.getByRole("button", {
+          name:
+            pluginState === "missing"
+              ? "pluginManager.installBtn"
+              : pluginState === "failed"
+              ? "pluginManager.repair"
+              : "common.enable",
+        }),
+      );
+      expect(screen.getByTestId("location")).toHaveTextContent(
+        `/market?tab=plugins&view=${
+          pluginState === "missing" ? "market" : "installed"
+        }&plugin=qwenpaw-harness-codex`,
+      );
+      expect(actions.scan).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["missing", "disabled", "failed"] as const)(
+    "opens the %s plugin action from a scan error",
+    (pluginState) => {
+      vi.mocked(useImportJob).mockReturnValue(
+        state({
+          sources: [],
+          error: "Harness plugin required",
+          requirement: {
+            code: "harness_plugin_required",
+            source: "codex",
+            plugin_id: "qwenpaw-harness-codex",
+            state: pluginState,
+          },
+        }) as never,
+      );
+      renderPage();
+      fireEvent.click(
+        screen.getByRole("button", {
+          name:
+            pluginState === "missing"
+              ? "pluginManager.installBtn"
+              : pluginState === "failed"
+              ? "pluginManager.repair"
+              : "common.enable",
+        }),
+      );
+      expect(screen.getByTestId("location")).toHaveTextContent(
+        `/market?tab=plugins&view=${
+          pluginState === "missing" ? "market" : "installed"
+        }&plugin=qwenpaw-harness-codex`,
+      );
+    },
+  );
 
   it("previews source changes and the destination without starting an import", async () => {
     vi.mocked(useImportJob).mockReturnValue(state() as never);

@@ -9,6 +9,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+# Temporary aliases while builtins migrate to the public Harness SDK.
+from ..plugins.harnesses import (
+    HarnessHistoryItem,
+    HarnessHistoryKind,
+)  # noqa: F401
+
 
 class HarnessAttachmentKind(str, Enum):
     """Attachment kinds accepted by third-party agent adapters."""
@@ -38,30 +44,10 @@ class HarnessEventKind(str, Enum):
     ERROR = "error"
 
 
-class HarnessHistoryKind(str, Enum):
-    """Kinds stored when a provider can replay an existing thread."""
-
-    USER = "user"
-    MESSAGE = "message"
-    REASONING = "reasoning"
-    TOOL_CALL = "tool_call"
-    TOOL_OUTPUT = "tool_output"
-
-
 class HarnessEvent(BaseModel):
     """One normalized provider event."""
 
     kind: HarnessEventKind
-    text: str = ""
-    item_id: str = ""
-    tool_name: str = ""
-    data: dict[str, Any] = Field(default_factory=dict)
-
-
-class HarnessHistoryItem(BaseModel):
-    """One provider-neutral item reconstructed from thread history."""
-
-    kind: HarnessHistoryKind
     text: str = ""
     item_id: str = ""
     tool_name: str = ""

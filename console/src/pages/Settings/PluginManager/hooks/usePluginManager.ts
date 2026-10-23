@@ -10,6 +10,8 @@ import {
   type PluginInfo,
   type PluginUpdateInfo,
   uninstallPlugin,
+  setPluginEnabled,
+  repairPluginDependencies,
 } from "@/api/modules/plugin";
 import {
   buildMarketDownloadUrl,
@@ -58,6 +60,7 @@ async function reloadInstalledPluginRuntime(plugin: PluginInfo): Promise<void> {
 export function usePluginManager() {
   const { t } = useTranslation();
   const { message } = useAppMessage();
+  const [enablingId, setEnablingId] = useState<string | null>(null);
   const [uninstallingId, setUninstallingId] = useState<string | null>(null);
   const [updates, setUpdates] = useState<Map<string, PluginUpdateInfo>>(
     new Map(),
@@ -244,6 +247,64 @@ export function usePluginManager() {
     }
   }, [message, plugins, refresh, t, updatingAll, updatingId, updates]);
 
+  const enableOne = useCallback(
+    async (plugin: PluginInfo) => {
+      if (enablingId !== null) return;
+      setEnablingId(plugin.id);
+      try {
+        const result = await setPluginEnabled(plugin.id, true);
+        if (
+          !result.loaded ||
+          !result.enabled ||
+          (result.status && result.status !== "active")
+        ) {
+          throw new Error(t("pluginManager.enableFailed"));
+        }
+        await reloadInstalledPluginRuntime(plugin);
+        message.success(t("pluginManager.enableSuccess"));
+      } catch (err) {
+        message.error(
+          err instanceof Error ? err.message : t("pluginManager.enableFailed"),
+        );
+      } finally {
+        try {
+          await refresh();
+        } finally {
+          setEnablingId(null);
+        }
+      }
+    },
+    [enablingId, message, refresh, t],
+  );
+
+  const repairOne = useCallback(
+    async (plugin: PluginInfo) => {
+      if (enablingId !== null) return;
+      setEnablingId(plugin.id);
+      try {
+        const result = await repairPluginDependencies(plugin.id);
+        if (!result.enabled || result.status !== "active") {
+          throw new Error(
+            result.diagnostics.join("\n") || t("pluginManager.repairFailed"),
+          );
+        }
+        await reloadInstalledPluginRuntime(plugin);
+        message.success(t("pluginManager.enableSuccess"));
+      } catch (err) {
+        message.error(
+          err instanceof Error ? err.message : t("pluginManager.repairFailed"),
+        );
+      } finally {
+        try {
+          await refresh();
+        } finally {
+          setEnablingId(null);
+        }
+      }
+    },
+    [enablingId, message, refresh, t],
+  );
+
   const handleUninstall = useCallback(
     (plugin: PluginInfo) => {
       Modal.confirm({
@@ -285,6 +346,9 @@ export function usePluginManager() {
     refreshUpdates,
     uninstallingId,
     handleUninstall,
+    enablingId,
+    enableOne,
+    repairOne,
     updates,
     updatesLoading,
     updatingId,

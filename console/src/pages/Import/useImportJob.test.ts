@@ -2,6 +2,8 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { createElement, StrictMode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { portabilityImportApi } from "../../api/modules/import";
+import { ApiError } from "../../api/request";
+import i18n from "../../i18n";
 import { useImportJob } from "./useImportJob";
 
 let selectedAgent = "agent-a";
@@ -97,6 +99,35 @@ describe("useImportJob", () => {
 
     expect(result.current.job?.job_id).toBe("import-agent-a");
   });
+
+  it.each(["missing", "disabled"] as const)(
+    "shows the localized %s Harness requirement from a real 409 error format",
+    async (state) => {
+      const detail = {
+        code: "harness_plugin_required",
+        source: "codex",
+        plugin_id: "qwenpaw-harness-codex",
+        state,
+      };
+      const raw = JSON.stringify({ detail });
+      vi.mocked(portabilityImportApi.create).mockRejectedValueOnce(
+        new ApiError(409, `${raw} - ${raw}`),
+      );
+      const { result } = renderHook(() => useImportJob());
+
+      await act(async () => {
+        await expect(result.current.scan(["codex"])).rejects.toThrow();
+      });
+
+      expect(result.current.requirement).toEqual(detail);
+      expect(result.current.error).toBe(
+        i18n.t("portabilityImport.harnessRequired", {
+          plugin: detail.plugin_id,
+          state: i18n.t(`portabilityImport.pluginStates.${state}`),
+        }),
+      );
+    },
+  );
 
   it("starts and retries only the currently selected agent's job", async () => {
     vi.mocked(portabilityImportApi.retry).mockImplementation(

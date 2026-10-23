@@ -30,6 +30,9 @@ const props = {
   updatingAll: false,
   onUpdate: vi.fn(),
   onUpdateAll: vi.fn(),
+  enablingId: null,
+  onEnable: vi.fn(),
+  onRepair: vi.fn(),
 };
 
 function plugin(loaded: boolean, status?: string): PluginInfo {
@@ -94,4 +97,31 @@ describe("installed plugin status", () => {
     expectTags("Running", "success", 2);
     expect(screen.queryByText("Error")).not.toBeInTheDocument();
   });
+
+  it.each([
+    [false, false, "inactive", "common.enable"],
+    [true, true, "failed", "pluginManager.repair"],
+  ] as const)(
+    "offers enabled=%s loaded=%s status=%s action %s in both views",
+    (enabled, loaded, status, label) => {
+      props.onEnable.mockClear();
+      props.onRepair.mockClear();
+      const action = status === "failed" ? props.onRepair : props.onEnable;
+      const other = status === "failed" ? props.onEnable : props.onRepair;
+      const target = { ...plugin(loaded, status), enabled };
+      render(<InstalledPluginList {...props} plugins={[target]} />);
+      fireEvent.click(screen.getByRole("button", { name: label }));
+      expect(action).toHaveBeenCalledWith(target);
+      expect(other).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByLabelText("skills.listView"));
+      const actions = screen.getAllByRole("button", {
+        name: label,
+        hidden: true,
+      });
+      expect(actions).toHaveLength(2);
+      fireEvent.click(actions[0]);
+      expect(action).toHaveBeenCalledTimes(2);
+    },
+  );
 });

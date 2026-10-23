@@ -6,9 +6,11 @@ from pathlib import Path
 
 import pytest
 
-import qwenpaw.harnesses.codex.rollout_reader as rollout_module
-from qwenpaw.harnesses.codex.rollout_reader import CodexRolloutReader
-from qwenpaw.harnesses.events import HarnessHistoryKind
+import qwenpaw.portability.providers.codex_rollout_reader as rollout_module
+from qwenpaw.plugins.harnesses import HarnessHistoryKind
+from qwenpaw.portability.providers.codex_rollout_reader import (
+    CodexRolloutReader,
+)
 
 
 def _line(entry_type: str, payload: dict, timestamp: str) -> str:

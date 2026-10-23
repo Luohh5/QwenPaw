@@ -101,6 +101,65 @@ export async function fetchPlugins(): Promise<PluginInfo[]> {
   return response.json();
 }
 
+export interface PluginRepairResult {
+  id: string;
+  status: string;
+  enabled: boolean;
+  diagnostics: string[];
+}
+
+/** Explicit user-requested dependency repair; viewing the list never installs. */
+export async function repairPluginDependencies(
+  pluginId: string,
+): Promise<PluginRepairResult> {
+  const response = await fetch(
+    getApiUrl(`/plugins/${encodeURIComponent(pluginId)}/repair-dependencies`),
+    {
+      method: "POST",
+      headers: buildAuthHeaders(),
+    },
+  );
+  if (!response.ok)
+    throw new Error(
+      await responseErrorMessage(
+        response,
+        `Repair failed (${response.status})`,
+      ),
+    );
+  const result = await response.json();
+  notifyPluginChange();
+  return result;
+}
+
+/** Persist enabled state through the host's existing lifecycle endpoint. */
+export async function setPluginEnabled(
+  pluginId: string,
+  enabled: boolean,
+): Promise<PluginStatus> {
+  const response = await requestWithPluginBusyConfirmation(
+    (interruptTasks) =>
+      fetch(getApiUrl(`/plugins/${encodeURIComponent(pluginId)}/enabled`), {
+        method: "POST",
+        headers: { ...buildAuthHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({
+          enabled,
+          ...(interruptTasks ? { interrupt_tasks: true } : {}),
+        }),
+      }),
+    "update",
+  );
+  if (!response.ok)
+    throw new Error(
+      await responseErrorMessage(
+        response,
+        `Activation failed (${response.status})`,
+      ),
+    );
+  const result = await response.json();
+  notifyPluginChange();
+  return result;
+}
+
 /**
  * Install a plugin from a local path or HTTP(S) URL via hot-reload.
  */

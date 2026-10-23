@@ -175,6 +175,12 @@
     "cliAuthenticated": "{{type}} CLI authenticated"
   },
   "portabilityImport": {
+    "harnessRequired": "{{plugin}} is required for import ({{state}}).",
+    "pluginStates": {
+      "missing": "not installed",
+      "disabled": "disabled",
+      "failed": "activation failed"
+    },
     "qwenpawOnly": "Import is only available for agents using the QwenPaw backend. Select a QwenPaw agent to continue.",
     "title": "Import",
     "description": "Import data from other AI applications into QwenPaw. Choose a source, then preview and select its content. QwenPaw is updated only when you start the import.",
@@ -5270,6 +5276,10 @@
     "details": "Details"
   },
   "pluginManager": {
+    "repair": "Repair and retry",
+    "repairFailed": "Plugin repair did not activate the plugin. Check its diagnostics and application logs.",
+    "enableSuccess": "Plugin activated.",
+    "enableFailed": "Plugin activation failed. Check its dependencies and application logs, then retry.",
     "busyTitle": "Plugin tasks are running",
     "busy": {
       "update": {
