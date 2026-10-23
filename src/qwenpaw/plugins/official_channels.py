@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from copy import deepcopy
 from functools import lru_cache
 import hashlib
@@ -171,6 +171,35 @@ def bundled_channel_source(plugin_id, *, retain=None):
         yield source
 
 
+@asynccontextmanager
+async def async_bundled_channel_source(plugin_id, *, retain=None):
+    """Extract off-loop while keeping source custody decisions on the loop."""
+    from ..utils.io_utils import run_sync_io
+
+    stack = ExitStack()
+    source_root = None
+    retained = False
+
+    def enter():
+        nonlocal source_root
+        source = stack.enter_context(
+            bundled_channel_source(plugin_id, retain=lambda _root: retained),
+        )
+        source_root = source.parent
+        return source
+
+    try:
+        yield await run_sync_io(enter)
+    finally:
+        try:
+            if source_root is not None and retain is not None:
+                # Preserve uncertain custody if the owner's check fails.
+                retained = True
+                retained = bool(retain(source_root))
+        finally:
+            await run_sync_io(stack.close)
+
+
 @lru_cache(maxsize=64)
 def _metadata_slot(root_identity, plugin_id):
     """Keep the most recent passive snapshot for this resource and channel."""
@@ -230,6 +259,8 @@ def _persisted_channel_enabled(data, key):
 
 async def prepare_channel_upgrade():
     """Prepare only persisted enabled channels during an explicit upgrade."""
+    from ..utils.io_utils import run_sync_io
+
     from ..constant import EnvVarLoader
     from ..config.utils import get_config_path, get_plugins_dir
     from .lifecycle import UnloadMode
@@ -279,21 +310,30 @@ async def prepare_channel_upgrade():
             try:
                 source = loader.find_installed_plugin_dir(plugin_id)
                 if source is None:
-                    with bundled_channel_source(plugin_id) as bundled:
+                    async with async_bundled_channel_source(
+                        plugin_id,
+                    ) as bundled:
                         record = await loader.seed_bundled_channel(
                             bundled,
                             settings.get(plugin_id),
                         )
                     source = record.source_path
                 async with loader.plugin_lifecycle(plugin_id):
-                    _, manifest = loader._read_source_manifest(source)
+                    _, manifest = await run_sync_io(
+                        loader._read_source_manifest,
+                        source,
+                    )
                     compatible, _ = loader._check_version_compatibility(
                         manifest,
                     )
                     if not compatible:
                         errors[plugin_id] = "PLUGIN_VERSION_INCOMPATIBLE"
                         continue
-                    binding = loader.backend_resolver.resolve(source, manifest)
+                    binding = await run_sync_io(
+                        loader.backend_resolver.resolve,
+                        source,
+                        manifest,
+                    )
                     if (
                         manifest.id != plugin_id
                         or binding.description.payload.descriptor.channel_key
@@ -412,7 +452,7 @@ async def provision_bundled_channels(loader):
     for plugin_id in sorted(requested - set(state.uninstalled)):
         try:
             if loader.find_installed_plugin_dir(plugin_id) is None:
-                with bundled_channel_source(plugin_id) as source:
+                async with async_bundled_channel_source(plugin_id) as source:
                     await loader.seed_bundled_channel(
                         source,
                         config.plugins.get(plugin_id),

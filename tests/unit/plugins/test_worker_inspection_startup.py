@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Exercise Windows socketpair semantics with real child-process IPC.
+"""Exercise Windows cold-start semantics with real child-process IPC.
 
-Forcing the stdlib TCP fallback on other hosts simulates the Windows
-self-pipe operations; it does not substitute for native Windows coverage.
+Simulated self-pipe and cached system queries exercise trusted startup
+ordering; they do not substitute for native Windows coverage.
 """
 from __future__ import annotations
 
@@ -36,7 +36,17 @@ def _inspection_spec(tmp_path, monkeypatch, *, candidate_operation=""):
     (code / "candidate.py").write_text(candidate_source, encoding="utf-8")
     launcher = tmp_path / "inspection-worker.py"
     launcher.write_text(
-        "import _socket, runpy, socket\n"
+        "import _socket, functools, platform, runpy, socket, subprocess, sys\n"
+        "from pathlib import Path\n"
+        "native_uname = platform.uname\n"
+        "@functools.lru_cache(maxsize=1)\n"
+        "def windows_uname():\n"
+        "    # Python 3.11 on Windows queries `ver` on a cold uname cache.\n"
+        f"    assert {str(code)!r} not in sys.path\n"
+        "    subprocess.run([sys.executable, '-I', '-c', 'pass'], check=True)\n"
+        f"    Path({str(tmp_path / 'trusted-platform')!r}).touch()\n"
+        "    return native_uname()\n"
+        "platform.uname = windows_uname\n"
         "native_socketpair = getattr(_socket, 'socketpair', None)\n"
         "if native_socketpair is not None:\n"
         "    del _socket.socketpair\n"
@@ -61,6 +71,7 @@ def _inspection_spec(tmp_path, monkeypatch, *, candidate_operation=""):
             instance_id="inspection-loop",
             generation=1,
             entrypoint="candidate:Worker",
+            dependency_paths=(code,),
             config={},
         ),
         imported,
@@ -88,6 +99,7 @@ async def test_inspection_initializes_trusted_loop_before_guard(
         result = await getattr(process, mode)(spec)
         assert result.cleanup.exited is True
         assert result.cleanup.residual == ()
+        assert (tmp_path / "trusted-platform").exists()
         assert imported.exists() is (mode == "probe")
     finally:
         stopped = await process.stop()
@@ -122,6 +134,7 @@ async def test_inspection_still_denies_candidate_network_or_process(
         with pytest.raises(ProcessError) as error:
             await process.probe(spec)
         assert error.value.reason_code == "PROBE_NETWORK_OR_PROCESS_DENIED"
+        assert (tmp_path / "trusted-platform").exists()
         assert not imported.exists()
     finally:
         stopped = await process.stop()

@@ -417,9 +417,9 @@ async def install_plugin_source(
     normalized = str(source or "").strip()
     temp_dir: Optional[Path] = None
     if normalized.startswith("bundled:"):
-        from ...plugins.official_channels import bundled_channel_source
+        from ...plugins.official_channels import async_bundled_channel_source
 
-        with bundled_channel_source(
+        async with async_bundled_channel_source(
             normalized.removeprefix("bundled:"),
             retain=loader.retains_preparation_source,
         ) as source_path:

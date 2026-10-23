@@ -24,7 +24,8 @@ def launch_spec(tmp_path, windows):
         """import json, ntpath, os
 from pathlib import Path
 observed = {name: os.environ.get(name) for name in (
-    'USERPROFILE', 'HOME', 'HOST_SECRET', 'PYTHONPATH', 'PYTHONHOME')}
+    'USERPROFILE', 'HOME', 'HOST_SECRET', 'PYTHONPATH', 'PYTHONHOME',
+    'PROCESSOR_ARCHITECTURE', 'PROCESSOR_ARCHITEW6432')}
 if WINDOWS:
     # Exercise CPython's Windows home lookup while keeping real POSIX I/O.
     original = Path.expanduser
@@ -48,7 +49,11 @@ class Worker:
     async def start(self, config): pass
     async def stop(self): pass
     async def home(self, params, request): return observed
-""".replace("WINDOWS", repr(windows)).replace("MARKER", repr(str(marker))),
+""".replace(
+            "WINDOWS", repr(windows)
+        ).replace(
+            "MARKER", repr(str(marker))
+        ),
     )
     return (
         PluginLaunchSpec(
@@ -89,6 +94,8 @@ async def test_real_workers_receive_only_trusted_platform_home(
     monkeypatch.setenv("HOST_SECRET", "host-canary")
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "poison-import"))
     monkeypatch.setenv("PYTHONHOME", str(tmp_path / "poison-home"))
+    monkeypatch.setenv("PROCESSOR_ARCHITECTURE", "x86")
+    monkeypatch.setenv("PROCESSOR_ARCHITEW6432", "AMD64")
     spec, marker = launch_spec(tmp_path, windows)
     monkeypatch.setattr(
         process_module,
@@ -128,6 +135,8 @@ async def test_real_workers_receive_only_trusted_platform_home(
         assert launched[0].get("USERPROFILE") == (
             str(home.resolve()) if windows else None
         )
+        assert launched[0].get("PROCESSOR_ARCHITECTURE") == "x86"
+        assert launched[0].get("PROCESSOR_ARCHITEW6432") == "AMD64"
         for name in ("HOME", "HOST_SECRET", "PYTHONPATH", "PYTHONHOME"):
             assert name not in launched[0]
         if mode == "audit":
@@ -138,6 +147,8 @@ async def test_real_workers_receive_only_trusted_platform_home(
             assert observed["USERPROFILE"] == (
                 str(home.resolve()) if windows else None
             )
+            assert observed["PROCESSOR_ARCHITECTURE"] == "x86"
+            assert observed["PROCESSOR_ARCHITEW6432"] == "AMD64"
             for name in ("HOME", "HOST_SECRET", "PYTHONPATH", "PYTHONHOME"):
                 assert observed[name] is None
             if windows:
@@ -159,6 +170,8 @@ def test_bootstrap_retains_windows_profile_without_ambient_controls(
         "HOST_SECRET": "host-canary",
         "PYTHONPATH": "poison-import",
         "PYTHONHOME": "poison-home",
+        "PROCESSOR_ARCHITECTURE": "x86",
+        "PROCESSOR_ARCHITEW6432": "AMD64",
     }
     monkeypatch.setattr(
         bootstrap,
@@ -166,11 +179,27 @@ def test_bootstrap_retains_windows_profile_without_ambient_controls(
         SimpleNamespace(name="nt", environ=environment),
     )
     bootstrap._clean_environment(())
-    assert environment == {name: r"C:\Users\Trusted", "PATH": "trusted-path"}
+    assert environment == {
+        name: r"C:\Users\Trusted",
+        "PATH": "trusted-path",
+        "PROCESSOR_ARCHITECTURE": "x86",
+        "PROCESSOR_ARCHITEW6432": "AMD64",
+    }
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("name", ["USERPROFILE", "userprofile", "UserProfile"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "USERPROFILE",
+        "userprofile",
+        "UserProfile",
+        "PROCESSOR_ARCHITECTURE",
+        "processor_architecture",
+        "PROCESSOR_ARCHITEW6432",
+        "processor_architew6432",
+    ],
+)
 async def test_private_profile_is_rejected_before_child_creation(
     tmp_path,
     name,
@@ -178,9 +207,13 @@ async def test_private_profile_is_rejected_before_child_creation(
     spec, marker = launch_spec(tmp_path, False)
     spec.private_env[name] = "private-profile-canary"
     process = PluginProcess()
-    with pytest.raises(process_module.ProcessError) as error:
-        await process.start(spec)
-    assert error.value.reason_code == "LAUNCH_ENVIRONMENT_INVALID"
-    assert "private-profile-canary" not in str(error.value)
-    assert process.health_snapshot()["pid"] is None
-    assert not marker.exists()
+    try:
+        with pytest.raises(process_module.ProcessError) as error:
+            await process.start(spec)
+        assert error.value.reason_code == "LAUNCH_ENVIRONMENT_INVALID"
+        assert "private-profile-canary" not in str(error.value)
+        assert process.health_snapshot()["pid"] is None
+        assert not marker.exists()
+    finally:
+        stopped = await process.stop()
+        assert stopped.exited and not stopped.residual

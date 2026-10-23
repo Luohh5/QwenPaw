@@ -539,6 +539,8 @@ class PluginProcess:
                 "WINDIR",
                 "COMSPEC",
                 "PATHEXT",
+                "PROCESSOR_ARCHITECTURE",
+                "PROCESSOR_ARCHITEW6432",
                 "TEMP",
                 "TMP",
                 "TMPDIR",

@@ -1620,7 +1620,10 @@ async def test_registration_restores_context_and_child_cannot_borrow(
         assert (
             await asyncio.wait_for(child, 2) is None
         ), "create_task borrowed parent's admission token"
-        assert token(loader._binding_for_record(record).description) is None
+        assert (
+            token((await loader._binding_for_record(record)).description)
+            is None
+        )
     finally:
         child_release.set()
         if child is not None:

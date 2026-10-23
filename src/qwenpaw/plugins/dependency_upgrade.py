@@ -208,22 +208,35 @@ class DependencyUpgradeManager:
             return self._public(operation)
 
     async def _binding(self, source):
-        _, manifest = self.loader.read_source_manifest(source)
+        _, manifest = await run_sync_io(
+            self.loader.read_source_manifest,
+            source,
+        )
         compatible, message = self.loader._check_version_compatibility(
             manifest,
         )
         if not compatible:
             _refuse("DEPENDENCY_PLAN_UNVERIFIED", message)
-        return self.loader.backend_resolver.resolve(source, manifest)
+        return await run_sync_io(
+            self.loader.backend_resolver.resolve,
+            source,
+            manifest,
+        )
 
     async def _consumers(self, binding, snapshot):
         """Installed declarations participate even when currently inactive."""
         consumers = []
         plugin_id = binding.description.manifest.id
-        for manifest, source in self.loader.discover_plugins():
+        for manifest, source in await run_sync_io(
+            self.loader.discover_plugins,
+        ):
             if manifest.id == plugin_id:
                 continue
-            other = self.loader.backend_resolver.resolve(source, manifest)
+            other = await run_sync_io(
+                self.loader.backend_resolver.resolve,
+                source,
+                manifest,
+            )
             observed = await other.backend.audit_dependencies(
                 other.description,
             )
@@ -932,7 +945,10 @@ async def continue_operation(directory, *, preflight=False):
     manager = DependencyUpgradeManager(loader)
     try:
         source = directory / "source"
-        if _source_hash(source) != operation["source_revision"]:
+        if (
+            await run_sync_io(_source_hash, source)
+            != operation["source_revision"]
+        ):
             raise RuntimeError(
                 "DEPENDENCY_PLAN_STALE: retained source changed.",
             )

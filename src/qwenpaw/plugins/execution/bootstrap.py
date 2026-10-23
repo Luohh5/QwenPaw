@@ -34,6 +34,8 @@ _STARTUP_ENVIRONMENT = (
             "COMSPEC",
             "PATH",
             "PATHEXT",
+            "PROCESSOR_ARCHITECTURE",
+            "PROCESSOR_ARCHITEW6432",
             "SSL_CERT_FILE",
             "SYSTEMDRIVE",
             "SYSTEMROOT",

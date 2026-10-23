@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import platform
 import sys
 import sysconfig
 import types
@@ -388,6 +389,8 @@ def main(
             # Windows builds the trusted loop's self-pipe with socketpair.
             # Install the guard after that, but before candidate paths enter.
             if mode in {"audit", "probe"}:
+                # Windows Python 3.11 may run `ver` to initialize uname.
+                platform.uname()
                 _guard_inspection(boot)
             _configure(boot, packet, protected_namespaces)
             from qwenpaw.plugins.execution.runtime import Runtime

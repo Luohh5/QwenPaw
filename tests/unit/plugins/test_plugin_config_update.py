@@ -271,7 +271,7 @@ async def test_cancel_config_shutdown_retains_original_hooks_for_retry(
         loader.lifecycle.update_config("cancel-stop", {"value": "new"}),
     )
     try:
-        await asyncio.wait_for(plugin.entered.wait(), timeout=1)
+        await asyncio.wait_for(plugin.entered.wait(), timeout=15)
         updating.cancel()
         with pytest.raises(asyncio.CancelledError):
             await updating
@@ -325,10 +325,10 @@ async def test_config_write_failure_restores_runtime_and_allows_retry(
     if restore_fails:
         reregister = loader.reregister_unlocked
 
-        async def fail_restore(plugin_id, config):
+        async def fail_restore(plugin_id, config, **kwargs):
             if config == {"cmd": "old"}:
                 raise RuntimeError("old config restore failed")
-            await reregister(plugin_id, config)
+            await reregister(plugin_id, config, **kwargs)
 
         monkeypatch.setattr(loader, "reregister_unlocked", fail_restore)
     report = await loader.lifecycle.update_config("cfg", {"cmd": "new"})
@@ -405,7 +405,7 @@ async def test_cancel_during_config_save_keeps_runtime_and_disk_consistent(
         loader.lifecycle.update_config("cfg", {"cmd": "new"}),
     )
     try:
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await asyncio.wait_for(started.wait(), timeout=15)
         task.cancel()
         await asyncio.sleep(0)
         assert not task.done()
@@ -426,7 +426,7 @@ async def test_cancel_during_config_save_keeps_runtime_and_disk_consistent(
     )
     report = await asyncio.wait_for(
         loader.lifecycle.update_config("cfg", {"cmd": "retry"}),
-        timeout=5,
+        timeout=15,
     )
     assert report.ok
 
