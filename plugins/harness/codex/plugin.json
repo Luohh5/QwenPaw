@@ -6,7 +6,8 @@
   "author": "QwenPaw Team",
   "type": "general",
   "entry": {
-    "backend": "main.py"
+    "backend": "main.py",
+    "frontend": "frontend/dist/index.js"
   },
   "qwenpaw_version": {
     "min": "2.3.0b1"
@@ -27,6 +28,11 @@
   },
   "pack_exclude": [
     "tests",
-    "requirements-test.txt"
+    "requirements-test.txt",
+    "frontend/src",
+    "frontend/package.json",
+    "frontend/package-lock.json",
+    "frontend/tsconfig.json",
+    "frontend/vite.config.ts"
   ]
 }

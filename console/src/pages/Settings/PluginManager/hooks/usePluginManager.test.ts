@@ -220,6 +220,29 @@ describe("usePluginManager", () => {
     expect(refreshMock).toHaveBeenCalledTimes(refreshedBeforeRepair + 2);
   });
 
+  it("disables an active plugin through the lifecycle API and refreshes installed state", async () => {
+    const active = {
+      ...makePlugin(),
+      enabled: true,
+      loaded: true,
+      status: "active",
+    };
+    hoisted.setPluginEnabledMock.mockResolvedValueOnce({
+      id: active.id,
+      enabled: false,
+      loaded: false,
+      status: "disabled",
+    });
+    const { result } = renderHook(() => usePluginManager());
+
+    await act(async () => {
+      await result.current.disableOne(active);
+    });
+    expect(hoisted.setPluginEnabledMock).toHaveBeenCalledWith(active.id, false);
+    expect(refreshMock).toHaveBeenCalledOnce();
+    expect(messageMock.success).toHaveBeenCalledOnce();
+  });
+
   it("detects official updates and updates one plugin without reloading", async () => {
     const plugin = { ...makePlugin(), version: "1.0.0" };
     hoisted.pluginsData = [plugin];

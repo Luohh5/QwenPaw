@@ -30,6 +30,7 @@ interface InstalledPluginListProps {
   enablingId: string | null;
   onEnable: (plugin: PluginInfo) => void;
   onRepair: (plugin: PluginInfo) => void;
+  onDisable: (plugin: PluginInfo) => void;
   loading: boolean;
   uninstallingId: string | null;
   onRefresh: () => void;
@@ -48,6 +49,7 @@ export function InstalledPluginList({
   enablingId,
   onEnable,
   onRepair,
+  onDisable,
   loading,
   uninstallingId,
   onRefresh,
@@ -77,7 +79,15 @@ export function InstalledPluginList({
           plugin.status === "failed" ? "pluginManager.repair" : "common.enable",
         )}
       </Button>
-    ) : null;
+    ) : (
+      <Button
+        loading={enablingId === plugin.id}
+        disabled={enablingId !== null && enablingId !== plugin.id}
+        onClick={() => onDisable(plugin)}
+      >
+        {t("common.disable")}
+      </Button>
+    );
   const columns = usePluginColumns({
     uninstallingId,
     onUninstall,

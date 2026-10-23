@@ -8,9 +8,9 @@ import type { HarnessApprovalPreset } from "@/api/modules/harness";
 import { useIsMobile } from "../../../hooks/useIsMobile";
 import { OsDrawer } from "../../../os/OsOverlay";
 import drawerStyles from "./ApprovalToggle.module.less";
-import styles from "./HarnessApprovalToggle.module.less";
+import styles from "./BackendApprovalToggle.module.less";
 
-interface HarnessApprovalToggleProps {
+interface BackendApprovalToggleProps {
   backend: string;
   sessionId: string;
   presets: HarnessApprovalPreset[];
@@ -23,14 +23,14 @@ function storageKey(backend: string, sessionId: string): string {
   return `harness-approval-${backend}-${sessionId}`;
 }
 
-export default function HarnessApprovalToggle({
+export default function BackendApprovalToggle({
   backend,
   sessionId,
   presets,
   onChange,
   className,
   compact = false,
-}: HarnessApprovalToggleProps) {
+}: BackendApprovalToggleProps) {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
   const defaultPreset = presets[0];
@@ -63,23 +63,13 @@ export default function HarnessApprovalToggle({
         key: preset.id,
         label: (
           <div>
-            <div>
-              {t(
-                `agent.backend.approvalPresets.${preset.id}.name`,
-                preset.name,
-              )}
-            </div>
-            <div className={styles.description}>
-              {t(
-                `agent.backend.approvalPresets.${preset.id}.description`,
-                preset.description,
-              )}
-            </div>
+            <div>{preset.name}</div>
+            <div className={styles.description}>{preset.description}</div>
           </div>
         ),
         onClick: () => selectPreset(preset),
       })),
-    [presets, selectPreset, t],
+    [presets, selectPreset],
   );
 
   if (!selected) return null;
@@ -95,10 +85,7 @@ export default function HarnessApprovalToggle({
       <ShieldCheck size={13} />
       {!compact && (
         <>
-          {t(
-            `agent.backend.approvalPresets.${selected.id}.name`,
-            selected.name,
-          )}
+          {selected.name}
           <ChevronDown size={12} />
         </>
       )}
@@ -157,18 +144,8 @@ export default function HarnessApprovalToggle({
                       <ShieldCheck size={15} />
                     </span>
                     <span className={drawerStyles.optionCopy}>
-                      <strong>
-                        {t(
-                          `agent.backend.approvalPresets.${preset.id}.name`,
-                          preset.name,
-                        )}
-                      </strong>
-                      <small>
-                        {t(
-                          `agent.backend.approvalPresets.${preset.id}.description`,
-                          preset.description,
-                        )}
-                      </small>
+                      <strong>{preset.name}</strong>
+                      <small>{preset.description}</small>
                     </span>
                     {presetSelected && <Check size={16} />}
                   </button>

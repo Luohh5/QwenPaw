@@ -115,7 +115,6 @@ class _Gateway:
 
             entry = owner(provider_id)
             workspace = await get_agent_for_request(request)
-            entry.assert_active()
             values = settings
             if values is None:
                 from ..config.config import load_agent_config_async
@@ -127,6 +126,7 @@ class _Gateway:
                     else {}
                 )
             try:
+                entry.assert_active()
                 result = await workspace.backend_runtime.call(
                     provider_id,
                     operation,

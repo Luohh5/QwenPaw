@@ -21,6 +21,7 @@ import {
 import { compareVersions } from "@/layouts/constants";
 import { marketPluginMatches } from "@/utils/marketPluginIdentity";
 import { reloadFrontendPlugin, reloadPawApp } from "@/plugins/usePluginLoader";
+import { refreshHarnessCatalog } from "@/plugins/harnesses";
 import { removePluginRuntime } from "@/plugins/pluginRuntimeCleanup";
 import { removePluginAppState } from "@/os/osCleanup";
 
@@ -247,27 +248,49 @@ export function usePluginManager() {
     }
   }, [message, plugins, refresh, t, updatingAll, updatingId, updates]);
 
-  const enableOne = useCallback(
-    async (plugin: PluginInfo) => {
+  const changeActivation = useCallback(
+    async (plugin: PluginInfo, action: "enable" | "repair" | "disable") => {
       if (enablingId !== null) return;
       setEnablingId(plugin.id);
+      const failureKey = `pluginManager.${action}Failed`;
       try {
-        const result = await setPluginEnabled(plugin.id, true);
-        if (
-          !result.loaded ||
-          !result.enabled ||
-          (result.status && result.status !== "active")
-        ) {
-          throw new Error(t("pluginManager.enableFailed"));
+        if (action === "repair") {
+          const result = await repairPluginDependencies(plugin.id);
+          if (!result.enabled || result.status !== "active")
+            throw new Error(result.diagnostics.join("\n") || t(failureKey));
+        } else {
+          const result = await setPluginEnabled(plugin.id, action === "enable");
+          if (action === "enable") {
+            if (
+              !result.loaded ||
+              !result.enabled ||
+              (result.status && result.status !== "active")
+            )
+              throw new Error(t(failureKey));
+          } else {
+            if (
+              result.enabled ||
+              result.loaded ||
+              result.needs_restart ||
+              result.clean === false
+            )
+              throw new Error(result.errors?.join("\n") || t(failureKey));
+          }
         }
-        await reloadInstalledPluginRuntime(plugin);
-        message.success(t("pluginManager.enableSuccess"));
-      } catch (err) {
-        message.error(
-          err instanceof Error ? err.message : t("pluginManager.enableFailed"),
+        if (action === "disable") removePluginRuntime(plugin.id);
+        else await reloadInstalledPluginRuntime(plugin);
+        message.success(
+          t(
+            action === "disable"
+              ? "pluginManager.disableSuccess"
+              : "pluginManager.enableSuccess",
+          ),
         );
+      } catch (err) {
+        message.error(err instanceof Error ? err.message : t(failureKey));
       } finally {
         try {
+          await refreshHarnessCatalog().catch(() => {});
           await refresh();
         } finally {
           setEnablingId(null);
@@ -276,34 +299,10 @@ export function usePluginManager() {
     },
     [enablingId, message, refresh, t],
   );
-
-  const repairOne = useCallback(
-    async (plugin: PluginInfo) => {
-      if (enablingId !== null) return;
-      setEnablingId(plugin.id);
-      try {
-        const result = await repairPluginDependencies(plugin.id);
-        if (!result.enabled || result.status !== "active") {
-          throw new Error(
-            result.diagnostics.join("\n") || t("pluginManager.repairFailed"),
-          );
-        }
-        await reloadInstalledPluginRuntime(plugin);
-        message.success(t("pluginManager.enableSuccess"));
-      } catch (err) {
-        message.error(
-          err instanceof Error ? err.message : t("pluginManager.repairFailed"),
-        );
-      } finally {
-        try {
-          await refresh();
-        } finally {
-          setEnablingId(null);
-        }
-      }
-    },
-    [enablingId, message, refresh, t],
-  );
+  const enableOne = (plugin: PluginInfo) => changeActivation(plugin, "enable");
+  const repairOne = (plugin: PluginInfo) => changeActivation(plugin, "repair");
+  const disableOne = (plugin: PluginInfo) =>
+    changeActivation(plugin, "disable");
 
   const handleUninstall = useCallback(
     (plugin: PluginInfo) => {
@@ -349,6 +348,7 @@ export function usePluginManager() {
     enablingId,
     enableOne,
     repairOne,
+    disableOne,
     updates,
     updatesLoading,
     updatingId,

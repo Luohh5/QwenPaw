@@ -1,10 +1,10 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor } from "@testing-library/react";
 
 import { agentsApi } from "@/api/modules/agents";
 import { harnessApi } from "@/api/modules/harness";
 import { renderWithProviders } from "@/test/common_setup";
-import HarnessModelSelector from "./HarnessModelSelector";
+import BackendModelSelector from "./BackendModelSelector";
 
 const { mockUpdateAgent, mockUseAgentStore } = vi.hoisted(() => ({
   mockUpdateAgent: vi.fn(),
@@ -60,7 +60,7 @@ function setupAgent(backendModel: string | null) {
   });
 }
 
-describe("HarnessModelSelector", () => {
+describe("BackendModelSelector", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     setupAgent(null);
@@ -72,7 +72,12 @@ describe("HarnessModelSelector", () => {
   });
 
   it("persists the backend default model on first load", async () => {
-    renderWithProviders(<HarnessModelSelector providerId="codex" />);
+    renderWithProviders(
+      <BackendModelSelector
+        backendId="codex"
+        capabilities={{ reasoning_effort: true }}
+      />,
+    );
 
     await waitFor(() =>
       expect(agentsApi.updateBackendSettings).toHaveBeenCalledWith(
@@ -94,7 +99,12 @@ describe("HarnessModelSelector", () => {
       models: models.map((item) => ({ ...item, is_default: false })),
     });
 
-    renderWithProviders(<HarnessModelSelector providerId="codex" />);
+    renderWithProviders(
+      <BackendModelSelector
+        backendId="codex"
+        capabilities={{ reasoning_effort: true }}
+      />,
+    );
 
     await waitFor(() =>
       expect(agentsApi.updateBackendSettings).toHaveBeenCalledWith(
@@ -121,7 +131,12 @@ describe("HarnessModelSelector", () => {
       ],
     });
 
-    renderWithProviders(<HarnessModelSelector providerId="codex" />);
+    renderWithProviders(
+      <BackendModelSelector
+        backendId="codex"
+        capabilities={{ reasoning_effort: true }}
+      />,
+    );
 
     await waitFor(() =>
       expect(agentsApi.updateBackendSettings).toHaveBeenCalledWith(
@@ -137,7 +152,12 @@ describe("HarnessModelSelector", () => {
   it("does not overwrite an existing model selection", async () => {
     setupAgent("codex-mini");
 
-    renderWithProviders(<HarnessModelSelector providerId="codex" />);
+    renderWithProviders(
+      <BackendModelSelector
+        backendId="codex"
+        capabilities={{ reasoning_effort: true }}
+      />,
+    );
 
     await waitFor(() => expect(harnessApi.listModels).toHaveBeenCalledOnce());
     expect(agentsApi.updateBackendSettings).not.toHaveBeenCalled();
@@ -146,19 +166,24 @@ describe("HarnessModelSelector", () => {
   it("does not save a model when the backend returns an empty list", async () => {
     vi.mocked(harnessApi.listModels).mockResolvedValue({ models: [] });
 
-    renderWithProviders(<HarnessModelSelector providerId="codex" />);
+    renderWithProviders(
+      <BackendModelSelector
+        backendId="codex"
+        capabilities={{ reasoning_effort: true }}
+      />,
+    );
 
     await waitFor(() => expect(harnessApi.listModels).toHaveBeenCalledOnce());
     expect(agentsApi.updateBackendSettings).not.toHaveBeenCalled();
   });
 
-  it("loads and persists Qoder-owned models through the same selector", async () => {
+  it("loads and persists a third-party backend's models through the same selector", async () => {
     mockUseAgentStore.mockReturnValue({
-      selectedAgent: "qoder-agent",
+      selectedAgent: "third-agent",
       agents: [
         {
-          id: "qoder-agent",
-          backend: "qoder",
+          id: "third-agent",
+          backend: "third-party",
           backend_model: null,
         },
       ],
@@ -177,19 +202,28 @@ describe("HarnessModelSelector", () => {
       ],
     });
 
-    renderWithProviders(<HarnessModelSelector providerId="qoder" />);
+    renderWithProviders(
+      <BackendModelSelector
+        backendId="third-party"
+        capabilities={{ reasoning_effort: false }}
+      />,
+    );
 
     await waitFor(() =>
-      expect(harnessApi.listModels).toHaveBeenCalledWith("qoder"),
+      expect(harnessApi.listModels).toHaveBeenCalledWith("third-party"),
     );
     await waitFor(() =>
       expect(agentsApi.updateBackendSettings).toHaveBeenCalledWith(
-        "qoder-agent",
+        "third-agent",
         {
           model: "auto",
-          reasoning_effort: "high",
         },
       ),
     );
+    expect(mockUpdateAgent).toHaveBeenCalledWith("third-agent", {
+      backend_model: "auto",
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Auto/ }));
+    expect(screen.queryByText("agent.backend.reasoningEffort")).toBeNull();
   });
 });

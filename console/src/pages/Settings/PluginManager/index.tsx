@@ -33,6 +33,7 @@ export default function PluginManagerPage() {
     enablingId,
     enableOne,
     repairOne,
+    disableOne,
     updates,
     updatesLoading,
     updatingId,
@@ -74,6 +75,7 @@ export default function PluginManagerPage() {
           enablingId={enablingId}
           onEnable={enableOne}
           onRepair={repairOne}
+          onDisable={disableOne}
           updates={updates}
           updatesLoading={updatesLoading}
           updatingId={updatingId}

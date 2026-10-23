@@ -7,20 +7,13 @@ import ptBR from "./pt-BR.json";
 import ru from "./ru.json";
 import vi from "./vi.json";
 import zh from "./zh.json";
+import { localMessages as codexMessages } from "../../../plugins/harness/codex/frontend/src/locale";
+import { localMessages as qoderMessages } from "../../../plugins/harness/qoder/frontend/src/locale";
 
 const locales = { en, id, ja, "pt-BR": ptBR, ru, vi, zh };
 
 const requiredPaths = [
   "common.saving",
-  "harnesses.connected",
-  "harnesses.disconnected",
-  "harnesses.notConnected",
-  "harnesses.comingSoon",
-  "harnesses.connect",
-  "harnesses.disconnect",
-  "harnesses.apiKeyAuthenticated",
-  "harnesses.chatGptAuthenticated",
-  "harnesses.cliAuthenticated",
   "mcp.qwenpawManaged",
   "mcp.qwenpawManagedHint",
   "mcp.providerManaged",
@@ -53,29 +46,12 @@ const requiredPaths = [
   "agent.backend.thirdPartyDescription",
   "agent.backend.providerTitle",
   "agent.backend.providerDescription",
-  "agent.backend.codexHint",
-  "agent.backend.qoderHint",
-  "agent.backend.account",
-  "agent.backend.qoderAccount",
-  "agent.backend.binary",
-  "agent.backend.binaryHelp",
-  "agent.backend.binaryPlaceholder",
-  "agent.backend.qoderBinary",
-  "agent.backend.qoderBinaryHelp",
-  "agent.backend.qoderBinaryPlaceholder",
   "agent.backend.detect",
-  "agent.backend.detectedBinary",
-  "agent.backend.qoderDetectedBinary",
-  "agent.backend.apiKeyLoginHint",
-  "agent.backend.qoderAuthHint",
-  "agent.backend.qoderConnect",
   "agent.backend.model",
   "agent.backend.modelDefault",
   "agent.backend.defaultBadge",
   "agent.backend.reasoningEffort",
   "agent.backend.reasoningDefault",
-  "agent.backend.codexNotFound",
-  "agent.backend.qoderNotFound",
   "agent.backend.chatSettingsHint",
   "agent.backend.capabilityTitle",
   "agent.backend.inheritedSkills",
@@ -88,20 +64,6 @@ const requiredPaths = [
   "agent.backend.chatModelHint",
   "agent.backend.appliesNextTurn",
   "agent.backend.approvalMode",
-  "agent.backend.approvalPresets.ask.name",
-  "agent.backend.approvalPresets.ask.description",
-  "agent.backend.approvalPresets.read-only.name",
-  "agent.backend.approvalPresets.read-only.description",
-  "agent.backend.approvalPresets.workspace.name",
-  "agent.backend.approvalPresets.workspace.description",
-  "agent.backend.approvalPresets.accept-edits.name",
-  "agent.backend.approvalPresets.accept-edits.description",
-  "agent.backend.approvalPresets.plan.name",
-  "agent.backend.approvalPresets.plan.description",
-  "agent.backend.approvalPresets.auto.name",
-  "agent.backend.approvalPresets.auto.description",
-  "agent.backend.approvalPresets.full-access.name",
-  "agent.backend.approvalPresets.full-access.description",
   "chat.commands.agents.description",
   "chat.commands.review.description",
   "chat.commands.status.description",
@@ -152,12 +114,32 @@ describe("third-party agent locale coverage", () => {
     },
   );
 
-  it.each(Object.entries(locales))(
-    "%s derives the authenticated CLI name from the agent type",
-    (_localeName, locale) => {
-      expect(
-        String(getTranslation(locale, "harnesses.cliAuthenticated")),
-      ).toContain("{{type}} CLI");
+  it.each(Object.keys(locales))(
+    "%s keeps vendor account and executable copy in each plugin",
+    (localeName) => {
+      for (const messages of [
+        codexMessages(localeName),
+        qoderMessages(localeName),
+      ]) {
+        for (const key of [
+          "hint",
+          "account",
+          "binary",
+          "binaryHelp",
+          "binaryPlaceholder",
+          "detected",
+          "notFound",
+          "authHint",
+          "connect",
+          "connected",
+          "disconnected",
+          "apiKeyAuthenticated",
+          "cliAuthenticated",
+        ] as const) {
+          expect(messages[key], `${localeName}.${key}`).toBeTruthy();
+        }
+        expect(messages.cliAuthenticated).toContain("{{type}} CLI");
+      }
     },
   );
 });

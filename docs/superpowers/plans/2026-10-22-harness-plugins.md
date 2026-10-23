@@ -273,13 +273,15 @@
 - Produces: 仅使用静态能力的通用选择/模型/审批控件；厂商账号和设置 UI 由对应插件注册。
 - frontend_plugin 的可执行入口需 enabled+ACTIVE+activated；对仅前端的已有合法插件保留其既有激活语义，不以“没有后端”误判为不可加载。
 
-- [ ] **Step 1：写原生界面失败测试。** 无插件时只有原生可用选项和安装入口，不请求 `/harnesses/*`，不加载厂商脚本；编辑缺失后端显示状态且保留设置。
-- [ ] **Step 2：写单插件和热启停失败测试。** `test_only_selected_backend_settings_render`、`test_disabled_script_never_executes`、`test_failed_plugin_not_executable_from_disk_fallback`、`test_disable_disposes_harness_extensions`；对原有仅前端插件增加兼容用例。
-- [ ] **Step 3：写 HTTP 失败测试。** 验证不启用时网关缺席、两个插件共存、禁用其一不影响另一个、旧路径/响应功能与鉴权可用、停用后匹配中的请求无法绕过门禁。
-- [ ] **Step 4：实现 UI 分离与泛化。** 删除 ProviderId 联合类型和厂商数组；移动认证逻辑/文案；通用控件只认 capabilities；Skill/MCP 通过已注册能力取数。
-- [ ] **Step 5：实现前后端加载状态一致。** 禁用/失败不下发可执行入口，loader 双重校验；启用与停用的事件沿现有插件事件接线，不要求整页重载才能生效。
-- [ ] **Step 6：移除旧常驻路由。** 只保留 SDK 动态网关；`/agents/backends` 是轻量发现入口；不把 router 放回聚合 `__init__.py`。
-- [ ] **Step 7：验证并提交。** Run: `python -m pytest tests/integration/test_harness_plugin_http.py tests/integration/test_frontend_plugin_router.py -q`。Run from console: `npm run test:run -- src/plugins/harnesses.test.ts src/plugins/usePluginLoader.test.ts src/pages/Settings/Agents/components/AgentBackendFields.test.tsx`，再 `npm run build`。建议提交：`refactor(console): load harness contributions from plugins`。
+- [x] **Step 1：写原生界面失败测试。** 无插件时只有原生可用选项和安装入口，不请求 `/harnesses/*`，不加载厂商脚本；编辑缺失后端显示状态且保留设置。
+- [x] **Step 2：写单插件和热启停失败测试。** `test_only_selected_backend_settings_render`、`test_disabled_script_never_executes`、`test_failed_plugin_not_executable_from_disk_fallback`、`test_disable_disposes_harness_extensions`；对原有仅前端插件增加兼容用例。
+- [x] **Step 3：写 HTTP 失败测试。** 验证不启用时网关缺席、两个插件共存、禁用其一不影响另一个、旧路径/响应功能与鉴权可用、停用后匹配中的请求无法绕过门禁。
+- [x] **Step 4：实现 UI 分离与泛化。** 删除 ProviderId 联合类型和厂商数组；移动认证逻辑/文案；通用控件只认 capabilities；Skill/MCP 通过已注册能力取数。
+- [x] **Step 5：实现前后端加载状态一致。** 禁用/失败不下发可执行入口，loader 双重校验；启用与停用的事件沿现有插件事件接线，不要求整页重载才能生效。
+- [x] **Step 6：移除旧常驻路由。** 只保留 SDK 动态网关；`/agents/backends` 是轻量发现入口；不把 router 放回聚合 `__init__.py`。
+- [x] **Step 7：验证并提交。** Run: `python -m pytest tests/integration/test_harness_plugin_http.py tests/integration/test_frontend_plugin_router.py -q`。Run from console: `npm run test:run -- src/plugins/harnesses.test.ts src/plugins/usePluginLoader.test.ts src/pages/Settings/Agents/components/AgentBackendFields.test.tsx`，再 `npm run build`。建议提交：`refactor(console): load harness contributions from plugins`。
+
+**执行证据（2026-10-24）：** 核心设置/模型/审批由静态能力驱动，厂商界面和七种文案已迁入独立插件；两个前端实际构建通过。最终受影响前端 123 项、聊天与文案 236 项、HTTP/目录 12 项、真实本地服务 11 项通过，类型与适用 hooks 通过。认证事件补载和下载并发经两轮定向修复，独立复审 SPEC/QUALITY PASS；实际浏览器无插件表单仅显示安装入口。完整 Console 构建通过，核心产物未包含检查的厂商认证文案。A5/A6 发行物和最终对照仍未完成。
 
 ### A5 可选插件产物、依赖和桌面分发
 

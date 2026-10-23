@@ -4,23 +4,29 @@ import { Brain, Check, ChevronDown, Cpu } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { agentsApi } from "@/api/modules/agents";
-import { harnessApi, type HarnessModel } from "@/api/modules/harness";
+import {
+  harnessApi,
+  type HarnessModel,
+  type HarnessCapabilities,
+} from "@/api/modules/harness";
 import { useAppMessage } from "@/hooks/useAppMessage";
 import { useAgentStore } from "@/stores/agentStore";
-import styles from "./HarnessModelSelector.module.less";
+import styles from "./BackendModelSelector.module.less";
 
-interface HarnessModelSelectorProps {
-  providerId: string;
+interface BackendModelSelectorProps {
+  backendId: string;
+  capabilities?: Partial<HarnessCapabilities>;
 }
 
 interface HarnessModelCatalog {
-  providerId: string;
+  backendId: string;
   models: HarnessModel[];
 }
 
-export default function HarnessModelSelector({
-  providerId,
-}: HarnessModelSelectorProps) {
+export default function BackendModelSelector({
+  backendId,
+  capabilities,
+}: BackendModelSelectorProps) {
   const { t } = useTranslation();
   const { message } = useAppMessage();
   const { selectedAgent, agents, updateAgent } = useAgentStore();
@@ -31,8 +37,8 @@ export default function HarnessModelSelector({
   const [open, setOpen] = useState(false);
   const autoSelectingRef = useRef<string | null>(null);
   const models = useMemo(
-    () => (catalog?.providerId === providerId ? catalog.models : []),
-    [catalog, providerId],
+    () => (catalog?.backendId === backendId ? catalog.models : []),
+    [catalog, backendId],
   );
   const modelId = agent?.backend_model ?? undefined;
   const model = useMemo(
@@ -45,10 +51,10 @@ export default function HarnessModelSelector({
     let cancelled = false;
     setLoading(true);
     harnessApi
-      .listModels(providerId)
+      .listModels(backendId)
       .then((result) => {
         if (!cancelled) {
-          setCatalog({ providerId, models: result.models });
+          setCatalog({ backendId, models: result.models });
           if (result.message) {
             message.warning(result.message);
           }
@@ -56,7 +62,7 @@ export default function HarnessModelSelector({
       })
       .catch((error) => {
         if (!cancelled) {
-          setCatalog({ providerId, models: [] });
+          setCatalog({ backendId, models: [] });
           message.error(error instanceof Error ? error.message : String(error));
         }
       })
@@ -66,7 +72,7 @@ export default function HarnessModelSelector({
     return () => {
       cancelled = true;
     };
-  }, [message, providerId]);
+  }, [message, backendId]);
 
   const save = useCallback(
     async (nextModel?: HarnessModel, nextEffort?: string) => {
@@ -77,11 +83,15 @@ export default function HarnessModelSelector({
         // omitted field would silently keep the old server-side value.
         await agentsApi.updateBackendSettings(selectedAgent, {
           model: nextModel?.id ?? null,
-          reasoning_effort: nextEffort ?? null,
+          ...(capabilities?.reasoning_effort
+            ? { reasoning_effort: nextEffort ?? null }
+            : {}),
         });
         updateAgent(selectedAgent, {
           backend_model: nextModel?.id ?? null,
-          backend_reasoning_effort: nextEffort ?? null,
+          ...(capabilities?.reasoning_effort
+            ? { backend_reasoning_effort: nextEffort ?? null }
+            : {}),
         });
       } catch (error) {
         message.error(error instanceof Error ? error.message : String(error));
@@ -89,17 +99,17 @@ export default function HarnessModelSelector({
         setSaving(false);
       }
     },
-    [message, selectedAgent, updateAgent],
+    [capabilities?.reasoning_effort, message, selectedAgent, updateAgent],
   );
 
   useEffect(() => {
     if (!agent || modelId || loading || models.length === 0) return;
-    const selectionKey = `${selectedAgent}:${providerId}`;
+    const selectionKey = `${selectedAgent}:${backendId}`;
     if (autoSelectingRef.current === selectionKey) return;
     const defaultModel = models.find((item) => item.is_default) ?? models[0];
     autoSelectingRef.current = selectionKey;
     void save(defaultModel, defaultModel.default_reasoning_effort ?? undefined);
-  }, [agent, loading, modelId, models, providerId, save, selectedAgent]);
+  }, [agent, loading, modelId, models, backendId, save, selectedAgent]);
 
   const selectedLabel =
     model?.name ??
@@ -109,7 +119,7 @@ export default function HarnessModelSelector({
   const content = (
     <div className={styles.panel}>
       <div className={styles.heading}>
-        <span>{providerId}</span>
+        <span>{backendId}</span>
         <small>{t("agent.backend.chatModelHint")}</small>
       </div>
       <label>
@@ -134,23 +144,25 @@ export default function HarnessModelSelector({
           }}
         />
       </label>
-      <label>
-        <span>
-          <Brain size={14} />
-          {t("agent.backend.reasoningEffort")}
-        </span>
-        <Select
-          value={effort}
-          allowClear
-          disabled={!model?.reasoning_efforts.length}
-          placeholder={t("agent.backend.reasoningDefault")}
-          options={(model?.reasoning_efforts ?? []).map((item) => ({
-            value: item,
-            label: item,
-          }))}
-          onChange={(value) => void save(model, value)}
-        />
-      </label>
+      {capabilities?.reasoning_effort && (
+        <label>
+          <span>
+            <Brain size={14} />
+            {t("agent.backend.reasoningEffort")}
+          </span>
+          <Select
+            value={effort}
+            allowClear
+            disabled={!model?.reasoning_efforts.length}
+            placeholder={t("agent.backend.reasoningDefault")}
+            options={(model?.reasoning_efforts ?? []).map((item) => ({
+              value: item,
+              label: item,
+            }))}
+            onChange={(value) => void save(model, value)}
+          />
+        </label>
+      )}
       <div className={styles.footer}>
         {saving ? <Spin size="small" /> : <Check size={13} />}
         {saving ? t("common.saving") : t("agent.backend.appliesNextTurn")}

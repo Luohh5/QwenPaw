@@ -47,6 +47,9 @@ export interface InstallPluginResult {
 }
 
 export interface PluginStatus {
+  clean?: boolean;
+  needs_restart?: boolean;
+  errors?: string[];
   id: string;
   loaded: boolean;
   status?: string;
@@ -146,7 +149,7 @@ export async function setPluginEnabled(
           ...(interruptTasks ? { interrupt_tasks: true } : {}),
         }),
       }),
-    "update",
+    enabled ? "update" : "disable",
   );
   if (!response.ok)
     throw new Error(

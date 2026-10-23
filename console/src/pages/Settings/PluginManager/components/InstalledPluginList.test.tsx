@@ -33,6 +33,7 @@ const props = {
   enablingId: null,
   onEnable: vi.fn(),
   onRepair: vi.fn(),
+  onDisable: vi.fn(),
 };
 
 function plugin(loaded: boolean, status?: string): PluginInfo {
@@ -124,4 +125,21 @@ describe("installed plugin status", () => {
       expect(action).toHaveBeenCalledTimes(2);
     },
   );
+
+  it("offers Disable for an active Harness in both installed views", () => {
+    props.onDisable.mockClear();
+    const target = plugin(true, "active");
+    render(<InstalledPluginList {...props} plugins={[target]} />);
+    fireEvent.click(screen.getByRole("button", { name: "common.disable" }));
+    expect(props.onDisable).toHaveBeenCalledWith(target);
+
+    fireEvent.click(screen.getByLabelText("skills.listView"));
+    const actions = screen.getAllByRole("button", {
+      name: "common.disable",
+      hidden: true,
+    });
+    expect(actions).toHaveLength(2);
+    fireEvent.click(actions[0]);
+    expect(props.onDisable).toHaveBeenCalledTimes(2);
+  });
 });
