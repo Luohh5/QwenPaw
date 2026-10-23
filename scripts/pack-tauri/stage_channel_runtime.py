@@ -112,7 +112,10 @@ def _dependency_wheels(wheelhouse: Path | None):
 def _wheel_metadata(path: Path):
     with zipfile.ZipFile(path) as archive:
         names = [
-            n for n in archive.namelist() if n.endswith(".dist-info/METADATA")
+            n
+            for n in archive.namelist()
+            if n.endswith(".dist-info/METADATA")
+            and len(PurePosixPath(n).parts) == 2
         ]
         if len(names) != 1:
             raise ValueError(f"Wheel must have one METADATA: {path.name}")

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Exercise release dependency commands with a real, offline pip resolver."""
 
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -94,6 +95,49 @@ def _wheel(project, destination):
 
 def _section(script, start, end):
     return script.split(start, 1)[1].partition("\n")[2].split(end, 1)[0]
+
+
+@pytest.fixture
+def runtime_stager():
+    spec = importlib.util.spec_from_file_location(
+        "desktop_channel_runtime_stager",
+        SCRIPTS / "stage_channel_runtime.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_wheel_metadata_ignores_vendored_distributions(
+    tmp_path,
+    runtime_stager,
+):
+    wheel = tmp_path / "setuptools-81.0.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(
+            "setuptools-81.0.0.dist-info/METADATA",
+            "Name: setuptools\nVersion: 81.0.0\n",
+        )
+        archive.writestr(
+            "setuptools/_vendor/packaging-24.2.dist-info/METADATA",
+            "Name: packaging\nVersion: 24.2\n",
+        )
+    assert runtime_stager._wheel_metadata(wheel) == ("setuptools", "81.0.0")
+
+
+def test_wheel_metadata_rejects_multiple_root_distributions(
+    tmp_path,
+    runtime_stager,
+):
+    wheel = tmp_path / "invalid-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name in ("first", "second"):
+            archive.writestr(
+                f"{name}-1.0.dist-info/METADATA",
+                f"Name: {name}\nVersion: 1.0\n",
+            )
+    with pytest.raises(ValueError, match="Wheel must have one METADATA"):
+        runtime_stager._wheel_metadata(wheel)
 
 
 @pytest.fixture

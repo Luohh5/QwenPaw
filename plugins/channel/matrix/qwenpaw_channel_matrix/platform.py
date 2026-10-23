@@ -196,10 +196,10 @@ class HistoryEntry:
 
 
 from qwenpaw.app.channels.utils import (  # noqa: E402
-    file_url_to_local_path,
     data_url_filename,
     parse_data_url_async,
 )  # noqa: E402
+from qwenpaw.utils.media_paths import local_media_path  # noqa: E402
 from .errors import MatrixDeliveryError  # noqa: E402
 from .state import MatrixStateStore  # noqa: E402
 
@@ -2002,13 +2002,10 @@ class MatrixPlatform:
                     f"MatrixChannel: data URL upload failed: {resp}",
                 )
                 return None
-            if urllib.parse.urlparse(file_ref).scheme not in {"", "file"}:
+            local_path = local_media_path(file_ref)
+            if local_path is None:
                 return None
-            path = (
-                Path(file_url_to_local_path(file_ref) or file_ref)
-                .expanduser()
-                .resolve()
-            )
+            path = Path(local_path).expanduser().resolve()
             if not any(
                 path.is_relative_to(root)
                 for root in (self._workspace_dir, self._media_dir())

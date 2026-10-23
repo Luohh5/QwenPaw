@@ -6,11 +6,13 @@ self-pipe operations; it does not substitute for native Windows coverage.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import sys
 
 import pytest
 
+from qwenpaw.channel_protocol.artifacts import code_root_digest
 from qwenpaw.plugins.execution import PluginLaunchSpec, PluginProcess
 from qwenpaw.plugins.execution import bootstrap
 from qwenpaw.plugins.execution.process import ProcessError
@@ -72,6 +74,15 @@ async def test_inspection_initializes_trusted_loop_before_guard(
     mode,
 ):
     spec, imported = _inspection_spec(tmp_path, monkeypatch)
+    (spec.code_root / "candidate.data").write_bytes(b"metadata")
+    nested = spec.code_root / "candidate"
+    nested.mkdir()
+    (nested / "data.txt").write_bytes(b"nested")
+    (nested / "driver.pyc").write_bytes(b"compiled")
+    cache = nested / "__pycache__"
+    cache.mkdir()
+    (cache / "driver.cpython-313.pyc").write_bytes(b"cached")
+    spec = replace(spec, source_revision=code_root_digest(spec.code_root))
     process = PluginProcess()
     try:
         result = await getattr(process, mode)(spec)

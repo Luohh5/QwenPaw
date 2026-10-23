@@ -497,12 +497,17 @@ def _absolute_existing_directory(value: str, name: str) -> Path:
 def _hash_code_root(code_root: Path) -> str:
     """Hash the trusted code artifact deterministically."""
     digest = hashlib.sha256()
-    files = sorted(
+    files = [
         path
         for path in code_root.rglob("*")
-        if path.is_file() and "__pycache__" not in path.parts
-    )
-    for path in files:
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and path.suffix != ".pyc"
+    ]
+    for path in sorted(
+        files,
+        key=lambda item: item.relative_to(code_root).as_posix(),
+    ):
         relative = path.relative_to(code_root).as_posix().encode("utf-8")
         digest.update(len(relative).to_bytes(8, "big"))
         digest.update(relative)

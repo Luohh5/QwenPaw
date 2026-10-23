@@ -28,16 +28,42 @@ def _resource_path(root, value):
     return path.resolve()
 
 
+def _runtime_resource_context():
+    """Use complete launcher paths or the frozen executable's fixed layout."""
+    keys = (
+        "QWENPAW_TAURI_RESOURCE_DIR",
+        "QWENPAW_CHANNEL_RUNTIME_MANIFEST",
+        "QWENPAW_DESKTOP_PY_RUNTIME",
+        "QWENPAW_CHANNEL_SUPPORT_ROOT",
+        "QWENPAW_CHANNEL_DEPENDENCY_PATHS",
+    )
+    values = tuple(os.environ.get(key) for key in keys)
+    if any(value is not None for value in values):
+        if any(value is None or not value.strip() for value in values):
+            raise ValueError("CHANNEL_RUNTIME_MANIFEST_INVALID")
+        return Path(values[0]), Path(values[1]), values[2:]
+    executable = Path(sys.executable)
+    if not getattr(sys, "frozen", False) or not executable.is_absolute():
+        raise ValueError("CHANNEL_RUNTIME_MANIFEST_INVALID")
+    executable = executable.resolve()
+    if (
+        executable.parent.name != "qwenpaw-backend"
+        or executable.parent.parent.name != "binaries"
+    ):
+        raise ValueError("CHANNEL_RUNTIME_MANIFEST_INVALID")
+    root = executable.parent.parent.parent
+    return root, root / "binaries/channel-runtime/runtime.json", None
+
+
 def runtime_manifest():
     """Read the launcher resource manifest, never workspace configuration."""
     # pylint: disable=too-many-branches
     from ..__version__ import __version__
 
-    root = Path(os.environ["QWENPAW_TAURI_RESOURCE_DIR"])
+    root, path, launcher_paths = _runtime_resource_context()
     if not root.is_absolute():
         raise ValueError("CHANNEL_RUNTIME_MANIFEST_INVALID")
     root = root.resolve()
-    path = Path(os.environ["QWENPAW_CHANNEL_RUNTIME_MANIFEST"])
     if (
         not path.is_absolute()
         or path.is_symlink()
@@ -78,17 +104,12 @@ def runtime_manifest():
     sites = tuple(
         _resource_path(root, value) for value in data["dependency_paths"]
     )
-    if (
-        str(executable)
-        != str(Path(os.environ["QWENPAW_DESKTOP_PY_RUNTIME"]).resolve())
-        or str(support)
-        != str(Path(os.environ["QWENPAW_CHANNEL_SUPPORT_ROOT"]).resolve())
+    if launcher_paths is not None and (
+        str(executable) != str(Path(launcher_paths[0]).resolve())
+        or str(support) != str(Path(launcher_paths[1]).resolve())
         or sites
         != tuple(
-            Path(item).resolve()
-            for item in json.loads(
-                os.environ["QWENPAW_CHANNEL_DEPENDENCY_PATHS"],
-            )
+            Path(item).resolve() for item in json.loads(launcher_paths[2])
         )
     ):
         raise ValueError("CHANNEL_RUNTIME_MANIFEST_MISMATCH")
@@ -182,7 +203,8 @@ def resolve_default_channel_runtime():
             "system": platform.system(),
             "machine": platform.machine(),
         }
-    if not (support / "qwenpaw/channel_protocol/shared_worker.py").is_file():
+    worker = support / "qwenpaw/channel_protocol/shared_worker.py"
+    if not worker.is_file() or not worker.resolve().is_relative_to(support):
         raise ValueError("CHANNEL_RUNTIME_MISSING")
     major, minor = identity["version"]
     bucket = (

@@ -52,6 +52,28 @@ async def test_local_media_types_and_original_bytes(hs, platform_factory, kind, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("file_ref", [
+    r"C:\Users\alice\workspace\photo.png",
+    "C:/Users/alice/workspace/photo.png",
+])
+async def test_windows_drive_path_upload(hs, platform_factory, monkeypatch, file_ref):
+    platform = platform_factory()
+    await platform.start()
+    path = Path(platform.config["workspace_dir"]) / "photo.png"
+    path.write_bytes(b"windows attachment")
+    # Emulate only filesystem resolution; retain real locator classification/upload.
+    monkeypatch.setattr(
+        "qwenpaw_channel_matrix.platform.Path",
+        lambda value: path if str(value) == file_ref else Path(value),
+    )
+    uploaded = await platform._upload_file(file_ref)
+    assert uploaded is not None and uploaded.filename == "photo.png"
+    assert len(hs.uploads) == 1
+    assert hs.uploads[0]["body"] == b"windows attachment"
+    assert hs.uploads[0]["headers"]["Content-Type"] == "image/png"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("url", ["https://example.com/img.png", "ftp://example.com/img.png", "file:///not/owned/no.png"])
 async def test_unsupported_media_never_uploads_or_sends(hs, platform_factory, url):
     platform = platform_factory()
