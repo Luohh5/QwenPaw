@@ -300,13 +300,15 @@
 - 默认 `full` 不再包含 codex/qoder extras；默认冻结包不收集其 SDK/CLI/hiddenimports/metadata。旧 extras 暂保留一周期且明确只准备依赖。
 - 插件专属 CI 显式安装各自 requirements-test，core SDK 测试在无两家 SDK 的环境也运行。
 
-- [ ] **Step 1：写产物失败测试。** `test_core_wheel_has_no_vendor_runtime`、`test_minimal_build_without_vendor_sdks`、`test_harness_zip_contains_entries_and_no_other_vendor`、`test_missing_frontend_fails_pack`。
-- [ ] **Step 2：写安装隔离失败测试。** 无厂商依赖环境装 core 后可启动；显式装 Codex 插件后 Qoder 仍缺席；反之同样；依赖版本冲突返回现有重启要求，不修改活跃宿主包。
-- [ ] **Step 3：运行红灯。** Run: `python -m pytest tests/integration/test_harness_distribution.py tests/unit/plugins/test_generate_plugin_metadata.py tests/unit/plugins/test_download_catalog.py -q`。
-- [ ] **Step 4：修改 Python 和冻结打包。** 移除强制 get_package_paths、binary 收集及缺包 SystemExit；root test extra 移除 Qoder。修改后必须能在两家 SDK 均未安装的构建环境运行到真实构建完成。
-- [ ] **Step 5：打通独立插件发布。** KIND_DIRS/上传循环加入 harness；主/legacy release 构建两个前端；下载目录支持新分类。此步骤只改代码和本地产物，不实际上传或发布。
+- [x] **Step 1：写产物失败测试。** `test_core_wheel_has_no_vendor_runtime`、`test_minimal_build_without_vendor_sdks`、`test_harness_zip_contains_entries_and_no_other_vendor`、`test_missing_frontend_fails_pack`。
+- [x] **Step 2：写安装隔离失败测试。** 无厂商依赖环境装 core 后可启动；显式装 Codex 插件后 Qoder 仍缺席；反之同样；依赖版本冲突返回现有重启要求，不修改活跃宿主包。
+- [x] **Step 3：运行红灯。** Run: `python -m pytest tests/integration/test_harness_distribution.py tests/unit/plugins/test_generate_plugin_metadata.py tests/unit/plugins/test_download_catalog.py -q`。
+- [x] **Step 4：修改 Python 和冻结打包。** 移除强制 get_package_paths、binary 收集及缺包 SystemExit；root test extra 移除 Qoder。修改后必须能在两家 SDK 均未安装的构建环境运行到真实构建完成。
+- [x] **Step 5：打通独立插件发布。** KIND_DIRS/上传循环加入 harness；主/legacy release 构建两个前端；下载目录支持新分类。此步骤只改代码和本地产物，不实际上传或发布。
 - [ ] **Step 6：验收冻结平台安装。** 在 macOS 与 Windows 最小宿主中，沿现有桌面 Python runtime 显式安装插件和平台 wheel；验证 CLI 权限、相邻资源、Qoder SDK 导入、卸载/重启门禁。Linux 验证 Python wheel 安装/运行；不以纯 Python 单测替代冻结包验收。
-- [ ] **Step 7：验证并提交。** 重跑 Step 3，检查 wheel/桌面/zip 具体文件清单，保存无厂商默认包与各插件依赖报告。建议提交：`build: ship harness integrations as optional plugins`。
+- [x] **Step 7：验证并提交。** 重跑 Step 3，检查 wheel/桌面/zip 具体文件清单，保存无厂商默认包与各插件依赖报告。建议提交：`build: ship harness integrations as optional plugins`。
+
+**A5 代码检查点（2026-10-24）：** 独立产物/规范检查58项、核心SDK91项、实际ZIP插件Codex36项/Qoder27项通过，前端与网站构建、hooks通过。真实无厂商SDK的full环境完成macOS PyInstaller后端/CLI、helper Python与Node准备；实际包/PYZ未发现旧运行包和厂商SDK/CLI。代码审查发现的PyInstaller测试依赖已补齐并复审通过。Step 6仍未通过：本机冻结可执行文件即使在工具沙箱外也被SIGKILL，签名验证有效，原因仍待定位；Windows/Linux执行及真实账户验收无可用环境，不能由构建成功或模拟测试推断。保留这些缺口，继续独立的A6迁移和缺席验收。
 
 ### A6 旧用户迁移、旧包删除和最终验收
 

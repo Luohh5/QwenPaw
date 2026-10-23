@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 from pathlib import Path
+import runpy
 
 import pytest
 
@@ -145,6 +147,27 @@ def test_desktop_spec_collects_reme_entry_point_plugins():
     assert plugin_modules <= _collected_submodule_packages()
     assert plugin_modules <= _called_packages("collect_data_files")
     assert {"reme-ai", *plugin_distributions} <= _metadata_packages()
+
+
+def test_desktop_spec_reaches_analysis_without_vendor_sdks() -> None:
+    """Execute real collection code; the full frozen build runs separately."""
+    assert importlib.util.find_spec("qoder_agent_sdk") is None
+    assert importlib.util.find_spec("codex_cli_bin") is None
+
+    class ReachedAnalysis(Exception):
+        """Stop before the expensive onedir build."""
+
+    def stop_at_analysis(*_args, **_kwargs):
+        raise ReachedAnalysis
+
+    with pytest.raises(ReachedAnalysis):
+        runpy.run_path(
+            str(SPEC_PATH),
+            init_globals={
+                "SPECPATH": str(SPEC_PATH.parent),
+                "Analysis": stop_at_analysis,
+            },
+        )
 
 
 def test_executable_scripts_preserves_runtime_hooks_and_selected_entry(
