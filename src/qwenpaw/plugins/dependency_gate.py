@@ -352,6 +352,12 @@ def _refine_admission(usage, token, snapshot, plugin_id, *, pending=False):
             raise _unverified("admission identity mismatch") from exc
 
 
+def _canonical_dependency_roots(paths):
+    from .install_lock import canonical_environment_path
+
+    return {canonical_environment_path(path) for path in paths}
+
+
 async def admit_shared_dependencies(
     audit,
     *,
@@ -364,20 +370,16 @@ async def admit_shared_dependencies(
 ):
     """Audit and admit the exact consumer under environment exclusion."""
     from .execution.dependencies import DependencySnapshot
-    from .install_lock import (
-        canonical_environment_path as canonical,
-        environment_coordinator,
-    )
+    from .install_lock import environment_coordinator
+    from ..utils.io_utils import run_sync_io
 
-    keys = {
-        canonical(path)
-        for path in (
-            snapshot.dependency_sites
-            if isinstance(snapshot, DependencySnapshot)
-            and snapshot.dependency_sites is not None
-            else targets
-        )
-    }
+    keys = await run_sync_io(
+        _canonical_dependency_roots,
+        snapshot.dependency_sites
+        if isinstance(snapshot, DependencySnapshot)
+        and snapshot.dependency_sites is not None
+        else targets,
+    )
     # Release before reacquiring one changed root set; never re-enter prepare.
     for _attempt in range(2):
         async with environment_coordinator(keys):
@@ -387,7 +389,10 @@ async def admit_shared_dependencies(
                 or observed.dependency_sites is None
             ):
                 raise _unverified("admission evidence unavailable")
-            actual = {canonical(path) for path in observed.dependency_sites}
+            actual = await run_sync_io(
+                _canonical_dependency_roots,
+                observed.dependency_sites,
+            )
             if actual != keys:
                 keys = actual
                 continue
@@ -397,14 +402,12 @@ async def admit_shared_dependencies(
                 observed,
                 plugin_id,
             )
-            decision = evaluate_shared_dependencies(
+            decision = await _evaluate_shared_dependencies_async(
                 requirements_file,
                 observed,
                 plugin_id=plugin_id,
-                uses=usage_registry.snapshot(
-                    None,
-                    admission_token=admission_token,
-                ).uses,
+                usage_registry=usage_registry,
+                admission_token=admission_token,
             )
             if not decision.already_satisfied:
                 raise SharedDependencyError(decision)
@@ -697,6 +700,37 @@ def evaluate_shared_dependencies(
     )
 
 
+async def _evaluate_shared_dependencies_async(
+    requirements_file,
+    snapshot,
+    *,
+    usage_registry,
+    admission_token=None,
+    **kwargs,
+):
+    """Read disk evidence against detached usage, then authorize on-loop."""
+    from ..utils.io_utils import run_sync_io
+
+    while True:
+        before = usage_registry.snapshot(
+            None,
+            admission_token=admission_token,
+        )
+        decision = await run_sync_io(
+            evaluate_shared_dependencies,
+            requirements_file,
+            snapshot,
+            uses=before.uses,
+            **kwargs,
+        )
+        current = usage_registry.snapshot(
+            None,
+            admission_token=admission_token,
+        )
+        if current.revision == before.revision:
+            return decision
+
+
 async def prepare_shared_dependencies(
     process,
     spec,
@@ -721,25 +755,30 @@ async def prepare_shared_dependencies(
     )
     from .wheel_additions import validate_additions
     from .execution.dependencies import protected_dependency_target
+    from ..utils.io_utils import run_sync_io
 
-    target = canonical(install_target) if install_target is not None else None
-    if target is not None and protected_dependency_target(target):
-        raise _unverified("protected publication target")
+    def inspect_target():
+        target = (
+            canonical(install_target) if install_target is not None else None
+        )
+        if target is not None and protected_dependency_target(target):
+            raise _unverified("protected publication target")
+        return target
+
+    target = await run_sync_io(inspect_target)
 
     async def audit():
         observed = (await process.audit(spec)).snapshot
         _refine_admission(usage_registry, admission_token, observed, plugin_id)
         return observed
 
-    def evaluate(observed, extra=()):
-        return evaluate_shared_dependencies(
+    async def evaluate(observed, extra=()):
+        return await _evaluate_shared_dependencies_async(
             requirements_file,
             observed,
             plugin_id=plugin_id,
-            uses=usage_registry.snapshot(
-                None,
-                admission_token=admission_token,
-            ).uses,
+            usage_registry=usage_registry,
+            admission_token=admission_token,
             install_target=target,
             extra_requirements=extra,
             installed_distributions=snapshot.distributions,
@@ -762,13 +801,17 @@ async def prepare_shared_dependencies(
                 reason_code="DEPENDENCY_PLAN_UNVERIFIED",
             ),
         )
+    keys = await run_sync_io(_canonical_dependency_roots, keys)
     async with environment_coordinator(keys), AsyncExitStack() as stack:
         if target is not None:
             try:
                 await stack.enter_async_context(
                     async_lock(
                         plugin_install_lock(
-                            environment_install_lock_path(target),
+                            await run_sync_io(
+                                environment_install_lock_path,
+                                target,
+                            ),
                             timeout=lock_timeout,
                         ),
                     ),
@@ -800,9 +843,13 @@ async def prepare_shared_dependencies(
                     reason_code="DEPENDENCY_RESTART_REQUIRED",
                 ),
             )
-        if target is None and {
-            canonical(path) for path in snapshot.dependency_sites or ()
-        } != {canonical(path) for path in keys}:
+        if target is None and (
+            await run_sync_io(
+                _canonical_dependency_roots,
+                snapshot.dependency_sites or (),
+            )
+            != keys
+        ):
             raise SharedDependencyError(
                 GateDecision(
                     False,
@@ -811,7 +858,7 @@ async def prepare_shared_dependencies(
                     reason_code="DEPENDENCY_PLAN_UNVERIFIED",
                 ),
             )
-        decision = evaluate(snapshot)
+        decision = await evaluate(snapshot)
         if decision.already_satisfied:
             return snapshot
         if (
@@ -821,13 +868,18 @@ async def prepare_shared_dependencies(
             or decision.unsupported
         ):
             raise SharedDependencyError(decision)
-        if (
-            snapshot.dependency_sites is None
-            or protected_dependency_target(target)
-            or target
-            not in {canonical(path) for path in snapshot.dependency_sites}
-            or target not in {canonical(path) for path in snapshot.sites}
-            or os.environ.get("QWENPAW_RUNTIME_PROVISIONER") == "local"
+
+        def valid_target():
+            return (
+                snapshot.dependency_sites is not None
+                and not protected_dependency_target(target)
+                and target
+                in {canonical(path) for path in snapshot.dependency_sites}
+                and target in {canonical(path) for path in snapshot.sites}
+            )
+
+        if os.environ.get("QWENPAW_RUNTIME_PROVISIONER") == "local" or not (
+            await run_sync_io(valid_target)
         ):
             raise SharedDependencyError(
                 GateDecision(
@@ -841,7 +893,8 @@ async def prepare_shared_dependencies(
                 ),
             )
         try:
-            files, proposed = validate_additions(
+            files, proposed = await run_sync_io(
+                validate_additions,
                 tuple(wheels),
                 snapshot,
                 target,
@@ -862,8 +915,8 @@ async def prepare_shared_dependencies(
             for name, row in proposed.distributions.items()
             if name not in snapshot.distributions
         )
-        # This fresh query is the final no-await authorization before writing.
-        decision = evaluate(proposed, added)
+        # No await separates the final usage check from submitting publication.
+        decision = await evaluate(proposed, added)
         if not decision.already_satisfied:
             raise SharedDependencyError(decision)
         return await _publish_additions(audit, evaluate, target, files)
@@ -873,26 +926,22 @@ async def _publish_additions(audit, evaluate, target, files):
     """Keep exclusion through exact-byte publication and child verification."""
     import asyncio
     from .execution.dependencies import repair_marker
-    from .execution.process import _settle
+    from ..utils.io_utils import run_sync_io
 
-    marker = repair_marker(target)
-    marker.write_text(
-        "Shared dependency publication requires verification.\n",
-        encoding="utf-8",
-    )
-    writer = asyncio.create_task(
-        asyncio.to_thread(_write_additions, target, files),
-    )
+    def mark(message):
+        repair_marker(target).write_text(message, encoding="utf-8")
+
+    def publish():
+        mark("Shared dependency publication requires verification.\n")
+        _write_additions(target, files)
+
     try:
-        await asyncio.shield(writer)
+        await run_sync_io(publish)
     except asyncio.CancelledError:
-        try:
-            await _settle(writer)
-        finally:
-            marker.write_text(
-                "Cancelled dependency publication requires repair.\n",
-                encoding="utf-8",
-            )
+        await run_sync_io(
+            mark,
+            "Cancelled dependency publication requires repair.\n",
+        )
         raise
     except Exception as exc:
         raise SharedDependencyError(
@@ -904,16 +953,16 @@ async def _publish_additions(audit, evaluate, target, files):
                 require_restart=True,
             ),
         ) from exc
-    marker.unlink()
     try:
+        await run_sync_io(lambda: repair_marker(target).unlink())
         snapshot = await audit()
-        decision = evaluate(snapshot)
+        decision = await evaluate(snapshot)
         if not decision.already_satisfied:
             raise SharedDependencyError(decision)
     except BaseException:
-        marker.write_text(
+        await run_sync_io(
+            mark,
             "Dependency verification failed; repair required.\n",
-            encoding="utf-8",
         )
         raise
     return snapshot

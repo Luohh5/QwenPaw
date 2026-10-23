@@ -28,8 +28,12 @@ import pytest
         ),
         (
             "wechat_w2_session_suite.py",
-            "delete_revokes or hard_ttl or authorize_save or owner_and_stop or "
+            "delete_revokes or hard_ttl or confirmed_save or owner_and_stop or "
             "confirmed_cancel_drops or terminal_cache",
+        ),
+        (
+            "wechat_w2_session_suite.py",
+            "actual_source_scan or last_source_scan",
         ),
         (
             "wechat_w2_session_suite.py",

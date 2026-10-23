@@ -128,6 +128,13 @@ class DependencyUsageRegistry:
         if self._declarations.pop(token, None) is not None:
             self._revision += 1
 
+    def has_declaration(self, token, *, plugin_id=None) -> bool:
+        """Check the exact admission without substituting a newer token."""
+        declaration = self._declarations.get(token)
+        return declaration is not None and (
+            plugin_id is None or declaration.plugin_id == plugin_id
+        )
+
     def bind(self, lease, token) -> None:
         if lease not in self._owners.leases():
             raise ValueError("DEPENDENCY_LEASE_STALE")

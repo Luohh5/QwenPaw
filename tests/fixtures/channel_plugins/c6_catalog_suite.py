@@ -208,3 +208,289 @@ def test_c6_structured_secret_names_keep_json_widget_and_type(
     assert structured["json_type"] == kind
     assert structured["default"] == default and structured["required"] is True
     assert scalar["type"] == "password"
+
+
+@pytest.fixture
+def passive_catalog(tmp_path, registry, monkeypatch):
+    """Use real authenticated release resources and loop-owned runtime state."""
+    import shutil
+
+    from qwenpaw.config import utils as config_utils
+    from qwenpaw.config.config import ChannelConfig
+    from qwenpaw.plugins import official_channels
+
+    resources = tmp_path / "resources"
+    shutil.copytree(ROOT / "src/qwenpaw/official_channels", resources)
+    monkeypatch.setattr(official_channels, "_resource_root", lambda: resources)
+    settings = NS(plugins={})
+    monkeypatch.setattr(config_utils, "load_config", lambda: settings)
+    monkeypatch.setattr(
+        config_utils,
+        "get_plugins_dir",
+        lambda: tmp_path / "installed",
+    )
+    agent = NS(config=NS(channels=ChannelConfig()), channel_manager=None)
+
+    async def get_agent(_request):
+        return agent
+
+    monkeypatch.setattr(
+        "qwenpaw.app.agent_context.get_agent_for_request",
+        get_agent,
+    )
+    from starlette.requests import Request
+
+    request = Request({"type": "http", "app": NS(state=NS())})
+    return NS(
+        resources=resources,
+        settings=settings,
+        request=request,
+        agent=agent,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["list_channels", "list_channel_schemas"])
+async def test_c6_catalog_request_reads_real_resources_off_loop(
+    passive_catalog,
+    monkeypatch,
+    endpoint,
+):
+    import asyncio
+    import threading
+
+    from qwenpaw.app.routers import config as routes
+
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    entered = asyncio.Event()
+    release = threading.Event()
+    original_open = Path.open
+    observed = []
+
+    def guarded_open(path, *args, **kwargs):
+        stream = original_open(path, *args, **kwargs)
+        if path.parent == passive_catalog.resources:
+            observed.append(path.name)
+            if threading.get_ident() == loop_thread:
+                stream.close()
+                raise AssertionError("Catalog resource file opened on loop")
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(5):
+                stream.close()
+                raise AssertionError("Loop did not release resource read")
+        return stream
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    task = asyncio.create_task(
+        getattr(routes, endpoint)(passive_catalog.request),
+    )
+    try:
+        barrier = asyncio.create_task(entered.wait())
+        done, _ = await asyncio.wait(
+            {task, barrier},
+            timeout=5,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if task in done:
+            await task
+        assert entered.is_set(), "No real resource read reached the barrier"
+        loop.call_soon(release.set)
+        result = await task
+        assert "index.json" in observed and any(
+            name.endswith(".zip") for name in observed
+        )
+        assert "feishu" in result and "azure_bot" in result
+        warm = await getattr(routes, endpoint)(passive_catalog.request)
+        assert "feishu" in warm and "azure_bot" in warm
+    finally:
+        release.set()
+        barrier.cancel()
+        await asyncio.gather(task, barrier, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_c6_catalog_single_flight_settles_cancel_and_keeps_runtime_fresh(
+    passive_catalog,
+    tmp_path,
+    registry,
+    monkeypatch,
+):
+    import asyncio
+    import threading
+
+    from catalog_suite import describe
+    from qwenpaw.app.channels.catalog import (
+        get_configurable_channel_catalog_async,
+    )
+    from qwenpaw.plugins import archive, official_channels
+    from qwenpaw.plugins.official_channel_catalog import OFFICIAL_CHANNELS
+
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    entered = asyncio.Event()
+    release = threading.Event()
+    extracted = []
+    original_extract = archive.safe_extract_zip
+    original_catalog = registry.get_channel_catalog
+
+    def extract(archive_file, target, *args, **kwargs):
+        assert threading.get_ident() != loop_thread
+        result = original_extract(archive_file, target, *args, **kwargs)
+        extracted.append(target)
+        if len(extracted) == 1:
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(5), "Loop did not release extraction"
+        return result
+
+    def runtime_catalog():
+        assert threading.get_ident() == loop_thread
+        return original_catalog()
+
+    monkeypatch.setattr(archive, "safe_extract_zip", extract)
+    monkeypatch.setattr(registry, "get_channel_catalog", runtime_catalog)
+    first = asyncio.create_task(get_configurable_channel_catalog_async())
+    second = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert extracted[0].is_dir()
+        second = asyncio.create_task(get_configurable_channel_catalog_async())
+        first.cancel()
+        await asyncio.sleep(0)
+        first.cancel()
+        await asyncio.sleep(0)
+        assert not first.done(), "Cancellation escaped active file work"
+        assert extracted[0].is_dir(), "Cancelled reader removed active source"
+        source, manifest = candidate(tmp_path / "runtime")
+        row = registry.register_channel_descriptor(
+            "feishu",
+            describe(source, manifest),
+            global_enabled=False,
+        )
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        cold = await second
+    finally:
+        release.set()
+        await asyncio.gather(
+            *(task for task in (first, second) if task is not None),
+            return_exceptions=True,
+        )
+    assert len(extracted) == len(OFFICIAL_CHANNELS)
+    assert all(not path.exists() for path in extracted)
+    assert cold["feishu"]["availability"] == "disabled"
+    cold["telegram"]["config_schema"]["properties"].clear()
+    row.global_enabled = True
+    row.runtime_settings = NS()
+    passive_catalog.settings.plugins["slack"] = {"enabled": False}
+    warm = await get_configurable_channel_catalog_async(["saved_unknown"])
+    assert len(extracted) == len(OFFICIAL_CHANNELS), "Warm cache re-extracted"
+    assert warm["telegram"]["config_schema"]["properties"]
+    assert warm["feishu"]["availability"] == "validation_pending"
+    assert warm["slack"]["availability"] == "missing_code"
+    assert warm["slack"]["global_enabled"] is False
+    assert warm["saved_unknown"]["availability"] == "missing_code"
+    metadata = official_channels.bundled_channel_description("telegram")
+    assert not any(
+        hasattr(metadata, name)
+        for name in (
+            "descriptor_path",
+            "requirements_path",
+            "code_root",
+            "create_proxy",
+        )
+    ), "Passive cache retained executable or temporary source metadata"
+    assert not hasattr(metadata.descriptor, "entrypoint")
+
+    from qwenpaw.app.routers.config import list_channel_schemas
+
+    health = {
+        "state": "ready",
+        "platform_state": "connected",
+        "last_error": "",
+    }
+
+    def health_snapshot():
+        assert threading.get_ident() == loop_thread
+        return dict(health)
+
+    async def get_channel(key):
+        if key == "feishu":
+            return NS(channel_process=NS(health_snapshot=health_snapshot))
+        return None
+
+    passive_catalog.agent.channel_manager = NS(get_channel=get_channel)
+    running = await list_channel_schemas(passive_catalog.request)
+    assert running["feishu"]["availability"] == "running"
+    assert "repair" not in running["feishu"]
+    health.update(state="failed", platform_state="failed", last_error="lost")
+    failed = await list_channel_schemas(passive_catalog.request)
+    assert failed["feishu"]["availability"] == "failed"
+    assert failed["feishu"]["diagnostic"] == "lost"
+    assert failed["feishu"]["repair"]["action"] == "repair"
+
+
+@pytest.mark.asyncio
+async def test_c6_catalog_cache_reauthenticates_changed_resources(
+    passive_catalog,
+    monkeypatch,
+):
+    import hashlib
+    import io
+    import json
+    import shutil
+    import zipfile
+
+    from qwenpaw.app.channels.catalog import (
+        get_configurable_channel_catalog_async,
+    )
+    from qwenpaw.plugins import official_channels
+
+    initial = await get_configurable_channel_catalog_async()
+    assert initial["feishu"]["config_schema"]
+    root = passive_catalog.resources
+    index_path = root / "index.json"
+    index = json.loads(index_path.read_text())
+    entry = next(
+        row for row in index["plugins"] if row["plugin_id"] == "feishu"
+    )
+    archive_path = root / entry["filename"]
+    original = archive_path.read_bytes()
+    archive_path.write_bytes(original + b"tampered")
+    damaged = await get_configurable_channel_catalog_async()
+    assert "config_schema" not in damaged["feishu"]
+    assert "digest" in damaged["feishu"]["diagnostic"].lower()
+    archive_path.write_bytes(original)
+    restored = await get_configurable_channel_catalog_async()
+    assert restored["feishu"]["config_schema"]
+
+    replacement = root.with_name("replacement-resources")
+    shutil.copytree(root, replacement)
+    payload = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(original)) as before:
+        with zipfile.ZipFile(payload, "w") as after:
+            for name in before.namelist():
+                data = before.read(name)
+                if name == "feishu/channel.json":
+                    descriptor = json.loads(data)
+                    descriptor["label"]["en"] = "Replacement Feishu"
+                    data = json.dumps(descriptor).encode()
+                    entry["descriptor_sha256"] = hashlib.sha256(
+                        data
+                    ).hexdigest()
+                after.writestr(name, data)
+    data = payload.getvalue()
+    (replacement / entry["filename"]).write_bytes(data)
+    entry["sha256"] = hashlib.sha256(data).hexdigest()
+    (replacement / "index.json").write_text(json.dumps(index))
+    monkeypatch.setattr(
+        official_channels, "_resource_root", lambda: replacement
+    )
+    changed = await get_configurable_channel_catalog_async()
+    assert changed["feishu"]["label"] == "Replacement Feishu"
+    index["host_version"] = "0.0.0"
+    (replacement / "index.json").write_text(json.dumps(index))
+    rejected = await get_configurable_channel_catalog_async()
+    assert "config_schema" not in rejected["feishu"]
+    assert "identity" in rejected["feishu"]["diagnostic"].lower()

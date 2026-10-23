@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import deepcopy
+from functools import lru_cache
 import hashlib
 from importlib import resources
 import io
@@ -13,6 +15,7 @@ import shutil
 import sys
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import zipfile
 
 from .official_channel_catalog import (
@@ -94,9 +97,17 @@ def _bundled_index(root):
     return index
 
 
+def _bundled_archive(root, row):
+    with root.joinpath(row["filename"]).open("rb") as stream:
+        payload = stream.read(64 * 1024 * 1024 + 1)
+    if len(payload) > 64 * 1024 * 1024 or _digest(payload) != row["sha256"]:
+        raise ValueError("Official archive digest mismatch")
+    return payload
+
+
 @contextmanager
-def bundled_channel_source(plugin_id, *, retain=None):
-    """Verify installed resource bytes and yield a private extracted source."""
+def _extracted_channel_source(plugin_id, row, payload, *, retain=None):
+    """Validate an authenticated archive in a private temporary directory."""
     from .architecture import PluginManifest
     from .archive import safe_extract_zip
     from .channel_adapter import describe_channel
@@ -104,13 +115,6 @@ def bundled_channel_source(plugin_id, *, retain=None):
     official = official_channel_for_plugin(plugin_id)
     if official is None:
         raise ValueError("Unknown official channel")
-    root = _resource_root()
-    index = _bundled_index(root)
-    row = {row["plugin_id"]: row for row in index["plugins"]}[plugin_id]
-    with root.joinpath(row["filename"]).open("rb") as stream:
-        payload = stream.read(64 * 1024 * 1024 + 1)
-    if len(payload) > 64 * 1024 * 1024 or _digest(payload) != row["sha256"]:
-        raise ValueError("Official archive digest mismatch")
     target = Path(tempfile.mkdtemp(prefix="qwenpaw-official-"))
     try:
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
@@ -149,16 +153,71 @@ def bundled_channel_source(plugin_id, *, retain=None):
             shutil.rmtree(target)
 
 
+@contextmanager
+def bundled_channel_source(plugin_id, *, retain=None):
+    """Verify installed resource bytes and yield a private extracted source."""
+    if official_channel_for_plugin(plugin_id) is None:
+        raise ValueError("Unknown official channel")
+    root = _resource_root()
+    index = _bundled_index(root)
+    row = {row["plugin_id"]: row for row in index["plugins"]}[plugin_id]
+    payload = _bundled_archive(root, row)
+    with _extracted_channel_source(
+        plugin_id,
+        row,
+        payload,
+        retain=retain,
+    ) as source:
+        yield source
+
+
+@lru_cache(maxsize=64)
+def _metadata_slot(root_identity, plugin_id):
+    """Keep the most recent passive snapshot for this resource and channel."""
+    return {}
+
+
 def bundled_channel_description(plugin_id: str):
-    """Read authenticated passive metadata; never retain executable source."""
+    """Cache authenticated passive fields, never paths or executable data."""
+    from ..__version__ import __version__
+    from ..utils.io_utils import get_sync_path_lock
     from .architecture import PluginManifest
     from .channel_adapter import describe_channel
 
-    with bundled_channel_source(plugin_id) as source:
-        manifest = PluginManifest.from_dict(
-            json.loads((source / "plugin.json").read_text(encoding="utf-8")),
-        )
-        return describe_channel(source, manifest)
+    if official_channel_for_plugin(plugin_id) is None:
+        raise ValueError("Unknown official channel")
+    root = _resource_root()
+    with get_sync_path_lock(str(root) + "/" + plugin_id):
+        cached = _metadata_slot((type(root), str(root)), plugin_id)
+        index = _bundled_index(root)
+        row = {row["plugin_id"]: row for row in index["plugins"]}[plugin_id]
+        payload = _bundled_archive(root, row)
+        identity = (__version__, json.dumps(index, sort_keys=True))
+        if cached.get("identity") != identity:
+            with _extracted_channel_source(plugin_id, row, payload) as source:
+                manifest = PluginManifest.from_dict(
+                    json.loads(
+                        (source / "plugin.json").read_text(encoding="utf-8"),
+                    ),
+                )
+                description = describe_channel(source, manifest)
+                descriptor = description.descriptor
+                metadata = SimpleNamespace(
+                    plugin_id=description.plugin_id,
+                    version=description.version,
+                    descriptor=SimpleNamespace(
+                        channel_key=descriptor.channel_key,
+                        label=dict(descriptor.label),
+                        config_schema=deepcopy(descriptor.config_schema),
+                        config_fields=descriptor.config_fields,
+                        capabilities=descriptor.capabilities,
+                        process_mode=descriptor.process_mode,
+                    ),
+                    name=description.name,
+                    description=description.description,
+                )
+            cached.update(identity=identity, metadata=metadata)
+        return deepcopy(cached["metadata"])
 
 
 def _persisted_channel_enabled(data, key):

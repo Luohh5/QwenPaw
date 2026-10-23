@@ -105,49 +105,52 @@ def profile_bytes(fixture):
 
 
 @pytest.mark.asyncio
-async def test_http_provenance_save_is_sync_exact_and_reloads_captured_a(
+async def test_http_provenance_save_uses_worker_and_reloads_captured_a(
     api_http, monkeypatch
 ):
-    from qwenpaw.config.config import load_agent_config, save_agent_config
+    from qwenpaw.config.config import load_agent_config
     from qwenpaw.config.utils import load_config, save_config
+    from wechat_qr_io_support import FileIOGate
 
     fixture = api_http
     token, values = await confirmed_http(fixture)
     before_b = profile_bytes(fixture)["B"]
-    router = import_module("qwenpaw.app.routers.config")
-    original_validate = router._validated_channel_config
-    turns, commits = [], []
-
-    def validate(name, proposed):
-        result = original_validate(name, proposed)
-        asyncio.get_running_loop().call_soon(turns.append, "turn")
-        root = load_config()
-        root.agents.active_agent = "B"
-        save_config(root)
-        return result
-
-    def persist(agent_id, candidate, *args, **kwargs):
-        assert turns == [], "await occurred between validation and persistence"
-        commits.append(agent_id)
-        return save_agent_config(agent_id, candidate, *args, **kwargs)
-
-    monkeypatch.setattr(router, "_validated_channel_config", validate)
-    monkeypatch.setattr("qwenpaw.config.config.save_agent_config", persist)
-    response = await fixture.client.put(
-        f"/config/channels/{KEY}",
-        json=values,
-        headers={"X-Channel-Auth-Session": token},
+    root = load_config()
+    root.agents.active_agent = "B"
+    save_config(root)
+    config = import_module("qwenpaw.config.config")
+    gate = FileIOGate(
+        monkeypatch,
+        config,
+        "write_json_atomic",
+        lambda path, *a, **kw: path == fixture.qr.paths["A"] / "agent.json",
     )
-    assert response.status_code == 200, response.text
-    await eventually(lambda: fixture.reloads == ["A"])
-    assert commits == ["A"] and not fixture.manager.agents
-    assert (
-        getattr(load_agent_config("A").channels, KEY)["api_token"]
-        == values["api_token"]
+    task = asyncio.create_task(
+        fixture.client.put(
+            f"/config/channels/{KEY}",
+            json=values,
+            headers={"X-Channel-Auth-Session": token},
+        )
     )
-    assert profile_bytes(fixture)["B"] == before_b
-    assert not qr_leases(fixture.qr)
-    assert fixture.manager._config_generations == {"A": 1}
+    try:
+        await gate.wait(task)
+        assert gate.calls == 1 and qr_leases(fixture.qr)
+        assert fixture.reloads == []
+        gate.release.set()
+        response = await task
+        assert response.status_code == 200, response.text
+        await eventually(lambda: fixture.reloads == ["A"])
+        assert not fixture.manager.agents
+        assert (
+            getattr(load_agent_config("A").channels, KEY)["api_token"]
+            == values["api_token"]
+        )
+        assert profile_bytes(fixture)["B"] == before_b
+        assert not qr_leases(fixture.qr)
+        assert fixture.manager._config_generations == {"A": 1}
+    finally:
+        gate.release.set()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -505,3 +508,107 @@ async def test_actual_http_delete_releases_real_seeded_qr_session(api_http):
     assert response.content == b""
     assert not qr_leases(fixture.qr)
     assert len(fixture.qr.http.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_http_provenance_merge_keeps_unrelated_latest_config(
+    api_http, monkeypatch
+):
+    from qwenpaw.config.config import load_agent_config, save_agent_config
+    from wechat_w2_session_suite import source_gate
+
+    fixture = api_http
+    token, values = await confirmed_http(fixture)
+    gate = source_gate(fixture.qr, monkeypatch)
+    task = asyncio.create_task(
+        fixture.client.put(
+            f"/config/channels/{KEY}",
+            json=values,
+            headers={"X-Channel-Auth-Session": token},
+        )
+    )
+    try:
+        await gate.wait(task)
+        profile = load_agent_config("A")
+        profile.name = "updated while authorization scanned"
+        setattr(
+            profile.channels,
+            "unrelated_manual",
+            {"enabled": False, "keep": "latest"},
+        )
+        save_agent_config("A", profile)
+        gate.release.set()
+        response = await task
+        assert response.status_code == 200, response.text
+        latest = load_agent_config("A")
+        assert latest.name == "updated while authorization scanned"
+        assert getattr(latest.channels, "unrelated_manual") == {
+            "enabled": False,
+            "keep": "latest",
+        }
+        assert (
+            getattr(latest.channels, KEY)["api_token"] == values["api_token"]
+        )
+    finally:
+        gate.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_http_provenance_manual_edit_waits_for_commit_then_wins(
+    api_http, monkeypatch
+):
+    from qwenpaw.app.workspace import Workspace
+    from qwenpaw.config.config import load_agent_config
+    from wechat_qr_io_support import FileIOGate
+
+    fixture = api_http
+    token, values = await confirmed_http(fixture)
+    workspace = Workspace("A", str(fixture.qr.paths["A"]))
+    workspace._config = load_agent_config("A")
+    fixture.manager.agents["A"] = workspace
+    reloads = []
+    monkeypatch.setattr(
+        "qwenpaw.app.routers.config.schedule_agent_reload",
+        lambda request, agent_id: reloads.append(agent_id),
+    )
+    config = import_module("qwenpaw.config.config")
+    gate = FileIOGate(
+        monkeypatch,
+        config,
+        "write_json_atomic",
+        lambda path, *a, **kw: path == fixture.qr.paths["A"] / "agent.json",
+    )
+    save = asyncio.create_task(
+        fixture.client.put(
+            f"/config/channels/{KEY}",
+            json=values,
+            headers={"X-Channel-Auth-Session": token},
+        )
+    )
+    manual = None
+    try:
+        await gate.wait(save)
+        manual = asyncio.create_task(
+            fixture.client.put(
+                f"/config/channels/{KEY}",
+                json={**values, "api_token": "manual-final"},
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not manual.done() and qr_leases(fixture.qr)
+        gate.release.set()
+        first, last = await asyncio.gather(save, manual)
+        assert first.status_code == last.status_code == 200
+        assert (
+            getattr(load_agent_config("A").channels, KEY)["api_token"]
+            == "manual-final"
+        )
+        assert reloads == ["A", "A"] and not qr_leases(fixture.qr)
+        assert gate.calls == 2
+    finally:
+        gate.release.set()
+        await asyncio.gather(
+            save, *([manual] if manual else []), return_exceptions=True
+        )

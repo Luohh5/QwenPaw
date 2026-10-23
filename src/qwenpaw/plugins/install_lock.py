@@ -60,7 +60,12 @@ async def async_lock(lock):
 @contextlib.asynccontextmanager
 async def environment_coordinator(targets):
     """Serialize overlapping in-process admissions and publications."""
-    keys = sorted({canonical_environment_path(path) for path in targets})
+    from ..utils.io_utils import run_sync_io
+
+    targets = tuple(targets)
+    keys = await run_sync_io(
+        lambda: sorted({canonical_environment_path(path) for path in targets}),
+    )
     locks = _environment_locks.setdefault(asyncio.get_running_loop(), {})
     async with contextlib.AsyncExitStack() as stack:
         for key in keys:

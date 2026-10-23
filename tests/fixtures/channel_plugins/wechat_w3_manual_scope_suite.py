@@ -7,9 +7,9 @@ These tests establish manual persistence/revocation, not WeChat QR integration.
 """
 
 import asyncio
-from contextlib import asynccontextmanager
 from hashlib import sha256
 from importlib import import_module
+from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi import FastAPI
@@ -172,10 +172,12 @@ async def test_manual_changed_scope_releases_exact_claims_only_after_commit(
     }[change]
     values[field] = value
     before = (fixture.paths["A"] / "agent.json").read_bytes()
+    from wechat_qr_io_support import FileIOGate
+
+    config = import_module("qwenpaw.config.config")
+    atomic = config.write_json_atomic
     entered, release = asyncio.Event(), asyncio.Event()
-    turns, guard_entries, commits = [], [], []
     original_stop = fixture.sessions._stop
-    original_guard = fixture.sessions.operation_guard
 
     async def gated_stop(session):
         if session is a:
@@ -183,89 +185,77 @@ async def test_manual_changed_scope_releases_exact_claims_only_after_commit(
             await release.wait()
         return await original_stop(session)
 
-    @asynccontextmanager
-    async def observe_guard(agent_id, channel_key=None):
-        assert (
-            turns == []
-        ), "postcommit guard entry yielded before closing admission"
-        assert getattr(load_agent_config("A").channels.wechat, field) == value
-        guard_entries.append((agent_id, channel_key))
-        async with original_guard(agent_id, channel_key):
-            yield
-
-    def persist(agent_id, candidate, *args, **kwargs):
-        assert not fixture.sessions._revoking
-        assert a.status == "confirmed" and set(a_claims).issubset(
-            fixture.rt.owners.leases()
-        )
-        if persistence == "failure":
-            raise OSError("isolated manual persistence failure")
-        result = save_agent_config(agent_id, candidate, *args, **kwargs)
-        commits.append(agent_id)
-        asyncio.get_running_loop().call_soon(turns.append, "turn")
-        return result
+    def publish(path, payload, *args, **kwargs):
+        if Path(path) == fixture.paths["A"] / "agent.json":
+            if persistence == "failure":
+                raise OSError("isolated manual persistence failure")
+        return atomic(path, payload, *args, **kwargs)
 
     monkeypatch.setattr(fixture.sessions, "_stop", gated_stop)
-    monkeypatch.setattr(fixture.sessions, "operation_guard", observe_guard)
-    monkeypatch.setattr("qwenpaw.config.config.save_agent_config", persist)
+    monkeypatch.setattr(config, "write_json_atomic", publish)
+    gate = FileIOGate(
+        monkeypatch,
+        config,
+        "write_json_atomic",
+        lambda path, *a, **kw: Path(path) == fixture.paths["A"] / "agent.json",
+    )
     operation = asyncio.create_task(
         fixture.client.put(
-            (
-                "/config/channels"
-                if change == "bulk"
-                else "/config/channels/wechat"
-            ),
+            "/config/channels"
+            if change == "bulk"
+            else "/config/channels/wechat",
             json={"wechat": values} if change == "bulk" else values,
         )
     )
     try:
+        async with asyncio.timeout(5):
+            await entered.wait()
+        assert (fixture.paths["A"] / "agent.json").read_bytes() == before
+        assert fixture.sessions._revoking[("A", "wechat")] == 1
+        assert a.status == "cancelled" and not a.credentials
+        assert set(a_claims).issubset(fixture.rt.owners.leases())
+        with pytest.raises(ManagementError) as busy:
+            await fixture.sessions.fetch(a.scope, {})
+        assert busy.value.reason_code == "MANAGEMENT_BUSY"
+        release.set()
+        await gate.wait(operation)
+        assert fixture.sessions._revoking[("A", "wechat")] == 1
+        assert a.lease not in fixture.rt.owners.leases()
+        assert set(a_claims).isdisjoint(fixture.rt.owners.leases())
+        assert fixture.reloads == []
+        assert (fixture.paths["A"] / "agent.json").read_bytes() == before
+        gate.release.set()
         if persistence == "failure":
             with pytest.raises(
                 OSError, match="isolated manual persistence failure"
             ):
                 await operation
             assert (fixture.paths["A"] / "agent.json").read_bytes() == before
-            assert (
-                guard_entries == [] and fixture.reloads == [] and commits == []
-            )
-            assert a.status == "confirmed" and a.credentials
-            assert set(a_claims).issubset(fixture.rt.owners.leases())
+            assert fixture.reloads == []
         else:
-            async with asyncio.timeout(5):
-                await entered.wait()
-            if change != "bulk":
-                assert guard_entries == [("A", "wechat")]
-            assert commits == ["A"] and fixture.reloads == []
-            assert a.status == "cancelled" and not a.credentials
-            assert set(a_claims).issubset(fixture.rt.owners.leases())
-            with pytest.raises(ManagementError) as busy:
-                await fixture.sessions.fetch(a.scope, {})
-            assert busy.value.reason_code == "MANAGEMENT_BUSY"
-            release.set()
             response = await operation
             assert response.status_code == 200, response.text
-            assert not a.claims and a.lease not in fixture.rt.owners.leases()
-            assert set(a_claims).isdisjoint(fixture.rt.owners.leases())
             assert fixture.reloads == ["A"]
             assert (
                 getattr(fixture.workspace.config.channels.wechat, field)
                 == value
             )
-            if extra is not None:
-                assert (
-                    extra.status == "confirmed"
-                ), "sparse bulk PUT revoked an untouched channel's QR scope"
-                assert extra.lease in fixture.rt.owners.leases()
-                assert set(extra_claims).issubset(fixture.rt.owners.leases())
+        assert not a.claims and a.lease not in fixture.rt.owners.leases()
+        assert set(a_claims).isdisjoint(fixture.rt.owners.leases())
+        assert not fixture.sessions._revoking
+        if extra is not None:
+            assert (
+                extra.status == "confirmed"
+            ), "sparse bulk PUT revoked an untouched channel's QR scope"
+            assert extra.lease in fixture.rt.owners.leases()
+            assert set(extra_claims).issubset(fixture.rt.owners.leases())
         assert b.status == "confirmed" and b.credentials
         assert b.lease in fixture.rt.owners.leases()
         assert set(b_claims).issubset(fixture.rt.owners.leases())
     finally:
         release.set()
+        gate.release.set()
         await asyncio.gather(operation, return_exceptions=True)
-        monkeypatch.setattr(
-            fixture.sessions, "operation_guard", original_guard
-        )
         monkeypatch.setattr(fixture.sessions, "_stop", original_stop)
 
 
@@ -281,6 +271,7 @@ async def test_manual_disable_closes_admission_before_persist_and_releases_claim
     profile = load_agent_config("A")
     profile.channels.wechat.enabled = True
     save_agent_config("A", profile)
+    before = (fixture.paths["A"] / "agent.json").read_bytes()
     a, b = fixture.seed("A"), fixture.seed("B")
     claims = a.claims
     values = load_agent_config("A").channels.wechat.model_dump()
@@ -294,16 +285,25 @@ async def test_manual_disable_closes_admission_before_persist_and_releases_claim
             await release.wait()
         return await original_stop(session)
 
-    def persist(agent_id, candidate, *args, **kwargs):
-        assert fixture.sessions._revoking[("A", "wechat")] == 1
-        assert a.lease not in fixture.rt.owners.leases()
-        assert set(claims).isdisjoint(fixture.rt.owners.leases())
-        if persistence == "failure":
-            raise OSError("isolated disable persistence failure")
-        return save_agent_config(agent_id, candidate, *args, **kwargs)
+    from wechat_qr_io_support import FileIOGate
+
+    config = import_module("qwenpaw.config.config")
+    atomic = config.write_json_atomic
+
+    def publish(path, payload, *args, **kwargs):
+        if Path(path) == fixture.paths["A"] / "agent.json":
+            if persistence == "failure":
+                raise OSError("isolated disable persistence failure")
+        return atomic(path, payload, *args, **kwargs)
 
     monkeypatch.setattr(fixture.sessions, "_stop", gated_stop)
-    monkeypatch.setattr("qwenpaw.config.config.save_agent_config", persist)
+    monkeypatch.setattr(config, "write_json_atomic", publish)
+    gate = FileIOGate(
+        monkeypatch,
+        config,
+        "write_json_atomic",
+        lambda path, *a, **kw: Path(path) == fixture.paths["A"] / "agent.json",
+    )
     operation = asyncio.create_task(
         fixture.client.put("/config/channels/wechat", json=values)
     )
@@ -316,12 +316,17 @@ async def test_manual_disable_closes_admission_before_persist_and_releases_claim
             await fixture.sessions.fetch(a.scope, {})
         assert busy.value.reason_code == "MANAGEMENT_BUSY"
         release.set()
+        await gate.wait(operation)
+        assert fixture.sessions._revoking[("A", "wechat")] == 1
+        assert a.lease not in fixture.rt.owners.leases()
+        assert set(claims).isdisjoint(fixture.rt.owners.leases())
+        gate.release.set()
         if persistence == "failure":
             with pytest.raises(
                 OSError, match="isolated disable persistence failure"
             ):
                 await operation
-            assert load_agent_config("A").channels.wechat.enabled
+            assert (fixture.paths["A"] / "agent.json").read_bytes() == before
             assert not fixture.reloads
         else:
             response = await operation
@@ -333,6 +338,7 @@ async def test_manual_disable_closes_admission_before_persist_and_releases_claim
         assert b.lease in fixture.rt.owners.leases() and b.claims
     finally:
         release.set()
+        gate.release.set()
         await asyncio.gather(operation, return_exceptions=True)
 
 
@@ -416,8 +422,11 @@ async def test_bulk_closes_all_changed_admission_before_first_cleanup_await(
             assert current.channels.wechat.enabled
             assert getattr(current.channels, second_key)["enabled"]
         else:
-            assert current.channels.wechat.bot_prefix == "group-new-prefix"
-            assert getattr(current.channels, second_key)["marker"] == "new"
+            assert (
+                current.channels.wechat.bot_prefix
+                == profile.channels.wechat.bot_prefix
+            )
+            assert getattr(current.channels, second_key)["marker"] == "old"
         # The real installed, untouched descriptor remains admitted and runs
         # its actual management worker while selected cleanup is still held.
         fetched = await fixture.sessions.fetch(untouched_scope, {})
@@ -446,3 +455,74 @@ async def test_bulk_closes_all_changed_admission_before_first_cleanup_await(
         monkeypatch.setattr(fixture.sessions, "_stop", original_stop)
         if fetched is not None:
             await fixture.sessions.cancel(untouched_scope, fetched.poll_token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bulk", [False, True])
+async def test_manual_atomic_write_repeated_cancellation_keeps_guard_and_reload(
+    manual_scope, monkeypatch, bulk
+):
+    from management_process_suite import eventually
+    from qwenpaw.app.utils import schedule_agent_reload
+    from qwenpaw.config.config import load_agent_config
+    from wechat_qr_io_support import FileIOGate
+
+    fixture = manual_scope
+    a, b = fixture.seed("A"), fixture.seed("B")
+    b_bytes = (fixture.paths["B"] / "agent.json").read_bytes()
+    profile = load_agent_config("A")
+    unrelated = dict(getattr(profile.channels, KEY))
+    values = profile.channels.wechat.model_dump()
+    values["bot_prefix"] = "persist despite repeated caller cancellation"
+    reloads = []
+    reload_agent = fixture.manager.reload_agent
+
+    async def observed_reload(agent_id):
+        reloads.append(agent_id)
+        return await reload_agent(agent_id)
+
+    monkeypatch.setattr(fixture.manager, "reload_agent", observed_reload)
+    monkeypatch.setattr(
+        "qwenpaw.app.routers.config.schedule_agent_reload",
+        schedule_agent_reload,
+    )
+    config = import_module("qwenpaw.config.config")
+    gate = FileIOGate(
+        monkeypatch,
+        config,
+        "write_json_atomic",
+        lambda path, *a, **kw: Path(path) == fixture.paths["A"] / "agent.json",
+    )
+    operation = asyncio.create_task(
+        fixture.client.put(
+            "/config/channels" if bulk else "/config/channels/wechat",
+            json={"wechat": values} if bulk else values,
+        )
+    )
+    try:
+        await gate.wait(operation)
+        # The request has captured its real Workspace. Keep the manager's
+        # scheduled reload on its real unloaded-agent path, without native I/O.
+        fixture.manager.agents.pop("A")
+        operation.cancel()
+        await asyncio.sleep(0)
+        operation.cancel()
+        await asyncio.sleep(0)
+        assert not operation.done()
+        assert fixture.sessions._revoking[("A", "wechat")] == 1
+        assert a.lease not in fixture.rt.owners.leases() and not a.claims
+        assert b.lease in fixture.rt.owners.leases() and b.claims
+        assert reloads == [] and fixture.manager._config_generations == {}
+        gate.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        persisted = load_agent_config("A")
+        assert persisted.channels.wechat.bot_prefix == values["bot_prefix"]
+        assert dict(getattr(persisted.channels, KEY)) == unrelated
+        assert (fixture.paths["B"] / "agent.json").read_bytes() == b_bytes
+        await eventually(lambda: reloads == ["A"])
+        assert fixture.manager._config_generations == {"A": 1}
+        assert not fixture.sessions._revoking and gate.calls == 1
+    finally:
+        gate.release.set()
+        await asyncio.gather(operation, return_exceptions=True)

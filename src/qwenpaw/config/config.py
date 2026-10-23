@@ -3736,15 +3736,14 @@ def load_agent_config(  # pylint: disable=too-many-branches,too-many-statements
         save_agent_config(agent_id, fallback_config)
         return fallback_config
 
-    try:
-        current_fingerprint = _agent_config_fingerprint(agent_config_path)
-    except OSError as exc:
-        raise ConfigurationException(
-            config_key="agent",
-            message=f"Agent '{agent_id}' config is temporarily unavailable",
-        ) from exc
-
     with _agent_config_lock:
+        try:
+            current_fingerprint = _agent_config_fingerprint(agent_config_path)
+        except OSError as exc:
+            raise ConfigurationException(
+                config_key="agent",
+                message=f"Agent '{agent_id}' config is temporarily unavailable",
+            ) from exc
         cached_entry = _agent_config_cache.get(agent_id)
         if (
             isinstance(cached_entry, _AgentConfigCacheEntry)
@@ -3930,6 +3929,7 @@ def save_agent_config(  # pylint: disable=too-many-branches,too-many-statements
         load_config,
         _agent_config_cache,
         _agent_config_lock,
+        _record_agent_config_publication,
     )
 
     config = load_config()
@@ -3993,6 +3993,7 @@ def save_agent_config(  # pylint: disable=too-many-branches,too-many-statements
             payload = candidate.model_dump(exclude_none=True)
             saved_digest = _json_payload_digest(payload)
             write_json_atomic(agent_config_path, payload)
+            _record_agent_config_publication()
             candidate.record_source_digest(saved_digest)
             agent_config.record_source_digest(saved_digest)
             try:

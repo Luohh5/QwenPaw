@@ -11,8 +11,9 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ...config.config import load_agent_config
-from ...config.utils import load_config
+from ...config.utils import config_publication_revision, load_config
 from ...constant import WORKING_DIR
+from ...utils.io_utils import run_sync_io
 from ...plugins.ownership import RuntimeKey, RuntimeLease, RuntimeStopReceipt
 from .management import ManagementError
 
@@ -62,43 +63,57 @@ class _AuthOwner:
     workspace_dir: Path
 
 
-def reserve_wechat_auth(
-    registry,
-    *,
-    owner: RuntimeLease,
-    workspace_id: str,
-    workspace_dir: Path,
-    config: Mapping[str, Any],
-) -> tuple[RuntimeLease, ...]:
-    """Atomically reserve known claims; never stop a conflicting owner."""
-    owners = registry.runtime_owners
-    if owner not in owners.leases():
-        raise ManagementError("IDENTITY_MISMATCH")
+def _read_wechat_auth_evidence(config, workspace_id, working_dir):
+    """Read detached path/config evidence without touching runtime owners."""
     if not any(
         config.get(key) for key in ("enabled", "bot_token", "bot_token_file")
     ):
-        return ()
-    scopes = set(wechat_auth_scopes(config, working_dir=WORKING_DIR))
+        return frozenset(), ()
+    scopes = frozenset(wechat_auth_scopes(config, working_dir=working_dir))
+    others = []
     root = load_config()
     for agent_id, profile in root.agents.profiles.items():
         if agent_id == workspace_id:
             continue
         channels = load_agent_config(agent_id).channels
         other = channels.model_dump().get("wechat", {}) if channels else {}
-        # A default disabled model is not evidence of account ownership.
         runtime_key = RuntimeKey(
             "channel",
             "wechat",
             str(Path(profile.workspace_dir).expanduser().resolve()),
         )
-        if not any(
+        configured = any(
             other.get(key)
             for key in ("enabled", "bot_token", "bot_token_file")
-        ) and not any(lease.key == runtime_key for lease in owners.leases()):
-            continue
-        if scopes.intersection(
-            wechat_auth_scopes(other, working_dir=WORKING_DIR),
-        ):
+        )
+        others.append(
+            (
+                runtime_key,
+                configured,
+                frozenset(wechat_auth_scopes(other, working_dir=WORKING_DIR)),
+            ),
+        )
+    return scopes, tuple(others)
+
+
+def _reserve_wechat_auth_evidence(
+    registry,
+    *,
+    owner,
+    workspace_id,
+    workspace_dir,
+    evidence,
+):
+    """Check fresh loop-owned custody and reserve the complete claim set."""
+    owners = registry.runtime_owners
+    leases = owners.leases()
+    if owner not in leases:
+        raise ManagementError("IDENTITY_MISMATCH")
+    scopes, others = evidence
+    for runtime_key, configured, other_scopes in others:
+        if (
+            configured or any(lease.key == runtime_key for lease in leases)
+        ) and (scopes.intersection(other_scopes)):
             raise ManagementError("ACCOUNT_IN_USE")
     keys = tuple(
         RuntimeKey("wechat_auth", scope, "host") for scope in sorted(scopes)
@@ -134,7 +149,7 @@ def reserve_wechat_auth(
                 resource=_AuthOwner(
                     owner,
                     workspace_id,
-                    Path(workspace_dir).expanduser().resolve(),
+                    workspace_dir,
                 ),
             )
     except BaseException:
@@ -145,6 +160,76 @@ def reserve_wechat_auth(
         )
         raise
     return tuple((*existing, *claims))
+
+
+def reserve_wechat_auth(
+    registry,
+    *,
+    owner,
+    workspace_id,
+    workspace_dir,
+    config,
+):
+    """Synchronous compatibility for runtime and CLI callers."""
+    if owner not in registry.runtime_owners.leases():
+        raise ManagementError("IDENTITY_MISMATCH")
+    evidence = _read_wechat_auth_evidence(config, workspace_id, WORKING_DIR)
+    return _reserve_wechat_auth_evidence(
+        registry,
+        owner=owner,
+        workspace_id=workspace_id,
+        workspace_dir=Path(workspace_dir).expanduser().resolve(),
+        evidence=evidence,
+    )
+
+
+async def reserve_wechat_auth_async(
+    registry,
+    *,
+    owner,
+    workspace_id,
+    workspace_dir,
+    config,
+    working_dir,
+    authorize=None,
+):
+    """Scan files off-loop, retrying if relevant custody changed meanwhile."""
+    owners = registry.runtime_owners
+
+    def ownership():
+        return tuple(
+            (lease, id(owners.resource(lease)))
+            for lease in owners.leases()
+            if lease == owner
+            or lease.key.kind == "wechat_auth"
+            or (lease.key.kind == "channel" and lease.key.name == "wechat")
+        )
+
+    while True:
+        if owner not in owners.leases():
+            raise ManagementError("IDENTITY_MISMATCH")
+        snapshot = ownership()
+        publication = config_publication_revision()
+        evidence = await run_sync_io(
+            _read_wechat_auth_evidence,
+            dict(config),
+            workspace_id,
+            working_dir,
+        )
+        if (
+            snapshot != ownership()
+            or publication != config_publication_revision()
+        ):
+            continue
+        if authorize is not None:
+            authorize()
+        return _reserve_wechat_auth_evidence(
+            registry,
+            owner=owner,
+            workspace_id=workspace_id,
+            workspace_dir=workspace_dir,
+            evidence=evidence,
+        )
 
 
 def release_wechat_auth(

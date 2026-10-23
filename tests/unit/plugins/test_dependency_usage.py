@@ -3,6 +3,7 @@
 # pylint: disable=too-many-statements
 """Independent F3.1 dependency custody and actual-environment contracts."""
 
+import asyncio
 import importlib
 import hashlib
 import json
@@ -12,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import threading
 from types import SimpleNamespace
 import venv
 
@@ -1217,13 +1219,14 @@ async def test_observation_failure_cannot_skip_owned_preparation_stop(
         await owners.stop_all(plugin_id)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("module_kind", ["flat", "namespace"])
 @pytest.mark.parametrize(
     "unrelated_other_drive",
     [False, True],
     ids=["same_drive", "other_drive"],
 )
-def test_record_without_top_level_identifies_actual_import_only(
+async def test_record_without_top_level_identifies_actual_import_only(
     usage_api,
     fresh_registry,
     tmp_path,
@@ -1296,8 +1299,11 @@ def test_record_without_top_level_identifies_actual_import_only(
                     return native_relpath(path, start)
 
                 patch.setattr(os.path, "relpath", different_drive_relpath)
-            PythonBackend.observe_host_dependencies(
-                SimpleNamespace(source_path=tmp_path / "plugin"),
+            await PythonBackend.observe_host_dependencies(
+                SimpleNamespace(
+                    source_path=tmp_path / "plugin",
+                    manifest=SimpleNamespace(id="record-host"),
+                ),
                 usage,
                 token,
             )
@@ -1415,3 +1421,240 @@ async def test_failed_host_refresh_retains_versions_with_unknown_environment(
             await loader_host.unload_plugin("refresh-host")
         for name in ("f31_refresh_initial_sdk", "f31_refresh_later_sdk"):
             sys.modules.pop(name, None)
+
+
+@pytest.mark.asyncio
+async def test_host_ledger_cancel_waits_for_real_evidence_before_withdrawal(
+    usage_api,
+    loader_host,
+    tmp_path,
+    monkeypatch,
+):
+    """A cancelled teardown must publish later imports before releasing custody."""
+    usage = public_usage(usage_api, loader_host.registry)
+    site = tmp_path / "cancel-host-site"
+    for name in ("cancel-initial-owner", "cancel-later-owner"):
+        install_metadata(site, name)
+        info = site / (name.replace("-", "_") + "-1.0.dist-info")
+        (info / "RECORD").write_text(name.replace("-", "_") + ".py,,\n")
+    monkeypatch.setattr(sys, "path", [str(site)])
+    source = loader_host.plugin_dirs[0] / "cancel-observer"
+    manifest = python_source(source, plugin="cancel-observer")
+    binding = loader_host.backend_resolver.resolve(source, manifest)
+    initial_name, later_name = "cancel_initial_owner", "cancel_later_owner"
+
+    def load(name):
+        spec = importlib.util.spec_from_file_location(
+            name,
+            site / (name + ".py"),
+        )
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, name, module)
+        spec.loader.exec_module(module)
+
+    load(initial_name)
+    async with loader_host._dependency_registration(binding):
+        pass
+    assert "cancel-later-owner" not in {
+        name
+        for use in rows(usage, "host")
+        if use.snapshot
+        for name in use.snapshot.distributions
+    }
+    load(later_name)
+    entered, attempting, acquired = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    native_open = Path.open
+    target = site / "cancel_initial_owner-1.0.dist-info" / "RECORD"
+
+    def slow_record(path, *args, **kwargs):
+        if path == target:
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(5), "teardown RECORD read was never released"
+        return native_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", slow_record)
+    instance = loader_host.lifecycle.ensure_instance("cancel-observer")
+
+    async def teardown():
+        async with loader_host.plugin_lifecycle("cancel-observer"):
+            await instance.teardown_runtime()
+
+    async def next_lifecycle():
+        attempting.set()
+        async with loader_host.plugin_lifecycle("cancel-observer"):
+            acquired.set()
+            assert not rows(usage, "declaration")
+            assert "cancel-later-owner" in {
+                name
+                for use in rows(usage, "host")
+                if use.snapshot
+                for name in use.snapshot.distributions
+            }
+
+    task = asyncio.create_task(teardown())
+    competing = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        competing = asyncio.create_task(next_lifecycle())
+        await attempting.wait()
+        for _ in range(3):
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            assert rows(
+                usage,
+                "declaration",
+            ), "protection withdrawn before read"
+            assert not acquired.is_set(), "lifecycle passed unfinished cleanup"
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(competing, 5)
+        assert not rows(usage, "declaration")
+    finally:
+        release.set()
+        await asyncio.gather(
+            *(item for item in (task, competing) if item is not None),
+            return_exceptions=True,
+        )
+        await instance.teardown_runtime()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_async_host_observer_error_retains_declaration(
+    usage_api,
+    loader_host,
+    tmp_path,
+    monkeypatch,
+):
+    """A backend failing outside metadata collection cannot authorize withdrawal."""
+    from qwenpaw.plugins.python_backend import PythonBackend
+
+    usage = public_usage(usage_api, loader_host.registry)
+    site = tmp_path / "observer-error-site"
+    site.mkdir()
+    monkeypatch.setattr(sys, "path", [str(site)])
+    source = loader_host.plugin_dirs[0] / "observer-error"
+    manifest = python_source(source, plugin="observer-error")
+    binding = loader_host.backend_resolver.resolve(source, manifest)
+    async with loader_host._dependency_registration(binding):
+        pass
+    instance = loader_host.lifecycle.ensure_instance("observer-error")
+
+    async def fail_observer(_description, _usage, _token):
+        raise RuntimeError("controlled async backend observer failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            PythonBackend,
+            "observe_host_dependencies",
+            staticmethod(fail_observer),
+        )
+        report = await instance.teardown_runtime()
+    assert not report.quiescent and not report.clean
+    assert rows(usage, "declaration"), "failed observation removed protection"
+    assert any(
+        "controlled async backend observer failure" in e for e in report.errors
+    )
+    assert (await instance.teardown_runtime()).quiescent
+    assert not rows(usage, "declaration")
+
+
+@pytest.mark.asyncio
+async def test_environment_coordinator_resolves_real_root_off_loop(
+    tmp_path,
+    monkeypatch,
+):
+    """Canonical root I/O yields while real asyncio lock custody stays on loop."""
+    from qwenpaw.plugins import install_lock
+
+    actual, site = tmp_path / "actual-site", tmp_path / "site"
+    actual.mkdir()
+    site.symlink_to(actual, target_is_directory=True)
+    expected = actual.resolve()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    entered, heartbeat, release = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    read_threads, progress, lock_threads = [], [], []
+    native_realpath = os.path.realpath
+    native_setdefault = install_lock._environment_locks.setdefault
+
+    class LoopLock(asyncio.Lock):
+        def __init__(self):
+            lock_threads.append(("create", threading.get_ident()))
+            assert threading.get_ident() == loop_thread
+            super().__init__()
+
+        async def acquire(self):
+            lock_threads.append(("acquire", threading.get_ident()))
+            assert threading.get_ident() == loop_thread
+            return await super().acquire()
+
+        def release(self):
+            lock_threads.append(("release", threading.get_ident()))
+            assert threading.get_ident() == loop_thread
+            super().release()
+
+    def registry_setdefault(*args):
+        lock_threads.append(("registry", threading.get_ident()))
+        assert threading.get_ident() == loop_thread
+        return native_setdefault(*args)
+
+    def pulse():
+        progress.append(not release.is_set())
+        heartbeat.set()
+
+    def unblock():
+        if entered.wait(5):
+            loop.call_soon_threadsafe(pulse)
+            heartbeat.wait(2)  # Rescue the old synchronous canonicalization.
+        release.set()
+
+    def slow_realpath(path, *args, **kwargs):
+        if os.fspath(path) == str(site):
+            read_threads.append(threading.get_ident())
+            entered.set()
+            assert release.wait(5), "site canonicalization was never released"
+        return native_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", slow_realpath)
+    monkeypatch.setattr(
+        install_lock._environment_locks,
+        "setdefault",
+        registry_setdefault,
+    )
+    monkeypatch.setattr(
+        install_lock,
+        "asyncio",
+        SimpleNamespace(**{**vars(asyncio), "Lock": LoopLock}),
+    )
+    watchdog = threading.Thread(target=unblock, daemon=True)
+    watchdog.start()
+    try:
+        async with install_lock.environment_coordinator((site,)):
+            locks = install_lock._environment_locks[loop]
+            assert locks[expected].locked(), "symlink did not use actual root"
+        await asyncio.sleep(0)
+        assert progress == [True], "loop stalled during real root resolution"
+        assert read_threads and loop_thread not in read_threads
+        assert {action for action, _ in lock_threads} == {
+            "registry",
+            "create",
+            "acquire",
+            "release",
+        }
+        assert {thread for _, thread in lock_threads} == {loop_thread}
+        assert not locks[expected].locked()
+    finally:
+        release.set()
+        watchdog.join(5)

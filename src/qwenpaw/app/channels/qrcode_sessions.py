@@ -29,7 +29,11 @@ from ...constant import WORKING_DIR
 from ...plugins.ownership import RuntimeKey, RuntimeLease, RuntimeStopReceipt
 from .management import ChannelManagementService, ManagementError
 from .qrcode_auth_handler import PollResult, QRCodeResult
-from .wechat_auth_custody import reserve_wechat_auth, release_wechat_auth
+from ...utils.io_utils import run_async_to_completion, run_sync_io
+from .wechat_auth_custody import (
+    reserve_wechat_auth_async,
+    release_wechat_auth,
+)
 
 _MAX_SESSIONS = 128
 _SESSION_TTL = 300.0
@@ -97,6 +101,25 @@ def resolve_channel_management_scope(
     return _read_scope(workspace_id, channel_key, principal)
 
 
+async def resolve_channel_management_scope_async(request, channel_key):
+    """Capture request values on-loop; resolve disk-backed scope in a worker."""
+    workspace_id = getattr(
+        request.state,
+        "agent_id",
+        None,
+    ) or request.headers.get("X-Agent-Id")
+    user = getattr(request.state, "user", None)
+    principal = user.get("username") if isinstance(user, dict) else None
+
+    def read():
+        selected = (
+            workspace_id or load_config().agents.active_agent or "default"
+        )
+        return _read_scope(selected, channel_key, principal)
+
+    return await run_sync_io(read)
+
+
 @dataclass
 class _Session:
     scope: ChannelManagementScope
@@ -113,6 +136,9 @@ class _Session:
     claims: tuple[RuntimeLease, ...] = ()
     operation: asyncio.Task | None = None
     waiters: int = 0
+    validation: asyncio.Task | None = None
+    validation_waiters: int = 0
+    commit: asyncio.Task | None = None
     timer: asyncio.TimerHandle | None = None
     cleanup: asyncio.Task | None = None
     retained: RuntimeLease | None = None
@@ -151,7 +177,7 @@ class ChannelQRCodeSessions:
             scope.principal_id,
         )
 
-    def _admit(self, scope):
+    def _check_admission(self, scope):
         if self._closed:
             raise ManagementError("MANAGEMENT_CLOSED")
         if any(
@@ -159,33 +185,40 @@ class ChannelQRCodeSessions:
             for key in (None, scope.channel_key)
         ):
             raise ManagementError("MANAGEMENT_BUSY")
-        current = _read_scope(
+
+    async def _admit(self, scope):
+        self._check_admission(scope)
+        current = await run_sync_io(
+            _read_scope,
             scope.workspace_id,
             scope.channel_key,
             scope.principal_id,
         )
+        self._check_admission(scope)
         if (
             self._identity(current) != self._identity(scope)
             or current.config != scope.config
         ):
             raise HTTPException(403, "Channel scope changed")
 
-    def _source(self, scope):
-        row = self._loader.registry.get_channel_catalog_entry(
-            scope.channel_key,
-        )
-        if row is None:
-            raise ManagementError("PLUGIN_NOT_INSTALLED")
-        record = self._loader.get_loaded_plugin(row.plugin_id)
-        if record is None:
-            raise ManagementError("PLUGIN_NOT_INSTALLED")
-        enabled = record.global_enabled
-        if not (record.enabled if enabled is None else enabled):
-            raise ManagementError("PLUGIN_DISABLED")
-        description, _ = self._management._source(
+    async def _source(self, scope, source=None):
+        if source is None:
+            row = self._loader.registry.get_channel_catalog_entry(
+                scope.channel_key,
+            )
+            if row is None:
+                raise ManagementError("PLUGIN_NOT_INSTALLED")
+            record = self._loader.get_loaded_plugin(row.plugin_id)
+            if record is None:
+                raise ManagementError("PLUGIN_NOT_INSTALLED")
+            snapshot = None
+        else:
+            row, record, snapshot = source
+        description, _ = await self._management._source(
             row,
             record,
             scope.channel_key,
+            snapshot=snapshot,
         )
         if (
             MANAGEMENT_CAPABILITIES["qrcode.fetch"]
@@ -212,19 +245,12 @@ class ChannelQRCodeSessions:
             working_dir=working_dir,
         )
 
-    def _validate(self, session):
+    def _check_session(self, session):
         if session.status == "expired":
             raise _SessionExpired()
         if session.status in {"cancelled", "consumed", "failed"}:
             raise HTTPException(400, "QR session is no longer active")
-        self._admit(session.scope)
-        _, description = self._source(session.scope)
-        if (
-            description.plugin_id != session.lease.plugin_id
-            or description.source_revision != session.source_revision
-            or description.code_root.resolve() != session.lease.code_root
-        ):
-            raise ManagementError("SOURCE_REVISION_MISMATCH")
+        self._check_admission(session.scope)
         if (
             session.lease not in self._owners.leases()
             or self._owners.resource(session.lease) is not session
@@ -233,6 +259,86 @@ class ChannelQRCodeSessions:
         if monotonic() >= session.expires:
             self._invalidate(session, "expired")
             raise _SessionExpired()
+
+    async def _scan_session(self, session, source=None):
+        self._check_session(session)
+        row, description = await self._source(session.scope, source)
+        record = self._loader.get_loaded_plugin(row.plugin_id)
+        snapshot = self._management._source_snapshot(
+            row,
+            record,
+            session.scope.channel_key,
+        )
+        self._check_session(session)
+        if (
+            description.plugin_id != session.lease.plugin_id
+            or description.source_revision != session.source_revision
+            or description.code_root != session.lease.code_root
+        ):
+            raise ManagementError("SOURCE_REVISION_MISMATCH")
+        await self._admit(session.scope)
+        self._check_session(session)
+        current = self._management._source_snapshot(
+            row,
+            record,
+            session.scope.channel_key,
+        )
+        if (
+            any(current[index] is not snapshot[index] for index in range(3))
+            or current[3] != snapshot[3]
+        ):
+            raise ManagementError("SOURCE_REVISION_MISMATCH")
+
+    async def _prepare_fetch(self, session, source):
+        await self._scan_session(session, source)
+        self._check_session(session)
+        if session.scope.channel_key == "wechat":
+            await self._reserve_auth(session)
+            self._check_session(session)
+
+    async def _wait_validation(self, session):
+        task = session.validation
+        session.validation_waiters += 1
+        try:
+            return await asyncio.shield(task)
+        finally:
+            session.validation_waiters -= 1
+            if session.validation_waiters == 0:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await _settle(task)
+                    except asyncio.CancelledError:
+                        pass
+                if session.validation is task:
+                    session.validation = None
+
+    async def _validate(self, session):
+        self._check_session(session)
+        if session.validation is None:
+            session.validation = asyncio.create_task(
+                self._scan_session(session),
+            )
+        await self._wait_validation(session)
+        self._check_session(session)
+
+    async def _reserve_auth(self, session, credentials=None):
+        self._check_session(session)
+        claims = await reserve_wechat_auth_async(
+            self._loader.registry,
+            owner=session.lease,
+            workspace_id=session.scope.workspace_id,
+            workspace_dir=session.scope.workspace_dir,
+            config=self._auth_config(
+                session,
+                credentials,
+                working_dir=self._working_dir,
+            ),
+            working_dir=WORKING_DIR,
+            authorize=lambda: self._check_session(session),
+        )
+        session.claims = tuple(dict.fromkeys((*session.claims, *claims)))
+        self._check_session(session)
 
     def _lookup(self, scope, token):
         if not isinstance(token, str) or not token:
@@ -295,16 +401,25 @@ class ChannelQRCodeSessions:
             self._invalidate(session, "cancelled")
         retained = session.retained
         operation = session.operation
-        if operation is not None:
-            if not operation.done():
-                operation.cancel()
+        validation = session.validation
+        commit = session.commit
+        tasks = tuple(
+            dict.fromkeys(
+                task for task in (validation, operation) if task is not None
+            ),
+        )
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in (*tasks, *((commit,) if commit is not None else ())):
             try:
-                await _settle(operation)
+                await _settle(task)
             except asyncio.CancelledError:
-                # The operation was cancelled; Service already settled it.
                 pass
-            except ManagementError as error:
-                if error.reason_code == "MANAGEMENT_CLEANUP_FAILED":
+            except Exception as error:
+                if isinstance(error, ManagementError) and (
+                    error.reason_code == "MANAGEMENT_CLEANUP_FAILED"
+                ):
                     session.cleanup_error = error
         if session.retained is not None:
             if retained is None:
@@ -322,6 +437,8 @@ class ChannelQRCodeSessions:
         session.config.clear()
         session.options.clear()
         session.cleanup_error = None
+        session.validation = None
+        session.commit = None
         # Waiters retain their own task reference and recheck session
         # authority. Once cleanup is proved, the session must not retain
         # its result secrets.
@@ -385,7 +502,19 @@ class ChannelQRCodeSessions:
             raise ManagementError("MANAGEMENT_INVALID_RESULT")
         if result.outcome != "ok":
             raise ManagementError(result.reason_code)
-        return result.result
+        self._check_session(session)
+        payload = result.result
+        if (
+            session.scope.channel_key == "wechat"
+            and operation == "qrcode.poll"
+            and payload["status"] in {"confirmed", "success"}
+            and payload["credentials"]
+            and any(payload["credentials"].values())
+            and "fail_reason" not in payload["credentials"]
+        ):
+            await self._reserve_auth(session, payload["credentials"])
+            self._check_session(session)
+        return payload
 
     async def _wait_operation(self, session):
         session.waiters += 1
@@ -402,8 +531,20 @@ class ChannelQRCodeSessions:
                     pass
 
     async def fetch(self, scope, options: Mapping[str, str]) -> QRCodeResult:
-        self._admit(scope)
-        row, description = self._source(scope)
+        self._check_admission(scope)
+        row = self._loader.registry.get_channel_catalog_entry(
+            scope.channel_key,
+        )
+        if row is None:
+            raise ManagementError("PLUGIN_NOT_INSTALLED")
+        record = self._loader.get_loaded_plugin(row.plugin_id)
+        if record is None:
+            raise ManagementError("PLUGIN_NOT_INSTALLED")
+        description, _, _, _ = self._management._source_snapshot(
+            row,
+            record,
+            scope.channel_key,
+        )
         fields = description.descriptor.config_schema.get("properties", {})
         allowed = (
             {"base_url"} if scope.channel_key == "wechat" else set(fields)
@@ -428,10 +569,14 @@ class ChannelQRCodeSessions:
         config = {
             key: value for key, value in config.items() if key not in private
         }
-        async with self._loader.execution_source(row.plugin_id):
-            self._admit(scope)
-            current_row, current = self._source(scope)
-            if current_row is not row or current != description:
+        async with self._loader.execution_source(row.plugin_id) as record:
+            self._check_admission(scope)
+            snapshot = self._management._source_snapshot(
+                row,
+                record,
+                scope.channel_key,
+            )
+            if snapshot[0] is not description:
                 raise ManagementError("SOURCE_REVISION_MISMATCH")
             runtime_key = RuntimeKey(
                 "channel",
@@ -482,33 +627,23 @@ class ChannelQRCodeSessions:
                 lambda: self._stop(session),
                 resource=session,
             )
-            try:
-                if scope.channel_key == "wechat":
-                    session.claims = reserve_wechat_auth(
-                        self._loader.registry,
-                        owner=lease,
-                        workspace_id=scope.workspace_id,
-                        workspace_dir=scope.workspace_dir,
-                        config=self._auth_config(
-                            session,
-                            working_dir=self._working_dir,
-                        ),
-                    )
-            except BaseException:
-                self._owners.release(
-                    lease,
-                    RuntimeStopReceipt(True, "QR_NOT_STARTED"),
-                )
-                raise
             token = token_urlsafe(32)
             self._sessions[sha256(token.encode()).hexdigest()] = session
             self._arm_expiry(session)
-        session.operation = asyncio.create_task(
-            self._execute(session, "qrcode.fetch"),
-        )
         try:
+            session.validation = asyncio.create_task(
+                self._prepare_fetch(session, (row, record, snapshot)),
+            )
+            await self._wait_validation(session)
+            self._check_session(session)
+            session.operation = asyncio.create_task(
+                self._execute(session, "qrcode.fetch"),
+            )
             result = await self._wait_operation(session)
-            self._validate(session)
+            await self._validate(session)
+            self._check_session(session)
+            if session.status != "fetching":
+                raise HTTPException(400, "QR session is no longer fetching")
             session.continuation = result["continuation"]
             if "expires_in_seconds" in result:
                 session.expires = monotonic() + result["expires_in_seconds"]
@@ -528,7 +663,9 @@ class ChannelQRCodeSessions:
         if session.status in {"cancelled", "consumed", "failed"}:
             raise HTTPException(400, "QR session is no longer active")
         try:
-            self._validate(session)
+            await self._validate(session)
+        except asyncio.CancelledError:
+            raise
         except _SessionExpired:
             await self._close(session)
             return PollResult("expired", {})
@@ -536,6 +673,7 @@ class ChannelQRCodeSessions:
             self._invalidate(session, "cancelled")
             await self._close(session)
             raise
+        self._check_session(session)
         if session.status == "confirmed":
             return PollResult(
                 session.public_status,
@@ -547,6 +685,9 @@ class ChannelQRCodeSessions:
             )
         try:
             result = await self._wait_operation(session)
+        except _SessionExpired:
+            await self._close(session)
+            return PollResult("expired", {})
         except asyncio.CancelledError:
             if (
                 session.status == "expired"
@@ -554,10 +695,16 @@ class ChannelQRCodeSessions:
             ):
                 return PollResult("expired", {})
             raise
+        except BaseException:
+            self._invalidate(session, "failed")
+            await self._close(session)
+            raise
         if session.status == "expired":
             return PollResult("expired", {})
         try:
-            self._validate(session)
+            await self._validate(session)
+        except asyncio.CancelledError:
+            raise
         except _SessionExpired:
             await self._close(session)
             return PollResult("expired", {})
@@ -567,6 +714,7 @@ class ChannelQRCodeSessions:
             raise
         if session.status in {"cancelled", "consumed", "failed"}:
             raise HTTPException(400, "QR session is no longer active")
+        self._check_session(session)
         if session.status == "confirmed":
             return PollResult(
                 session.public_status,
@@ -582,28 +730,6 @@ class ChannelQRCodeSessions:
                 self._invalidate(session, "failed")
                 await self._close(session)
                 raise ManagementError("MANAGEMENT_INVALID_RESULT")
-            if scope.channel_key == "wechat":
-                # The platform can reveal a known credential only at confirm.
-                # Claim it before any caller can receive or save it.
-                try:
-                    claims = reserve_wechat_auth(
-                        self._loader.registry,
-                        owner=session.lease,
-                        workspace_id=scope.workspace_id,
-                        workspace_dir=scope.workspace_dir,
-                        config=self._auth_config(
-                            session,
-                            result["credentials"],
-                            working_dir=self._working_dir,
-                        ),
-                    )
-                    session.claims = tuple(
-                        dict.fromkeys((*session.claims, *claims)),
-                    )
-                except BaseException:
-                    self._invalidate(session, "failed")
-                    await self._close(session)
-                    raise
             session.credentials = deepcopy(result["credentials"])
             session.metadata = deepcopy(result.get("metadata", {}))
             session.public_status = status
@@ -707,15 +833,28 @@ class ChannelQRCodeSessions:
         if errors:
             raise errors[0]
 
-    @asynccontextmanager
-    async def authorize_save(
-        self,
-        scope,
-        token: str,
-        values: Mapping[str, Any],
-    ):
+    async def save_confirmed(self, scope, token, values, persist):
+        """Authorize once, then retain custody until the real commit settles."""
         session = self._lookup(scope, token)
-        self._validate(session)
+        if session.commit is not None:
+            raise HTTPException(409, "QR save is already in progress")
+        try:
+            await self._validate(session)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            if session.status not in {
+                "expired",
+                "consumed",
+                "cancelled",
+                "failed",
+            }:
+                self._invalidate(session, "cancelled")
+            await self._close(session)
+            raise
+        self._check_session(session)
+        if session.commit is not None:
+            raise HTTPException(409, "QR save is already in progress")
         if session.status != "confirmed":
             raise HTTPException(400, "QR session is not confirmed")
         for key, value in session.credentials.items():
@@ -735,8 +874,22 @@ class ChannelQRCodeSessions:
             scope.config.get("bot_token_file"),
         ) != scope.config.get("bot_token_file"):
             raise HTTPException(403, "QR authentication path changed")
-        # Entry through yield is synchronous. W3 performs the validated save
-        # without awaiting; an exception leaves this session unconsumed.
-        yield
-        self._invalidate(session, "consumed")
-        await self._close(session)
+
+        async def commit():
+            result = await persist()
+            self._invalidate(session, "consumed")
+            return result
+
+        session.commit = task = asyncio.create_task(commit())
+        try:
+            return await run_async_to_completion(task)
+        finally:
+            if task.done() and session.commit is task:
+                session.commit = None
+            if session.status in {
+                "consumed",
+                "cancelled",
+                "expired",
+                "failed",
+            }:
+                await self._close(session)

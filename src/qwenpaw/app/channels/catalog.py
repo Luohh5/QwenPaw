@@ -127,20 +127,51 @@ def clean_channel_config(value, schema=None):
     }
 
 
-def get_configurable_channel_catalog(saved_keys=()):
-    """Keep missing and disabled channel settings editable without imports."""
-    from ...config.config import ChannelConfig
+def _catalog_files():
+    """Read filesystem inputs without touching live plugin registrations."""
     from ...config.utils import get_plugins_dir, load_config
-    from ...plugins.registry import PluginRegistry
-    from ...plugins.settings import is_plugin_enabled
-    from ...plugins.channel_config import channel_config_defaults
-
     from ...plugins.official_channel_catalog import OFFICIAL_CHANNELS
     from ...plugins.official_channels import bundled_channel_description
 
+    descriptions = {}
+    installed = {}
+    plugins_dir = get_plugins_dir()
+    for official in OFFICIAL_CHANNELS:
+        plugin_id = official["plugin_id"]
+        try:
+            descriptions[plugin_id] = bundled_channel_description(plugin_id)
+        except (OSError, ValueError, KeyError) as exc:
+            descriptions[plugin_id] = str(exc)
+        installed[plugin_id] = (
+            plugins_dir / plugin_id / "plugin.json"
+        ).is_file()
+    return descriptions, installed, load_config().plugins
+
+
+def get_configurable_channel_catalog(saved_keys=()):
+    """Keep the synchronous CLI catalog available."""
+    return _assemble_channel_catalog(saved_keys, *_catalog_files())
+
+
+async def get_configurable_channel_catalog_async(saved_keys=()):
+    """Read passive files off-loop, then merge current runtime registrations."""
+    from ...utils.io_utils import run_sync_io
+
+    saved_keys = tuple(saved_keys)
+    files = await run_sync_io(_catalog_files)
+    return _assemble_channel_catalog(saved_keys, *files)
+
+
+def _assemble_channel_catalog(saved_keys, descriptions, installed, settings):
+    """Assemble one catalog from filesystem and live registry snapshots."""
+    from ...config.config import ChannelConfig
+    from ...plugins.registry import PluginRegistry
+    from ...plugins.settings import is_plugin_enabled
+    from ...plugins.channel_config import channel_config_defaults
+    from ...plugins.official_channel_catalog import OFFICIAL_CHANNELS
+
     registry = PluginRegistry()
     owners = official_channel_owners()
-    settings = load_config().plugins
     result = {}
     for key, field in ChannelConfig.model_fields.items():
         model = field.annotation
@@ -161,14 +192,17 @@ def get_configurable_channel_catalog(saved_keys=()):
             key,
             {"label": key, "description": "", "form_kind": "schema"},
         )
-        installed = (get_plugins_dir() / plugin_id / "plugin.json").is_file()
         enabled = is_plugin_enabled(settings.get(plugin_id))
         state = (
             "missing_code"
-            if not installed
+            if not installed[plugin_id]
             else ("disabled" if not enabled else "validation_pending")
         )
-        if installed and enabled and registry.channel_runtime is None:
+        if (
+            installed[plugin_id]
+            and enabled
+            and registry.channel_runtime is None
+        ):
             state = "missing_runtime"
         base.update(
             owner=plugin_id,
@@ -179,12 +213,11 @@ def get_configurable_channel_catalog(saved_keys=()):
             icon=official["icon"],
             doc_url=official["doc_url"],
         )
-        try:
-            description = bundled_channel_description(plugin_id)
-        except (OSError, ValueError, KeyError) as exc:
+        description = descriptions[plugin_id]
+        if isinstance(description, str):
             # Keep builtin lightweight settings editable if release resources
             # are damaged; never trust or execute unauthenticated metadata.
-            base["diagnostic"] = str(exc)
+            base["diagnostic"] = description
             base.setdefault("config_fields", [])
         else:
             descriptor = description.descriptor

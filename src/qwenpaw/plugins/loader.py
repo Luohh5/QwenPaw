@@ -605,11 +605,16 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         from .execution.dependencies import repair_marker
         from .dependency_maintenance import authorized
 
-        if any(
-            repair_marker(path).exists() and not authorized(path)
-            for path in sys.path
-            if path and Path(path).is_dir()
-        ):
+        host_paths = tuple(sys.path)
+
+        def repair_required():
+            return any(
+                repair_marker(path).exists() and not authorized(path)
+                for path in host_paths
+                if path and Path(path).is_dir()
+            )
+
+        if await run_sync_io(repair_required):
             return GateDecision(
                 False,
                 False,
@@ -851,6 +856,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         from .execution import PluginLaunchSpec, PluginProcess
         from .execution.bootstrap import _hash_code_root
         from .execution.environment import shared_dependency_paths
+        from ..utils.io_utils import run_sync_io
 
         if os.environ.get("QWENPAW_RUNTIME_PROVISIONER") == "local":
             raise RuntimeError(
@@ -859,9 +865,17 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         frozen = _is_frozen()
         runtime = None
         target = None
-        support = Path(__file__).resolve().parents[2]
         python = sys.executable
-        paths = shared_dependency_paths() if not frozen else ()
+        host_paths = tuple(sys.path)
+
+        def inspect_environment():
+            return (
+                Path(__file__).resolve().parents[2],
+                shared_dependency_paths(host_paths) if not frozen else (),
+                (source_path or requirements_file.parent).resolve(),
+            )
+
+        support, paths, root = await run_sync_io(inspect_environment)
         if frozen:
             from .channel_bootstrap import (
                 resolve_default_channel_runtime,
@@ -875,7 +889,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
 
             runtime = self.registry.channel_runtime
             if runtime is None:
-                runtime = await asyncio.to_thread(
+                runtime = await run_sync_io(
                     resolve_default_channel_runtime,
                 )
             if (
@@ -886,20 +900,24 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             python = runtime.python_executable
             support = runtime.support_root
             target = Path(runtime.dependency_install_target)
-            async with async_lock(
-                plugin_install_lock(environment_install_lock_path(target)),
-            ):
+
+            def prepare_target():
                 if target.is_symlink():
                     raise ValueError("CHANNEL_RUNTIME_TARGET_INVALID")
                 target.mkdir(parents=True, exist_ok=True)
-            target = target.resolve()
+                return target.resolve()
+
+            async with async_lock(
+                plugin_install_lock(
+                    await run_sync_io(environment_install_lock_path, target),
+                ),
+            ):
+                target = await run_sync_io(prepare_target)
             paths = tuple(dict.fromkeys((*runtime.dependency_paths, target)))
-        root = (source_path or requirements_file.parent).resolve()
         await self._stop_preparation(plugin_id)
         cleanup = ExitStack()
         try:
             if source_path is not None:
-                from ..utils.io_utils import run_sync_io
 
                 def stage_requirements():
                     temporary = cleanup.enter_context(
@@ -912,7 +930,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     return staged
 
                 requirements_file = await run_sync_io(stage_requirements)
-            audit_root = requirements_file.parent.resolve()
+            audit_root = await run_sync_io(requirements_file.parent.resolve)
             process, lease = self._own_preparation(
                 plugin_id,
                 PluginProcess,
@@ -921,32 +939,39 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 cleanup=cleanup.close,
             )
         except BaseException:
-            from ..utils.io_utils import run_sync_io
-
             await run_sync_io(cleanup.close)
             raise
         usage = self.registry.dependency_usage
         token = None
         identity_error = None
         try:
+            from .dependency_gate import parse_requirements_file
+            from .dependency_usage import DependencyDeclaration
+
+            def inspect_requirements():
+                return (
+                    _hash_code_root(audit_root),
+                    requirements_file.resolve(),
+                    parse_requirements_file(requirements_file),
+                )
+
+            revision, requirements_path, requirements = await run_sync_io(
+                inspect_requirements,
+            )
             spec = PluginLaunchSpec(
                 python_executable=python,
                 support_root=support,
                 code_root=audit_root,
-                source_revision=_hash_code_root(audit_root),
+                source_revision=revision,
                 plugin_id=plugin_id,
                 instance_id="dependency:" + plugin_id,
                 generation=lease.generation,
                 entrypoint="_dependency_audit:Driver",
                 config={},
-                requirements_path=requirements_file.resolve(),
+                requirements_path=requirements_path,
                 dependency_paths=paths,
                 startup_timeout=15,
             )
-            from .dependency_gate import parse_requirements_file
-            from .dependency_usage import DependencyDeclaration
-
-            requirements = parse_requirements_file(requirements_file)
             token = usage.declare(
                 DependencyDeclaration(
                     plugin_id,
@@ -980,7 +1005,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             # audited roots before the additive writer admits another audit.
             from .dependency_maintenance import lease_environment
 
-            lease_environment(snapshot.dependency_sites or ())
+            await run_sync_io(
+                lease_environment,
+                snapshot.dependency_sites or (),
+            )
             from .dependency_usage import current_admission_token
 
             if not frozen:
@@ -1060,27 +1088,26 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         )
 
         from .dependency_usage import current_admission_token
-        from .execution.process import _settle
+        from ..utils.io_utils import run_sync_io
 
         async def run(command):
-            task = asyncio.create_task(
-                asyncio.to_thread(
-                    self._run_subprocess_with_streaming_log,
-                    command,
-                    timeout=300,
-                    plugin_id=plugin_id,
-                ),
+            return await run_sync_io(
+                self._run_subprocess_with_streaming_log,
+                command,
+                timeout=300,
+                plugin_id=plugin_id,
             )
-            try:
-                return await asyncio.shield(task)
-            except asyncio.CancelledError:
-                await _settle(task)
-                raise
 
         usage = self.registry.dependency_usage
-        with tempfile.TemporaryDirectory(
-            prefix="qwenpaw-dependency-wheels-",
-        ) as temporary:
+        cleanup = ExitStack()
+        try:
+            temporary = await run_sync_io(
+                lambda: cleanup.enter_context(
+                    tempfile.TemporaryDirectory(
+                        prefix="qwenpaw-dependency-wheels-",
+                    ),
+                ),
+            )
             staging = Path(temporary)
             constraints = staging / "constraints.txt"
 
@@ -1093,7 +1120,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     encoding="utf-8",
                 )
 
-            constrain(snapshot)
+            await run_sync_io(constrain, snapshot)
             command = [
                 spec.python_executable,
                 "-I",
@@ -1128,17 +1155,25 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                         ),
                     )
                 snapshot = (await process.audit(spec)).snapshot
-                constrain(snapshot)
+                await run_sync_io(constrain, snapshot)
                 result = await run(command)
             if result.returncode:
                 unpinned = command.copy()
                 index = unpinned.index("--constraint")
                 del unpinned[index : index + 2]
-                with tempfile.TemporaryDirectory(
-                    prefix="qwenpaw-dependency-control-",
-                ) as control:
+                control_cleanup = ExitStack()
+                try:
+                    control = await run_sync_io(
+                        lambda: control_cleanup.enter_context(
+                            tempfile.TemporaryDirectory(
+                                prefix="qwenpaw-dependency-control-",
+                            ),
+                        ),
+                    )
                     unpinned[unpinned.index("--wheel-dir") + 1] = control
                     resolved = await run(unpinned)
+                finally:
+                    await run_sync_io(control_cleanup.close)
                 restart = resolved.returncode == 0
                 code = (
                     "DEPENDENCY_RESTART_REQUIRED"
@@ -1157,15 +1192,19 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                         reason_code=code,
                     ),
                 )
-            wheels = tuple(
-                WheelAddition(
-                    path,
-                    hashlib.sha256(path.read_bytes()).hexdigest(),
+
+            def collect_wheels():
+                return tuple(
+                    WheelAddition(
+                        path,
+                        hashlib.sha256(path.read_bytes()).hexdigest(),
+                    )
+                    for path in staging.glob("*.whl")
+                    if str(parse_wheel_filename(path.name)[0])
+                    not in snapshot.distributions
                 )
-                for path in staging.glob("*.whl")
-                if str(parse_wheel_filename(path.name)[0])
-                not in snapshot.distributions
-            )
+
+            wheels = await run_sync_io(collect_wheels)
             await prepare_shared_dependencies(
                 process,
                 spec,
@@ -1181,6 +1220,8 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 wheels=wheels,
                 expected_snapshot=snapshot,
             )
+        finally:
+            await run_sync_io(cleanup.close)
 
     async def _load_backend_module(
         self,
@@ -1287,6 +1328,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             return
         description = binding.description
         usage = self.registry.dependency_usage
+        from ..utils.io_utils import run_async_to_completion
         from .dependency_usage import admission_context
         from .install_lock import environment_coordinator
 
@@ -1302,21 +1344,26 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         )
         pending = True
 
-        def observe():
+        async def observe():
             observer = getattr(
                 binding.backend,
                 "observe_host_dependencies",
                 None,
             )
             if pending and observer is not None:
-                observer(description, usage, token)
+                result = observer(description, usage, token)
+                if inspect.isawaitable(result):
+                    await result
 
-        def withdraw():
-            nonlocal pending
-            if pending:
-                observe()
-                usage.withdraw(token)
-                pending = False
+        async def withdraw():
+            async def cleanup():
+                nonlocal pending
+                if pending:
+                    await observe()
+                    usage.withdraw(token)
+                    pending = False
+
+            await run_async_to_completion(cleanup())
 
         try:
             self.lifecycle.ensure_instance(
@@ -1326,9 +1373,9 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 withdraw,
             )
             yield token
-            observe()
+            await observe()
         except BaseException:
-            withdraw()
+            await withdraw()
             raise
         finally:
             admission_context.reset(context)

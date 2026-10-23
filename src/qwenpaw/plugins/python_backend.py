@@ -73,6 +73,86 @@ def _files_for_loaded_origins(distribution, origins):
     ]
 
 
+def _host_paths(cwd):
+    """Detach path strings without resolving filesystem origins on the loop."""
+    return tuple(
+        os.path.join(cwd, path)
+        for path in sys.path
+        if isinstance(path, str) and path
+    )
+
+
+def _host_dependency_state():
+    modules = sys.modules.copy()
+    cwd = os.getcwd()
+    paths = _host_paths(cwd)
+    loaded = []
+    for name, module in modules.items():
+        if module is None:
+            continue
+        origin = module.__dict__.get("__file__")
+        if isinstance(origin, str):
+            loaded.append(
+                (
+                    name,
+                    id(module),
+                    os.path.join(cwd, origin),
+                ),
+            )
+    return paths, tuple(loaded)
+
+
+def _observe_host_dependencies(code_root, paths, loaded_origins):
+    """Read metadata and RECORD ownership using only detached origins."""
+    from importlib.metadata import PathDistribution
+    from .execution.dependencies import observe_dependencies
+
+    snapshot = observe_dependencies(
+        {
+            "code_root": code_root,
+            "_audit_sites": paths,
+            "dependency_paths": (),
+        },
+    )
+    loaded = {name: Path(origin) for name, origin in loaded_origins}
+    resolved = {path: path.resolve() for path in set(loaded.values())}
+    origins = {*resolved, *resolved.values()}
+    relative_origins = {}
+    imported = {}
+    for name, row in snapshot.distributions.items():
+        root = Path(row["metadata_path"]).parent
+        distribution = PathDistribution(Path(row["metadata_path"]))
+        if root not in relative_origins:
+            relative_origins[root] = _relative_module_origins(origins, root)
+        files = _files_for_loaded_origins(distribution, relative_origins[root])
+        if files is not None:
+            if any(
+                os.path.normcase(os.path.normpath(item))
+                in relative_origins[root]
+                for item in files
+            ):
+                imported[name] = row
+            continue
+        # Legacy metadata without a file inventory needs top-level origin
+        # evidence; RECORD ownership never uses this guess.
+        if any(
+            module_name.split(".", 1)[0] in row["top_level"]
+            and (
+                (
+                    resolved[path].parent == root
+                    and resolved[path].name.split(".", 1)[0]
+                    == module_name.split(".", 1)[0]
+                )
+                or resolved[path].is_relative_to(
+                    root / module_name.split(".", 1)[0],
+                )
+            )
+            for module_name, path in loaded.items()
+        ):
+            imported[name] = row
+    return snapshot, imported
+
+
 async def _probe_incoming(
     plugin_id: str,
     source_path: Path,
@@ -233,15 +313,23 @@ class PythonBackend:
 
     async def audit_dependencies(self, description):
         """Read this host's metadata without importing candidate modules."""
+        from ..utils.io_utils import run_sync_io
         from .execution.dependencies import observe_dependencies
 
-        return observe_dependencies(
-            {
-                "code_root": str(description.source_path),
-                "_audit_sites": tuple(path for path in sys.path if path),
-                "dependency_paths": (),
-            },
-        )
+        for _ in range(2):
+            cwd = os.getcwd()
+            paths = _host_paths(cwd)
+            snapshot = await run_sync_io(
+                observe_dependencies,
+                {
+                    "code_root": os.path.join(cwd, description.source_path),
+                    "_audit_sites": paths,
+                    "dependency_paths": (),
+                },
+            )
+            if _host_paths(os.getcwd()) == paths:
+                return snapshot
+        raise RuntimeError("Host dependency paths changed during audit")
 
     async def load_definition(
         self,
@@ -276,75 +364,83 @@ class PythonBackend:
         """Python activation has no additional execution gate."""
 
     @staticmethod
-    def observe_host_dependencies(description, usage, token):
+    async def observe_host_dependencies(description, usage, token):
         """Capture imported distribution origins at lifecycle boundaries."""
-        from importlib.metadata import PathDistribution
-        from .execution.dependencies import observe_dependencies
+        from ..utils.io_utils import run_async_to_completion, run_sync_io
+        from .execution.dependencies import dependency_sites
+        from .install_lock import environment_coordinator
 
-        try:
-            snapshot = observe_dependencies(
-                {
-                    "code_root": str(description.source_path),
-                    "_audit_sites": tuple(path for path in sys.path if path),
-                    "dependency_paths": (),
-                },
-            )
-            loaded = {
-                name: Path(module.__dict__["__file__"]).absolute()
-                for name, module in tuple(sys.modules.items())
-                if module is not None
-                and isinstance(module.__dict__.get("__file__"), str)
-            }
-            resolved = {path: path.resolve() for path in set(loaded.values())}
-            origins = {*resolved, *resolved.values()}
-            relative_origins = {}
-            imported = {}
-            for name, row in snapshot.distributions.items():
-                root = Path(row["metadata_path"]).parent
-                distribution = PathDistribution(Path(row["metadata_path"]))
-                if root not in relative_origins:
-                    relative_origins[root] = _relative_module_origins(
-                        origins,
-                        root,
+        plugin_id = description.manifest.id
+
+        def valid():
+            return usage.has_declaration(token, plugin_id=plugin_id)
+
+        def unknown():
+            if valid():
+                usage.observe_host(token, None)
+
+        async def observe():
+            if not valid():
+                return
+            try:
+                for attempt in range(2):
+                    paths, loaded = _host_dependency_state()
+                    code_root = os.path.join(
+                        os.getcwd(),
+                        description.source_path,
                     )
-                files = _files_for_loaded_origins(
-                    distribution,
-                    relative_origins[root],
-                )
-                if files is not None:
-                    if any(
-                        os.path.normcase(os.path.normpath(item))
-                        in relative_origins[root]
-                        for item in files
-                    ):
-                        imported[name] = row
-                    continue
-                # Legacy metadata without a file inventory needs top-level
-                # origin evidence; RECORD ownership never uses this guess.
-                if any(
-                    module_name.split(".", 1)[0] in row["top_level"]
-                    and (
-                        (
-                            resolved[path].parent == root
-                            and resolved[path].name.split(".", 1)[0]
-                            == module_name.split(".", 1)[0]
+                    roots = await run_sync_io(dependency_sites, paths)
+                    async with environment_coordinator(roots):
+                        if not valid():
+                            return
+                        try:
+                            snapshot, imported = await run_sync_io(
+                                _observe_host_dependencies,
+                                code_root,
+                                paths,
+                                tuple(
+                                    (name, origin)
+                                    for name, _, origin in loaded
+                                ),
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Host dependency evidence unavailable",
+                                exc_info=True,
+                            )
+                            unknown()
+                            return
+                        fresh = _host_dependency_state() == (paths, loaded)
+                        covered = (
+                            snapshot.dependency_sites is not None
+                            and set(snapshot.dependency_sites) <= set(roots)
                         )
-                        or resolved[path].is_relative_to(
-                            root / module_name.split(".", 1)[0],
-                        )
-                    )
-                    for module_name, path in loaded.items()
-                ):
-                    imported[name] = row
-            usage.refine(token, snapshot)
-            if imported:
-                usage.observe_host(
-                    token,
-                    replace(snapshot, distributions=imported),
+                        if fresh and covered:
+                            if valid():
+                                usage.refine(
+                                    token,
+                                    snapshot,
+                                    plugin_id=plugin_id,
+                                )
+                                if imported:
+                                    usage.observe_host(
+                                        token,
+                                        replace(
+                                            snapshot,
+                                            distributions=imported,
+                                        ),
+                                    )
+                            return
+                        if attempt == 1:
+                            unknown()
+            except Exception:
+                logger.debug(
+                    "Host dependency evidence unavailable",
+                    exc_info=True,
                 )
-        except Exception:  # Evidence failure must not invent a clean host.
-            logger.debug("Host dependency evidence unavailable", exc_info=True)
-            usage.observe_host(token, None)
+                unknown()
+
+        await run_async_to_completion(observe())
 
     def validate_update(self, old, candidate, *, in_place):
         """Python sources support both in-place and directory updates."""

@@ -11,6 +11,7 @@ import hashlib
 from importlib import metadata
 import inspect
 import json
+import os
 from pathlib import Path
 import sys
 import sysconfig
@@ -659,6 +660,252 @@ async def test_locked_audit_reuses_peer_install_without_reading_deleted_wheel(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "requirements",
+        "host-metadata",
+        "wheel",
+        "marker-write",
+        "marker-unlink",
+    ],
+)
+async def test_install_file_boundaries_leave_loop_and_registry_responsive(
+    tmp_path,
+    monkeypatch,
+    boundary,
+):
+    site, reqs, process, usage, spec = inputs(tmp_path, "f32-sdk==2.0\n")
+    addition = wheel(tmp_path)
+    marker = repair_marker(site)
+    host = evidence(
+        tmp_path / "host",
+        versions={"f32-host": "1.0"},
+        package_sites=(tmp_path / "host", site),
+    )
+    if boundary == "host-metadata":
+        materialize_host_metadata(host)
+        token = declare(usage, "imported-host", host, ())
+        usage.observe_host(token, host)
+        usage.withdraw(token)
+    loop_thread = threading.get_ident()
+    entered, release = threading.Event(), threading.Event()
+    threads = []
+    method = {
+        "requirements": "read_text",
+        "host-metadata": "open",
+        "wheel": "read_bytes",
+        "marker-write": "write_text",
+        "marker-unlink": "unlink",
+    }[boundary]
+    selected = {
+        "requirements": reqs,
+        "host-metadata": Path(host.distributions["f32-host"]["metadata_path"])
+        / "METADATA",
+        "wheel": addition.path,
+        "marker-write": marker,
+        "marker-unlink": marker,
+    }[boundary]
+    original = getattr(Path, method)
+    snapshot = usage.snapshot
+
+    def query(*args, **kwargs):
+        assert threading.get_ident() == loop_thread
+        return snapshot(*args, **kwargs)
+
+    def file_io(path, *args, **kwargs):
+        if path == selected:
+            threads.append(threading.get_ident())
+            entered.set()
+            if threading.get_ident() != loop_thread:
+                assert release.wait(5), "test did not release file operation"
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(usage, "snapshot", query)
+    monkeypatch.setattr(Path, method, file_io)
+    operation = asyncio.create_task(
+        prepare_api()(
+            process,
+            spec,
+            plugin_id="edge",
+            requirements_file=reqs,
+            usage_registry=usage,
+            install_target=site,
+            wheels=(addition,),
+        ),
+    )
+    try:
+        await event_set(entered)
+        assert all(thread != loop_thread for thread in threads)
+        assert not operation.done()
+        progressed = asyncio.Event()
+        asyncio.get_running_loop().call_soon(progressed.set)
+        await asyncio.wait_for(progressed.wait(), 2)
+        release.set()
+        result = await asyncio.wait_for(operation, 3)
+        assert result.distributions["f32-sdk"]["version"] == "2.0"
+        assert all(thread != loop_thread for thread in threads)
+        assert (site / "f32_sdk.py").read_text() == (
+            "VALUE = 'safe-local-addition'\n"
+        )
+        assert not marker.exists()
+    finally:
+        release.set()
+        await asyncio.gather(operation, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["prepare", "admit"])
+async def test_consumer_arriving_during_file_evidence_refuses_admission(
+    tmp_path,
+    monkeypatch,
+    entry,
+):
+    site, reqs, process, usage, spec = inputs(tmp_path, "f32-sdk==2.0\n")
+    process.snapshot = evidence(site, versions={"f32-sdk": "2.0"})
+    entered, release = threading.Event(), threading.Event()
+    loop_thread = threading.get_ident()
+    original = Path.read_text
+
+    def read(path, *args, **kwargs):
+        value = original(path, *args, **kwargs)
+        if path == reqs and not entered.is_set():
+            entered.set()
+            if threading.get_ident() != loop_thread:
+                assert release.wait(5), "test did not release evidence read"
+        return value
+
+    monkeypatch.setattr(Path, "read_text", read)
+    if entry == "prepare":
+        work = prepare_api()(
+            process,
+            spec,
+            plugin_id="edge",
+            requirements_file=reqs,
+            usage_registry=usage,
+            install_target=site,
+        )
+    else:
+
+        async def audit():
+            return (await process.audit(spec)).snapshot
+
+        work = gate.admit_shared_dependencies(
+            audit,
+            plugin_id="edge",
+            requirements_file=reqs,
+            usage_registry=usage,
+            snapshot=process.snapshot,
+        )
+    operation = asyncio.create_task(work)
+    try:
+        await event_set(entered)
+        assert not operation.done(), "file evidence blocked the event loop"
+        declare(usage, "arriving-consumer", evidence(site), ("f32-sdk<2",))
+        release.set()
+        with pytest.raises(gate.SharedDependencyError) as error:
+            await asyncio.wait_for(operation, 3)
+        assert any(
+            row["plugin_id"] == "arriving-consumer"
+            for row in error.value.decision.affected_instances
+        )
+        assert not list(site.iterdir()) and not repair_marker(site).exists()
+    finally:
+        release.set()
+        await asyncio.gather(operation, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["validation", "unlink", "repair"])
+async def test_repeated_cancel_settles_file_work_before_releasing_locks(
+    tmp_path,
+    monkeypatch,
+    boundary,
+):
+    site, reqs, process, usage, spec = inputs(tmp_path, "f32-sdk==2.0\n")
+    addition = wheel(tmp_path)
+    marker = repair_marker(site)
+    entered, release = threading.Event(), threading.Event()
+    admitted = asyncio.Event()
+    loop_thread = threading.get_ident()
+    method = (
+        "read_bytes"
+        if boundary == "validation"
+        else ("unlink" if boundary == "unlink" else "write_text")
+    )
+    original = getattr(Path, method)
+
+    def file_io(path, *args, **kwargs):
+        selected = (
+            path == addition.path
+            if boundary == "validation"
+            else path == marker
+            and (boundary == "unlink" or "verification failed" in args[0])
+        )
+        if selected:
+            entered.set()
+            assert threading.get_ident() != loop_thread
+            assert release.wait(5), "test did not release owned file work"
+        return original(path, *args, **kwargs)
+
+    if boundary == "repair":
+        original_audit = process.audit
+
+        async def audit(value):
+            if (site / "f32_sdk.py").exists():
+                raise RuntimeError("verification rejected")
+            return await original_audit(value)
+
+        process.audit = audit
+
+    async def peer():
+        async with coordinator()((site,)):
+            admitted.set()
+
+    monkeypatch.setattr(Path, method, file_io)
+    operation = asyncio.create_task(
+        prepare_api()(
+            process,
+            spec,
+            plugin_id="edge",
+            requirements_file=reqs,
+            usage_registry=usage,
+            install_target=site,
+            wheels=(addition,),
+        ),
+    )
+    waiter = None
+    try:
+        await event_set(entered)
+        operation.cancel()
+        await asyncio.sleep(0)
+        operation.cancel()
+        waiter = asyncio.create_task(peer())
+        await asyncio.sleep(0)
+        assert not operation.done() and not admitted.is_set()
+        with pytest.raises(install_lock.InstallLockError):
+            with install_lock.plugin_install_lock(
+                install_lock.environment_install_lock_path(site),
+                timeout=0,
+            ):
+                pytest.fail("file work released installer exclusion")
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(operation, 3)
+        await asyncio.wait_for(waiter, 3)
+        if boundary == "validation":
+            assert not list(site.iterdir()) and not marker.exists()
+        else:
+            assert (site / "f32_sdk.py").exists() and marker.exists()
+    finally:
+        release.set()
+        await asyncio.gather(
+            *(task for task in (operation, waiter) if task),
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["prewrite", "postwrite"])
 async def test_latest_usage_is_checked_at_publication_boundaries(
     tmp_path,
@@ -669,6 +916,8 @@ async def test_latest_usage_is_checked_at_publication_boundaries(
     site = tmp_path / "site"
     usage = DependencyUsageRegistry(RuntimeOwners())
     process = Audit(evidence(site))
+    loop_thread = threading.get_ident()
+    entered, release = threading.Event(), threading.Event()
     if boundary == "prewrite":
         from qwenpaw.plugins import wheel_additions
 
@@ -676,7 +925,9 @@ async def test_latest_usage_is_checked_at_publication_boundaries(
 
         def validate(*args):
             validated = original(*args)
-            declare(usage, "latest", evidence(site), ("f32-sdk<2",))
+            entered.set()
+            if threading.get_ident() != loop_thread:
+                assert release.wait(5), "test did not release validation"
             return validated
 
         monkeypatch.setattr(wheel_additions, "validate_additions", validate)
@@ -690,8 +941,20 @@ async def test_latest_usage_is_checked_at_publication_boundaries(
             return result
 
         process.audit = audit
-    with pytest.raises(gate.SharedDependencyError):
-        await install(tmp_path, usage=usage, process=process)
+    operation = asyncio.create_task(
+        install(tmp_path, usage=usage, process=process),
+    )
+    try:
+        if boundary == "prewrite":
+            await event_set(entered)
+            assert not operation.done(), "validation blocked the event loop"
+            declare(usage, "latest", evidence(site), ("f32-sdk<2",))
+            release.set()
+        with pytest.raises(gate.SharedDependencyError):
+            await operation
+    finally:
+        release.set()
+        await asyncio.gather(operation, return_exceptions=True)
     if boundary == "prewrite":
         assert not list(site.iterdir()) and not repair_marker(site).exists()
     else:
@@ -1482,3 +1745,53 @@ async def test_public_admission_preserves_private_consumer_inventory(
     assert all(
         not list(site.iterdir()) for site in (private_a, private_b, common)
     )
+
+
+def test_concurrent_first_environment_lease_keeps_single_live_reader(
+    tmp_path,
+    monkeypatch,
+):
+    from qwenpaw.plugins import dependency_maintenance as maintenance
+
+    site = tmp_path / "site"
+    site.mkdir()
+    root = maintenance.canonical(site)
+    started = threading.Barrier(2)
+    original_authorized = maintenance.authorized
+    original_open = maintenance._open_lock
+    handles = []
+    monkeypatch.setattr(maintenance, "_READERS", {})
+
+    def authorized(path):
+        started.wait(timeout=3)
+        return original_authorized(path)
+
+    def open_lock(path):
+        descriptor = original_open(path)
+        if path.suffix == ".lease":
+            handles.append((descriptor, path))
+        return descriptor
+
+    monkeypatch.setattr(maintenance, "authorized", authorized)
+    monkeypatch.setattr(maintenance, "_open_lock", open_lock)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            operations = [
+                workers.submit(maintenance.lease_environment, (site,))
+                for _ in range(2)
+            ]
+            for operation in operations:
+                operation.result(timeout=5)
+        files = list(maintenance._readers_dir(site).glob("*.lease"))
+        assert len(files) == 1
+        descriptor, path = maintenance._READERS[root]
+        assert path == files[0]
+        assert os.fstat(descriptor).st_size > 1
+        assert maintenance.live_readers((site,)) == [
+            {"pid": os.getpid(), "site": str(root)},
+        ]
+    finally:
+        maintenance._READERS.clear()
+        for descriptor, path in handles:
+            os.close(descriptor)
+            path.unlink(missing_ok=True)

@@ -38,7 +38,7 @@ from ...config.config import (
     SkillScannerWhitelistEntry,
     ThemeConfig,
 )
-from ...utils.io_utils import run_sync_io
+from ...utils.io_utils import run_async_to_completion, run_sync_io
 from ...config.timezone import normalize_tz
 from ..channels.conflict import (
     get_channel_bot_identity,
@@ -48,10 +48,10 @@ from ..channels.qrcode_auth_handler import (
     generate_qrcode_image,
 )
 from ..channels.management import ManagementError
-from ..channels.qrcode_sessions import resolve_channel_management_scope
+from ..channels.qrcode_sessions import resolve_channel_management_scope_async
 from ..channels.registry import BUILTIN_CHANNEL_KEYS
 from ..channels.catalog import (
-    get_configurable_channel_catalog,
+    get_configurable_channel_catalog_async,
     clean_channel_config,
 )
 from ..utils import schedule_agent_reload
@@ -123,7 +123,12 @@ def _channel_config_class(name: str) -> Optional[type[BaseModel]]:
     return None
 
 
-def _validated_channel_config(name: str, values: dict):
+def _validated_channel_config(
+    name: str,
+    values: dict,
+    *,
+    official_description=None,
+):
     """Use trusted static schemas with or without installed channel code."""
     from ...plugins.registry import PluginRegistry
     from ...plugins.channel_config import validate_channel_config
@@ -144,9 +149,10 @@ def _validated_channel_config(name: str, values: dict):
             schema = row.description_record.descriptor.config_schema
         elif name in official_channel_owners():
             plugin_id = official_channel_owners()[name]
-            schema = bundled_channel_description(
+            description = official_description or bundled_channel_description(
                 plugin_id,
-            ).descriptor.config_schema
+            )
+            schema = description.descriptor.config_schema
         if schema is not None:
             return validate_channel_config(
                 schema,
@@ -164,6 +170,27 @@ def _validated_channel_config(name: str, values: dict):
         ) from exc
     except (ValueError, OSError, KeyError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+async def _validated_channel_config_async(name: str, values: dict):
+    """Prefetch official schemas without moving registry reads off-loop."""
+    from ...plugins.registry import PluginRegistry
+    from ...plugins.official_channel_catalog import official_channel_owners
+    from ...plugins.official_channels import bundled_channel_description
+
+    description = None
+    owner = official_channel_owners().get(name)
+    row = PluginRegistry().get_channel_catalog_entry(name)
+    if owner is not None and (row is None or row.description_record is None):
+        try:
+            description = await run_sync_io(bundled_channel_description, owner)
+        except (ValueError, OSError, KeyError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _validated_channel_config(
+        name,
+        values,
+        official_description=description,
+    )
 
 
 def _save_channel_updates(agent_id: str, updates: dict) -> ChannelConfig:
@@ -185,6 +212,17 @@ def _save_channel_updates(agent_id: str, updates: dict) -> ChannelConfig:
         ) from exc
     # The mutator always assigns a validated ChannelConfig before saving.
     return cast(ChannelConfig, saved.channels)
+
+
+async def _save_channel_updates_async(request, agent_id, updates):
+    """Finish publication and captured-agent reload before caller cancellation."""
+
+    async def persist():
+        saved = await run_sync_io(_save_channel_updates, agent_id, updates)
+        schedule_agent_reload(request, agent_id)
+        return saved
+
+    return await run_async_to_completion(persist())
 
 
 _ALLOWED_ACP_TOOL_PARSE_MODES = {
@@ -209,7 +247,7 @@ async def list_channels(request: Request) -> dict:
 
     agent = await get_agent_for_request(request)
     agent_config = agent.config
-    available = get_configurable_channel_catalog(
+    available = await get_configurable_channel_catalog_async(
         agent.config.channels.model_dump() if agent.config.channels else (),
     )
 
@@ -264,7 +302,7 @@ async def list_channel_schemas(request: Request) -> dict:
 
     agent = await get_agent_for_request(request)
     saved = agent.config.channels.model_dump() if agent.config.channels else {}
-    result = get_configurable_channel_catalog(saved)
+    result = await get_configurable_channel_catalog_async(saved)
     loader = getattr(request.app.state, "plugin_loader", None)
     ready = set()
     if loader is not None:
@@ -354,36 +392,30 @@ async def put_channels(
     from ..agent_context import get_agent_for_request
 
     agent = await get_agent_for_request(request)
-    persisted = load_agent_config(agent.agent_id)
+    persisted = await run_sync_io(load_agent_config, agent.agent_id)
     current = persisted.channels.model_dump() if persisted.channels else {}
     from ...plugins.channel_config import channel_config_dict
 
     incoming = channel_config_dict(channels_config)
     keys = getattr(channels_config, "model_fields_set", incoming.keys())
     updates = {}
-    disabled = []
-    other_changes = []
+    changed = []
     for key in keys:
-        value = _validated_channel_config(key, incoming[key])
-        if current.get(key, {}).get("enabled") and not value.get("enabled"):
-            disabled.append(key)
-        elif current.get(key) != value:
-            other_changes.append(key)
+        value = await _validated_channel_config_async(key, incoming[key])
+        if current.get(key) != value:
+            changed.append(key)
         updates[key] = value
     sessions = getattr(request.app.state, "channel_qrcode_sessions", None)
     async with AsyncExitStack() as stack:
-        if sessions is not None and disabled:
+        if sessions is not None and changed:
             await stack.enter_async_context(
-                sessions.operation_guard(agent.agent_id, tuple(disabled)),
+                sessions.operation_guard(agent.agent_id, tuple(changed)),
             )
-        saved_channels = _save_channel_updates(agent.agent_id, updates)
-        if sessions is not None and other_changes:
-            await stack.enter_async_context(
-                sessions.operation_guard(agent.agent_id, tuple(other_changes)),
-            )
-
-    # Hot reload config (async, non-blocking)
-    schedule_agent_reload(request, agent.agent_id)
+        saved_channels = await _save_channel_updates_async(
+            request,
+            agent.agent_id,
+            updates,
+        )
 
     return saved_channels
 
@@ -403,7 +435,7 @@ async def _resolve_channel_manager(
     from ..agent_context import get_agent_for_request
 
     agent = await get_agent_for_request(request)
-    available = get_configurable_channel_catalog(
+    available = await get_configurable_channel_catalog_async(
         agent.config.channels.model_dump() if agent.config.channels else (),
     )
     if channel_name not in available:
@@ -513,7 +545,7 @@ def _management_http_error(error: ManagementError) -> HTTPException:
     return HTTPException(status, reason)
 
 
-def _managed_qrcode_sessions(request, channel):
+async def _managed_qrcode_sessions(request, channel):
     """Select QR descriptors, including offline official takeover metadata."""
     from ...channel_protocol.management import MANAGEMENT_CAPABILITIES
     from ...plugins.official_channel_catalog import official_channel_owners
@@ -528,7 +560,10 @@ def _managed_qrcode_sessions(request, channel):
         owner = official_channel_owners().get(channel)
         if owner is not None:
             try:
-                description = bundled_channel_description(owner)
+                description = await run_sync_io(
+                    bundled_channel_description,
+                    owner,
+                )
             except (OSError, ValueError, KeyError):
                 raise HTTPException(503, "CHANNEL_UNAVAILABLE") from None
     if description is None or (
@@ -577,8 +612,6 @@ async def _qrcode_request(request, operation):
         watcher.cancel()
         if not task.done():
             task.cancel()
-        from ...utils.io_utils import run_async_to_completion
-
         await run_async_to_completion(
             asyncio.gather(task, watcher, return_exceptions=True),
         )
@@ -595,8 +628,8 @@ async def _qrcode_request(request, operation):
 )
 async def get_channel_qrcode(request: Request, channel: str) -> dict:
     """Return {qrcode_img, poll_token} for the requested channel."""
-    sessions = _managed_qrcode_sessions(request, channel)
-    scope = resolve_channel_management_scope(request, channel)
+    sessions = await _managed_qrcode_sessions(request, channel)
+    scope = await resolve_channel_management_scope_async(request, channel)
     result = await _qrcode_request(
         request,
         sessions.fetch(scope, dict(request.query_params)),
@@ -621,8 +654,8 @@ async def get_channel_qrcode_status(
     token: str,
 ) -> dict:
     """Return {status, credentials} for the requested channel."""
-    sessions = _managed_qrcode_sessions(request, channel)
-    scope = resolve_channel_management_scope(request, channel)
+    sessions = await _managed_qrcode_sessions(request, channel)
+    scope = await resolve_channel_management_scope_async(request, channel)
     result = await _qrcode_request(request, sessions.poll(scope, token))
     return {"status": result.status, "credentials": result.credentials}
 
@@ -637,7 +670,7 @@ async def cancel_channel_qrcode(
     sessions = getattr(request.app.state, "channel_qrcode_sessions", None)
     if sessions is None:
         raise HTTPException(503, "MANAGEMENT_CLOSED")
-    scope = resolve_channel_management_scope(request, channel)
+    scope = await resolve_channel_management_scope_async(request, channel)
     try:
         await sessions.cancel(scope, token)
     except ManagementError as error:
@@ -662,7 +695,7 @@ async def get_channel(
     from ..agent_context import get_agent_for_request
 
     agent = await get_agent_for_request(request)
-    available = get_configurable_channel_catalog(
+    available = await get_configurable_channel_catalog_async(
         agent.config.channels.model_dump() if agent.config.channels else (),
     )
     if channel_name not in available:
@@ -715,7 +748,7 @@ async def check_channel_conflict(
     from ..agent_context import get_agent_for_request
 
     agent = await get_agent_for_request(request)
-    available = get_configurable_channel_catalog(
+    available = await get_configurable_channel_catalog_async(
         agent.config.channels.model_dump() if agent.config.channels else (),
     )
     if channel_name not in available:
@@ -799,12 +832,15 @@ async def put_channel(
     ),
 ) -> dict:
     """Update a specific channel config by name."""
-    from ...config.config import load_agent_config, save_agent_config
+    from ...config.config import load_agent_config, update_agent_config_async
     from ..agent_context import get_agent_for_request
 
     token = request.headers.get("X-Channel-Auth-Session")
     if token is not None:
-        scope = resolve_channel_management_scope(request, channel_name)
+        scope = await resolve_channel_management_scope_async(
+            request,
+            channel_name,
+        )
         sessions = getattr(request.app.state, "channel_qrcode_sessions", None)
         if sessions is None:
             raise HTTPException(503, "MANAGEMENT_CLOSED")
@@ -812,42 +848,52 @@ async def put_channel(
         if channel_name == "wechat":
             for key in ("bot_token_file", "base_url"):
                 values.setdefault(key, scope.config.get(key, ""))
-        candidate = load_agent_config(scope.workspace_id)
-        current = candidate.channels.model_dump() if candidate.channels else {}
-        candidate.channels = ChannelConfig.model_validate(
-            {
-                **current,
-                channel_name: _validated_channel_config(channel_name, values),
-            },
-        )
-        channel_config = candidate.channels.model_dump(mode="json")[
-            channel_name
-        ]
+        validated = await _validated_channel_config_async(channel_name, values)
+        channel_config = ChannelConfig.model_validate(
+            {channel_name: validated},
+        ).model_dump(mode="json")[channel_name]
+
+        def apply_channel(candidate):
+            root = load_config()
+            profile = root.agents.profiles.get(scope.workspace_id)
+            if (
+                profile is None
+                or not profile.enabled
+                or FilePath(profile.workspace_dir).expanduser().resolve()
+                != scope.workspace_dir
+            ):
+                raise HTTPException(403, "Channel scope changed")
+            current = (
+                candidate.channels.model_dump() if candidate.channels else {}
+            )
+            if current.get(channel_name) != scope.config:
+                raise HTTPException(409, "Channel configuration changed")
+            candidate.channels = ChannelConfig.model_validate(
+                {**current, channel_name: channel_config},
+            )
+
+        async def persist():
+            saved = await update_agent_config_async(
+                scope.workspace_id,
+                apply_channel,
+            )
+            schedule_agent_reload(request, scope.workspace_id)
+            return saved.channels.model_dump(mode="json")[channel_name]
+
         try:
-            async with sessions.authorize_save(scope, token, channel_config):
-                # Everything through the persisted commit is synchronous. The
-                # session and target cannot change at an intervening await.
-                root = load_config()
-                profile = root.agents.profiles.get(scope.workspace_id)
-                if (
-                    profile is None
-                    or not profile.enabled
-                    or FilePath(profile.workspace_dir).expanduser().resolve()
-                    != scope.workspace_dir
-                ):
-                    raise HTTPException(403, "Channel scope changed")
-                if current.get(channel_name) != scope.config:
-                    raise HTTPException(409, "Channel configuration changed")
-                save_agent_config(scope.workspace_id, candidate)
+            return await sessions.save_confirmed(
+                scope,
+                token,
+                channel_config,
+                persist,
+            )
         except ManagementError as error:
             raise _management_http_error(error) from None
-        schedule_agent_reload(request, scope.workspace_id)
-        return channel_config
 
     agent = await get_agent_for_request(request)
-    persisted = load_agent_config(agent.agent_id)
+    persisted = await run_sync_io(load_agent_config, agent.agent_id)
     current = persisted.channels.model_dump() if persisted.channels else {}
-    available = get_configurable_channel_catalog(
+    available = await get_configurable_channel_catalog_async(
         current,
     )
     if channel_name not in available:
@@ -856,32 +902,22 @@ async def put_channel(
             detail=f"Channel '{channel_name}' not found",
         )
 
-    channel_config = _validated_channel_config(
+    channel_config = await _validated_channel_config_async(
         channel_name,
         single_channel_config,
     )
-    disabling = current.get(channel_name, {}).get(
-        "enabled",
-    ) and not channel_config.get("enabled")
     changed = current.get(channel_name) != channel_config
     sessions = getattr(request.app.state, "channel_qrcode_sessions", None)
-    if sessions is not None and disabling:
-        async with sessions.operation_guard(agent.agent_id, channel_name):
-            saved_channels = _save_channel_updates(
-                agent.agent_id,
-                {channel_name: channel_config},
+    async with AsyncExitStack() as stack:
+        if sessions is not None and changed:
+            await stack.enter_async_context(
+                sessions.operation_guard(agent.agent_id, channel_name),
             )
-    else:
-        saved_channels = _save_channel_updates(
+        saved_channels = await _save_channel_updates_async(
+            request,
             agent.agent_id,
             {channel_name: channel_config},
         )
-        if sessions is not None and changed:
-            async with sessions.operation_guard(agent.agent_id, channel_name):
-                pass
-
-    # Hot reload config (async, non-blocking)
-    schedule_agent_reload(request, agent.agent_id)
 
     return saved_channels.model_dump(mode="json")[channel_name]
 

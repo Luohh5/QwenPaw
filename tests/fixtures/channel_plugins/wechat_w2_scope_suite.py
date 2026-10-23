@@ -112,3 +112,38 @@ def test_unknown_or_disabled_profile_is_refused_without_agent_start(
     with pytest.raises(HTTPException) as denied:
         resolver()(request(header="missing" if missing else "A"), "wechat")
     assert denied.value.status_code in (403, 404)
+
+
+@pytest.mark.asyncio
+async def test_async_scope_reads_actual_config_metadata_off_loop(
+    tmp_path, monkeypatch
+):
+    import asyncio
+    from pathlib import Path
+    from wechat_qr_io_support import FileIOGate
+
+    _, paths = write_profiles(
+        tmp_path, monkeypatch, "wechat", {"base_url": "https://scope.invalid"}
+    )
+    root_path = tmp_path / "host" / "config.json"
+    gate = FileIOGate(
+        monkeypatch, Path, "stat", lambda path, *a, **kw: path == root_path
+    )
+    api = import_module("qwenpaw.app.channels.qrcode_sessions")
+    task = asyncio.create_task(
+        api.resolve_channel_management_scope_async(
+            request(header="A"), "wechat"
+        )
+    )
+    try:
+        await gate.wait(task)
+        gate.release.set()
+        scope = await task
+        assert (
+            scope.workspace_id == "A"
+            and scope.workspace_dir == paths["A"].resolve()
+        )
+        assert scope.config["base_url"] == "https://scope.invalid"
+    finally:
+        gate.release.set()
+        await asyncio.gather(task, return_exceptions=True)

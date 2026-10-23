@@ -617,7 +617,7 @@ async def test_actual_worker_retains_only_required_version_closure(tmp_path):
         assert (await process.stop()).exited
 
 
-def observed_host(tmp_path, monkeypatch):
+async def observed_host(tmp_path, monkeypatch):
     shared, parent_user = (
         tmp_path / "shared-site",
         tmp_path / "parent-user-site",
@@ -644,8 +644,11 @@ def observed_host(tmp_path, monkeypatch):
             },
         )
         assert full.versions["shared-fixture-pdf"] == "6.1"
-        PythonBackend.observe_host_dependencies(
-            SimpleNamespace(source_path=tmp_path / "host-plugin"),
+        await PythonBackend.observe_host_dependencies(
+            SimpleNamespace(
+                source_path=tmp_path / "host-plugin",
+                manifest=SimpleNamespace(id="host-agent"),
+            ),
             usage,
             token,
         )
@@ -657,7 +660,9 @@ async def test_host_loaded_pin_uses_unimported_parent_transitive_inventory(
     tmp_path,
     monkeypatch,
 ):
-    usage, token, shared, _parent_user = observed_host(tmp_path, monkeypatch)
+    usage, token, shared, _parent_user = await observed_host(
+        tmp_path, monkeypatch
+    )
     usage.withdraw(token)
     hosts = [use for use in usage.snapshot().uses if use.origin == "host"]
     assert len(hosts) == 1
@@ -690,7 +695,9 @@ async def test_stale_child_cannot_replace_fresh_host_requirement_metadata(
     tmp_path,
     monkeypatch,
 ):
-    usage, token, shared, parent_user = observed_host(tmp_path, monkeypatch)
+    usage, token, shared, parent_user = await observed_host(
+        tmp_path, monkeypatch
+    )
     spec = launch(
         tmp_path,
         paths=(shared, parent_user),
@@ -753,7 +760,9 @@ async def test_fresh_host_audit_cannot_reuse_stale_candidate_inventory(
     monkeypatch,
     mutation,
 ):
-    usage, token, shared, parent_user = observed_host(tmp_path, monkeypatch)
+    usage, token, shared, parent_user = await observed_host(
+        tmp_path, monkeypatch
+    )
     spec = launch(
         tmp_path,
         paths=(shared, parent_user),
@@ -824,7 +833,9 @@ async def test_host_metadata_completion_avoids_unrelated_record_files(
     tmp_path,
     monkeypatch,
 ):
-    usage, token, shared, parent_user = observed_host(tmp_path, monkeypatch)
+    usage, token, shared, parent_user = await observed_host(
+        tmp_path, monkeypatch
+    )
     install(
         parent_user,
         "shared-unused-host",
@@ -877,7 +888,9 @@ async def test_ambiguous_pdf_between_host_sites_is_not_completed_from_child(
     tmp_path,
     monkeypatch,
 ):
-    usage, token, shared, parent_user = observed_host(tmp_path, monkeypatch)
+    usage, token, shared, parent_user = await observed_host(
+        tmp_path, monkeypatch
+    )
     # The host reads two real origins; the isolated candidate reads only one.
     install(shared, "shared-fixture-pdf", "6.1")
     usage.withdraw(token)

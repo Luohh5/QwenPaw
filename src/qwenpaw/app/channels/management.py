@@ -22,6 +22,7 @@ from ...channel_protocol.management import (
     management_options,
 )
 from ...plugins.dependency_usage import DependencyDeclaration
+from ...utils.io_utils import run_sync_io
 from ...plugins.ownership import (
     RuntimeKey,
     RuntimeLease,
@@ -130,7 +131,8 @@ class ChannelManagementService:
             async with self._loader.execution_source(row.plugin_id) as record:
                 if self._closed:
                     raise ManagementError("MANAGEMENT_CLOSED")
-                description, settings = self._source(row, record, channel_key)
+                source = self._source_snapshot(row, record, channel_key)
+                description, settings, _, _ = source
                 if (
                     MANAGEMENT_CAPABILITIES[operation]
                     not in description.descriptor.capabilities
@@ -251,9 +253,9 @@ class ChannelManagementService:
                     work = None
                     raise
                 self._work[lease] = work
-            # Release the lifecycle lock before startup or RPC can suspend.
+            # Source validation belongs to this exact owner's tracked task.
             work.task = asyncio.create_task(
-                self._execute(work, spec, request, description),
+                self._execute(work, spec, request, row, record, source),
             )
             try:
                 return await asyncio.shield(work.task)
@@ -283,33 +285,66 @@ class ChannelManagementService:
                         side_effect_possible=work.side_effect_possible,
                     ) from None
 
-    def _source(self, row, record, channel_key):
+    def _source_snapshot(self, row, record, channel_key):
         if (
             self._loader.registry.get_channel_catalog_entry(channel_key)
             is not row
         ):
             raise ManagementError("PLUGIN_NOT_INSTALLED")
+        if self._loader.get_loaded_plugin(row.plugin_id) is not record:
+            raise ManagementError("PLUGIN_NOT_INSTALLED")
         description = row.description_record
         binding = record.backend_binding
         if (
-            description.plugin_id != row.plugin_id
+            description is None
+            or description.plugin_id != row.plugin_id
             or record.manifest.id != row.plugin_id
-            or record.source_path.resolve() != description.code_root.resolve()
             or binding is None
             or binding.description.payload != description
         ):
             raise ManagementError("CHANNEL_UNAVAILABLE")
-        if not row.global_enabled:
+        enabled = record.global_enabled
+        if not row.global_enabled or not (
+            record.enabled if enabled is None else enabled
+        ):
             raise ManagementError("PLUGIN_DISABLED")
-        try:
-            revision = code_root_digest(description.code_root)
-        except (OSError, ValueError, RuntimeError):
-            raise ManagementError("SOURCE_REVISION_MISMATCH") from None
-        if revision != description.source_revision:
-            raise ManagementError("SOURCE_REVISION_MISMATCH")
         settings = row.runtime_settings
         if settings is None or not settings.allows(channel_key):
             raise ManagementError("CHANNEL_UNAVAILABLE")
+        return description, settings, binding, record.source_path
+
+    async def _source(self, row, record, channel_key, *, snapshot=None):
+        current = self._source_snapshot(row, record, channel_key)
+        if snapshot is None:
+            snapshot = current
+        elif (
+            any(current[index] is not snapshot[index] for index in range(3))
+            or current[3] != snapshot[3]
+        ):
+            raise ManagementError("SOURCE_REVISION_MISMATCH")
+        description, settings, binding, source_path = snapshot
+        code_root = description.code_root
+        expected_revision = description.source_revision
+
+        def read_source():
+            if source_path.resolve() != code_root.resolve():
+                raise ManagementError("CHANNEL_UNAVAILABLE")
+            return code_root_digest(code_root)
+
+        try:
+            revision = await run_sync_io(read_source)
+        except (OSError, ValueError, RuntimeError):
+            raise ManagementError("SOURCE_REVISION_MISMATCH") from None
+        current = self._source_snapshot(row, record, channel_key)
+        if (
+            current[0] is not description
+            or current[1] is not settings
+            or current[2] is not binding
+            or current[3] != source_path
+        ):
+            raise ManagementError("SOURCE_REVISION_MISMATCH")
+        if revision != expected_revision:
+            raise ManagementError("SOURCE_REVISION_MISMATCH")
         return description, settings
 
     @staticmethod
@@ -375,9 +410,22 @@ class ChannelManagementService:
             },
         }
 
-    @staticmethod
-    async def _execute(work, spec, request, description):
+    async def _execute(self, work, spec, request, row, record, source):
         try:
+            description, _ = await self._source(
+                row,
+                record,
+                request.channel_key,
+                snapshot=source,
+            )
+            if self._closed:
+                raise ManagementError("MANAGEMENT_CLOSED")
+            owners = self._loader.registry.runtime_owners
+            if (
+                work.lease not in owners.leases()
+                or owners.resource(work.lease) is not work.process
+            ):
+                raise ManagementError("IDENTITY_MISMATCH")
             await work.process.start_management(spec)
             loop = asyncio.get_running_loop()
             deadline = loop.time() + request.timeout_ms / 1000

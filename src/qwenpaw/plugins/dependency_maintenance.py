@@ -160,6 +160,8 @@ def lease_environment(sites, parent_pid=None, timeout=5):
                     yield
 
         with admission():
+            if root in _READERS:
+                continue
             check_admission(root)
             path = _readers_dir(root) / (
                 str(os.getpid()) + "-" + uuid4().hex + ".lease"

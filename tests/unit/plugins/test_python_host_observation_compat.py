@@ -14,8 +14,9 @@ from qwenpaw.plugins.dependency_usage import DependencyDeclaration
 from qwenpaw.plugins import python_backend
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("disk_state", ["deleted", "stat-denied"])
-def test_older_inventory_retains_loaded_owner_without_rechecking_disk(
+async def test_older_inventory_retains_loaded_owner_without_rechecking_disk(
     tmp_path,
     monkeypatch,
     fresh_registry,
@@ -89,8 +90,11 @@ def test_older_inventory_retains_loaded_owner_without_rechecking_disk(
         DependencyDeclaration("older-host", "fresh", (), None),
     )
     try:
-        python_backend.PythonBackend.observe_host_dependencies(
-            SimpleNamespace(source_path=tmp_path / "plugin"),
+        await python_backend.PythonBackend.observe_host_dependencies(
+            SimpleNamespace(
+                source_path=tmp_path / "plugin",
+                manifest=SimpleNamespace(id="older-host"),
+            ),
             usage,
             token,
         )

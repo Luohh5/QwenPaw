@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
 """Offline acquisition exercises pip and the real shared publication gate."""
 
+import asyncio
 import base64
 from io import BytesIO
 import os
+from pathlib import Path
+import shutil
 import sys
 import tarfile
+import tempfile
+import threading
 from types import SimpleNamespace
 import zipfile
 
@@ -19,6 +24,7 @@ from .test_generic_dependency_gate import (
     Audit,
     declare,
     evidence,
+    event_set,
     materialize_host_metadata,
     wheel,
 )
@@ -261,3 +267,104 @@ async def test_acquisition_respects_existing_distribution_version_constraints(
         if path.is_file()
     } == before
     assert not repair_marker(acquisition.site).exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary,cancel",
+    [
+        ("staging", False),
+        ("constraints", False),
+        ("hash", False),
+        ("cleanup", False),
+        ("hash", True),
+        ("cleanup", True),
+    ],
+)
+async def test_acquisition_files_settle_off_loop_before_staging_disappears(
+    acquisition,
+    monkeypatch,
+    boundary,
+    cancel,
+):
+    wheel(acquisition.index)
+    loop_thread = threading.get_ident()
+    entered, release = threading.Event(), threading.Event()
+    threads, staging = [], []
+
+    def pause(root):
+        staging.append(Path(root))
+        threads.append(threading.get_ident())
+        entered.set()
+        if threading.get_ident() != loop_thread:
+            assert release.wait(10), "test did not release staged file work"
+
+    if boundary == "staging":
+        original = tempfile.mkdtemp
+
+        def create(*args, **kwargs):
+            root = original(*args, **kwargs)
+            if Path(root).name.startswith("qwenpaw-dependency-wheels-"):
+                pause(root)
+            return root
+
+        monkeypatch.setattr(tempfile, "mkdtemp", create)
+    elif boundary == "cleanup":
+        original = shutil.rmtree
+
+        def cleanup(path, *args, **kwargs):
+            if Path(path).name.startswith("qwenpaw-dependency-wheels-"):
+                pause(path)
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(shutil, "rmtree", cleanup)
+    else:
+        method = "write_text" if boundary == "constraints" else "read_bytes"
+        original = getattr(Path, method)
+
+        def file_io(path, *args, **kwargs):
+            if path.parent.name.startswith("qwenpaw-dependency-wheels-"):
+                pause(path.parent)
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, method, file_io)
+
+    original_snapshot = acquisition.usage.snapshot
+
+    def snapshot(*args, **kwargs):
+        assert threading.get_ident() == loop_thread
+        return original_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(acquisition.usage, "snapshot", snapshot)
+    operation = asyncio.create_task(acquisition.acquire())
+    try:
+        await event_set(entered)
+        assert all(thread != loop_thread for thread in threads)
+        assert not operation.done() and staging[0].is_dir()
+        progressed = asyncio.Event()
+        asyncio.get_running_loop().call_soon(progressed.set)
+        await asyncio.wait_for(progressed.wait(), 2)
+        if cancel:
+            operation.cancel()
+            await asyncio.sleep(0)
+            operation.cancel()
+            await asyncio.sleep(0)
+            assert not operation.done() and staging[0].is_dir()
+        release.set()
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(operation, 10)
+        else:
+            await asyncio.wait_for(operation, 10)
+        assert not staging[0].exists()
+        assert all(thread != loop_thread for thread in threads)
+        if cancel and boundary == "hash":
+            assert not list(acquisition.site.iterdir())
+        else:
+            assert (acquisition.site / "f32_sdk.py").read_text() == (
+                "VALUE = 'safe-local-addition'\n"
+            )
+        assert not repair_marker(acquisition.site).exists()
+    finally:
+        release.set()
+        await asyncio.gather(operation, return_exceptions=True)

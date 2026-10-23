@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 from importlib import import_module
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi import HTTPException
@@ -25,6 +26,7 @@ from management_process_suite import (
 )
 from wechat_w2_config_support import write_profiles
 from wechat_w2_scope_suite import request
+from wechat_qr_io_support import FileIOGate
 
 
 @pytest.fixture(autouse=True)
@@ -257,38 +259,44 @@ async def test_hard_ttl_discards_late_confirmed_and_clears_owner(
 
 
 @pytest.mark.asyncio
-async def test_confirmed_authorize_save_consumes_only_successful_sync_commit(
-    qr,
-):
-    from qwenpaw.config.config import load_agent_config, save_agent_config
+async def test_confirmed_save_consumes_only_successful_async_commit(qr):
+    from qwenpaw.config.config import (
+        load_agent_config,
+        update_agent_config_async,
+    )
 
     fetched = await qr.sessions.fetch(qr.scope, {})
     confirmed = await qr.sessions.poll(qr.scope, fetched.poll_token)
     values = {**qr.scope.config, **confirmed.credentials}
+
+    async def fail():
+        raise ValueError("caller aborted")
+
     with pytest.raises(ValueError, match="caller aborted"):
-        async with qr.sessions.authorize_save(
-            qr.scope, fetched.poll_token, values
-        ):
-            raise ValueError("caller aborted")
-    scheduled = []
-    asyncio.get_running_loop().call_soon(scheduled.append, "loop-turn")
-    async with qr.sessions.authorize_save(
-        qr.scope, fetched.poll_token, values
-    ):
-        assert scheduled == []  # Validation-to-save entry must not await.
-        profile = load_agent_config("A")
-        setattr(profile.channels, KEY, values)
-        save_agent_config("A", profile)
-    assert not qr_leases(qr)
+        await qr.sessions.save_confirmed(
+            qr.scope, fetched.poll_token, values, fail
+        )
+    assert qr_leases(qr)
+
+    async def persist():
+        def update(profile):
+            setattr(profile.channels, KEY, values)
+
+        await update_agent_config_async("A", update)
+        return values
+
+    saved = await qr.sessions.save_confirmed(
+        qr.scope, fetched.poll_token, values, persist
+    )
+    assert saved == values and not qr_leases(qr)
     assert (
         getattr(load_agent_config("A").channels, KEY)["api_token"]
         == "fixture-result-secret"
     )
     with pytest.raises(HTTPException):
-        async with qr.sessions.authorize_save(
-            qr.scope, fetched.poll_token, values
-        ):
-            raise AssertionError("consumed auth token admitted twice")
+        await qr.sessions.save_confirmed(
+            qr.scope, fetched.poll_token, values, persist
+        )
 
 
 @pytest.mark.asyncio
@@ -491,3 +499,190 @@ async def test_terminal_cache_is_sixty_seconds_bounded_by_original_hard_ttl(
     assert expired.status == "expired" and expired.credentials == {}
     await qr.sessions.cancel(qr.scope, fetched.poll_token)
     assert not qr_leases(qr) and not active_management(qr.rt)
+
+
+def source_gate(qr, monkeypatch):
+    driver = qr.rt.record.source_path / KEY / "driver.py"
+    return FileIOGate(
+        monkeypatch, Path, "read_bytes", lambda path: path == driver
+    )
+
+
+@pytest.mark.asyncio
+async def test_actual_source_scan_shares_waiters_and_cancel_one_preserves_other(
+    qr, monkeypatch
+):
+    fetched = await qr.sessions.fetch(qr.scope, {})
+    gate = source_gate(qr, monkeypatch)
+    first = asyncio.create_task(qr.sessions.poll(qr.scope, fetched.poll_token))
+    second = None
+    try:
+        await gate.wait(first)
+        second = asyncio.create_task(
+            qr.sessions.poll(qr.scope, fetched.poll_token)
+        )
+        session = next(iter(qr.sessions._sessions.values()))
+        await eventually(lambda: session.validation_waiters == 2)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert gate.calls == 1 and not second.done() and qr_leases(qr)
+        assert len(qr.http.requests) == 1
+        gate.release.set()
+        result = await second
+        assert result.status == "confirmed" and result.credentials
+        completed = gate.calls
+        await qr.sessions.poll(qr.scope, fetched.poll_token)
+        assert (
+            gate.calls > completed
+        ), "completed evidence was reused as authorization"
+    finally:
+        gate.release.set()
+        await asyncio.gather(
+            first, *([second] if second else []), return_exceptions=True
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    ["source", "config", "owner-resource", "binding", "cancel", "unload"],
+)
+async def test_actual_source_scan_rechecks_authority_and_retains_owner_until_settled(
+    qr, monkeypatch, change
+):
+    from qwenpaw.config.config import load_agent_config, save_agent_config
+
+    fetched = await qr.sessions.fetch(qr.scope, {})
+    lease = qr_leases(qr)[0]
+    gate = source_gate(qr, monkeypatch)
+    poll = asyncio.create_task(qr.sessions.poll(qr.scope, fetched.poll_token))
+    stop = None
+    try:
+        await gate.wait(poll)
+        if change == "source":
+            driver = qr.rt.record.source_path / KEY / "driver.py"
+            driver.write_text(
+                driver.read_text() + "\n# changed during source scan\n"
+            )
+        elif change == "config":
+            profile = load_agent_config("A")
+            setattr(
+                profile.channels,
+                KEY,
+                {**qr.scope.config, "behavior": "changed"},
+            )
+            save_agent_config("A", profile)
+        elif change == "owner-resource":
+            resource = qr.rt.owners.resource
+            monkeypatch.setattr(
+                qr.rt.owners,
+                "resource",
+                lambda current: object()
+                if current == lease
+                else resource(current),
+            )
+        elif change == "binding":
+            from copy import copy
+
+            qr.rt.record.backend_binding = copy(qr.rt.record.backend_binding)
+        elif change == "cancel":
+            stop = asyncio.create_task(
+                qr.sessions.cancel(qr.scope, fetched.poll_token)
+            )
+        else:
+            stop = asyncio.create_task(
+                qr.rt.loader.lifecycle.set_enabled(KEY, False)
+            )
+        if stop:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert (
+                not stop.done()
+            ), "stop attested completion while actual scan was blocked"
+            assert lease in qr.rt.owners.leases()
+        gate.release.set()
+        outcome = (await asyncio.gather(poll, return_exceptions=True))[0]
+        assert not getattr(outcome, "credentials", {})
+        assert isinstance(
+            outcome, (HTTPException, asyncio.CancelledError, RuntimeError)
+        )
+        assert len(qr.http.requests) == 1
+        if stop:
+            await stop
+            assert lease not in qr.rt.owners.leases()
+    finally:
+        gate.release.set()
+        await asyncio.gather(
+            poll, *([stop] if stop else []), return_exceptions=True
+        )
+
+
+@pytest.mark.asyncio
+async def test_last_source_scan_waiter_cancel_settles_file_before_fresh_poll(
+    qr, monkeypatch
+):
+    fetched = await qr.sessions.fetch(qr.scope, {})
+    gate = source_gate(qr, monkeypatch)
+    poll = asyncio.create_task(qr.sessions.poll(qr.scope, fetched.poll_token))
+    try:
+        await gate.wait(poll)
+        poll.cancel()
+        await asyncio.sleep(0)
+        poll.cancel()
+        await asyncio.sleep(0)
+        assert not poll.done() and qr_leases(qr)
+        assert len(qr.http.requests) == 1
+        gate.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await poll
+        assert qr_leases(qr)
+        result = await qr.sessions.poll(qr.scope, fetched.poll_token)
+        assert result.status == "confirmed" and result.credentials
+        assert len(qr.http.requests) == 2
+    finally:
+        gate.release.set()
+        await asyncio.gather(poll, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end", ["revoke", "unload", "caller"])
+async def test_actual_source_scan_initial_fetch_keeps_owned_custody(
+    qr, monkeypatch, end
+):
+    gate = source_gate(qr, monkeypatch)
+    fetch = asyncio.create_task(qr.sessions.fetch(qr.scope, {}))
+    stop = None
+    try:
+        await gate.wait(fetch)
+        (lease,) = qr_leases(qr)
+        assert qr.rt.owners.resource(lease) is not None
+        assert not qr.http.requests
+        if end == "caller":
+            fetch.cancel()
+            await asyncio.sleep(0)
+            fetch.cancel()
+        elif end == "revoke":
+            stop = asyncio.create_task(qr.sessions.revoke_workspace("A"))
+        else:
+            stop = asyncio.create_task(
+                qr.rt.loader.lifecycle.set_enabled(KEY, False)
+            )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not fetch.done() and lease in qr.rt.owners.leases()
+        if stop:
+            assert not stop.done()
+        gate.release.set()
+        result = (await asyncio.gather(fetch, return_exceptions=True))[0]
+        assert isinstance(
+            result, (HTTPException, asyncio.CancelledError, RuntimeError)
+        )
+        if stop:
+            await stop
+        assert not qr.http.requests and not qr_leases(qr)
+    finally:
+        gate.release.set()
+        await asyncio.gather(
+            fetch, *([stop] if stop else []), return_exceptions=True
+        )

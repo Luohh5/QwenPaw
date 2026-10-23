@@ -10,7 +10,7 @@ import sys
 import sysconfig
 
 
-def shared_dependency_paths() -> tuple[Path, ...]:
+def shared_dependency_paths(paths=None) -> tuple[Path, ...]:
     """Share active system/user sites without inheriting arbitrary paths."""
     candidates = [
         *site.getsitepackages(),
@@ -28,7 +28,7 @@ def shared_dependency_paths() -> tuple[Path, ...]:
     return tuple(
         dict.fromkeys(
             path
-            for item in sys.path
+            for item in (sys.path if paths is None else paths)
             if item
             and (path := Path(os.path.normcase(os.path.realpath(item))))
             in trusted
