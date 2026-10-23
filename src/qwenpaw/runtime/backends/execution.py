@@ -138,7 +138,9 @@ class BackendExecution:
                     backend = await backend
                 if not callable(getattr(backend, "close", None)):
                     raise SDKError("Harness backend requires close()")
-                scope.connection(backend, f"harness:{entry.spec.id}")
+                # Direct release preserves the SDK cleanup task's storage
+                # ownership while retaining bounded, retryable close custody.
+                scope.defer(backend.close, f"harness:{entry.spec.id}")
                 instance.backend = backend
                 return instance
             except BaseException:
@@ -224,6 +226,7 @@ class BackendExecution:
 
                 async def approval(summary, *, timeout):
                     entry.assert_active()
+                    base.resources._check()
                     if not isinstance(summary, HarnessApprovalSummary):
                         raise SDKError(
                             "Approval requires HarnessApprovalSummary",

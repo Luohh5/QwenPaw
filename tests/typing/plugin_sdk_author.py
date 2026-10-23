@@ -198,3 +198,25 @@ async def harness_contract(
     async for event in events:
         assert_type(event.text, str)
     await handle.close()
+
+
+async def harness_author_host(host: PluginTestHost) -> None:
+    from qwenpaw.plugins.harnesses import HarnessRunRequest, HarnessStatus
+
+    assert_type(host.list_harnesses(), tuple[dict[str, Any], ...])
+    assert_type(
+        await host.harness_status("author-example", workspace_id="one"),
+        HarnessStatus,
+    )
+    events = assert_type(
+        host.run_harness(
+            "author-example",
+            HarnessRunRequest("hello"),
+            workspace_id="one",
+            session_id="session",
+            user_id="user",
+            channel="console",
+        ),
+        AsyncGenerator[ChatEvent, None],
+    )
+    await events.aclose()

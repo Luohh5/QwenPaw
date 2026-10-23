@@ -214,6 +214,161 @@ interruption with `reload(plugin_id, interrupt_tasks=True)` when needed. A timeo
 unreleased resource still prevents replacement; retry public lifecycle operations after
 the fault is resolved. Old contexts cannot write or register resources for a new generation.
 
+## Harness backends (SDK 1.1)
+
+Use `HarnessSpec` to run an agent backend that owns its own turn execution,
+provider sessions and normalized events. `ProviderSpec` supplies model completions
+to QwenPaw's native agent loop. A Harness backend is a separate Agent backend.
+SDK 1.0 plugins continue to load; requesting `harnesses` requires `sdk.version`
+1.1.0 or later. Backend IDs match `[a-z][a-z0-9_-]*`; `qwenpaw` is reserved.
+Duplicate IDs name their current owner instead of replacing another plugin.
+
+Save the following manifest as `plugin.json` and the complete example as `main.py`:
+
+```json
+{
+  "id": "echo-owner",
+  "name": "Echo harness",
+  "version": "1.0.0",
+  "entry": { "backend": "main.py" },
+  "sdk": { "version": "1.1.0", "capabilities": ["harnesses", "resources", "storage"] },
+  "meta": { "harnesses": [{ "id": "echo-backend", "label": "Echo" }] }
+}
+```
+
+```python
+from qwenpaw.plugins import PluginContext
+from qwenpaw.plugins.harnesses import (
+    HarnessCapabilities, HarnessContext, HarnessEvent, HarnessEventKind,
+    HarnessLogin, HarnessOperationNotSupportedError, HarnessSpec, HarnessStatus,
+)
+
+class EchoBackend:
+    def __init__(self, context: HarnessContext, settings: dict):
+        self.context = context
+        self.prefix = settings.get("prefix", "")
+
+    async def status(self, context):
+        return HarnessStatus(installed=True, available=True)
+
+    async def start_login(self, context, *, device_code=False):
+        raise HarnessOperationNotSupportedError("Echo needs no login")
+
+    async def logout(self, context):
+        raise HarnessOperationNotSupportedError("Echo needs no login")
+
+    async def models(self, context):
+        return ()
+
+    async def discover_skills(self, context):
+        return ()
+
+    async def discover_mcp(self, context):
+        return ()
+
+    async def run_turn(self, context, request):
+        yield HarnessEvent(
+            HarnessEventKind.TEXT_DELTA, text=self.prefix + request.prompt
+        )
+        yield HarnessEvent(HarnessEventKind.COMPLETED)
+
+    async def run_command(self, context, command, arguments):
+        raise HarnessOperationNotSupportedError("Echo has no commands")
+
+    async def history(self, context):
+        return ()
+
+    async def reset_session(self, context):
+        pass  # Echo has no provider session state.
+
+    async def close(self):
+        pass  # Await client/process cleanup here when your backend owns any.
+
+class Plugin:
+    def register(self, context: PluginContext):
+        async def create(instance: HarnessContext, settings: dict):
+            return EchoBackend(instance, settings)
+
+        context.register_harness(HarnessSpec(
+            id="echo-backend", label="Echo", create=create,
+            capabilities=HarnessCapabilities(),
+            config_fields=({"name": "prefix", "label": "Prefix", "type": "text"},),
+        ))
+
+plugin = Plugin()
+```
+
+Registration stores the factory without executing it. Catalog reads do not create
+clients, query accounts, discover CLI binaries or write projections. Instances are
+owned by plugin generation, context and workspace; effective settings changes
+close the previous instance before construction. Factories run on the event loop:
+keep synchronous construction pure, and use an async factory for preparation.
+Offload only bounded filesystem/discovery operations, preserving locks until their
+real worker completes. Do not construct asyncio clients or locks in worker threads.
+
+| Public operation | Result and responsibility |
+| --- | --- |
+| `status`, `start_login`, `logout` | Explicit status/authentication calls; return `HarnessStatus`, `HarnessLogin`, or None. |
+| `models`, `discover_skills`, `discover_mcp` | Tuples of public picker/discovery DTOs; no discovery during catalog enumeration. |
+| `run_turn` | Async iterator of `HarnessEvent`; text, reasoning, tool start/progress/completion, completed/cancelled/error preserve wire values. |
+| `run_command`, `reset_session`, `history` | Managed session operations; history uses public `HarnessHistoryItem` and `HarnessHistoryKind`. |
+| `close` | Idempotent async cleanup that waits for real clients/processes to stop. |
+| `HarnessArchiveBackend` | Optional online archive operations when `external_history=True`; return JSON snapshots/public history, never raw clients. |
+
+Declare supported behavior in frozen `HarnessCapabilities`: model/reasoning/tool
+streaming, resume, attachments, skill/MCP projection/discovery, command and approval
+preset tuples, and optional `external_history`. Unsupported operations raise
+`HarnessOperationNotSupportedError`. `config_fields` supplies the generic settings
+fallback when a plugin has no frontend settings component.
+
+`HarnessContext` owns workspace/state paths, `PluginStorage`, `ResourceScope` and
+logging. Use asynchronous storage methods and register background tasks/connections
+with `context.resources`; cleanup must be retryable. `HarnessCallContext` is fresh
+for every invocation: use its trusted session/user/channel/request identity and do
+not cache caller identity on the backend. Runtime skill/MCP capabilities are resolved
+for each turn and are None for management calls. MCP environment/header values are
+read-only secret wrappers; repr and generic serialization stay masked. Only
+`revealed_env()` / `revealed_headers()` reveal values at the client/process boundary.
+Never log those revealed dictionaries; use the nonsecret capability fingerprint.
+
+For approval, await `context.request_approval(HarnessApprovalSummary(...), timeout=...)`.
+The host owns approval identity; summary JSON cannot override the workspace, user or
+session. Outcomes are approved/rejected/cancelled/timeout. Task cancellation and
+async-generator closure propagate to the backend; release resources and await
+shutdown in `finally`. Plugin disable/reload remains busy through the producer and
+terminal transcript save. Already materialized QwenPaw history remains readable
+without creating the backend.
+
+Frontend bundles may register only their own backend's settings component:
+
+```typescript
+import { getHost, type HarnessSettingsProps } from "@qwenpaw/plugin-sdk";
+const { React } = getHost().host;
+const registration = getHost().harnesses.register("echo-owner", {
+  backendId: "echo-backend",
+  SettingsComponent: (props: HarnessSettingsProps) =>
+    props.open ? React.createElement("input", {
+      value: String(props.value.prefix ?? ""),
+      onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+        props.onChange({ ...props.value, prefix: event.target.value }),
+    }) : null,
+});
+// registration.dispose() revokes this registration only.
+```
+
+Only the selected, available backend with matching host catalog ownership renders
+its component. Registrations made before catalog loading remain inert until their
+owner is known. The existing frontend runtime cleanup removes all registrations
+owned by a plugin; stale disposable handles cannot remove a replacement.
+
+Test from an installed SDK using `PluginTestHost`: `list_harnesses()` is metadata
+only; `harness_status(backend_id, workspace_id=...)` probes explicitly;
+`run_harness(backend_id, HarnessRunRequest(...), workspace_id=..., session_id=...,
+user_id=..., channel=...)` yields public `ChatEvent` values through the production
+bridge. Use `host.install()` for disable/re-enable tests, real approval helpers for
+approval, and public storage for persistent resume assertions. Authors import only
+public `qwenpaw.plugins.*` contracts; vendor SDKs and adapters belong to the plugin.
+
 ## Public capabilities
 
 | Capability                                          | Public entry                                                                               |

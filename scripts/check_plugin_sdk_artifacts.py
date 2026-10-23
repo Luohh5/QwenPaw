@@ -18,6 +18,9 @@ import zipfile
 
 INTERNAL = {
     "test_sdk_entry_contract.py",
+    "test_sdk_harness_bridge.py",
+    "test_sdk_harness_registration.py",
+    "test_sdk_harness_lifecycle.py",
     "test_sdk_host_bridge.py",
     "test_sdk_context_bridge.py",
     "test_sdk_message_bridge.py",

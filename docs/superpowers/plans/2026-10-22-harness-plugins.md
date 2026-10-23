@@ -163,13 +163,15 @@
 - 作者测试宿主新增 `list_harnesses()`、`harness_status(backend_id, *, workspace_id)`、`run_harness(backend_id, request, *, workspace_id, session_id, user_id="test", channel="console")`；运行返回标准 ChatEvent 异步流，使用真实注册/生命周期桥接。
 - 新增 `test_sdk_harness_bridge.py`/`test_sdk_harness_registration.py`/`test_sdk_harness_lifecycle.py` 到 artifact checker 的 INTERNAL 集合；公开 author/contract 测试要能被复制到仓库外执行。
 
-- [ ] **Step 1：写前端注册失败测试。** 覆盖 backendId 归属、重复注册、dispose、旧句柄、配置 props 与缺省 schema 回退；只允许所选 backend 的 SettingsComponent 出现。
-- [ ] **Step 2：写仓库外作者测试。** fake 第三种 Harness 使用且仅使用公开 SDK，注册后通过测试宿主运行、审批、恢复、停用和重新启用；源码合规检查不得依赖白名单外的 qwenpaw 导入。
-- [ ] **Step 3：运行红灯。** Run: `python -m pytest tests/unit/plugins/test_sdk_harness_author.py -q`；Run from console: `npm run test:run -- src/plugins/harnesses.test.ts`。
-- [ ] **Step 4：实现前端 namespace/类型和测试宿主方法。** 前端清理纳入已有 removePluginRuntime，不复制一个插件 loader；测试宿主调用生产桥接。
-- [ ] **Step 5：同步 SDK 说明。** 新增完整 `HarnessSpec` 作者示例、manifest、能力/方法表、受管资源/取消/秘密值约束，明确 ProviderSpec 与 HarnessSpec 的职责。
-- [ ] **Step 6：验证本地与外部产物。** 重跑 Step 3；构建 wheel/sdist，在仓库外新环境安装后使用 `check_plugin_sdk_artifacts.py --wheel <wheel> --sdist <sdist> --python <external-python> --source-root <repo> --output <new-output>`；前端 checker 使用 `--package <extracted-sdk> --dependencies <node_modules> --output <new-output>`。预期检查全 PASS、无 checkout/PYTHONPATH/conftest 依赖。
-- [ ] **Step 7：提交 SDK 完整入口。** 建议提交：`feat(sdk): expose harness author and frontend contracts`。此时 B 可以用 fake Harness 独立验收，A 尚未完成不能宣称减负。
+- [x] **Step 1：写前端注册失败测试。** 覆盖 backendId 归属、重复注册、dispose、旧句柄、配置 props 与缺省 schema 回退；只允许所选 backend 的 SettingsComponent 出现。
+- [x] **Step 2：写仓库外作者测试。** fake 第三种 Harness 使用且仅使用公开 SDK，注册后通过测试宿主运行、审批、恢复、停用和重新启用；源码合规检查不得依赖白名单外的 qwenpaw 导入。
+- [x] **Step 3：运行红灯。** Run: `python -m pytest tests/unit/plugins/test_sdk_harness_author.py -q`；Run from console: `npm run test:run -- src/plugins/harnesses.test.ts`。
+- [x] **Step 4：实现前端 namespace/类型和测试宿主方法。** 前端清理纳入已有 removePluginRuntime，不复制一个插件 loader；测试宿主调用生产桥接。
+- [x] **Step 5：同步 SDK 说明。** 新增完整 `HarnessSpec` 作者示例、manifest、能力/方法表、受管资源/取消/秘密值约束，明确 ProviderSpec 与 HarnessSpec 的职责。
+- [x] **Step 6：验证本地与外部产物。** 重跑 Step 3；构建 wheel/sdist，在仓库外新环境安装后使用 `check_plugin_sdk_artifacts.py --wheel <wheel> --sdist <sdist> --python <external-python> --source-root <repo> --output <new-output>`；前端 checker 使用 `--package <extracted-sdk> --dependencies <node_modules> --output <new-output>`。预期检查全 PASS、无 checkout/PYTHONPATH/conftest 依赖。
+- [x] **Step 7：提交 SDK 完整入口。** 建议提交：`feat(sdk): expose harness author and frontend contracts`。此时 B 可以用 fake Harness 独立验收，A 尚未完成不能宣称减负。
+
+**执行证据（2026-10-23）：** 独立源码快照构建 wheel/sdist；仓库外新环境从非 editable wheel 导入，严格作者类型、228 项作者测试、模板真实运行及从 wheel 导出的 SDK 前端 NodeNext/bundler/runtime 全通过。详见 `docs/research/harness-sdk-acceptance.json`。B 以第三种 fake Harness 独立验收；A 尚未迁出厂商代码，未宣称默认运行减负。
 
 ## 总任务 A：拆出第三方 Harness 运行集成
 

@@ -3,6 +3,7 @@
 import { getApiToken, getApiUrl } from "../api/config";
 import { removePluginRuntime } from "./pluginRuntimeCleanup";
 import { routeRegistry } from "./registry/store";
+import { refreshHarnessCatalog } from "./harnesses";
 
 interface FrontendPluginInfo {
   id: string;
@@ -64,6 +65,8 @@ export async function loadAllPlugins(): Promise<PluginLoadSummary> {
   }
 
   const loadable = plugins.filter((plugin) => plugin.frontend_entry);
+  // A failed catalog leaves registrations inert until ownership is known.
+  await refreshHarnessCatalog().catch(() => {});
   const results = await Promise.allSettled(
     loadable.map((plugin) =>
       executePluginScript(resolveUrl(plugin.id, plugin.frontend_entry!)),
@@ -115,6 +118,7 @@ function loadFrontendPlugin(
     }
     if (options.force) removePluginRuntime(pluginId);
     try {
+      await refreshHarnessCatalog().catch(() => {});
       await executePluginScript(resolveUrl(plugin.id, plugin.frontend_entry));
       if (options.expectedType === "app" && !registered()) {
         throw new Error(`PawApp ${pluginId} did not register its app route`);

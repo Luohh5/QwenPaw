@@ -101,6 +101,9 @@ async def test_call_context_uses_host_identity_and_fresh_capabilities(
     tmp_path,
     harness,
 ):
+    from qwenpaw.app.approvals import get_approval_service
+    from qwenpaw.plugins import SDKError
+    from qwenpaw.plugins.harnesses import HarnessApprovalSummary
     from tests.unit.harnesses.test_capability_resolver import _write_skill
 
     path = tmp_path / "one"
@@ -187,6 +190,16 @@ async def test_call_context_uses_host_identity_and_fresh_capabilities(
     await runtime.call("fake-backend", "status", forged)
     assert backend.calls[-1].runtime_capabilities is None
     assert backend.calls[-1].session_id == ""
+    service = get_approval_service()
+    pending_before = await service.list_pending_by_session("same-session")
+    with pytest.raises(SDKError):
+        await alice.request_approval(
+            HarnessApprovalSummary("late-tool", "Late request"),
+            timeout=0.05,
+        )
+    assert (
+        await service.list_pending_by_session("same-session") == pending_before
+    )
 
 
 async def test_same_session_id_isolated_by_workspace_and_user(
