@@ -2,7 +2,10 @@
 """Strict external-author typing: returned streams can always be closed."""
 
 from pathlib import Path
-from typing import AsyncGenerator, assert_type
+from typing import Any, AsyncGenerator, assert_type
+
+from qwenpaw.plugins import PluginContext
+from qwenpaw.plugins.harnesses import HarnessBackend, HarnessCallContext
 
 from qwenpaw.plugins.apps import AppContext, ChatRequest, TaskSnapshot
 from qwenpaw.plugins.events import ChatEvent
@@ -138,7 +141,6 @@ def custom_workspace_host(root: Path) -> PluginTestHost:
 
 
 async def async_storage(call: ToolContext) -> None:
-    from typing import Any
     from qwenpaw.plugins.messages import Attachment
 
     assert_type(await call.storage.aread_bytes("data.bin"), bytes)
@@ -147,3 +149,52 @@ async def async_storage(call: ToolContext) -> None:
     await call.storage.awrite_json("state.json", {"count": 1})
     await call.storage.adelete("state.json")
     assert_type(await call.media.awrite("result.txt", b"result"), Attachment)
+
+
+async def harness_contract(
+    plugin: PluginContext,
+    backend: HarnessBackend,
+    call: HarnessCallContext,
+) -> None:
+    from collections.abc import AsyncIterator
+    from qwenpaw.plugins.harnesses import (
+        HarnessCapabilities,
+        HarnessContext,
+        HarnessEvent,
+        HarnessHistoryItem,
+        HarnessModel,
+        HarnessRunRequest,
+        HarnessSpec,
+        HarnessStatus,
+    )
+    from qwenpaw.plugins.resources import Registration
+
+    def create(
+        context: HarnessContext,
+        settings: dict[str, Any],
+    ) -> HarnessBackend:
+        assert_type(context.workspace_id, str)
+        assert_type(settings, dict[str, Any])
+        return backend
+
+    handle = assert_type(
+        plugin.register_harness(
+            HarnessSpec(
+                "author-example",
+                "Example",
+                create,
+                HarnessCapabilities(),
+            ),
+        ),
+        Registration,
+    )
+    assert_type(await backend.status(call), HarnessStatus)
+    assert_type(await backend.models(call), tuple[HarnessModel, ...])
+    assert_type(await backend.history(call), tuple[HarnessHistoryItem, ...])
+    events = assert_type(
+        backend.run_turn(call, HarnessRunRequest("hello")),
+        AsyncIterator[HarnessEvent],
+    )
+    async for event in events:
+        assert_type(event.text, str)
+    await handle.close()

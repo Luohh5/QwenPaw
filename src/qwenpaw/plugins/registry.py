@@ -170,12 +170,29 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
         self._prompt_sections: List[PromptSectionRegistration] = []
         self._prompt_section_names: set = set()
         self._workspace_manager: Optional[Any] = None
+        self._backend_registry = None
         from .workspace_projector import WorkspaceProjector
 
         self.projector = WorkspaceProjector()
         self._stop_workspaces: dict[str, Any] = {}
 
         self._initialized = True
+
+    @property
+    def backend_registry_initialized(self):
+        """Check declaration presence without importing backend machinery."""
+        return self._backend_registry is not None
+
+    @property
+    def backend_registry(self):
+        """Load only the declaration registry when harnesses are used."""
+        if self._backend_registry is None:
+            from ..runtime.backends.registry import BackendRegistry
+
+            self._backend_registry = BackendRegistry(
+                self.get_all_plugin_manifests,
+            )
+        return self._backend_registry
 
     def register_middleware(
         self,

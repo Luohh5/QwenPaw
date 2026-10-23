@@ -882,6 +882,14 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 what="register()",
                 plugin_id=plugin_id,
             )
+            if manifest_dict.get("sdk") is not None and (
+                "harnesses" in (manifest_dict.get("meta") or {})
+                or self.registry.backend_registry_initialized
+            ):
+                self.registry.backend_registry.validate_manifest(
+                    api.resources.owner,
+                    manifest_dict,
+                )
         except BaseException as exc:
             instance.mark_failed(str(exc) or type(exc).__name__)
             await self._dispose_then_undo_txn_disk(plugin_id, instance)
@@ -3750,6 +3758,14 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 what="register()",
                 plugin_id=plugin_id,
             )
+            if manifest_dict.get("sdk") is not None and (
+                "harnesses" in (manifest_dict.get("meta") or {})
+                or self.registry.backend_registry_initialized
+            ):
+                self.registry.backend_registry.validate_manifest(
+                    api.resources.owner,
+                    manifest_dict,
+                )
         except BaseException as exc:
             cleanup_report = await self._dispose_then_undo_txn_disk(
                 plugin_id,
