@@ -87,13 +87,6 @@ class _Gateway:
         self.app.openapi_schema = None
         if not self.entries:
             return
-        # During migration the legacy builtin router owns these URLs. The
-        # generic gateway is exercised on isolated apps until A4 switches it.
-        if any(
-            getattr(route, "path", "").startswith("/api/harnesses")
-            for route in self.app.router.routes
-        ):
-            return
         snapshot = dict(self.entries)
         router = APIRouter(prefix="/harnesses", tags=["harnesses"])
 
@@ -123,16 +116,16 @@ class _Gateway:
             entry = owner(provider_id)
             workspace = await get_agent_for_request(request)
             entry.assert_active()
-            config = workspace.config
-            values = (
-                settings
-                if settings is not None
-                else (
+            values = settings
+            if values is None:
+                from ..config.config import load_agent_config_async
+
+                config = await load_agent_config_async(workspace.agent_id)
+                values = (
                     dict(config.backend_settings)
                     if config.backend == provider_id
                     else {}
                 )
-            )
             try:
                 result = await workspace.backend_runtime.call(
                     provider_id,

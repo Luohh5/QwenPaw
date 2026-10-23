@@ -57,7 +57,8 @@ from ...agents.utils import (
     normalize_agent_language,
 )
 from ...agents.skill_system import SkillPoolService, get_workspace_skills_dir
-from ...harnesses.registry import ProviderCatalogItem, get_provider
+from ...plugins._harness_http import backend_catalog
+from ...plugins.registry import PluginRegistry
 from ..agent_startup import AgentStartupStatus
 from ..multi_agent_manager import MultiAgentManager
 from ...constant import WORKING_DIR
@@ -72,9 +73,6 @@ router = APIRouter(prefix="/agents", tags=["agents"])
 @router.get("/backends")
 async def list_backends(request: Request) -> dict:
     """Describe registered backends using metadata only."""
-    from ...plugins._harness_http import backend_catalog
-    from ...plugins.registry import PluginRegistry
-
     registry = getattr(request.app.state, "plugin_registry", None)
     return {"backends": backend_catalog(registry or PluginRegistry())}
 
@@ -99,6 +97,13 @@ class AgentSummary(BaseModel):
     startup_status: AgentStartupStatus
     backend: str = "qwenpaw"
     backend_capabilities: dict[str, Any] = Field(default_factory=dict)
+    backend_status: Literal[
+        "available",
+        "missing",
+        "disabled",
+        "failed",
+    ] = "available"
+    backend_plugin_id: str | None = None
     backend_model: str | None = None
     backend_reasoning_effort: str | None = None
     active_model: ModelSlotConfig | None = None
@@ -351,20 +356,36 @@ _COPYABLE_MD_FILES = (
 )
 
 
-def _get_available_third_party_provider(
-    backend: str,
-) -> ProviderCatalogItem:
-    """Resolve an available third-party backend for API mutations."""
-    try:
-        provider = get_provider(backend)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if provider.coming_soon:
+def _backend_metadata(backend: str) -> dict[str, Any]:
+    """Read the existing declaration snapshot without probing vendors."""
+    return next(
+        (
+            row
+            for row in backend_catalog(PluginRegistry())
+            if row["id"] == backend
+        ),
+        {
+            "id": backend,
+            "status": "missing",
+            "plugin_id": None,
+            "capabilities": {},
+        },
+    )
+
+
+def _get_available_third_party_provider(backend: str) -> dict[str, Any]:
+    """Require a live SDK contribution when selecting a new backend."""
+    row = _backend_metadata(backend)
+    if row["status"] != "available":
         raise HTTPException(
             status_code=409,
-            detail=f"{provider.name} is not available yet",
+            detail={
+                "code": "backend_unavailable",
+                "backend_id": backend,
+                "status": row["status"],
+            },
         )
-    return provider
+    return row
 
 
 def _get_multi_agent_manager(request: Request) -> MultiAgentManager:
@@ -501,15 +522,12 @@ async def list_agents(request: Request = None) -> AgentListResponse:
                 if template_id.startswith("pawapp:")
                 else None
             )
-            if agent_config.backend == "qwenpaw":
-                backend_capabilities = {"workspace_ui": True}
-            else:
-                try:
-                    backend_capabilities = get_provider(
-                        agent_config.backend,
-                    ).capabilities.model_dump()
-                except ValueError:
-                    backend_capabilities = {}
+            backend_metadata = _backend_metadata(agent_config.backend)
+            backend_capabilities = (
+                {"workspace_ui": True}
+                if agent_config.backend == "qwenpaw"
+                else backend_metadata["capabilities"]
+            )
 
             agents.append(
                 AgentSummary(
@@ -522,6 +540,8 @@ async def list_agents(request: Request = None) -> AgentListResponse:
                     startup_status=startup_status,
                     backend=agent_config.backend,
                     backend_capabilities=backend_capabilities,
+                    backend_status=backend_metadata["status"],
+                    backend_plugin_id=backend_metadata["plugin_id"],
                     backend_model=agent_config.backend_settings.get("model"),
                     backend_reasoning_effort=(
                         agent_config.backend_settings.get(
@@ -660,15 +680,15 @@ async def update_backend_settings(
                 status_code=409,
                 detail="QwenPaw models use the native model configuration",
             )
-        provider = _get_available_third_party_provider(agent_config.backend)
+        capabilities = _backend_metadata(agent_config.backend)["capabilities"]
         settings = dict(agent_config.backend_settings)
-        if provider.capabilities.model_selection and "model" in values:
+        if capabilities.get("model_selection") and "model" in values:
             if values["model"]:
                 settings["model"] = values["model"]
             else:
                 settings.pop("model", None)
         if (
-            provider.capabilities.reasoning_effort
+            capabilities.get("reasoning_effort")
             and "reasoning_effort" in values
         ):
             if values["reasoning_effort"]:

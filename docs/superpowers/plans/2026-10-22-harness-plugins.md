@@ -241,13 +241,15 @@
 - Agent 列表补充 `backend_status: available|missing|disabled|failed` 与 `backend_plugin_id: str|null`；已保存未知 backend 可读取，真正运行返回 `backend_unavailable`。
 - 保留 Qoder 无非交互 logout、无 provider MCP discovery 的现有能力限制；不伪造 API 成功。
 
-- [ ] **Step 1：写 Qoder/分发失败测试。** 覆盖 SDK 不存在时原生启动成功、Codex/Qoder 可独立加载、第三个 fake backend 可用、未知 backend 无原生 fallback。
-- [ ] **Step 2：写隔离与数据失败测试。** `test_qoder_sessions_scoped_to_workspace`、`test_qoder_policy_and_skill_projection_preserved`、`test_qoder_mapping_migration_is_idempotent`；不同用户/渠道的审批和凭据不得串用。
-- [ ] **Step 3：运行红灯。** Run: `python -m pytest plugins/harness/qoder/tests tests/unit/app/test_backend_dispatch.py -q`。
-- [ ] **Step 4：迁出 Qoder 并替换内部服务依赖。** 与 Codex 同一公开接口，不为 Qoder 额外开放 Workspace 私有属性；保留 SDK/事件/权限语义。
-- [ ] **Step 5：切换 Workspace、Agent CRUD 和 Chat 恢复。** 去掉 get_provider/厂商枚举；原生仍走现有 Runtime；已禁用后端的 Agent 可管理、物化历史可读，调用明确失败。
-- [ ] **Step 6：删除旧硬编码工厂。** 后端配置变化由通用 settings revision 管理，不在核心判断 `if provider_id in {codex,qoder}`。
-- [ ] **Step 7：验证并提交。** 重跑 Step 3、B2 与 A1 测试；建议提交：`refactor(harness): extract Qoder and use backend registry`。
+- [x] **Step 1：写 Qoder/分发失败测试。** 覆盖 SDK 不存在时原生启动成功、Codex/Qoder 可独立加载、第三个 fake backend 可用、未知 backend 无原生 fallback。
+- [x] **Step 2：写隔离与数据失败测试。** `test_qoder_sessions_scoped_to_workspace`、`test_qoder_policy_and_skill_projection_preserved`、`test_qoder_mapping_migration_is_idempotent`；不同用户/渠道的审批和凭据不得串用。
+- [x] **Step 3：运行红灯。** Run: `python -m pytest plugins/harness/qoder/tests tests/unit/app/test_backend_dispatch.py -q`。
+- [x] **Step 4：迁出 Qoder 并替换内部服务依赖。** 与 Codex 同一公开接口，不为 Qoder 额外开放 Workspace 私有属性；保留 SDK/事件/权限语义。
+- [x] **Step 5：切换 Workspace、Agent CRUD 和 Chat 恢复。** 去掉 get_provider/厂商枚举；原生仍走现有 Runtime；已禁用后端的 Agent 可管理、物化历史可读，调用明确失败。
+- [x] **Step 6：删除旧硬编码工厂。** 后端配置变化由通用 settings revision 管理，不在核心判断 `if provider_id in {codex,qoder}`。
+- [x] **Step 7：验证并提交。** 重跑 Step 3、B2 与 A1 测试；建议提交：`refactor(harness): extract Qoder and use backend registry`。
+
+**执行证据（2026-10-23）：** Qoder 独立环境 27 项通过；核心/SDK/PawPort 回归 749 项通过，3 个旧 Qoder 测试模块因核心环境无 SDK 跳过，其迁出版本已单独运行。新增阻塞配置读取回归 3 项通过。独立审查发现并修复 reset/rebuild 取消事务及测试隔离问题，两轮定向复审最终 SPEC/QUALITY PASS；所有适用提交 hooks 通过后形成阶段提交。A4–A6 和真实账户/平台验收仍未完成。
 
 ### A4 厂商前端、API 路由和启停装配清理
 

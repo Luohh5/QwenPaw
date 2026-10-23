@@ -903,33 +903,20 @@ async def get_chat(
         chat_spec.user_id,
         chat_spec.channel,
     )
-    backend = workspace.config.backend
+    from ...config.config import load_agent_config_async
+
+    config = await load_agent_config_async(workspace.agent_id)
+    backend = config.backend
     context = ((state.get("agent") or {}).get("state") or {}).get("context")
     if not context and backend != "qwenpaw":
         try:
-            from ...plugins.registry import PluginRegistry
-
-            declared = any(
-                item.id == backend
-                for item in PluginRegistry().backend_registry.descriptors()
+            await workspace.backend_runtime.hydrate_session(
+                backend,
+                session_id=chat_spec.session_id,
+                user_id=chat_spec.user_id,
+                channel=chat_spec.channel,
+                settings=dict(config.backend_settings),
             )
-            identity = {
-                "session_id": chat_spec.session_id,
-                "user_id": chat_spec.user_id,
-                "channel": chat_spec.channel,
-                "settings": dict(workspace.config.backend_settings),
-            }
-            if declared:
-                await workspace.backend_runtime.hydrate_session(
-                    backend,
-                    **identity,
-                )
-            else:
-                # Transitional builtins retain their old path until A3.
-                await workspace.harness_runtime.hydrate_session(
-                    backend=backend,
-                    **identity,
-                )
             state = await session.get_session_state_dict(
                 chat_spec.session_id,
                 chat_spec.user_id,

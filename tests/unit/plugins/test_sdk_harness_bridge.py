@@ -28,6 +28,8 @@ async def test_turn_envelopes_attachments_commands_clear_and_history(
     incoming = request()
     image = tmp_path / "picture.png"
     image.write_bytes(b"fake-image")
+    document = tmp_path / "notes.txt"
+    document.write_text("notes", encoding="utf-8")
     incoming = AgentRequest.model_validate(
         {
             **incoming.model_dump(),
@@ -37,6 +39,11 @@ async def test_turn_envelopes_attachments_commands_clear_and_history(
                     "content": [
                         {"type": "text", "text": "hello"},
                         {"type": "image", "image_url": str(image)},
+                        {
+                            "type": "file",
+                            "filename": "notes.txt",
+                            "file_url": str(document),
+                        },
                     ],
                 },
             ],
@@ -56,7 +63,34 @@ async def test_turn_envelopes_attachments_commands_clear_and_history(
         == '{"command": "echo test"}'
     )
     backend = harness.plugin.created[0]
-    assert backend.last_request.attachments[0].path == image
+    assert [
+        attachment.path for attachment in backend.last_request.attachments
+    ] == [
+        image,
+        document,
+    ]
+    assert backend.last_request.attachments[1].name == "notes.txt"
+    attachment_only = AgentRequest.model_validate(
+        {
+            **incoming.model_dump(),
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image_url": str(image)},
+                    ],
+                },
+            ],
+        },
+    )
+    assert [
+        item
+        async for item in runtime.stream(
+            "fake-backend",
+            attachment_only,
+        )
+    ][-1].status == "completed"
+    assert backend.last_request.prompt == ""
     persisted = await session.get_session_state_dict(
         "same-session",
         "user",

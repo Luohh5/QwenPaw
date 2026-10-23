@@ -43,7 +43,7 @@ from ..task_tracker import TaskTracker
 from ..chats.session import SafeJSONSession
 from ..crons.manager import CronManager
 from ..crons.repo.json_repo import JsonJobRepository
-from ...config.config import load_agent_config
+from ...config.config import load_agent_config, load_agent_config_async
 from ...utils.logging import sanitize_log_value
 from ...plugins._events import observe_stream as _sdk_observe_stream
 
@@ -193,7 +193,6 @@ class Workspace:
         self._manager = None  # Reference to MultiAgentManager
         self._task_tracker = TaskTracker()
         self._app_services: Any = None
-        self._harness_runtime = None
         self._backend_runtime = None
 
         # Register all services
@@ -298,20 +297,6 @@ class Workspace:
                 self,
             )
         return self._backend_runtime
-
-    @property
-    def harness_runtime(self):
-        """Return the lazily-created third-party agent runtime."""
-        if self._harness_runtime is None:
-            from ...harnesses import HarnessRuntime
-
-            self._harness_runtime = HarnessRuntime(
-                self.workspace_dir,
-                self.session,
-                self.agent_id,
-                self,
-            )
-        return self._harness_runtime
 
     def bootstrap_plugins(  # pylint: disable=too-many-branches
         self,
@@ -451,7 +436,7 @@ class Workspace:
         available = getattr(self._manager, "assert_agent_available", None)
         if available is not None:
             available(self.agent_id)
-        config = load_agent_config(self.agent_id)
+        config = await load_agent_config_async(self.agent_id)
         backend = config.backend
         if backend != "qwenpaw":
             request_context = dict(
@@ -469,18 +454,11 @@ class Workspace:
             )
             if isinstance(backend_controls, dict):
                 settings.update(backend_controls)
-            settings["_request_context"] = {
-                **request_context,
-                "agent_id": self.agent_id,
-                "session_id": getattr(request, "session_id", None),
-                "user_id": getattr(request, "user_id", None),
-                "channel": getattr(request, "channel", None) or "console",
-            }
-            stream = self.harness_runtime.stream(
-                backend=backend,
-                request=request,
-                cwd=self.workspace_dir.resolve(),
-                settings=settings,
+            stream = self.backend_runtime.stream(
+                backend,
+                request,
+                settings,
+                cwd=self.workspace_dir,
             )
             try:
                 async for item in stream:
@@ -908,14 +886,6 @@ class Workspace:
             )
         except Exception as exc:
             errors.append(("services", exc))
-
-        if self._harness_runtime is not None:
-            try:
-                await self._harness_runtime.stop()
-            except Exception as exc:
-                errors.append(("harness", exc))
-            else:
-                self._harness_runtime = None
 
         if self._backend_runtime is not None:
             try:

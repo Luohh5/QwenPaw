@@ -3,14 +3,10 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
-
-import pytest
-
-from qwenpaw.harnesses.base import MissingDependencyAdapter
-from qwenpaw.harnesses.registry import create_adapter
 
 
 def test_codex_and_qoder_sdks_are_optional_and_in_full() -> None:
@@ -29,22 +25,21 @@ def test_codex_and_qoder_sdks_are_optional_and_in_full() -> None:
     ]
 
 
-@pytest.mark.asyncio
-async def test_missing_qoder_sdk_does_not_break_provider_creation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delitem(
-        sys.modules,
-        "qwenpaw.harnesses.qoder.adapter",
-        raising=False,
+def test_core_app_imports_without_optional_vendor_sdks() -> None:
+    code = (
+        "import sys; "
+        'sys.modules["qoder_agent_sdk"] = None; '
+        'sys.modules["codex_cli_bin"] = None; '
+        "import qwenpaw.app.workspace.workspace; "
+        'assert not any(name.startswith("qwenpaw.harnesses.qoder") '
+        'or name.startswith("qwenpaw.harnesses.codex") '
+        "for name in sys.modules)"
     )
-    monkeypatch.setitem(sys.modules, "qoder_agent_sdk", None)
-
-    adapter = create_adapter("qoder", tmp_path)
-    status = await adapter.status()
-
-    assert isinstance(adapter, MissingDependencyAdapter)
-    assert status.available is False
-    assert status.installed is False
-    assert status.error == "Install qwenpaw[qoder] to enable Qoder."
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr

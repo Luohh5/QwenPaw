@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from ...plugins.harnesses import HarnessHistoryItem, HarnessHistoryKind
+from ...config.config import load_agent_config_async
 from .codex_rollout_reader import (
     CodexRolloutReader,
     codex_non_root_session_kind,
@@ -100,9 +101,10 @@ class CodexMigrationProvider:  # pylint: disable=too-few-public-methods
                 include_sessions=include_sessions,
                 session_ids=session_ids,
             )
+        config = await load_agent_config_async(self._workspace.agent_id)
         settings = (
-            dict(self._workspace.config.backend_settings)
-            if self._workspace.config.backend == self.provider_id
+            dict(config.backend_settings)
+            if config.backend == self.provider_id
             else {}
         )
         runtime = self._workspace.backend_runtime

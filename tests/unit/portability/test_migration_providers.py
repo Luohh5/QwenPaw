@@ -92,6 +92,7 @@ class _BackendRuntime:
 def _workspace(tmp_path: Path):
     config = SimpleNamespace(backend="qwenpaw", backend_settings={})
     return SimpleNamespace(
+        agent_id="test-agent",
         workspace_dir=tmp_path,
         config=config,
         backend_runtime=_BackendRuntime(_CodexAdapter()),
@@ -103,8 +104,18 @@ def _workspace(tmp_path: Path):
 async def test_codex_provider_reuses_runtime_and_normalizes_inventory(
     tmp_path: Path,
     limit: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace = _workspace(tmp_path)
+
+    async def load(agent_id):
+        assert agent_id == "test-agent"
+        return workspace.config
+
+    monkeypatch.setattr(
+        "qwenpaw.portability.providers.codex.load_agent_config_async",
+        load,
+    )
     inventory = await CodexMigrationProvider(
         workspace,
         rollout_reader=CodexRolloutReader(tmp_path / ".codex"),

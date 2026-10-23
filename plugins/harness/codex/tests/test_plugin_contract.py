@@ -59,6 +59,7 @@ async def test_explicit_install_registers_only_codex(tmp_path, monkeypatch):
             for row in host.list_harnesses()
         ] == [("codex", "qwenpaw-harness-codex", "available")]
         assert host.list_harnesses()[0]["capabilities"]["external_history"]
+        assert host.list_harnesses()[0]["capabilities"]["attachments"]
         newly_imported = set(sys.modules) - imported_before
         assert "codex_cli_bin" not in newly_imported
         assert not any(
