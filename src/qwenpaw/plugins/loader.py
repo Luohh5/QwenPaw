@@ -13,8 +13,9 @@ import subprocess
 import sys
 import threading
 import tempfile
-from contextlib import ExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
@@ -224,6 +225,17 @@ _LIFECYCLE_HELD: ContextVar[Optional[_LifecycleHoldKey]] = ContextVar(
     "qwenpaw_plugin_lifecycle_held",
     default=None,
 )
+
+
+@dataclass
+class _DependencyAdmission:
+    """Transaction custody until an exact declaration reaches a new ledger."""
+
+    binding: BackendBinding
+    token: object = None
+    snapshot: object = None
+    attached: bool = False
+    released: bool = False
 
 
 def _ensure_plugin_site_on_path(
@@ -1314,6 +1326,17 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             instance.accepts_provision_declarations = False
         market_registry.finish_load(plugin_id)
 
+    async def _observe_host_dependencies(self, binding, token):
+        observer = getattr(binding.backend, "observe_host_dependencies", None)
+        if observer is not None:
+            result = observer(
+                binding.description,
+                self.registry.dependency_usage,
+                token,
+            )
+            if inspect.isawaitable(result):
+                await result
+
     @asynccontextmanager
     async def _dependency_registration(
         self,
@@ -1321,8 +1344,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         *,
         enabled=True,
         pending=True,
+        admission=None,
+        attach=True,
     ):
-        """Attach exact declaration cleanup to the existing runtime ledger."""
+        """Own a declaration locally or transfer it to a runtime ledger."""
         if not enabled:
             yield None
             return
@@ -1332,53 +1357,68 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         from .dependency_usage import admission_context
         from .install_lock import environment_coordinator
 
-        hints = getattr(binding.backend, "dependency_targets", None)
-        targets = hints(description) if hints is not None else ()
-        async with environment_coordinator(targets):
-            token = usage.declare(
-                description.dependency_declaration(),
-                pending=pending,
+        admission = admission or _DependencyAdmission(binding)
+        if admission.token is None:
+            hints = getattr(binding.backend, "dependency_targets", None)
+            targets = hints(description) if hints is not None else ()
+            async with environment_coordinator(targets):
+                admission.token = usage.declare(
+                    description.dependency_declaration(),
+                    pending=pending,
+                )
+        elif (
+            admission.released
+            or admission.attached
+            or admission.binding.backend is not binding.backend
+            or admission.binding.description.dependency_declaration()
+            != description.dependency_declaration()
+            or not usage.has_declaration(
+                admission.token,
+                plugin_id=description.manifest.id,
             )
+        ):
+            raise RuntimeError("DEPENDENCY_ADMISSION_MISMATCH")
+        token = admission.token
         context = admission_context.set(
             (usage, token, asyncio.current_task(), description),
         )
-        pending = True
 
         async def observe():
-            observer = getattr(
-                binding.backend,
-                "observe_host_dependencies",
-                None,
-            )
-            if pending and observer is not None:
-                result = observer(description, usage, token)
-                if inspect.isawaitable(result):
-                    await result
+            if not admission.released:
+                await self._observe_host_dependencies(binding, token)
 
         async def withdraw():
             async def cleanup():
-                nonlocal pending
-                if pending:
-                    await observe()
+                if not admission.released:
+                    if attach:
+                        await observe()
                     usage.withdraw(token)
-                    pending = False
+                    admission.released = True
 
             await run_async_to_completion(cleanup())
 
         try:
-            self.lifecycle.ensure_instance(
-                description.manifest.id,
-            ).record_runtime(
-                "dependency_declaration",
-                withdraw,
-            )
+            if attach:
+                self.lifecycle.ensure_instance(
+                    description.manifest.id,
+                ).record_runtime(
+                    "dependency_declaration",
+                    withdraw,
+                )
+                admission.attached = True
             yield token
-            await observe()
+            if attach:
+                await observe()
         except BaseException:
-            await withdraw()
+            if attach:
+                await withdraw()
             raise
         finally:
-            admission_context.reset(context)
+            try:
+                if not attach and not admission.attached:
+                    await withdraw()
+            finally:
+                admission_context.reset(context)
 
     async def _admit_dependencies(self, binding, token, snapshot):
         """Commit exact evidence before host definitions or business start."""
@@ -1391,6 +1431,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             raise RuntimeError(
                 "DEPENDENCY_PLAN_UNVERIFIED: fresh audit unavailable",
             )
+
         return await admit_shared_dependencies(
             lambda: audit(binding.description),
             plugin_id=binding.description.manifest.id,
@@ -1580,6 +1621,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         allow_existing=True,
         backend_binding=None,
         prepared=False,
+        dependency_admission=None,
     ) -> PluginRecord:
         """Load through a binding; retain public registration and ledger."""
         plugin_id = manifest.id
@@ -1640,8 +1682,32 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 binding,
                 enabled=is_plugin_enabled(config),
                 pending=not static_discovery,
+                admission=dependency_admission,
             ) as dependency_token:
-                snapshot = None
+                snapshot = (
+                    dependency_admission.snapshot
+                    if dependency_admission is not None
+                    else None
+                )
+                if dependency_admission is not None:
+                    # A saved Python definition may outlive its mutable files.
+                    # New definitions must still match preflight dependencies.
+                    if saved_plugin_def is None:
+                        from ..utils.io_utils import run_sync_io
+
+                        fresh = await run_sync_io(
+                            binding.backend.describe,
+                            source_path,
+                            manifest,
+                        )
+                        if (
+                            fresh.dependency_declaration()
+                            != binding.description.dependency_declaration()
+                        ):
+                            raise RuntimeError(
+                                "DEPENDENCY_PLAN_UNVERIFIED: "
+                                "admission source changed",
+                            )
                 if not prepared:
                     snapshot = await self.lifecycle.prepare_backend(
                         binding,
@@ -1651,6 +1717,11 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                         and probes_before_activation(binding),
                     )
                 if not static_discovery:
+                    if dependency_admission is not None:
+                        await self._observe_host_dependencies(
+                            binding,
+                            dependency_token,
+                        )
                     await self._admit_dependencies(
                         binding,
                         dependency_token,
@@ -2049,10 +2120,20 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 wheels=wheels,
             )
 
-    async def _reload_plugin_body(
+    async def _reload_plugin_body(self, plugin_id, **kwargs):
+        """Keep temporary admissions owned through switch and recovery."""
+        async with AsyncExitStack() as admissions:
+            return await self._reload_plugin_transaction(
+                plugin_id,
+                admissions=admissions,
+                **kwargs,
+            )
+
+    async def _reload_plugin_transaction(
         self,
         plugin_id: str,
         *,
+        admissions,
         new_source: Optional[Path] = None,
         config: Optional[Dict] = None,
         allow_install: bool = False,
@@ -2143,6 +2224,8 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             and lease.key.kind != "preparation"
             and lease.code_root == old_path.resolve()
         }
+        candidate_admission = None
+        old_admission = None
         try:
             old_binding = self._binding_for_record(record)
             candidate_binding = self.backend_resolver.resolve(
@@ -2151,12 +2234,44 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             )
             old_binding.validate_update(candidate_binding, in_place=in_place)
             if is_plugin_enabled(config):
-                await self.lifecycle.prepare_backend(
+                candidate_admission = _DependencyAdmission(candidate_binding)
+                candidate_token = await admissions.enter_async_context(
+                    self._dependency_registration(
+                        candidate_binding,
+                        admission=candidate_admission,
+                        attach=False,
+                    ),
+                )
+                await self._observe_host_dependencies(
+                    candidate_binding,
+                    candidate_token,
+                )
+                snapshot = await self.lifecycle.prepare_backend(
                     candidate_binding,
                     allow_install=allow_install,
                     probe=True,
                     wheels=wheels,
                     owns_dependency_env=owns_dependency_env,
+                )
+                candidate_admission.snapshot = await self._admit_dependencies(
+                    candidate_binding,
+                    candidate_token,
+                    snapshot,
+                )
+                # Recovery owns separate evidence even if replacement cleanup
+                # withdraws the candidate's exact declaration.
+                old_admission = _DependencyAdmission(old_binding)
+                old_token = await admissions.enter_async_context(
+                    self._dependency_registration(
+                        old_binding,
+                        admission=old_admission,
+                        attach=False,
+                    ),
+                )
+                old_admission.snapshot = await self._admit_dependencies(
+                    old_binding,
+                    old_token,
+                    candidate_admission.snapshot,
                 )
         except Exception as exc:
             return ReloadReport(
@@ -2176,6 +2291,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     for lease in self.registry.runtime_owners.leases(plugin_id)
                 ),
                 errors=[str(exc)],
+                generation=old_generation,
             )
         # Callback rejection owns no replacement transaction to recover.
         await _invoke_after_unload(before_unload, plugin_id)
@@ -2231,6 +2347,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 generation=old_generation + 1,
                 backend_binding=published_binding,
                 prepared=True,
+                dependency_admission=candidate_admission,
             )
             if new_record.status == "failed":
                 raise RuntimeError(
@@ -2309,6 +2426,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     in_place=in_place,
                     saved_plugin_def=old_plugin_def,
                     generation=old_generation,
+                    dependency_admission=old_admission,
                 )
             if committed and not isinstance(exc, asyncio.CancelledError):
                 await self._finish_committed_reload(plugin_id, swapped)
@@ -2668,6 +2786,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         generation: int = 0,
         old_binding=None,
         owns_dependency_env=True,
+        dependency_admission=None,
     ) -> ReloadReport:
         """Restore the previous service after a failed reload.
 
@@ -2752,10 +2871,20 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 failed.errors.append(f"directory recovery failed: {exc}")
                 return failed
         try:
-            _, restored_manifest = await run_sync_io(
-                self._read_source_manifest,
-                old_path,
+            restoring_saved_definition = (
+                in_place
+                and saved_plugin_def is not None
+                and dependency_admission is not None
+                and old_binding is not None
+                and old_binding.backend is self._python_backend
             )
+            if restoring_saved_definition:
+                restored_manifest = old_binding.description.manifest
+            else:
+                _, restored_manifest = await run_sync_io(
+                    self._read_source_manifest,
+                    old_path,
+                )
             if old_binding is None:
                 old_binding = self.backend_resolver.resolve(
                     old_path,
@@ -2772,7 +2901,12 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     restored_manifest,
                 )
             old_binding.backend.restore_state(snapshot)
-            if old_config.get("enabled", True):
+            # Saved Python code uses its original admitted declaration. Its
+            # mutable source can now describe the rejected candidate instead.
+            if (
+                old_config.get("enabled", True)
+                and not restoring_saved_definition
+            ):
                 await self.lifecycle.prepare_backend(
                     restored_binding,
                     allow_install=False,
@@ -2790,6 +2924,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 allow_existing=False,
                 backend_binding=restored_binding,
                 prepared=True,
+                dependency_admission=dependency_admission,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception(
