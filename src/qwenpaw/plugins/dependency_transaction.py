@@ -812,19 +812,40 @@ def _error_code(exc):
     )
 
 
+def _verify_reviewed_plan(directory, operation, snapshot):
+    if (
+        environment_fingerprint(snapshot)
+        != operation["environment_fingerprint"]
+    ):
+        raise RuntimeError(
+            "DEPENDENCY_PLAN_STALE: dependency environment changed after review.",
+        )
+    verify_payload(directory, operation)
+
+
+def _reconcile_pending_commit(directory, operation):
+    journal_path = directory / "journal.json"
+    if journal_path.exists() and json.loads(journal_path.read_text())[
+        "phase"
+    ] in {"committing", "committed"}:
+        reconcile_commit(directory, operation)
+        return True
+    return False
+
+
 async def apply_operation(manager, operation_id):
     """Stop exact consumers, replace bytes, verify, and resume installation."""
     import asyncio
     from .dependency_maintenance import maintenance, capability_context
     from .dependency_upgrade import _source_hash, install_result
     from .execution.dependencies import DependencySnapshot
-    from .execution.process import _settle
+    from ..utils.io_utils import run_sync_io
     from .lifecycle import UnloadMode
 
-    directory = manager._directory(operation_id)
+    directory = await run_sync_io(manager._directory, operation_id)
     loader = manager.loader
     with operation_lock(directory):
-        operation = manager._read(operation_id)
+        operation = await run_sync_io(manager._read, operation_id)
         if operation["status"] in {"succeeded", "cancelled"}:
             return manager._public(operation)
         if operation.get("worker_pid") or operation["status"] == "applying":
@@ -834,7 +855,10 @@ async def apply_operation(manager, operation_id):
         token = None
         try:
             source = directory / "source"
-            if _source_hash(source) != operation["source_revision"]:
+            if (
+                await run_sync_io(_source_hash, source)
+                != operation["source_revision"]
+            ):
                 raise RuntimeError(
                     "DEPENDENCY_PLAN_STALE: retained source changed after review.",
                 )
@@ -842,14 +866,12 @@ async def apply_operation(manager, operation_id):
             fresh = await binding.backend.audit_dependencies(
                 binding.description,
             )
-            if (
-                environment_fingerprint(fresh.to_mapping())
-                != operation["environment_fingerprint"]
-            ):
-                raise RuntimeError(
-                    "DEPENDENCY_PLAN_STALE: dependency environment changed after review.",
-                )
-            verify_payload(directory, operation)
+            await run_sync_io(
+                _verify_reviewed_plan,
+                directory,
+                operation,
+                fresh.to_mapping(),
+            )
             consumers = await manager._consumers(binding, fresh)
             manager._check_reviewed_usage(operation, consumers)
             for consumer in consumers:
@@ -878,14 +900,20 @@ async def apply_operation(manager, operation_id):
             if operation["requires_restart"]:
                 from .dependency_upgrade import schedule_maintenance
 
-                schedule_maintenance(manager, directory, operation)
+                await run_sync_io(
+                    schedule_maintenance,
+                    manager,
+                    directory,
+                    operation,
+                    loop=asyncio.get_running_loop(),
+                )
                 return manager._public(operation)
             operation.update(
                 status="preparing",
                 message="Stopping shared dependency consumers.",
                 error=None,
             )
-            manager._save(directory, operation)
+            await run_sync_io(manager._save, directory, operation)
             owners = loader.registry.runtime_owners
             affected = {
                 (row["plugin_id"], row["instance_id"], row["generation"])
@@ -953,7 +981,7 @@ async def apply_operation(manager, operation_id):
             # Capture the prior source independently of the loader's short-lived
             # swap backup, because dependency commit includes continuation.
             _, target = loader._install_paths(operation["plugin_id"], None)
-            operation["source_before"] = await asyncio.to_thread(
+            operation["source_before"] = await run_sync_io(
                 backup_source,
                 directory,
                 target,
@@ -962,7 +990,7 @@ async def apply_operation(manager, operation_id):
                 status="applying",
                 message="Applying and verifying shared dependencies.",
             )
-            manager._save(directory, operation)
+            await run_sync_io(manager._save, directory, operation)
             # The marker outlives this gate. Only the private continuation
             # capability can admit fresh verification while it remains set.
             with maintenance(
@@ -979,7 +1007,10 @@ async def apply_operation(manager, operation_id):
                     binding.description,
                 )
                 if (
-                    environment_fingerprint(verified.to_mapping())
+                    await run_sync_io(
+                        environment_fingerprint,
+                        verified.to_mapping(),
+                    )
                     != operation["environment_fingerprint"]
                 ):
                     raise RuntimeError(
@@ -995,14 +1026,7 @@ async def apply_operation(manager, operation_id):
                     raise RuntimeError(
                         "DEPENDENCY_PLAN_STALE: a host import appeared during preparation; prepare a new confirmation.",
                     )
-                writer = asyncio.create_task(
-                    asyncio.to_thread(publish, directory, operation),
-                )
-                try:
-                    await asyncio.shield(writer)
-                except asyncio.CancelledError:
-                    await _settle(writer)
-                    raise
+                await run_sync_io(publish, directory, operation)
             fresh = await binding.backend.audit_dependencies(
                 binding.description,
             )
@@ -1050,13 +1074,25 @@ async def apply_operation(manager, operation_id):
                         raise RuntimeError(
                             "DEPENDENCY_RESTORE_FAILED: previous consumer did not resume.",
                         )
-            commit_result(directory, operation, install_result(record))
+            await run_sync_io(
+                commit_result,
+                directory,
+                operation,
+                install_result(record),
+            )
         except BaseException as exc:
-            journal_path = directory / "journal.json"
-            if journal_path.exists() and json.loads(journal_path.read_text())[
-                "phase"
-            ] in {"committing", "committed"}:
-                reconcile_commit(directory, operation)
+            if (
+                isinstance(exc, asyncio.CancelledError)
+                and operation["status"] == "waiting_restart"
+            ):
+                raise
+            if await run_sync_io(
+                _reconcile_pending_commit,
+                directory,
+                operation,
+            ):
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
                 return manager._public(operation)
             failure_code = _error_code(exc)
             operation.update(
@@ -1092,14 +1128,19 @@ async def apply_operation(manager, operation_id):
                                 raise RuntimeError(
                                     "DEPENDENCY_REPAIR_REQUIRED: new consumer remains active.",
                                 )
-                    await asyncio.to_thread(rollback, directory)
+                    await run_sync_io(rollback, directory)
                     loader.registry.dependency_usage.restore_rebased(rebased)
-                    await asyncio.to_thread(
+                    await run_sync_io(
                         restore_source,
                         directory,
                         operation,
                     )
-                    finish(directory, operation, committed=False)
+                    await run_sync_io(
+                        finish,
+                        directory,
+                        operation,
+                        committed=False,
+                    )
                 except BaseException:
                     repair = True
             if not repair:
@@ -1131,7 +1172,7 @@ async def apply_operation(manager, operation_id):
                     ),
                 },
             )
-            manager._save(directory, operation)
+            await run_sync_io(manager._save, directory, operation)
             if isinstance(exc, asyncio.CancelledError):
                 raise
         finally:

@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import threading
 import tomllib
 import venv
 import zipfile
@@ -257,6 +258,7 @@ async def test_install_old_unconsumed_package_returns_reviewable_upgrade(
     old,
     module,
     other,
+    monkeypatch,
 ):
     # Removing structured upgrade staging recreates the user's actual install
     # failure even though there is no running consumer to stop.
@@ -267,6 +269,47 @@ async def test_install_old_unconsumed_package_returns_reviewable_upgrade(
     source = tmp_path / "incoming"
     shutil.copytree(ROOT / "plugins/channel" / channel, source)
     before = tree_bytes(site)
+    from qwenpaw.plugins import dependency_transaction, dependency_upgrade
+
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    observed = set()
+    callback_ran = threading.Event()
+    read_bytes = Path.read_bytes
+
+    def wheel_bytes(path):
+        if path.suffix == ".whl":
+            assert (
+                threading.get_ident() != loop_thread
+            ), "wheel hash blocked event loop"
+            observed.add("wheel hash")
+            loop.call_soon_threadsafe(callback_ran.set)
+            assert callback_ran.wait(
+                5
+            ), "event loop could not run during wheel I/O"
+        return read_bytes(path)
+
+    def observe(name, function):
+        def call(*args, **kwargs):
+            assert (
+                threading.get_ident() != loop_thread
+            ), f"{name} blocked event loop"
+            observed.add(name)
+            return function(*args, **kwargs)
+
+        return call
+
+    monkeypatch.setattr(Path, "read_bytes", wheel_bytes)
+    monkeypatch.setattr(
+        dependency_upgrade,
+        "validate_additions",
+        observe("wheel validation", dependency_upgrade.validate_additions),
+    )
+    monkeypatch.setattr(
+        dependency_transaction,
+        "prepare_payload",
+        observe("payload preparation", dependency_transaction.prepare_payload),
+    )
     assert not loader.registry.runtime_owners.leases()
     assert not loader.registry.dependency_usage.snapshot().uses
     async with httpx.AsyncClient(
@@ -286,6 +329,24 @@ async def test_install_old_unconsumed_package_returns_reviewable_upgrade(
     assert operation["id"]
     assert operation["status"] == "needs_confirmation", operation
     assert operation["plugin_id"] == channel
+    assert observed == {
+        "wheel hash",
+        "wheel validation",
+        "payload preparation",
+    }
+    assert callback_ran.is_set()
+    directory = (
+        dependency_upgrade.dependency_upgrades(loader).root / operation["id"]
+    )
+    stored = json.loads((directory / "operation.json").read_text())
+    new_module = stored["payload"]["new"][str(site / f"{module}.py")]
+    expected = (
+        b"VERSION = '3.0.0'\n"
+        if channel == "matrix"
+        else b"VERSION = '1.9.0'\n"
+    )
+    assert (directory / new_module["payload"]).read_bytes() == expected
+    assert stored["approved"] is False
 
 
 def channel_source(
@@ -514,6 +575,7 @@ async def test_requested_host_extra_upgrade_requires_restart_before_write(
 async def test_apply_replaces_owned_files_in_original_site_and_continues_install(
     isolated_loader,
     tmp_path,
+    monkeypatch,
 ):
     loader, _, site, destination = isolated_loader
     distribution(site, "upgrade-sdk", "1.0")
@@ -534,6 +596,50 @@ async def test_apply_replaces_owned_files_in_original_site_and_continues_install
     assert not operation["requires_restart"]
     assert tree_bytes(site) == before
     assert imported_sdk(loader, site)["value"] == "1.0"
+    from qwenpaw.plugins import dependency_transaction, dependency_upgrade
+
+    loop_thread = threading.get_ident()
+    observed = set()
+
+    def file_work(name, function):
+        def call(*args, **kwargs):
+            assert (
+                threading.get_ident() != loop_thread
+            ), f"{name} blocked event loop"
+            observed.add(name)
+            return function(*args, **kwargs)
+
+        return call
+
+    def loop_work(name, function):
+        async def call(*args, **kwargs):
+            assert (
+                threading.get_ident() == loop_thread
+            ), f"{name} left event loop"
+            observed.add(name)
+            return await function(*args, **kwargs)
+
+        return call
+
+    for name in ("verify_payload", "environment_fingerprint"):
+        monkeypatch.setattr(
+            dependency_transaction,
+            name,
+            file_work(name, getattr(dependency_transaction, name)),
+        )
+    monkeypatch.setattr(
+        dependency_upgrade,
+        "_source_hash",
+        file_work("source verification", dependency_upgrade._source_hash),
+    )
+    monkeypatch.setattr(
+        manager, "_consumers", loop_work("consumers", manager._consumers)
+    )
+    monkeypatch.setattr(
+        loader.lifecycle,
+        "prepare_backend",
+        loop_work("lifecycle", loader.lifecycle.prepare_backend),
+    )
     applied = await manager.apply(operation["id"])
     assert applied["status"] == "succeeded", applied
     assert applied["result"]["id"] == "upgrade_fixture"
@@ -554,6 +660,252 @@ async def test_apply_replaces_owned_files_in_original_site_and_continues_install
         source / "driver.py"
     ).read_bytes()
     assert "upgrade_sdk" not in sys.modules
+    assert observed == {
+        "verify_payload",
+        "environment_fingerprint",
+        "source verification",
+        "consumers",
+        "lifecycle",
+    }
+
+
+@pytest.mark.asyncio
+async def test_concurrent_plan_seals_wait_for_complete_private_key(
+    isolated_loader, tmp_path, monkeypatch
+):
+    from qwenpaw.plugins import dependency_upgrade
+    from qwenpaw.plugins.dependency_transaction import authenticate_plan
+    from qwenpaw.utils.io_utils import get_sync_path_lock
+
+    loader, _, site, _ = isolated_loader
+    distribution(site, "upgrade-sdk", "1.0")
+    manager = upgrade_manager(loader)
+    source = channel_source(tmp_path / "incoming")
+    key = manager.root / ".key"
+    assert not key.exists()
+    loop = asyncio.get_running_loop()
+    created = asyncio.Event()
+    second_started = asyncio.Event()
+    release = threading.Event()
+    open_file = os.open
+    read_bytes = Path.read_bytes
+    lock_requests = []
+
+    def locking(path):
+        lock_requests.append(path)
+        if len(lock_requests) == 2:
+            loop.call_soon_threadsafe(second_started.set)
+        return get_sync_path_lock(path)
+
+    def opening(path, flags, *args, **kwargs):
+        descriptor = open_file(path, flags, *args, **kwargs)
+        if Path(path) == key and flags & os.O_CREAT:
+            assert read_bytes(key) == b""
+            loop.call_soon_threadsafe(created.set)
+            assert release.wait(5), "test did not release key initialization"
+        return descriptor
+
+    def reading(path):
+        content = read_bytes(path)
+        if path == key:
+            assert len(content) == 32, "concurrent seal read an incomplete key"
+        return content
+
+    monkeypatch.setattr(os, "open", opening)
+    monkeypatch.setattr(Path, "read_bytes", reading)
+    monkeypatch.setattr(dependency_upgrade, "get_sync_path_lock", locking)
+    first_task = asyncio.create_task(manager.stage(source))
+    second_task = None
+    try:
+        await asyncio.wait_for(created.wait(), 5)
+        second_task = asyncio.create_task(manager.stage(source))
+        await asyncio.wait_for(second_started.wait(), 5)
+        assert lock_requests == [key, key]
+        lock = get_sync_path_lock(key)
+        acquired = lock.acquire(blocking=False)
+        if acquired:
+            lock.release()
+        assert not acquired, "private key initialization was not locked"
+        assert not first_task.done()
+        assert not second_task.done()
+        release.set()
+        first, second = await asyncio.gather(first_task, second_task)
+        assert first["id"] != second["id"]
+        assert len(key.read_bytes()) == 32
+        for staged in (first, second):
+            directory = manager.root / staged["id"]
+            operation = json.loads((directory / "operation.json").read_text())
+            authenticate_plan(directory, operation)
+    finally:
+        release.set()
+        await asyncio.gather(
+            first_task,
+            *([second_task] if second_task is not None else []),
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["restart_handoff", "commit"])
+async def test_cancelled_apply_preserves_completed_handoff_or_commit(
+    isolated_loader, tmp_path, monkeypatch, boundary
+):
+    from qwenpaw.plugins import dependency_transaction, dependency_upgrade
+
+    loader, _, site, destination = isolated_loader
+    if boundary == "restart_handoff":
+        host_extra_graph(site, "agentscope", bridge_requires="upgrade-sdk>=1")
+    distribution(site, "upgrade-sdk", "1.0")
+    before = tree_bytes(site)
+    manager = upgrade_manager(loader)
+    operation = await manager.stage(channel_source(tmp_path / "incoming"))
+    assert operation["requires_restart"] == (boundary == "restart_handoff")
+    assert getattr(loader, "dependency_upgrade_shutdown", None) is None
+    directory = manager.root / operation["id"]
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    entered = asyncio.Event()
+    release = threading.Event()
+    module, name = (
+        (dependency_upgrade, "schedule_maintenance")
+        if boundary == "restart_handoff"
+        else (dependency_transaction, "commit_result")
+    )
+    function = getattr(module, name)
+    rollback = dependency_transaction.rollback
+    rolled_back = []
+
+    def completing(*args, **kwargs):
+        assert threading.get_ident() != loop_thread
+        result = function(*args, **kwargs)
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5), "test did not release completed file work"
+        return result
+
+    def rolling_back(*args, **kwargs):
+        rolled_back.append(True)
+        return rollback(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, completing)
+    monkeypatch.setattr(dependency_transaction, "rollback", rolling_back)
+    task = asyncio.create_task(manager.apply(operation["id"]))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert manager._locks[operation["id"]].locked()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        stored = json.loads((directory / "operation.json").read_text())
+        assert stored["approved"] is True
+        assert rolled_back == []
+        if boundary == "restart_handoff":
+            assert (
+                manager.status(operation["id"])["status"] == "waiting_restart"
+            )
+            assert stored["status"] == "waiting_restart"
+            assert not stored.get("worker_pid")
+            assert stored["instructions"]
+            assert tree_bytes(site) == before
+            assert not (destination / "upgrade_fixture").exists()
+        else:
+            assert manager.status(operation["id"])["status"] == "succeeded"
+            assert stored["status"] == "succeeded"
+            assert stored["result"]["id"] == "upgrade_fixture"
+            assert imported_sdk(loader, site)["value"] == "2.0"
+            assert (destination / "upgrade_fixture/driver.py").is_file()
+            assert (
+                json.loads((directory / "journal.json").read_text())["phase"]
+                == "committed"
+            )
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["source_copy", "payload"])
+async def test_cancelled_stage_waits_for_file_work_before_removing_candidate(
+    isolated_loader, tmp_path, monkeypatch, phase
+):
+    from qwenpaw.plugins import dependency_transaction
+
+    loader, _, site, destination = isolated_loader
+    distribution(site, "upgrade-sdk", "1.0")
+    source = channel_source(tmp_path / "incoming")
+    before = tree_bytes(site)
+    manager = upgrade_manager(loader)
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    directories = []
+    copytree = shutil.copytree
+    prepare_payload = dependency_transaction.prepare_payload
+    rmtree = shutil.rmtree
+
+    def pause(directory, function, *args, **kwargs):
+        assert (
+            threading.get_ident() != loop_thread
+        ), "stage file work blocked event loop"
+        directories.append(directory)
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5), "test did not release stage file work"
+        try:
+            assert (
+                directory.is_dir()
+            ), "candidate removed while file work was running"
+            return function(*args, **kwargs)
+        finally:
+            finished.set()
+
+    def copying(src, dst, *args, **kwargs):
+        if Path(src) == source and Path(dst).name == "source":
+            return pause(Path(dst).parent, copytree, src, dst, *args, **kwargs)
+        return copytree(src, dst, *args, **kwargs)
+
+    def preparing(directory, *args, **kwargs):
+        return pause(directory, prepare_payload, directory, *args, **kwargs)
+
+    def removing(path, *args, **kwargs):
+        if Path(path) in directories:
+            assert (
+                finished.is_set()
+            ), "candidate cleanup raced unfinished file work"
+        return rmtree(path, *args, **kwargs)
+
+    if phase == "source_copy":
+        monkeypatch.setattr(shutil, "copytree", copying)
+    else:
+        monkeypatch.setattr(
+            dependency_transaction, "prepare_payload", preparing
+        )
+    monkeypatch.setattr(shutil, "rmtree", removing)
+    task = asyncio.create_task(manager.stage(source))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert (
+            not task.done()
+        ), "stage propagated cancellation before its file worker finished"
+        assert directories[0].is_dir()
+        assert not finished.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert finished.is_set()
+        assert not directories[0].exists()
+        assert tree_bytes(site) == before
+        assert not list(destination.iterdir())
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -786,6 +1138,91 @@ async def running_consumer(loader, site, root, *, stop_ok=True):
         "version": "1.0"
     }
     return process, lease, token, stops
+
+
+@pytest.mark.asyncio
+async def test_cancelled_apply_keeps_operation_lock_until_verification_finishes(
+    isolated_loader, tmp_path, monkeypatch
+):
+    from qwenpaw.plugins import dependency_transaction
+    from qwenpaw.plugins.install_lock import InstallLockError
+    from qwenpaw.plugins.ownership import RuntimeStopReceipt
+
+    loader, _, site, destination = isolated_loader
+    distribution(site, "upgrade-sdk", "1.0")
+    process, lease, token, stops = await running_consumer(
+        loader, site, tmp_path / "consumer"
+    )
+    release = threading.Event()
+    task = None
+    try:
+        manager = upgrade_manager(loader)
+        operation = await manager.stage(channel_source(tmp_path / "incoming"))
+        directory = manager.root / operation["id"]
+        before = tree_bytes(site)
+        loop = asyncio.get_running_loop()
+        loop_thread = threading.get_ident()
+        entered = asyncio.Event()
+        finished = threading.Event()
+        verify_payload = dependency_transaction.verify_payload
+
+        def verifying(*args):
+            assert (
+                threading.get_ident() != loop_thread
+            ), "apply verification blocked event loop"
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(5), "test did not release apply verification"
+            try:
+                return verify_payload(*args)
+            finally:
+                finished.set()
+
+        monkeypatch.setattr(
+            dependency_transaction, "verify_payload", verifying
+        )
+        task = asyncio.create_task(manager.apply(operation["id"]))
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert (
+            not task.done()
+        ), "apply propagated cancellation before verification finished"
+        assert manager._locks[operation["id"]].locked()
+        with pytest.raises(InstallLockError):
+            with dependency_transaction.operation_lock(directory):
+                pytest.fail(
+                    "apply released its operation lock during file verification"
+                )
+        assert stops == []
+        assert not finished.is_set()
+        assert await process.call("fixture.version", {}, timeout=2) == {
+            "version": "1.0"
+        }
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert finished.is_set()
+        assert not manager._locks[operation["id"]].locked()
+        with dependency_transaction.operation_lock(directory):
+            pass
+        assert stops == []
+        assert lease in loader.registry.runtime_owners.leases()
+        assert tree_bytes(site) == before
+        assert not (destination / "upgrade_fixture").exists()
+        stored = json.loads((directory / "operation.json").read_text())
+        assert stored["approved"] is False
+        assert not (directory / "journal.json").exists()
+    finally:
+        release.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        result = await process.stop()
+        loader.registry.runtime_owners.release(
+            lease, RuntimeStopReceipt(result.exited, exited=result.exited)
+        )
+        loader.registry.dependency_usage.withdraw(token)
 
 
 @pytest.mark.asyncio

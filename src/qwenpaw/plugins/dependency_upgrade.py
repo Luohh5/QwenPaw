@@ -16,6 +16,8 @@ from uuid import uuid4
 
 from packaging.utils import parse_wheel_filename
 
+from ..utils.io_utils import get_sync_path_lock, run_sync_io
+
 from .dependency_gate import (
     GateDecision,
     SharedDependencyError,
@@ -235,7 +237,10 @@ class DependencyUpgradeManager:
                         "generation": None,
                         "origin": "installed",
                         "active": False,
-                        "source_revision": _source_hash(source),
+                        "source_revision": await run_sync_io(
+                            _source_hash,
+                            source,
+                        ),
                         "requirements": list(other.description.requirements),
                         "environment": observed.to_mapping(),
                     },
@@ -414,23 +419,220 @@ class DependencyUpgradeManager:
                 "Shared requirement metadata cannot be verified.",
             )
 
-    async def stage(self, source_path, force=False):
+    @staticmethod
+    def _prepare_source(source_path, directory):
         source_path = Path(source_path).resolve()
         revision = _source_hash(source_path)
+        directory.mkdir(parents=True, mode=0o700)
+        source = directory / "source"
+        shutil.copytree(source_path, source)
+        if _source_hash(source) != revision:
+            _refuse(
+                "DEPENDENCY_PLAN_STALE",
+                "Plugin source changed during preparation; retry installation.",
+            )
+        return revision
+
+    @staticmethod
+    def _prepare_resolution(
+        directory,
+        snapshot,
+        requirements,
+        consumers,
+        requirements_path,
+    ):
+        from .dependency_transaction import environment_fingerprint
+
+        fingerprint = environment_fingerprint(snapshot.to_mapping())
+        wheels_dir = directory / "wheels"
+        wheels_dir.mkdir()
+        resolver = directory / "requirements.txt"
+        # Resolve host dependencies without acquiring a new QwenPaw wheel.
+        resolver.write_text(
+            "".join(str(value) + "\n" for value in requirements)
+            + "".join(
+                value + "\n"
+                for consumer in consumers
+                for value in (
+                    consumer["environment"]["distributions"]["qwenpaw"][
+                        "requires_dist"
+                    ]
+                    if consumer["origin"] == "host"
+                    and consumer["plugin_id"] == "qwenpaw"
+                    else consumer["requirements"]
+                )
+            ),
+            encoding="utf-8",
+        )
+        closure = {
+            name
+            for name, _ in _dependency_closure(
+                requirements,
+                snapshot.distributions,
+                snapshot.marker_environment,
+            )
+        }
+        constraints = directory / "constraints.txt"
+        constraints.write_text(
+            "".join(
+                f"{name}=={row['version']}\n"
+                for name, row in snapshot.distributions.items()
+                if name not in closure
+            ),
+            encoding="utf-8",
+        )
+        command = [
+            snapshot.executable,
+            "-I",
+            "-m",
+            "pip",
+            "wheel",
+            "--disable-pip-version-check",
+            "--no-input",
+            "--wheel-dir",
+            str(wheels_dir),
+            "--constraint",
+            str(constraints),
+            "-r",
+            str(resolver),
+            "-r",
+            str(requirements_path),
+        ]
+        return fingerprint, command
+
+    @classmethod
+    def _prepare_payload(
+        cls,
+        directory,
+        snapshot,
+        requirements,
+        consumers,
+        target,
+    ):
+        wheels = []
+        changed = {}
+        for path in sorted((directory / "wheels").glob("*.whl")):
+            name, version, _, _ = parse_wheel_filename(path.name)
+            name = str(name)
+            old = snapshot.distributions.get(name)
+            if old and old["version"] == str(version):
+                continue
+            if name in changed:
+                _refuse(
+                    "DEPENDENCY_PLAN_UNVERIFIED",
+                    "Duplicate wheel provider in dependency plan.",
+                )
+            changed[name] = old
+            wheels.append(
+                WheelAddition(
+                    path,
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                ),
+            )
+        if not changed:
+            _refuse(
+                "DEPENDENCY_PLAN_UNVERIFIED",
+                "No dependency replacement was resolved.",
+            )
+        # Archive validation is shared with online additions. Physical
+        # collisions are checked below against exact installed ownership.
+        clean = replace(
+            snapshot,
+            sites=(),
+            distributions={
+                name: row
+                for name, row in snapshot.distributions.items()
+                if name not in changed
+            },
+        )
+        files, proposed = validate_additions(
+            tuple(wheels),
+            clean,
+            Path(target),
+        )
+        destinations = {}
+        changes = []
+        for name in changed:
+            old, row = changed[name], proposed.distributions[name]
+            site = Path(old["metadata_path"]).parent if old else Path(target)
+            destinations[name] = str(site.resolve())
+            proposed.distributions[name]["metadata_path"] = str(
+                site / Path(row["metadata_path"]).name,
+            )
+            changes.append(
+                {
+                    "name": name,
+                    "current_version": old["version"] if old else None,
+                    "target_version": row["version"],
+                },
+            )
+        inventory = dict(proposed.distributions)
+        cls._compatible(
+            requirements,
+            inventory,
+            snapshot.marker_environment,
+        )
+        for consumer in consumers:
+            evidence = consumer["environment"]
+            visible = set(evidence["dependency_sites"])
+            merged = dict(evidence["distributions"])
+            merged.update(
+                {
+                    name: row
+                    for name, row in inventory.items()
+                    if str(Path(row["metadata_path"]).parent) in visible
+                },
+            )
+            cls._compatible(
+                consumer["requirements"],
+                merged,
+                evidence["marker_environment"],
+            )
+        from .dependency_transaction import prepare_payload
+
+        payload = prepare_payload(
+            directory,
+            snapshot.to_mapping(),
+            changed,
+            destinations,
+            files,
+            [
+                (
+                    item.to_mapping()
+                    if hasattr(item, "to_mapping")
+                    else {
+                        "path": str(item.path),
+                        "sha256": item.sha256,
+                    }
+                )
+                for item in wheels
+            ],
+        )
+        return changed, changes, inventory, payload
+
+    @classmethod
+    def _seal_operation(cls, directory, operation):
+        from .dependency_transaction import authenticate_plan
+
+        retain_maintenance_assets(directory, operation, operation["runtime"])
+        with get_sync_path_lock(directory.parent / ".key"):
+            authenticate_plan(directory, operation, seal=True)
+        cls._save(directory, operation)
+
+    async def stage(self, source_path, force=False):
         operation_id = uuid4().hex
         directory = self.root / operation_id
-        directory.mkdir(parents=True, mode=0o700)
         try:
             source = directory / "source"
-            await asyncio.to_thread(shutil.copytree, source_path, source)
-            if _source_hash(source) != revision:
-                _refuse(
-                    "DEPENDENCY_PLAN_STALE",
-                    "Plugin source changed during preparation; retry installation.",
-                )
+            revision = await run_sync_io(
+                self._prepare_source,
+                source_path,
+                directory,
+            )
             binding = await self._binding(source)
             plugin_id = binding.description.manifest.id
-            parsed = parse_requirements_file(
+            parsed = await run_sync_io(
+                parse_requirements_file,
                 binding.description.requirements_path,
             )
             if parsed.unsupported:
@@ -461,187 +663,35 @@ class DependencyUpgradeManager:
                     "The dependency installation site is ambiguous.",
                 )
             requirements = list(binding.description.requirements)
-            from .dependency_transaction import environment_fingerprint
-
-            fingerprint = environment_fingerprint(snapshot.to_mapping())
-            wheels_dir = directory / "wheels"
-            wheels_dir.mkdir()
-            resolver = directory / "requirements.txt"
-            # Resolve host dependencies without acquiring a new QwenPaw wheel.
-            resolver.write_text(
-                "".join(str(value) + "\n" for value in requirements)
-                + "".join(
-                    value + "\n"
-                    for consumer in consumers
-                    for value in (
-                        consumer["environment"]["distributions"]["qwenpaw"][
-                            "requires_dist"
-                        ]
-                        if consumer["origin"] == "host"
-                        and consumer["plugin_id"] == "qwenpaw"
-                        else consumer["requirements"]
-                    )
-                ),
-                encoding="utf-8",
+            fingerprint, command = await run_sync_io(
+                self._prepare_resolution,
+                directory,
+                snapshot,
+                requirements,
+                consumers,
+                binding.description.requirements_path,
             )
-            closure = {
-                name
-                for name, _ in _dependency_closure(
-                    requirements,
-                    snapshot.distributions,
-                    snapshot.marker_environment,
-                )
-            }
-            constraints = directory / "constraints.txt"
-            constraints.write_text(
-                "".join(
-                    f"{name}=={row['version']}\n"
-                    for name, row in snapshot.distributions.items()
-                    if name not in closure
-                ),
-                encoding="utf-8",
+            result = await run_sync_io(
+                self.loader._run_subprocess_with_streaming_log,
+                command,
+                timeout=300,
+                plugin_id=plugin_id,
             )
-            command = [
-                snapshot.executable,
-                "-I",
-                "-m",
-                "pip",
-                "wheel",
-                "--disable-pip-version-check",
-                "--no-input",
-                "--wheel-dir",
-                str(wheels_dir),
-                "--constraint",
-                str(constraints),
-                "-r",
-                str(resolver),
-                "-r",
-                str(binding.description.requirements_path),
-            ]
-            task = asyncio.create_task(
-                asyncio.to_thread(
-                    self.loader._run_subprocess_with_streaming_log,
-                    command,
-                    timeout=300,
-                    plugin_id=plugin_id,
-                ),
-            )
-            try:
-                result = await asyncio.shield(task)
-            except asyncio.CancelledError:
-                from .execution.process import _settle
-
-                await _settle(task)
-                raise
             if result.returncode:
                 _refuse(
                     "DEPENDENCY_CONFLICT",
                     "A complete compatible wheel plan could not be prepared; check the plugin and shared requirements.",
                 )
-            wheels = []
-            changed = {}
-            for path in sorted(wheels_dir.glob("*.whl")):
-                name, version, _, _ = parse_wheel_filename(path.name)
-                name = str(name)
-                old = snapshot.distributions.get(name)
-                if old and old["version"] == str(version):
-                    continue
-                if name in changed:
-                    _refuse(
-                        "DEPENDENCY_PLAN_UNVERIFIED",
-                        "Duplicate wheel provider in dependency plan.",
-                    )
-                changed[name] = old
-                wheels.append(
-                    WheelAddition(
-                        path,
-                        hashlib.sha256(path.read_bytes()).hexdigest(),
-                    ),
-                )
-            if not changed:
-                _refuse(
-                    "DEPENDENCY_PLAN_UNVERIFIED",
-                    "No dependency replacement was resolved.",
-                )
-            # Archive validation is shared with online additions. Physical
-            # collisions are checked below against exact installed ownership.
-            clean = replace(
-                snapshot,
-                sites=(),
-                distributions={
-                    name: row
-                    for name, row in snapshot.distributions.items()
-                    if name not in changed
-                },
-            )
-            files, proposed = validate_additions(
-                tuple(wheels),
-                clean,
-                Path(target),
-            )
-            destinations = {}
-            changes = []
-            for name in changed:
-                old, row = changed[name], proposed.distributions[name]
-                site = (
-                    Path(old["metadata_path"]).parent if old else Path(target)
-                )
-                destinations[name] = str(site.resolve())
-                proposed.distributions[name]["metadata_path"] = str(
-                    site / Path(row["metadata_path"]).name,
-                )
-                changes.append(
-                    {
-                        "name": name,
-                        "current_version": old["version"] if old else None,
-                        "target_version": row["version"],
-                    },
-                )
-            inventory = dict(proposed.distributions)
-            self._compatible(
-                requirements,
-                inventory,
-                snapshot.marker_environment,
-            )
-            for consumer in consumers:
-                evidence = consumer["environment"]
-                visible = set(evidence["dependency_sites"])
-                merged = dict(evidence["distributions"])
-                merged.update(
-                    {
-                        name: row
-                        for name, row in inventory.items()
-                        if str(Path(row["metadata_path"]).parent) in visible
-                    },
-                )
-                self._compatible(
-                    consumer["requirements"],
-                    merged,
-                    evidence["marker_environment"],
-                )
-            from .dependency_transaction import (
-                prepare_payload,
-                imported_changes,
-            )
-
-            payload = prepare_payload(
+            changed, changes, inventory, payload = await run_sync_io(
+                self._prepare_payload,
                 directory,
-                snapshot.to_mapping(),
-                changed,
-                destinations,
-                files,
-                [
-                    (
-                        item.to_mapping()
-                        if hasattr(item, "to_mapping")
-                        else {
-                            "path": str(item.path),
-                            "sha256": item.sha256,
-                        }
-                    )
-                    for item in wheels
-                ],
+                snapshot,
+                requirements,
+                consumers,
+                target,
             )
+            from .dependency_transaction import imported_changes
+
             requires_restart = bool(imported_changes(payload)) or any(
                 consumer["origin"] == "host"
                 and set(changed).intersection(
@@ -712,14 +762,10 @@ class DependencyUpgradeManager:
                 "runtime": runtime_data,
                 "approved": False,
             }
-            retain_maintenance_assets(directory, operation, self.loader)
-            from .dependency_transaction import authenticate_plan
-
-            authenticate_plan(directory, operation, seal=True)
-            self._save(directory, operation)
+            await run_sync_io(self._seal_operation, directory, operation)
             return self._public(operation)
         except BaseException as exc:
-            shutil.rmtree(directory, ignore_errors=True)
+            await run_sync_io(shutil.rmtree, directory, ignore_errors=True)
             if (
                 isinstance(exc, RuntimeError)
                 and not isinstance(exc, SharedDependencyError)
@@ -733,17 +779,16 @@ class DependencyUpgradeManager:
 
         lock = self._locks.setdefault(operation_id, asyncio.Lock())
         if lock.locked():
-            return self.status(operation_id)
+            return await run_sync_io(self.status, operation_id)
         async with lock:
             return await apply_operation(self, operation_id)
 
 
-def retain_maintenance_assets(directory, operation, loader):
+def retain_maintenance_assets(directory, operation, runtime):
     """Recovery must remain executable before any online file can change."""
-    runtime = getattr(loader.registry, "channel_runtime", None)
     candidates = [Path(__file__).resolve().parent]
     if runtime is not None:
-        candidates.append(Path(runtime.support_root) / "qwenpaw/plugins")
+        candidates.append(Path(runtime["support_root"]) / "qwenpaw/plugins")
     names = (
         "dependency_worker.py",
         "dependency_transaction.py",
@@ -771,7 +816,7 @@ def retain_maintenance_assets(directory, operation, loader):
         shutil.copy2(assets / name, worker / name)
     frozen = bool(getattr(sys, "frozen", False))
     executable = (
-        runtime.python_executable
+        runtime["python_executable"]
         if frozen and runtime is not None
         else sys.executable
     )
@@ -782,7 +827,7 @@ def retain_maintenance_assets(directory, operation, loader):
     )
 
 
-def schedule_maintenance(manager, directory, operation):
+def schedule_maintenance(manager, directory, operation, *, loop=None):
     """Explicit apply persists approval before handing off to a fresh worker."""
     import shlex
     import subprocess
@@ -842,7 +887,10 @@ def schedule_maintenance(manager, directory, operation):
         ] = "Restarting the backend to apply shared dependencies and resume installation."
         operation["instructions"] = []
         manager._save(directory, operation)
-        asyncio.get_running_loop().call_later(0.25, shutdown)
+        if loop is None:
+            asyncio.get_running_loop().call_later(0.25, shutdown)
+        else:
+            loop.call_soon_threadsafe(loop.call_later, 0.25, shutdown)
 
 
 async def continue_operation(directory, *, preflight=False):
