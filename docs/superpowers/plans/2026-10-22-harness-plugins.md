@@ -216,13 +216,13 @@
 - Produces: `qwenpaw-harness-codex` 提供 `codex`，`external_history=True`；main.py 的工厂内导入 adapter，外部依赖仅在该插件环境准备。
 - `CodexBackend.close()` 管理所有 runtime clients、读取任务、未完成 RPC、审批与登录；不删除用户账户或原生线程。
 
-- [ ] **Step 1：写插件加载失败测试。** 移除旧模块导入可用性，正式 loader 加载插件后仅出现 codex；未加载插件时 fake 二进制和 SDK 即使存在也不被检测；`check_plugin` 无内部宿主导入违规。
-- [ ] **Step 2：写兼容失败测试。** `test_resume_existing_thread_mapping`、`test_state_copy_keeps_legacy_and_existing_target`、`test_corrupt_legacy_state_is_not_replaced_with_empty`、`test_archive_preserves_external_thread_metadata`。
-- [ ] **Step 3：运行红灯。** Run: `python -m pytest plugins/harness/codex/tests -q`（插件测试依赖已显式安装）。
-- [ ] **Step 4：移动并适配厂商实现。** 替换 approvals/security/io_utils 的内部导入：审批走 call context；文件写入用公开 storage 或插件自有普通 Python I/O，保留原子写语义；投影接受公开 DTO。
-- [ ] **Step 5：实现状态目录兼容。** 仅插件激活后的实际打开执行原子复制；旧文件保留，新目标优先；缓存再生不移动原生 Codex 数据。
-- [ ] **Step 6：验证已有功能。** 文本/推理/工具流、模型/effort、图片/文件、OAuth/API key 状态、审批、compact/review/skills/status/new/clear、取消、续接、历史恢复和 archive 均有模拟引擎测试。
-- [ ] **Step 7：验证并提交。** 重跑 Step 3 和 B2/B3 的假 Harness 契约；建议提交：`refactor(harness): extract Codex into SDK plugin`。本步在独立测试宿主验证新插件，主应用仍走旧内置路径，不在同一应用同时激活两套实现；A3 统一切换，A6 删除旧源码，此步不宣称默认启动已减负。
+- [x] **Step 1：写插件加载失败测试。** 移除旧模块导入可用性，正式 loader 加载插件后仅出现 codex；未加载插件时 fake 二进制和 SDK 即使存在也不被检测；`check_plugin` 无内部宿主导入违规。
+- [x] **Step 2：写兼容失败测试。** `test_resume_existing_thread_mapping`、`test_state_copy_keeps_legacy_and_existing_target`、`test_corrupt_legacy_state_is_not_replaced_with_empty`、`test_archive_preserves_external_thread_metadata`。
+- [x] **Step 3：运行红灯。** Run: `python -m pytest plugins/harness/codex/tests -q`（插件测试依赖已显式安装）。
+- [x] **Step 4：移动并适配厂商实现。** 替换 approvals/security/io_utils 的内部导入：审批走 call context；文件写入用公开 storage 或插件自有普通 Python I/O，保留原子写语义；投影接受公开 DTO。
+- [x] **Step 5：实现状态目录兼容。** 仅插件激活后的实际打开执行原子复制；旧文件保留，新目标优先；缓存再生不移动原生 Codex 数据。
+- [x] **Step 6：验证已有功能。** 文本/推理/工具流、模型/effort、图片/文件、OAuth/API key 状态、审批、compact/review/skills/status/new/clear、取消、续接、历史恢复和 archive 均有模拟引擎测试。
+- [x] **Step 7：验证并提交。** 重跑 Step 3 和 B2/B3 的假 Harness 契约；建议提交：`refactor(harness): extract Codex into SDK plugin`。本步在独立测试宿主验证新插件，主应用仍走旧内置路径，不在同一应用同时激活两套实现；A3 统一切换，A6 删除旧源码，此步不宣称默认启动已减负。
 
 ### A3 迁出 Qoder 并完成通用后端分发
 
