@@ -90,8 +90,8 @@ datas += collect_data_files(
 )
 
 # Collect package metadata for packages that use importlib.metadata at runtime.
-# Keep this allowlist in sync when adding runtime dependencies that query
-# importlib.metadata, otherwise packaged sidecars may fail only after install.
+# Include required dependency metadata so SDK target installs can audit bundled
+# host packages as well as packages that query importlib.metadata themselves.
 _metadata_pkgs = [
     "qwenpaw",
     "fastmcp",
@@ -119,7 +119,7 @@ _metadata_pkgs = [
 ]
 for _pkg in _metadata_pkgs:
     try:
-        datas += copy_metadata(_pkg)
+        datas += copy_metadata(_pkg, recursive=True)
     except Exception:
         pass
 

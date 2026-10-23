@@ -163,6 +163,47 @@ def _uv_additions(output: str) -> set[str]:
     return names
 
 
+def _target_requirements(
+    entries: list,
+    installed: dict[str, str],
+) -> list[str]:
+    """Install only audited missing artifacts, never target copies of hosts."""
+    requirements = []
+    seen = set()
+    try:
+        for item in entries:
+            metadata = item["metadata"]
+            name = canonicalize_name(metadata["name"], validate=True)
+            version = Version(metadata["version"])
+            if name in seen:
+                raise ValueError("Duplicate distribution in pip report")
+            seen.add(name)
+            if name in installed:
+                if version != Version(installed[name]):
+                    raise ValueError(f"Plan changes installed {name}")
+                continue
+            download = item["download_info"]
+            url = download["url"]
+            digest = download["archive_info"]["hashes"]["sha256"]
+            if any(char.isspace() for char in url) or not re.fullmatch(
+                r"[0-9a-fA-F]{64}",
+                digest,
+            ):
+                raise ValueError("Invalid artifact URL or SHA256")
+            declaration = f"{name} @ {url}"
+            Requirement(declaration)
+            requirements.append(f"{declaration} --hash=sha256:{digest}")
+    except (ValueError, TypeError, KeyError) as exc:
+        raise SDKRestartRequiredError(
+            "Cannot verify pip target dependency artifacts; prepare "
+            "dependencies offline with an auditable pip report. "
+            f"{exc}",
+        ) from exc
+    return requirements
+
+
+# Keep resolution and the matching audited install command together.
+# pylint: disable-next=too-many-branches,too-many-statements
 def install_sdk_requirements(
     requirements: Path,
     plugin_id: str,
@@ -210,6 +251,12 @@ def install_sdk_requirements(
         if result.returncode and "No module named pip" in (
             result.stdout + result.stderr
         ):
+            if target:
+                raise SDKRestartRequiredError(
+                    "Verified SDK target installation requires pip with "
+                    "JSON reporting in the helper Python; uv target plans "
+                    "cannot verify artifact provenance.",
+                )
             uv = find_uv()
             if uv is None:
                 raise RuntimeError(
@@ -252,6 +299,19 @@ def install_sdk_requirements(
                 raise SDKRestartRequiredError(
                     "Unrecognized pip dependency plan.",
                 ) from exc
+        if target:
+            selected = _target_requirements(plan["install"], installed)
+            filtered = Path(temp) / "missing.txt"
+            filtered.write_text("\n".join(selected) + "\n", encoding="utf-8")
+            suffix = [
+                "--target",
+                target,
+                "--no-deps",
+                "--require-hashes",
+                "-r",
+                str(filtered),
+            ]
+            additions -= installed.keys()
         if additions & installed.keys():
             raise SDKRestartRequiredError(
                 "Dependency plan reinstalls existing distributions (including "

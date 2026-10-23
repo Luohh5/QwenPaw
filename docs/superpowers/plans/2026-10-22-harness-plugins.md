@@ -310,6 +310,8 @@
 
 **A5 代码检查点（2026-10-24）：** 独立产物/规范检查58项、核心SDK91项、实际ZIP插件Codex36项/Qoder27项通过，前端与网站构建、hooks通过。真实无厂商SDK的full环境完成macOS PyInstaller后端/CLI、helper Python与Node准备；实际包/PYZ未发现旧运行包和厂商SDK/CLI。代码审查发现的PyInstaller测试依赖已补齐并复审通过。Step 6仍未通过：本机冻结可执行文件即使在工具沙箱外也被SIGKILL，签名验证有效，原因仍待定位；Windows/Linux执行及真实账户验收无可用环境，不能由构建成功或模拟测试推断。保留这些缺口，继续独立的A6迁移和缺席验收。
 
+**A5 安装器后续修复：** 真实 helper 事务复现了 pip target 计划包含宿主同版本依赖而被误判重启的问题，现仅安装经 URL/SHA256 校验的缺失产物，保留非 target 的替换保护。冻结规范递归保留宿主依赖元数据。独立真实 wheel/ZIP + staged helper 的 Codex、Qoder 事务与 CLI 版本验证通过；该验证显式模拟了桌面路由，不等同于冻结可执行宿主验收。旧冻结包早于元数据修复，最终须重建，Step 6继续保持未完成。
+
 ### A6 旧用户迁移、旧包删除和最终验收
 
 **Files**

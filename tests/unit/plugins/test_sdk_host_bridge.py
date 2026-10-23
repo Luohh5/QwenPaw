@@ -841,22 +841,19 @@ async def test_cancel_at_tracker_terminal_lock_does_not_leak_async_generator_con
         loop.set_exception_handler(previous)
 
 
-def test_sdk_dependency_uv_reinstall_plan_is_rejected_before_mutation(
+def test_sdk_dependency_target_without_pip_fails_before_mutation(
     tmp_path,
     monkeypatch,
 ):
-    """Internal installer check; direct URLs remain outside the Gate."""
+    """A target install requires an auditable pip artifact plan."""
     import importlib.metadata
-    import shutil
     import subprocess
     import sys
-    import zipfile
     from qwenpaw.plugins import SDKRestartRequiredError
     from qwenpaw.plugins import _sdk_dependencies as dependencies
 
     target = tmp_path / "site"
     target.mkdir()
-    archive = tmp_path / "sdk_plan_child-1.0-py3-none-any.whl"
     files = {
         "sdk_plan_child/__init__.py": "VALUE = 'old'\n",
         "sdk_plan_child-1.0.dist-info/METADATA": (
@@ -873,24 +870,13 @@ def test_sdk_dependency_uv_reinstall_plan_is_rejected_before_mutation(
         destination = target / key
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(value)
-    files["sdk_plan_child/__init__.py"] = "VALUE = 'replacement'\n"
-    with zipfile.ZipFile(archive, "w") as output:
-        for key, value in files.items():
-            output.writestr(key, value)
     requirements = tmp_path / "requirements.txt"
-    requirements.write_text("sdk-plan-child @ " + archive.as_uri() + "\n")
+    requirements.write_text("sdk-plan-child==1.0\n")
     monkeypatch.setattr(
         dependencies,
         "distributions",
         lambda: importlib.metadata.distributions(path=[str(target)]),
     )
-    for key in ("UV_CACHE_DIR", "UV_CREDENTIALS_DIR", "XDG_CONFIG_HOME"):
-        monkeypatch.setenv(key, str(tmp_path / key.lower()))
-    monkeypatch.setenv("UV_NO_INDEX", "1")
-    uv = shutil.which("uv")
-    assert (
-        uv
-    ), "The isolated test environment must provide its dependency resolver"
     commands = []
 
     def run(args, **_):
@@ -898,41 +884,29 @@ def test_sdk_dependency_uv_reinstall_plan_is_rejected_before_mutation(
             "--dry-run" in args
         ), "A reinstall plan reached a mutating command"
         commands.append(args)
-        if "--report" in args:
-            # Select the actual uv fallback without relying on whether this
-            # pytest interpreter happens to have pip installed.
-            return subprocess.CompletedProcess(
-                args,
-                1,
-                "",
-                "No module named pip",
-            )
-        result = subprocess.run(
+        return subprocess.CompletedProcess(
             args,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
+            1,
+            "",
+            "No module named pip",
         )
-        (tmp_path / "uv-plan.txt").write_text(result.stdout + result.stderr)
-        return result
 
-    with pytest.raises(SDKRestartRequiredError):
+    def no_uv_fallback():
+        raise AssertionError("Target install fell back to unaudited uv plan")
+
+    with pytest.raises(SDKRestartRequiredError, match="requires pip"):
         dependencies.install_sdk_requirements(
             requirements,
             "plan-contract",
             python=sys.executable,
             target=str(target),
             run=run,
-            find_uv=lambda: uv,
+            find_uv=no_uv_fallback,
         )
-    assert len(commands) == 2
+    assert len(commands) == 1
     assert (
         target / "sdk_plan_child/__init__.py"
     ).read_text() == "VALUE = 'old'\n"
-    assert (
-        "Would uninstall 1 package" in (tmp_path / "uv-plan.txt").read_text()
-    )
 
 
 @pytest.mark.parametrize("resolver", ["pip", "uv"])

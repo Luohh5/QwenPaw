@@ -157,7 +157,10 @@ def test_desktop_spec_reaches_analysis_without_vendor_sdks() -> None:
     class ReachedAnalysis(Exception):
         """Stop before the expensive onedir build."""
 
-    def stop_at_analysis(*_args, **_kwargs):
+    collected_data = []
+
+    def stop_at_analysis(*_args, **kwargs):
+        collected_data.extend(kwargs["datas"])
         raise ReachedAnalysis
 
     with pytest.raises(ReachedAnalysis):
@@ -168,6 +171,29 @@ def test_desktop_spec_reaches_analysis_without_vendor_sdks() -> None:
                 "Analysis": stop_at_analysis,
             },
         )
+
+    metadata_names = {
+        destination.partition("-")[0].replace("_", "-")
+        for _source, destination in collected_data
+        if destination.endswith(".dist-info")
+    }
+    host_transitives = {
+        "typing-extensions",
+        "typing-inspection",
+        "annotated-types",
+        "certifi",
+        "jiter",
+        "distro",
+    }
+    assert host_transitives <= metadata_names
+    assert (
+        not {
+            "openai-codex",
+            "codex-cli-bin",
+            "qoder-agent-sdk",
+        }
+        & metadata_names
+    )
 
 
 def test_executable_scripts_preserves_runtime_hooks_and_selected_entry(

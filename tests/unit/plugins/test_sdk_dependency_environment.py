@@ -173,6 +173,76 @@ def test_dependency_environment_change_during_resolution_blocks_install(
     assert len(calls) == 1
 
 
+def test_target_install_keeps_host_dependency_out_of_plugin_site(
+    tmp_path,
+    monkeypatch,
+):
+    """A desktop helper installs only the new SDK, not host-pinned code."""
+    import zipfile
+
+    from .sdk_dependency_fixture import dependency_python
+
+    host = tmp_path / "host"
+    distribution(host, "sdk-host-child", "1.0")
+    audit_paths(monkeypatch, host)
+    python, _ = dependency_python(tmp_path / "helper")
+    wheels = tmp_path / "wheels"
+    wheels.mkdir()
+    for name, dependency in (
+        ("sdk-host-child", ""),
+        ("sdk-new-parent", "sdk-host-child>=1.0"),
+    ):
+        module = name.replace("-", "_")
+        info = f"{module}-1.0.dist-info"
+        metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
+        if dependency:
+            metadata += f"Requires-Dist: {dependency}\n"
+        files = {
+            f"{module}/__init__.py": "VALUE = 'wheel'\n",
+            f"{info}/METADATA": metadata,
+            f"{info}/WHEEL": (
+                "Wheel-Version: 1.0\nRoot-Is-Purelib: true\n"
+                "Tag: py3-none-any\n"
+            ),
+        }
+        files[f"{info}/RECORD"] = (
+            "".join(f"{path},,\n" for path in files) + f"{info}/RECORD,,\n"
+        )
+        with zipfile.ZipFile(
+            wheels / f"{module}-1.0-py3-none-any.whl",
+            "w",
+        ) as archive:
+            for path, content in files.items():
+                archive.writestr(path, content)
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("sdk-new-parent==1.0\n")
+    target = tmp_path / "plugin-site"
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(wheels))
+
+    def run(args, **_kwargs):
+        return subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    dependencies.install_sdk_requirements(
+        requirements,
+        "target-plan",
+        python=str(python),
+        target=str(target),
+        run=run,
+        find_uv=lambda: None,
+    )
+    assert (target / "sdk_new_parent/__init__.py").is_file()
+    assert not (target / "sdk_host_child").exists()
+    assert not (target / "sdk_host_child-1.0.dist-info").exists()
+    assert (host / "sdk_host_child.py").read_text() == "VERSION = '1.0'\n"
+
+
 @pytest.mark.parametrize(
     ("installer", "host_has_pip"),
     [("pip", True), ("pip", False), ("uv", True)],
