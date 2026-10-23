@@ -16,9 +16,11 @@ from .test_sdk_entry_contract import plugin_loader
 from .harness_bridge_fixture import collect, harness_fixture, request, until
 
 
+@pytest.mark.parametrize("reset_command", ["/clear", "/new"])
 async def test_turn_envelopes_attachments_commands_clear_and_history(
     tmp_path,
     harness,
+    reset_command,
 ):
     from qwenpaw.app.chats.session import SafeJSONSession
     from qwenpaw.schemas import AgentRequest, MessageType
@@ -100,7 +102,7 @@ async def test_turn_envelopes_attachments_commands_clear_and_history(
     assert (await collect(runtime, "/compact details"))[-1].output[-1].content[
         0
     ].text == "compact:details"
-    await collect(runtime, "/clear")
+    await collect(runtime, reset_command)
     assert backend.resets == 1
     cleared = await session.get_session_state_dict(
         "same-session",
@@ -138,7 +140,7 @@ async def test_call_context_uses_host_identity_and_fresh_capabilities(
     from qwenpaw.app.approvals import get_approval_service
     from qwenpaw.plugins import SDKError
     from qwenpaw.plugins.harnesses import HarnessApprovalSummary
-    from tests.unit.harnesses.test_capability_resolver import _write_skill
+    from tests.unit.plugins.test_harness_capabilities import _write_skill
 
     path = tmp_path / "one"
     _write_skill(path, "console-only", channels=["console"])
@@ -292,6 +294,127 @@ async def test_same_session_id_isolated_by_workspace_and_user(
     )["agent"]["state"]["context"]
 
 
+async def test_concurrent_same_session_approval_and_credentials_stay_scoped(
+    tmp_path,
+    harness,
+):
+    from types import SimpleNamespace
+
+    from qwenpaw.app.approvals import get_approval_service
+    from qwenpaw.app.approvals.service import (
+        ApprovalActor,
+        ApprovalIdentityMismatchError,
+    )
+    from qwenpaw.app.driver_config_service import DriverConfigService
+    from qwenpaw.drivers.contracts import DriverCard
+    from qwenpaw.security.tool_guard.approval import ApprovalDecision
+
+    for workspace, token in (("one", "one-secret"), ("two", "two-secret")):
+        path = tmp_path / workspace
+        path.mkdir()
+        await DriverConfigService(
+            SimpleNamespace(workspace_dir=path),
+        ).save_card(
+            DriverCard(
+                name="private-mcp",
+                protocol="mcp",
+                endpoint={
+                    "transport": "stdio",
+                    "command": "never-run",
+                    "env": {"TOKEN": token},
+                },
+                config={"tools": ["read"]},
+            ),
+            reload_driver=False,
+        )
+    service = get_approval_service()
+    calls = (
+        ("one", "alice", "console"),
+        ("two", "bob", "mail"),
+    )
+    tasks = [
+        asyncio.create_task(
+            collect(
+                harness.runtime(workspace),
+                "approval",
+                user=user,
+                channel=channel,
+            ),
+        )
+        for workspace, user, channel in calls
+    ]
+    try:
+        async with asyncio.timeout(5):
+            while True:
+                pending = await service.list_pending_by_session(
+                    "same-session",
+                )
+                if len(pending) == 2:
+                    break
+                await asyncio.sleep(0.005)
+        by_agent = {row.agent_id: row for row in pending}
+        assert set(by_agent) == {"one", "two"}
+        assert {
+            (row.user_id, row.channel, row.session_id) for row in pending
+        } == {
+            ("alice", "console", "same-session"),
+            ("bob", "mail", "same-session"),
+        }
+        contexts = {
+            backend.context.workspace_id: backend.calls[0]
+            for backend in harness.plugin.created
+        }
+        assert {
+            workspace: context.runtime_capabilities.mcp_servers[
+                0
+            ].revealed_env()
+            for workspace, context in contexts.items()
+        } == {
+            "one": {"TOKEN": "one-secret"},
+            "two": {"TOKEN": "two-secret"},
+        }
+        alice = ApprovalActor(
+            "same-session",
+            "same-session",
+            "alice",
+            "console",
+            "one",
+        )
+        bob = ApprovalActor(
+            "same-session",
+            "same-session",
+            "bob",
+            "mail",
+            "two",
+        )
+        with pytest.raises(ApprovalIdentityMismatchError):
+            await service.resolve_request(
+                by_agent["one"].request_id,
+                ApprovalDecision.APPROVED,
+                actor=bob,
+            )
+        await service.resolve_request(
+            by_agent["one"].request_id,
+            ApprovalDecision.APPROVED,
+            actor=alice,
+        )
+        await service.resolve_request(
+            by_agent["two"].request_id,
+            ApprovalDecision.DENIED,
+            actor=bob,
+        )
+        completed = await asyncio.gather(*tasks)
+        assert all(items[-1].status == "completed" for items in completed)
+        assert {
+            backend.context.workspace_id: backend.approval_decision
+            for backend in harness.plugin.created
+        } == {"one": "approved", "two": "rejected"}
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def test_materialized_history_does_not_resolve_missing_backend(tmp_path):
     from qwenpaw.app.chats.session import SafeJSONSession
     from qwenpaw.runtime.backends.execution import BackendExecution
@@ -335,7 +458,7 @@ async def test_skill_snapshot_keeps_loop_live_and_lock_until_worker_finishes(
 ):
     from qwenpaw.plugins._harness_capabilities import HarnessCapabilityResolver
     from qwenpaw.utils.io_utils import get_path_lock
-    from tests.unit.harnesses.test_capability_resolver import _write_skill
+    from tests.unit.plugins.test_harness_capabilities import _write_skill
 
     _write_skill(tmp_path, "blocked", channels=["console"])
     target = tmp_path / "skills" / "blocked" / "SKILL.md"
@@ -380,7 +503,10 @@ async def test_skill_snapshot_keeps_loop_live_and_lock_until_worker_finishes(
     assert contender_entered.is_set()
 
 
-@pytest.mark.parametrize("outcome", ["approved", "rejected", "cancelled"])
+@pytest.mark.parametrize(
+    "outcome",
+    ["approved", "rejected", "cancelled", "timeout"],
+)
 async def test_approval_uses_host_identity_and_original_decisions(
     harness,
     outcome,
@@ -434,9 +560,11 @@ async def test_approval_uses_host_identity_and_original_decisions(
             await service.resolve_request(
                 pending.request_id,
                 (
-                    ApprovalDecision.APPROVED
-                    if outcome == "approved"
-                    else ApprovalDecision.DENIED
+                    {
+                        "approved": ApprovalDecision.APPROVED,
+                        "rejected": ApprovalDecision.DENIED,
+                        "timeout": ApprovalDecision.TIMEOUT,
+                    }[outcome]
                 ),
                 actor=actor,
             )

@@ -199,7 +199,25 @@ async def test_archive_preserves_external_thread_metadata(
     harness_context,
     call_context,
     codex_client,
+    monkeypatch,
 ):
+    original_request = codex_client.request
+
+    async def request_with_reasoning(method, params):
+        response = await original_request(method, params)
+        if method == "thread/read":
+            response["thread"]["turns"][0]["items"].insert(
+                1,
+                {
+                    "id": "reason-1",
+                    "type": "reasoning",
+                    "summary": ["Checking"],
+                    "content": ["Raw private reasoning"],
+                },
+            )
+        return response
+
+    monkeypatch.setattr(codex_client, "request", request_with_reasoning)
     instance = backend(harness_context, codex_client)
     try:
         await instance.prepare()
@@ -218,7 +236,16 @@ async def test_archive_preserves_external_thread_metadata(
                 "archived": True,
             },
         )
-        assert [item.text for item in history] == ["Old prompt", "Old answer"]
+        assert [item.text for item in history] == [
+            "Old prompt",
+            "Checking",
+            "Old answer",
+        ]
+        assert [item.kind.value for item in history] == [
+            "user",
+            "reasoning",
+            "message",
+        ]
         assert (
             "thread/list",
             {"limit": 10, "archived": True},

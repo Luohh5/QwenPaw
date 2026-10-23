@@ -336,6 +336,45 @@ user_id=..., channel=...)` 经生产桥接返回公开 `ChatEvent` 异步流。
 停用/重新启用测试使用 `host.install()`，审批使用真实测试宿主审批方法，续接通过
 公开存储断言。作者只导入公开 `qwenpaw.plugins.*`，厂商 SDK 和 adapter 属于插件包。
 
+## 可选 Codex 与 Qoder 后端
+
+SDK 1.1 的 `qwenpaw-harness-codex` 与 `qwenpaw-harness-qoder` 是独立插件，
+通过 **设置 → 插件** 或经过验证的本地 ZIP 安装。原生宿主和 `qwenpaw[full]`
+不包含两家 SDK，也不启用对应后端。过渡期的 `qwenpaw[codex]` / `qwenpaw[qoder]`
+extra 只准备 Python 依赖，不能代替插件安装或启用。账号和可执行文件设置仅在选中
+可用后端时出现；禁用、修复沿用已有插件生命周期操作。
+
+### 升级已有第三方 Agent
+
+本版本要求在新宿主重启前显式完成准备与迁移。先停止旧宿主，为已有 Agent 实际使用
+的后端取得已验证插件包，并在匹配的 Python/runtime 环境中离线准备固定依赖。
+安装新宿主但尚未启动时执行：
+
+```sh
+QWENPAW_WORKING_DIR="$HOME/.qwenpaw" qwenpaw plugin migrate-legacy-harnesses \
+  --plugin-dir /path/to/verified-local-packages --dry-run
+QWENPAW_WORKING_DIR="$HOME/.qwenpaw" qwenpaw plugin migrate-legacy-harnesses \
+  --plugin-dir /path/to/verified-local-packages --apply
+```
+
+PowerShell 先设置 `$env:QWENPAW_WORKING_DIR = "$HOME/.qwenpaw"` 再调用 `qwenpaw`。
+CLI 不会改指向已经初始化的工作目录。从源码发行物也可调用相同实现：
+
+```sh
+python scripts/pack/migrate_legacy_harnesses.py --working-dir /path/to/data \
+  --plugin-dir /path/to/verified-local-packages --dry-run
+# 计划确认包和依赖均已准备后，再将 --dry-run 换成 --apply。
+```
+
+JSON 仅列出所需 plugin ID、现有启停状态、可用包及版本、缺失依赖、动作和执行结果。
+纯原生用户计划为空。apply 经过正式离线安装事务，不启动插件、不下载依赖；显式禁用
+优先，重复执行不重装已有插件。Agent 后端选择、已保存历史、会话映射和原生账号均保留。
+
+缺包或缺依赖时按报告中的安装动作处理，不应把保存的 Agent 悄悄改成原生。
+配置和已物化历史仍可读取，但运行该 Agent 或恢复未物化厂商历史需要对应插件已启用。
+启动后仍可使用正常的插件安装/修复界面。现有桌面/CLI 自动更新流程不会替用户准备这些
+可选包；跳过准备的升级不保证无缝完成。
+
 ## 能力与公开模块
 
 | 能力                         | 公开入口                                                             |
@@ -554,8 +593,9 @@ deadline，`call.cancelled/check_cancelled()` 可供同步线程协作退出。
 满足版本约束或当前平台 marker 不适用的依赖不受此限制；旧插件门禁不变。
 安装锁内复核当前分发快照；固定全部已安装包也避免解析期间首次 import 的窗口，
 但不承诺能阻止管理员或其他进程同时修改共享环境。解析与安装也不是共享环境的原子事务。
-桌面冻结环境的 `--target` 解析可能计划重新复制已有依赖，此时同样拒绝热安装，
-需在停止进程后准备依赖；不能把这项保守保护理解为已验证所有桌面安装组合。
+SDK 桌面 `--target` 安装要求 helper Python 提供 pip（标准桌面 helper 已包含）。
+宿主审核 JSON 计划，排除已安装的宿主包，仅按 URL 和 SHA-256 安装缺失包；
+无法验证的计划在安装前拒绝，不支持 uv target 回退。非 target 的 uv 安装仍保留原有依赖检查。
 
 公开异常为 `SDKError`、`SDKAccessError`、`SDKCompatibilityError`、`SDKRestartRequiredError`、`StaleContextError`、
 `ResourceError`、`ToolInputError` 和兼容导出的 `PluginBusyError`。

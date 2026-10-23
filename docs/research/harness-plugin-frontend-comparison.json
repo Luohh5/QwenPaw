@@ -1,0 +1,163 @@
+{
+  "metric": "observed actual browser-scene document+asset response BODY bytes (identity encoded); not whole HTTP wire transferSize or timing",
+  "baseline_commit": "0db9a8e625e73917a0d113e255b3147134022db8",
+  "source_phase": "Final reviewed source; finalfix Console build PASS; all five after-browser samples rerun after final catalog/loader fixes",
+  "scene": "fresh native Harness QA Agent -> Edit -> Third-party agent expand -> Cancel (no saved backend change)",
+  "environment": "same full-core pinned dependencies plus both SDKs (/private/tmp/qwenpaw-harness-both-vendors-20261024); fresh HOME/config, server process and browser origin per run; every subprocess/network launch denied by fixedguard",
+  "driver_sha256": "87f7043081b4c4bb5f1e3052147127d5dc3580013ddf42bb5768416ea95872f1",
+  "guard_sha256": "b7125ac0f65245826519ff6b8cbc1e59dd9d511f80d48580d7d50f1692047616",
+  "before": {
+    "runs": [
+      {
+        "run": 1,
+        "document_asset_response_body_bytes": 11547780,
+        "static_responses": 62,
+        "vendor_probe_count": 1,
+        "vendor_process_count": 0,
+        "vendor_status_requests": 1,
+        "vendor_module_count": 17
+      },
+      {
+        "run": 2,
+        "document_asset_response_body_bytes": 11547780,
+        "static_responses": 62,
+        "vendor_probe_count": 1,
+        "vendor_process_count": 0,
+        "vendor_status_requests": 1,
+        "vendor_module_count": 17
+      },
+      {
+        "run": 3,
+        "document_asset_response_body_bytes": 11547780,
+        "static_responses": 62,
+        "vendor_probe_count": 1,
+        "vendor_process_count": 0,
+        "vendor_status_requests": 1,
+        "vendor_module_count": 17
+      },
+      {
+        "run": 4,
+        "document_asset_response_body_bytes": 11547780,
+        "static_responses": 62,
+        "vendor_probe_count": 1,
+        "vendor_process_count": 0,
+        "vendor_status_requests": 1,
+        "vendor_module_count": 17
+      },
+      {
+        "run": 5,
+        "document_asset_response_body_bytes": 11547780,
+        "static_responses": 62,
+        "vendor_probe_count": 1,
+        "vendor_process_count": 0,
+        "vendor_status_requests": 1,
+        "vendor_module_count": 17
+      }
+    ],
+    "median_body_bytes": 11547780,
+    "max_body_bytes": 11547780
+  },
+  "after": {
+    "runs": [
+      {
+        "run": 1,
+        "document_asset_response_body_bytes": 11529598,
+        "static_responses": 61,
+        "vendor_probe_count": 0,
+        "vendor_process_count": 0,
+        "vendor_status_requests": 0,
+        "vendor_module_count": 0
+      },
+      {
+        "run": 2,
+        "document_asset_response_body_bytes": 11529598,
+        "static_responses": 61,
+        "vendor_probe_count": 0,
+        "vendor_process_count": 0,
+        "vendor_status_requests": 0,
+        "vendor_module_count": 0
+      },
+      {
+        "run": 3,
+        "document_asset_response_body_bytes": 11529598,
+        "static_responses": 61,
+        "vendor_probe_count": 0,
+        "vendor_process_count": 0,
+        "vendor_status_requests": 0,
+        "vendor_module_count": 0
+      },
+      {
+        "run": 4,
+        "document_asset_response_body_bytes": 11529598,
+        "static_responses": 61,
+        "vendor_probe_count": 0,
+        "vendor_process_count": 0,
+        "vendor_status_requests": 0,
+        "vendor_module_count": 0
+      },
+      {
+        "run": 5,
+        "document_asset_response_body_bytes": 11529598,
+        "static_responses": 61,
+        "vendor_probe_count": 0,
+        "vendor_process_count": 0,
+        "vendor_status_requests": 0,
+        "vendor_module_count": 0
+      }
+    ],
+    "median_body_bytes": 11529598,
+    "max_body_bytes": 11529598
+  },
+  "delta_body_bytes": 18182,
+  "frontend_file_manifest_sha256": "f075edcb77ba73dfb3f67319187db41024b91e9825e400b360a96b0f1340e6c4",
+  "limitations": [
+    "No real vendor process was allowed. Probe counts are denied attempts. API polling bytes excluded; sample1 stayed open longer during unrelated diagnosis. Static document/asset body metric remains identical-scope; not whole wire bytes or performance latency.",
+    "Actual served document/assets BODY bytes, identity encoded; not HTTP wiretransferSize or elapsedtime/RAM saving. APIs/polling excluded. Both revisions use the same fixed guard/driver and full pinned runtime environment."
+  ],
+  "screenshots": [
+    "harness-plugin-acceptance-assets/frontend-before.jpg",
+    "harness-plugin-acceptance-assets/frontend-after.jpg"
+  ],
+  "final_build": {
+    "command": "npm run build",
+    "workdir": "/Users/luohh/Documents/Qwenpaw/QwenPaw-main_plugin/console",
+    "exit_code": 0,
+    "session": 30719,
+    "log": "/private/tmp/harness-finalfix-console-build.log",
+    "vite_seconds": 47.03,
+    "checks": [
+      "TypeScript",
+      "Vite",
+      "Monaco CSS",
+      "496-asset precompression",
+      "initial bundle"
+    ],
+    "initial_bundle": {
+      "raw_mib": 9.85,
+      "brotli_mib": 2.55,
+      "assets": 11,
+      "scope": "build metrics, not observed browser transfer"
+    },
+    "source_sha256": {
+      "src/qwenpaw/app/routers/agents.py": "8eebe811d9276926ac91a333511386c07a6243cf421202cecc26b98e84dd2a1a",
+      "console/src/plugins/harnesses.ts": "bb930e93a3ca4ee1e16198e825a07127dc160c9e3c981c27bda63d9052b5d118",
+      "console/src/plugins/usePluginLoader.ts": "381e26820b9add93714a85b45027cfd648726878d846acb0d019b78521492be6"
+    },
+    "dist_file_count": 1746,
+    "index_sha256": "4ac026a9cf7fed0a0ac676342291d2e6d7f1517da61f1ec6437a30d56f36c6e5",
+    "vendor_frontends_rebuilt": false,
+    "source_and_dist_frozen": true
+  },
+  "frontend_file_manifest": "harness-plugin-final-frontend-files.json",
+  "vendor_auth_marker_audit": {
+    "javascript_files": 555,
+    "markers": [
+      "Connect with ChatGPT",
+      "codex login --with-api-key",
+      "QODER_PERSONAL_ACCESS_TOKEN",
+      "Binaries inside the ChatGPT app"
+    ],
+    "matched_files": [],
+    "scope": "vendor authentication UI markers; legitimate Portability and delegation source labels may remain"
+  }
+}

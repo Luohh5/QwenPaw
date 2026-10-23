@@ -2447,8 +2447,9 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         source_path: Path,
         *,
         force: bool = False,
+        allow_install: bool = True,
     ) -> PluginRecord:
-        """Install offline without registering or starting resources."""
+        """Install offline; preparation tools may require check-only deps."""
         source_path = await asyncio.to_thread(Path(source_path).resolve)
         _, manifest = await asyncio.to_thread(
             self._read_source_manifest,
@@ -2483,8 +2484,11 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             decision = await self._ensure_dependencies_installed(
                 source_path,
                 manifest.id,
-                allow_install=self.lifecycle.delegate.owns_dependency_env(
-                    manifest.id,
+                allow_install=(
+                    allow_install
+                    and self.lifecycle.delegate.owns_dependency_env(
+                        manifest.id,
+                    )
                 ),
             )
             if decision.require_restart and manifest.sdk is not None:

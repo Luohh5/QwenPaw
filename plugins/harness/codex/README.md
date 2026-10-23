@@ -38,10 +38,33 @@ Tests use synthetic app-server messages, temporary state and public SDK contexts
 they do not require a Codex account or launch the real executable. CLI/platform
 acceptance is a separate release check.
 
-During extraction staging, the main application still selects its existing
-builtin implementation. This directory is validated in an isolated SDK host;
-do not activate two implementations of backend `codex` in one host. Core routing
-and removal of the old implementation are separate migration steps.
+The native host and `full` extra do not include or enable this backend. The
+transitional `qwenpaw[codex]` extra only prepares Python dependencies; it does
+not install the plugin. Install the verified plugin ZIP separately. Disable or
+uninstall preserves saved Agent settings, materialized history, plugin data and
+the vendor's native account. A saved Agent with an unavailable backend remains
+manageable and returns an explicit unavailable error when run.
+
+For an upgrade from the old builtin backend, stop the old host and prepare the
+verified plugin package and its matching offline dependencies before starting
+the new host. Run the shared migration first with `--dry-run`, then `--apply`:
+
+```sh
+QWENPAW_WORKING_DIR="$HOME/.qwenpaw" qwenpaw plugin migrate-legacy-harnesses \
+  --plugin-dir /path/to/verified-local-packages --dry-run
+QWENPAW_WORKING_DIR="$HOME/.qwenpaw" qwenpaw plugin migrate-legacy-harnesses \
+  --plugin-dir /path/to/verified-local-packages --apply
+```
+
+The installed CLI uses the working directory selected before process startup.
+The source distribution also provides `scripts/pack/migrate_legacy_harnesses.py`
+with an explicit `--working-dir`. Both entry points use one implementation and
+the formal offline installation transaction. Only used backends are planned;
+explicit disable wins, repeated apply is idempotent, and missing packages or
+dependencies produce installation actions without replacing Agent/data files.
+The migration does not download dependencies or activate resources. Existing
+automatic desktop updates do not perform this preparation; a skipped preparation
+requires explicit plugin installation and is not a seamless upgrade.
 
 
 ## Frontend build

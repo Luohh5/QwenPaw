@@ -7,6 +7,7 @@ import { routeRegistry } from "./registry/store";
 import { harnessRegistry } from "./harnesses";
 import { PluginProvider, usePlugins } from "./PluginContext";
 import { setAuthToken } from "../api/config";
+import { setPluginEnabled } from "../api/modules/plugin";
 import { notifyPluginChange } from "../utils/pluginChangeEvents";
 import { removePluginRuntime } from "./pluginRuntimeCleanup";
 import {
@@ -314,6 +315,71 @@ describe("frontend plugin loader", () => {
         String(url).includes("custom-login/files"),
       ),
     ).toHaveLength(1);
+  });
+
+  it("finishes an unrelated ordinary startup script after another plugin changes", async () => {
+    let scriptRequests = 0;
+    let releaseScript!: (response: Response) => void;
+    const heldScript = new Promise<Response>((resolve) => {
+      releaseScript = resolve;
+    });
+    const register = vi.fn(() =>
+      routeRegistry.add("ordinary-notes", {
+        id: "ordinary-notes.page",
+        path: "/apps/ordinary-notes",
+        component: () => null,
+      }),
+    );
+    (
+      globalThis as typeof globalThis & { __registerOrdinary?: () => void }
+    ).__registerOrdinary = register;
+    URL.createObjectURL = vi.fn(
+      () =>
+        `data:text/javascript,${encodeURIComponent(
+          "globalThis.__registerOrdinary(); /* unrelated plugin changed */",
+        )}`,
+    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async (url) => {
+        const path = String(url);
+        if (path.endsWith("/frontend_plugin"))
+          return jsonResponse([
+            { ...plugin("ordinary-notes", "frontend"), status: "active" },
+          ]);
+        if (path.includes("/agents/backends"))
+          return jsonResponse({ backends: [] });
+        if (path.includes("/plugins/other-owner/enabled"))
+          return jsonResponse({
+            id: "other-owner",
+            enabled: false,
+            loaded: false,
+            status: "disabled",
+          });
+        if (path.includes("ordinary-notes/files"))
+          return ++scriptRequests === 1
+            ? heldScript
+            : new Response("globalThis.__registerOrdinary()");
+        return new Response(null, { status: 204 });
+      });
+
+    renderPluginProvider();
+    await waitFor(
+      () =>
+        expect(
+          fetchMock.mock.calls.filter(([url]) =>
+            String(url).includes("ordinary-notes/files"),
+          ),
+        ).toHaveLength(1),
+      { timeout: 5000 },
+    );
+    await setPluginEnabled("other-owner", false);
+    releaseScript(new Response("globalThis.__registerOrdinary()"));
+    await waitFor(() => expect(screen.getByText("ready")).toBeTruthy());
+    await waitFor(() => expect(register).toHaveBeenCalledOnce());
+    expect(routeRegistry.snapshot()).toMatchObject([
+      { id: "ordinary-notes.page", source: "ordinary-notes" },
+    ]);
   });
 
   it("does not execute a pending Harness script after its plugin is disabled", async () => {

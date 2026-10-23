@@ -39,6 +39,7 @@ class HarnessRegistry {
   private listeners = new Set<() => void>();
   private snapshot: HarnessBackendDescriptor[] = [];
   private catalogValid = false;
+  private catalogRevision = 0;
 
   register(pluginId: string, extension: HarnessFrontendExtension): Disposable {
     const id = extension.backendId;
@@ -79,6 +80,7 @@ class HarnessRegistry {
   }
 
   syncCatalog(rows: HarnessBackendDescriptor[]): void {
+    this.catalogRevision += 1;
     this.catalog = new Map(rows.map((row) => [row.id, row]));
     this.catalogValid = true;
     for (const [id, entry] of this.entries) {
@@ -103,8 +105,27 @@ class HarnessRegistry {
   };
   getSnapshot = () => this.snapshot;
   invalidateCatalog(): void {
+    this.catalogRevision += 1;
     this.catalogValid = false;
     this.rebuild();
+  }
+  async refreshCatalog(): Promise<void> {
+    const revision = ++this.catalogRevision;
+    try {
+      const token = getApiToken();
+      const response = await fetch(getApiUrl("/agents/backends"), {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!response.ok)
+        throw new Error(`Failed to load backend catalog (${response.status})`);
+      const body = (await response.json()) as {
+        backends: HarnessBackendDescriptor[];
+      };
+      if (revision === this.catalogRevision) this.syncCatalog(body.backends);
+    } catch (error) {
+      if (revision === this.catalogRevision) this.invalidateCatalog();
+      throw error;
+    }
   }
   private rebuild(): void {
     this.snapshot = this.catalogValid ? Array.from(this.catalog.values()) : [];
@@ -121,21 +142,7 @@ export const harnessNamespace = {
 };
 
 export async function refreshHarnessCatalog(): Promise<void> {
-  try {
-    const token = getApiToken();
-    const response = await fetch(getApiUrl("/agents/backends"), {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    });
-    if (!response.ok)
-      throw new Error(`Failed to load backend catalog (${response.status})`);
-    const body = (await response.json()) as {
-      backends: HarnessBackendDescriptor[];
-    };
-    harnessRegistry.syncCatalog(body.backends);
-  } catch (error) {
-    harnessRegistry.invalidateCatalog();
-    throw error;
-  }
+  await harnessRegistry.refreshCatalog();
 }
 
 function SchemaSettings({

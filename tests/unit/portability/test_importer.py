@@ -23,7 +23,7 @@ from qwenpaw.app.driver_config_service import DriverConfigService
 from qwenpaw.drivers.adapters.mcp_legacy_config import (
     legacy_mcp_client_to_driver,
 )
-from qwenpaw.harnesses.events import HarnessHistoryItem, HarnessHistoryKind
+from qwenpaw.plugins.harnesses import HarnessHistoryItem, HarnessHistoryKind
 from qwenpaw.portability.importer import ProviderImportService
 from qwenpaw.portability.import_jobs import (
     ImportProviderSnapshot,

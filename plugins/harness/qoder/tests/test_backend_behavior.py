@@ -14,6 +14,7 @@ import pytest
 
 from qoder_agent_sdk import (
     PermissionResultAllow,
+    PermissionResultDeny,
     SessionMessage,
     ToolPermissionContext,
 )
@@ -423,4 +424,98 @@ async def test_live_approval_is_scoped_to_call_and_cancelled_with_turn(
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+        await backend.close()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_type"),
+    [
+        ("approved", PermissionResultAllow),
+        ("rejected", PermissionResultDeny),
+        ("cancelled", PermissionResultDeny),
+        ("timeout", PermissionResultDeny),
+    ],
+)
+async def test_qoder_permission_decisions_use_live_public_call(
+    backend_factory,
+    call_context,
+    client_factory,
+    outcome,
+    expected_type,
+):
+    seen = []
+
+    async def decide(summary, *, timeout):
+        seen.append((summary.tool_name, timeout))
+        return outcome
+
+    backend = backend_factory()
+    call = replace(call_context(), _request_approval=decide)
+    waiting = asyncio.Event()
+
+    async def blocked_response():
+        waiting.set()
+        await asyncio.Future()
+        yield None
+
+    async def consume():
+        async for _ in backend.run_turn(call, HarnessRunRequest("Review")):
+            pass
+
+    turn = asyncio.create_task(consume())
+    try:
+        while not client_factory.created:
+            await asyncio.sleep(0)
+        client = client_factory.created[0]
+        client.receive_response = blocked_response
+        await asyncio.wait_for(waiting.wait(), 2)
+        decision = await client.options.can_use_tool(
+            "Bash",
+            {"command": "pytest"},
+            ToolPermissionContext(
+                display_name="Shell",
+                description="Run tests",
+                tool_use_id="tool-1",
+            ),
+        )
+        assert isinstance(decision, expected_type)
+        assert seen == [("Bash", 60)]
+    finally:
+        turn.cancel()
+        await asyncio.gather(turn, return_exceptions=True)
+        await backend.close()
+
+
+@pytest.mark.parametrize(
+    ("permission_mode", "skip_permissions"),
+    [
+        ("bypassPermissions", True),
+        ("default", False),
+        ("plan", False),
+    ],
+)
+async def test_qoder_permission_presets_reach_vendor_client(
+    backend_factory,
+    call_context,
+    client_factory,
+    permission_mode,
+    skip_permissions,
+):
+    backend = backend_factory()
+    call = replace(
+        call_context(),
+        settings={"permission_mode": permission_mode},
+    )
+    try:
+        _ = [
+            event
+            async for event in backend.run_turn(
+                call,
+                HarnessRunRequest("Review"),
+            )
+        ]
+        options = client_factory.created[0].options
+        assert options.permission_mode == permission_mode
+        assert options.allow_dangerously_skip_permissions is skip_permissions
+    finally:
         await backend.close()

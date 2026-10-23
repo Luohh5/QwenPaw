@@ -11,6 +11,7 @@ import pytest
 
 from qwenpaw.plugins import PluginBusyError, StaleContextError
 from qwenpaw.plugins.compliance import check_plugin
+from qwenpaw.plugins.harnesses import HarnessRunRequest
 from qwenpaw.plugins.testing import PluginTestHost
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -90,3 +91,170 @@ async def test_explicit_install_registers_only_codex(tmp_path, monkeypatch):
             await archive.list_external_threads(limit=0, archived=False)
         result = await host.unload("qwenpaw-harness-codex")
         assert result.clean and result.quiescent
+
+
+async def test_reenable_resumes_original_codex_thread(
+    tmp_path,
+    monkeypatch,
+    codex_client,
+):
+    async with PluginTestHost(tmp_path / "host") as host:
+        assert (await host.install(PLUGIN_ROOT)).ok
+        first = codex_client
+        adapter = importlib.import_module(
+            "plugin_qwenpaw_harness_codex.adapter",
+        )
+        monkeypatch.setattr(
+            adapter,
+            "CodexAppServerClient",
+            lambda **_kwargs: first,
+        )
+        _ = [
+            item
+            async for item in host.run_harness(
+                "codex",
+                HarnessRunRequest("first"),
+                workspace_id="test",
+                session_id="original",
+                user_id="alice",
+            )
+        ]
+        assert [
+            params["threadId"]
+            for method, params in first.requests
+            if method == "turn/start"
+        ] == ["new-thread-1"]
+
+        assert (await host.set_enabled("qwenpaw-harness-codex", False)).ok
+        assert (await host.set_enabled("qwenpaw-harness-codex", True)).ok
+        second = type(codex_client)()
+        adapter = importlib.import_module(
+            "plugin_qwenpaw_harness_codex.adapter",
+        )
+        monkeypatch.setattr(
+            adapter,
+            "CodexAppServerClient",
+            lambda **_kwargs: second,
+        )
+        _ = [
+            item
+            async for item in host.run_harness(
+                "codex",
+                HarnessRunRequest("resume"),
+                workspace_id="test",
+                session_id="original",
+                user_id="alice",
+            )
+        ]
+        assert ("thread/resume", {"threadId": "new-thread-1"}) in (
+            second.requests
+        )
+        assert [
+            params["threadId"]
+            for method, params in second.requests
+            if method == "turn/start"
+        ] == ["new-thread-1"]
+
+
+async def test_failed_codex_turn_reaches_public_failed_stream(
+    tmp_path,
+    monkeypatch,
+    codex_client,
+):
+    async with PluginTestHost(tmp_path / "host") as host:
+        assert (await host.install(PLUGIN_ROOT)).ok
+        adapter = importlib.import_module(
+            "plugin_qwenpaw_harness_codex.adapter",
+        )
+        monkeypatch.setattr(
+            adapter,
+            "CodexAppServerClient",
+            lambda **_kwargs: codex_client,
+        )
+        original = codex_client.request
+
+        async def failed_turn(method, params):
+            if method == "turn/start":
+                await codex_client.queue.put(
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": params["threadId"],
+                            "turn": {
+                                "id": "turn-1",
+                                "status": "failed",
+                                "error": {"message": "Vendor turn failed"},
+                            },
+                        },
+                    },
+                )
+                return {"turn": {"id": "turn-1"}}
+            return await original(method, params)
+
+        codex_client.request = failed_turn
+        output = [
+            item
+            async for item in host.run_harness(
+                "codex",
+                HarnessRunRequest("fail"),
+                workspace_id="test",
+                session_id="failed-turn",
+            )
+        ]
+        assert output[-1].status == "failed"
+        assert "Vendor turn failed" in str(output[-1])
+
+
+async def test_force_unload_interrupts_live_codex_turn(
+    tmp_path,
+    monkeypatch,
+    codex_client,
+):
+    started = asyncio.Event()
+    original = codex_client.request
+
+    async def pending_turn(method, params):
+        if method == "turn/start":
+            started.set()
+            return {"turn": {"id": "turn-1"}}
+        return await original(method, params)
+
+    codex_client.request = pending_turn
+    async with PluginTestHost(tmp_path / "host") as host:
+        assert (await host.install(PLUGIN_ROOT)).ok
+        adapter = importlib.import_module(
+            "plugin_qwenpaw_harness_codex.adapter",
+        )
+        monkeypatch.setattr(
+            adapter,
+            "CodexAppServerClient",
+            lambda **_kwargs: codex_client,
+        )
+
+        async def consume():
+            return [
+                item
+                async for item in host.run_harness(
+                    "codex",
+                    HarnessRunRequest("keep working"),
+                    workspace_id="test",
+                    session_id="busy",
+                )
+            ]
+
+        turn = asyncio.create_task(consume())
+        try:
+            await asyncio.wait_for(started.wait(), 3)
+            report = await asyncio.wait_for(
+                host.unload("qwenpaw-harness-codex", interrupt_tasks=True),
+                3,
+            )
+            assert report.clean and report.quiescent
+            assert turn.done()
+            assert codex_client.stopped
+            assert all(
+                row["status"] != "available" for row in host.list_harnesses()
+            )
+        finally:
+            turn.cancel()
+            await asyncio.gather(turn, return_exceptions=True)

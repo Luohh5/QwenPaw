@@ -36,6 +36,11 @@ function descriptor(
     config_fields: [],
   };
 }
+function jsonResponse(value: unknown) {
+  return new Response(JSON.stringify(value), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
 beforeEach(() => {
   owners.forEach((owner) => harnessRegistry.disposeAll(owner));
   harnessRegistry.syncCatalog([]);
@@ -137,6 +142,42 @@ describe("harness frontend ownership", () => {
 
     await act(refreshHarnessCatalog);
     expect(screen.getByText("live settings")).toBeInTheDocument();
+  });
+
+  it("ignores an older failed refresh after a newer available catalog", async () => {
+    let failOld!: (error: Error) => void;
+    const oldResponse = new Promise<Response>((_resolve, reject) => {
+      failOld = reject;
+    });
+    vi.spyOn(globalThis, "fetch")
+      .mockImplementationOnce(() => oldResponse)
+      .mockResolvedValueOnce(jsonResponse({ backends: [descriptor()] }));
+    const old = refreshHarnessCatalog();
+    await refreshHarnessCatalog();
+    failOld(new Error("old unauthorized response"));
+    await expect(old).rejects.toThrow("old unauthorized response");
+    expect(harnessRegistry.getSnapshot()).toEqual([descriptor()]);
+  });
+
+  it("ignores an older available refresh after a newer disabled catalog", async () => {
+    let releaseOld!: (response: Response) => void;
+    const oldResponse = new Promise<Response>((resolve) => {
+      releaseOld = resolve;
+    });
+    vi.spyOn(globalThis, "fetch")
+      .mockImplementationOnce(() => oldResponse)
+      .mockResolvedValueOnce(
+        jsonResponse({
+          backends: [descriptor("third-one", "first-owner", "disabled")],
+        }),
+      );
+    const old = refreshHarnessCatalog();
+    await refreshHarnessCatalog();
+    releaseOld(jsonResponse({ backends: [descriptor()] }));
+    await old;
+    expect(harnessRegistry.getSnapshot()).toEqual([
+      descriptor("third-one", "first-owner", "disabled"),
+    ]);
   });
 });
 

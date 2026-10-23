@@ -62,7 +62,7 @@ from ...plugins.registry import PluginRegistry
 from ..agent_startup import AgentStartupStatus
 from ..multi_agent_manager import MultiAgentManager
 from ...constant import WORKING_DIR
-from ...utils.io_utils import run_sync_io, write_json_atomic
+from ...utils.io_utils import read_json_async, run_sync_io, write_json_atomic
 from ...utils.logging import sanitize_log_value
 
 logger = logging.getLogger(__name__)
@@ -373,9 +373,13 @@ def _backend_metadata(backend: str) -> dict[str, Any]:
     )
 
 
-def _get_available_third_party_provider(backend: str) -> dict[str, Any]:
+def _get_available_third_party_provider(
+    backend: str,
+    *,
+    snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Require a live SDK contribution when selecting a new backend."""
-    row = _backend_metadata(backend)
+    row = _backend_metadata(backend) if snapshot is None else snapshot
     if row["status"] != "available":
         raise HTTPException(
             status_code=409,
@@ -1184,6 +1188,28 @@ async def update_agent(  # pylint: disable=too-many-statements
     ).expanduser()
     canonical_workspace_dir = str(workspace_dir)
 
+    backend_snapshot = None
+    if (
+        "backend" in agent_config.model_fields_set
+        and agent_config.backend != "qwenpaw"
+    ):
+        # Capture mutable registry state on the loop, not in the file worker.
+        backend_snapshot = {
+            "status": _backend_metadata(agent_config.backend)["status"],
+        }
+        if backend_snapshot["status"] != "available":
+            # Normal config loading can persist legacy migrations. Reject an
+            # unavailable switch before invoking that mutating reader.
+            try:
+                saved = await read_json_async(workspace_dir / "agent.json")
+            except FileNotFoundError:
+                saved = {}
+            if saved.get("backend", "qwenpaw") != agent_config.backend:
+                _get_available_third_party_provider(
+                    agent_config.backend,
+                    snapshot=backend_snapshot,
+                )
+
     existing_config_snap = deepcopy(
         await run_sync_io(load_agent_config, agentId),
     )
@@ -1225,6 +1251,15 @@ async def update_agent(  # pylint: disable=too-many-statements
         requested = AgentProfileConfig.model_validate(
             {**existing_config.model_dump(), **update_data},
         )
+        if (
+            backend_snapshot is not None
+            and requested.backend != existing_config.backend
+            and requested.backend != "qwenpaw"
+        ):
+            _get_available_third_party_provider(
+                requested.backend,
+                snapshot=backend_snapshot,
+            )
         if mail_was_set:
             requested.mail = (
                 _merge_unchanged_mail_secrets(

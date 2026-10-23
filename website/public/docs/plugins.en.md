@@ -369,6 +369,55 @@ bridge. Use `host.install()` for disable/re-enable tests, real approval helpers 
 approval, and public storage for persistent resume assertions. Authors import only
 public `qwenpaw.plugins.*` contracts; vendor SDKs and adapters belong to the plugin.
 
+## Optional Codex and Qoder backends
+
+SDK 1.1 Harness plugins `qwenpaw-harness-codex` and `qwenpaw-harness-qoder` are
+installed independently through **Settings → Plugins** or a verified local ZIP.
+The native host and `qwenpaw[full]` do not include their SDKs or enable their
+backends. Transitional `qwenpaw[codex]` / `qwenpaw[qoder]` extras only prepare
+Python dependencies; installing an extra does not install or enable a plugin.
+Account/executable settings appear only for the selected available backend.
+Disable and Repair use the existing plugin lifecycle controls.
+
+### Upgrade an existing third-party Agent
+
+This release requires an explicit prepared/operator step before restarting the
+new host. Stop the old host, obtain the verified packages for the backends already
+used by saved Agents, and prepare their exact dependencies offline in the matching
+Python/runtime environment. With the new host installed but not started:
+
+```sh
+QWENPAW_WORKING_DIR="$HOME/.qwenpaw" qwenpaw plugin migrate-legacy-harnesses \
+  --plugin-dir /path/to/verified-local-packages --dry-run
+QWENPAW_WORKING_DIR="$HOME/.qwenpaw" qwenpaw plugin migrate-legacy-harnesses \
+  --plugin-dir /path/to/verified-local-packages --apply
+```
+
+In PowerShell, set `$env:QWENPAW_WORKING_DIR = "$HOME/.qwenpaw"` before invoking
+`qwenpaw`. The CLI does not repoint an initialized working directory. From a source
+distribution the same implementation is available as:
+
+```sh
+python scripts/pack/migrate_legacy_harnesses.py --working-dir /path/to/data \
+  --plugin-dir /path/to/verified-local-packages --dry-run
+# Repeat with --apply only after the plan reports prepared packages/dependencies.
+```
+
+JSON lists only needed plugin IDs, existing enable/disable state, available
+packages/versions, missing dependencies, actions and apply results. A native-only
+installation has an empty plan. Apply uses the formal offline installation
+transaction without starting plugins or downloading dependencies. Explicitly
+disabled plugins stay disabled; repeated apply leaves existing installations
+alone. Agent backend choices, saved history, session maps and native accounts
+are preserved.
+
+If a package or dependency is missing, follow the reported install action; do not
+switch the saved Agent silently to native. Its configuration and materialized
+history remain readable, but running it or recovering nonmaterialized vendor
+history requires its active plugin. The normal plugin install/repair UI remains
+available after startup. Existing automatic desktop/CLI update flows do not
+prepare these optional bundles: an unprepared upgrade is not claimed seamless.
+
 ## Public capabilities
 
 | Capability                                          | Public entry                                                                               |
@@ -2334,6 +2383,12 @@ that plugin's load. Call `POST /api/plugins/{plugin_id}/repair-dependencies` to 
 them; disabled plugins stay disabled. Versions that conflict with protected host
 packages are refused; resolve the environment conflict first. Administrator-managed
 local runtimes require the administrator to install dependencies.
+
+SDK desktop target installs require pip in the helper Python (included in the
+canonical desktop helper). They audit its JSON plan, omit already-installed host
+packages, and install only missing artifacts by URL and SHA-256. Unverifiable
+plans fail before installation; uv target fallback is unsupported. Non-target uv
+installation keeps its existing dependency checks.
 
 #### Using Custom PyPI Index
 

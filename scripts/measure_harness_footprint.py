@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Measure an isolated import footprint without claiming lifecycle readiness.
+"""Measure isolated native lifecycle stages with process/network denial.
 
-Each invocation uses a fresh process and disposable home/config directories.
-Process creation and network access are denied before importing the app. The
-scenario labels reserve lifecycle measurements; import_ms is never ready_ms.
+Every invocation uses a fresh process and disposable home/config directories.
+Only model transport is replaced; Workspace, Runtime, Agent and history are real.
+The frontend label remains import-only; browser evidence is collected separately.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import importlib
 import json
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 
 SCENARIOS = (
     "native-startup",
@@ -35,6 +37,7 @@ _SOURCE_PATHS = (
     "packages",
     "pyproject.toml",
     "scripts/measure_harness_footprint.py",
+    "plugins/harness",
 )
 
 
@@ -165,25 +168,179 @@ def _rss():
         )
 
 
-def _probe(scenario, commit):
-    # Keep stdout reserved for the protocol; imported libraries may print.
+def _install_model_boundary():
+    from agentscope.formatter import OpenAIChatFormatter
+    from agentscope.message import TextBlock
+    from agentscope.model import ChatModelBase, ChatResponse
+    from qwenpaw.agents import model_factory
+
+    class NativeModel(ChatModelBase):
+        def __init__(self):
+            super().__init__(
+                credential=None,
+                model="footprint-native",
+                parameters=ChatModelBase.Parameters(),
+                stream=True,
+            )
+            self.formatter = OpenAIChatFormatter()
+
+        async def _call_api(self, *_args, **_kwargs):
+            async def chunks():
+                yield ChatResponse(
+                    content=[TextBlock(text="native-answer")],
+                    is_last=False,
+                )
+                yield ChatResponse(
+                    content=[TextBlock(text="native-answer")],
+                    is_last=True,
+                )
+
+            return chunks()
+
+    model_factory.create_model_and_formatter = lambda **_kwargs: (
+        NativeModel(),
+        OpenAIChatFormatter(),
+    )
+
+
+async def _native_scene(app, scenario, report, started):
+    await asyncio.wait_for(app.state.startup_ready.wait(), 30)
+    report.update(
+        milestone="core-agents-ready",
+        ready_ms=(time.perf_counter() - started) * 1000,
+        unavailable_reason=None,
+    )
+    import httpx
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://probe",
+    ) as client:
+        async with asyncio.timeout(30):
+            while True:
+                ready = getattr(app.state, "plugin_registry", None) is not None
+                variant = report["variant"]
+                if variant == "absent" and ready:
+                    report["plugin_states"] = {}
+                    break
+                if variant != "absent" and ready:
+                    response = await client.get("/api/agents/backends")
+                    response.raise_for_status()
+                    states = {
+                        row["id"]: row["status"]
+                        for row in response.json()["backends"]
+                    }
+                    report["plugin_states"] = states
+                    expected = (
+                        {"codex": "disabled", "qoder": "disabled"}
+                        if variant == "disabled"
+                        else {variant: "available"}
+                    )
+                    if all(
+                        states.get(key) == value
+                        for key, value in expected.items()
+                    ):
+                        break
+                await asyncio.sleep(0.01)
+    report["plugin_ready_ms"] = (time.perf_counter() - started) * 1000
+    if scenario == "native-startup":
+        return
+    listed = time.perf_counter()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://probe",
+    ) as client:
+        response = await client.get("/api/agents")
+        response.raise_for_status()
+    report.update(
+        milestone="native-agent-list-complete",
+        agent_list_ms=(time.perf_counter() - listed) * 1000,
+        agent_count=len(response.json()["agents"]),
+    )
+    if scenario == "native-agent-list":
+        return
+    from qwenpaw.schemas import AgentRequest
+
+    chatting = time.perf_counter()
+    workspace = await app.state.multi_agent_manager.get_agent(
+        "default",
+    )
+    stream = workspace.stream_query(
+        AgentRequest(
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "native question"},
+                    ],
+                },
+            ],
+            session_id="probe-session",
+            user_id="probe-user",
+            channel="console",
+            agent_id="default",
+        ),
+    )
+    try:
+        async for _event in stream:
+            pass
+    finally:
+        await stream.aclose()
+    history = workspace.workspace_dir / (
+        "sessions/console/probe-user_probe-session.json"
+    )
+    saved = json.loads(history.read_text(encoding="utf-8"))
+    context = saved["agent"]["state"]["context"]
+    evidence = {
+        role: any(
+            message["role"] == role
+            and any(
+                text in block.get("text", "") for block in message["content"]
+            )
+            for message in context
+        )
+        for role, text in (
+            ("user", "native question"),
+            ("assistant", "native-answer"),
+        )
+    }
+    if not all(evidence.values()):
+        raise RuntimeError("Native terminal history was not persisted")
+    report.update(
+        milestone="native-chat-persisted",
+        history_verified=True,
+        history_roles=sorted(evidence),
+        native_chat_ms=(time.perf_counter() - chatting) * 1000,
+    )
+
+
+async def _lifecycle(app, scenario, report, started, guard):
+    failure = None
+    async with app.router.lifespan_context(app):
+        try:
+            await _native_scene(app, scenario, report, started)
+        except Exception as exc:
+            failure = exc
+        finally:
+            _snapshot(report, guard)
+            report["snapshot_while_running"] = True
+            cleanup_started = time.perf_counter()
+    report["cleanup"] = {
+        "outcome": "completed",
+        "elapsed_ms": (time.perf_counter() - cleanup_started) * 1000,
+        "vendor_probe_count": guard.vendor_probe_count,
+        "blocked_process_attempt_count": len(guard.blocked_process_attempts),
+        "blocked_network_attempts": guard.blocked_network_attempts,
+    }
+    if failure is not None:
+        raise failure
+
+
+def _probe(scenario, commit, variant="absent", source_root=ROOT):
     from contextlib import redirect_stdout, redirect_stderr
 
     started = time.perf_counter()
-    error = None
-    missing_module = None
-    with VendorProbeGuard() as guard:
-        with open(os.devnull, "w", encoding="utf-8") as quiet:
-            with redirect_stdout(quiet), redirect_stderr(quiet):
-                try:
-                    importlib.import_module("qwenpaw.app._app")
-                except Exception as exc:  # report partial imports honestly
-                    error = type(exc).__name__
-                    if isinstance(exc, ModuleNotFoundError):
-                        missing_module = exc.name
-        elapsed = (time.perf_counter() - started) * 1000
-        rss, children_rss, rss_source = _rss()
-    return {
+    report = {
         "commit": commit,
         "python": platform.python_version(),
         "platform": {
@@ -192,69 +349,250 @@ def _probe(scenario, commit):
             "machine": platform.machine(),
         },
         "scenario": scenario,
-        "milestone": "app-import-failed" if error else "app-imported",
+        "variant": variant,
+        "milestone": "app-import-failed",
         "ready_ms": None,
-        "import_ms": elapsed,
-        "import_error": error,
-        "missing_module": missing_module,
-        "unavailable_reason": (
-            "Import-only probe; ASGI lifespan, native agent listing/chat, "
-            "and browser interaction were not executed."
-            + (f" App import stopped with {error}." if error else "")
-        ),
-        "process_rss_bytes": rss,
-        "children_rss_bytes": children_rss,
-        "rss_source": rss_source,
-        "modules": sorted(sys.modules),
-        "vendor_process_count": guard.vendor_process_count,
-        "vendor_probe_count": guard.vendor_probe_count,
-        "blocked_process_attempts": guard.blocked_process_attempts,
-        "blocked_network_attempts": guard.blocked_network_attempts,
-        "isolation": (
-            "fresh process; temporary home, working, secret, cache and "
-            "config directories; launches/network denied"
-        ),
+        "agent_list_ms": None,
+        "native_chat_ms": None,
+        "history_verified": False,
+        "import_error": None,
+        "missing_module": None,
+        "unavailable_reason": "App import has not completed.",
+    }
+    with VendorProbeGuard() as guard:
+        with open(os.devnull, "w", encoding="utf-8") as quiet:
+            with redirect_stdout(quiet), redirect_stderr(quiet):
+                try:
+                    app = importlib.import_module("qwenpaw.app._app").app
+                    origin = Path(sys.modules["qwenpaw"].__file__).resolve()
+                    report["imported_source_path"] = str(origin)
+                    if not origin.is_relative_to(source_root / "src"):
+                        raise RuntimeError(
+                            "Imported source differs from selected source root",
+                        )
+                    report["import_ms"] = (
+                        time.perf_counter() - started
+                    ) * 1000
+                    report["milestone"] = "app-imported"
+                    if scenario == "frontend-native":
+                        report["unavailable_reason"] = (
+                            "Import-only; actual browser transfer evidence "
+                            "is measured separately."
+                        )
+                    else:
+                        if scenario == "native-chat":
+                            _install_model_boundary()
+                        asyncio.run(
+                            _lifecycle(app, scenario, report, started, guard),
+                        )
+                except Exception as exc:
+                    report["error"] = type(exc).__name__
+                    report["unavailable_reason"] = (
+                        "Probe stopped after "
+                        + report["milestone"]
+                        + ": "
+                        + type(exc).__name__
+                    )
+                    if report["milestone"] == "app-import-failed":
+                        report["import_error"] = type(exc).__name__
+                    if isinstance(exc, ModuleNotFoundError):
+                        report["missing_module"] = exc.name
+        report.setdefault("import_ms", (time.perf_counter() - started) * 1000)
+        if "modules" not in report:
+            _snapshot(report, guard)
+            report["snapshot_while_running"] = False
+    return report
+
+
+def _snapshot(report, guard):
+    rss, children_rss, rss_source = _rss()
+    report.update(
+        process_rss_bytes=rss,
+        children_rss_bytes=children_rss,
+        rss_source=rss_source,
+        modules=sorted(sys.modules),
+        vendor_process_count=guard.vendor_process_count,
+        vendor_probe_count=guard.vendor_probe_count,
+        blocked_process_attempts=list(guard.blocked_process_attempts),
+        blocked_network_attempts=guard.blocked_network_attempts,
+        isolation="fresh process; temporary home/config; launches/network denied",
+    )
+    report["module_origins"] = {
+        name: str(origin)
+        for name, module in tuple(sys.modules.items())
+        if (origin := getattr(module, "__file__", None))
+        and (
+            "/plugins/" in str(origin).replace("\\", "/")
+            or name.startswith(
+                (
+                    "qwenpaw.harnesses",
+                    "openai_codex",
+                    "codex_cli_bin",
+                    "qoder_agent_sdk",
+                ),
+            )
+        )
     }
 
 
 def _source_state(root):
-    """Identify actual git-listed source bytes, including untracked edits."""
-    names = subprocess.check_output(
-        [
-            "git",
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "--",
-            *_SOURCE_PATHS,
-        ],
-        cwd=root,
-    ).split(b"\0")
+    """Fingerprint actual source bytes; archive SHAs are declared separately."""
+    root = Path(root)
+    try:
+        names = subprocess.check_output(
+            [
+                "git",
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "--",
+                *_SOURCE_PATHS,
+            ],
+            cwd=root,
+            stderr=subprocess.DEVNULL,
+        ).split(b"\0")
+        dirty = bool(
+            subprocess.check_output(
+                [
+                    "git",
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                    "--",
+                    *_SOURCE_PATHS,
+                ],
+                cwd=root,
+            ),
+        )
+        kind = "git"
+    except subprocess.CalledProcessError:
+        names = [
+            path.relative_to(root).as_posix().encode()
+            for relative in _SOURCE_PATHS
+            for path in (
+                [root / relative]
+                if (root / relative).is_file()
+                else (root / relative).rglob("*")
+            )
+            if path.is_file()
+            and not {"__pycache__", "node_modules"}.intersection(path.parts)
+            and path.suffix != ".pyc"
+        ]
+        dirty, kind = None, "archive"
     digest = hashlib.sha256()
     for name in sorted(set(names) - {b""}):
-        path = Path(root) / os.fsdecode(name)
+        path = root / os.fsdecode(name)
         digest.update(name + b"\0")
         digest.update(
             b"file\0" + path.read_bytes() if path.is_file() else b"missing\0",
         )
         digest.update(b"\0")
-    dirty = subprocess.check_output(
-        [
-            "git",
-            "status",
-            "--porcelain",
-            "--untracked-files=all",
-            "--",
-            *_SOURCE_PATHS,
-        ],
-        cwd=root,
+    return {"dirty": dirty, "kind": kind, "fingerprint": digest.hexdigest()}
+
+
+def _seed(temporary, variant, plugin_dir):
+    work = temporary / "work"
+    workspace = work / "workspaces/default"
+    workspace.mkdir(parents=True)
+    plugins = {}
+    wanted = (
+        ("codex", "qoder")
+        if variant == "disabled"
+        else (() if variant == "absent" else (variant,))
     )
-    return {"dirty": bool(dirty), "fingerprint": digest.hexdigest()}
+    manifests = {}
+    for backend in wanted:
+        plugin_id = "qwenpaw-harness-" + backend
+        matches = [
+            path.parent
+            for path in plugin_dir.rglob("plugin.json")
+            if json.loads(path.read_text(encoding="utf-8")).get("id")
+            == plugin_id
+        ]
+        archives = []
+        if not matches:
+            for path in plugin_dir.rglob("*.zip"):
+                with zipfile.ZipFile(path) as archive:
+                    for name in archive.namelist():
+                        if (
+                            Path(name).name == "plugin.json"
+                            and len(Path(name).parts) <= 2
+                            and json.loads(archive.read(name)).get("id")
+                            == plugin_id
+                        ):
+                            archives.append((path, name))
+        target = work / "plugins" / plugin_id
+        if len(matches) == 1:
+            shutil.copytree(
+                matches[0],
+                target,
+                ignore=shutil.ignore_patterns(
+                    "node_modules",
+                    "tests",
+                    "__pycache__",
+                ),
+            )
+        elif not matches and len(archives) == 1:
+            bundle, manifest = archives[0]
+            with tempfile.TemporaryDirectory() as directory:
+                unpacked = Path(directory).resolve()
+                with zipfile.ZipFile(bundle) as archive:
+                    for name in archive.namelist():
+                        if (
+                            not (unpacked / name)
+                            .resolve()
+                            .is_relative_to(unpacked)
+                        ):
+                            raise ValueError("Unsafe prepared plugin archive")
+                    archive.extractall(unpacked)
+                shutil.copytree((unpacked / manifest).parent, target)
+        else:
+            raise ValueError(
+                f"Provide exactly one prepared {plugin_id} package",
+            )
+        plugins[plugin_id] = {"enabled": variant != "disabled"}
+        manifests[plugin_id] = hashlib.sha256(
+            (target / "plugin.json").read_bytes(),
+        ).hexdigest()
+    (work / "config.json").write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "active_agent": "default",
+                    "agent_order": ["default"],
+                    "profiles": {
+                        "default": {
+                            "id": "default",
+                            "workspace_dir": str(workspace),
+                        },
+                    },
+                },
+                "plugins": plugins,
+            },
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "agent.json").write_text(
+        json.dumps(
+            {
+                "id": "default",
+                "name": "Native probe",
+                "backend": "qwenpaw",
+                "active_model": {
+                    "provider_id": "footprint",
+                    "model": "native",
+                },
+                "running": {"memory_manager_backend": "none"},
+            },
+        ),
+        encoding="utf-8",
+    )
+    return manifests
 
 
-def _isolated_env(temporary):
+def _isolated_env(temporary, source_root=ROOT):
     temporary = Path(temporary)
     env = {
         key: value
@@ -281,7 +619,10 @@ def _isolated_env(temporary):
         QWENPAW_LOG_LEVEL="error",
         PYTHONDONTWRITEBYTECODE="1",
         PYTHONPATH=os.pathsep.join(
-            (str(ROOT / "src"), str(ROOT / "packages/qwenpawmail-mcp/src")),
+            (
+                str(source_root / "src"),
+                str(source_root / "packages/qwenpawmail-mcp/src"),
+            ),
         ),
     )
     return env
@@ -291,6 +632,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", required=True, choices=SCENARIOS)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--source-root", type=Path, default=ROOT)
+    parser.add_argument("--baseline-commit", help="Trusted source archive SHA")
+    parser.add_argument(
+        "--variant",
+        choices=("absent", "disabled", "codex", "qoder"),
+        default="absent",
+    )
+    parser.add_argument(
+        "--plugin-dir",
+        type=Path,
+        default=ROOT / "plugins/harness",
+    )
     parser.add_argument(
         "--_child",
         action="store_true",
@@ -305,21 +658,38 @@ def main():
     )
     args = parser.parse_args()
     if args.child:
-        print(json.dumps(_probe(args.scenario, args.commit), sort_keys=True))
+        print(
+            json.dumps(
+                _probe(
+                    args.scenario,
+                    args.commit,
+                    args.variant,
+                    args.source_root.resolve(),
+                ),
+                sort_keys=True,
+            ),
+        )
         return
-    commit = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"],
-        cwd=ROOT,
-        text=True,
-    ).strip()
-    source_state = _source_state(ROOT)
+    source_root = args.source_root.resolve()
+    source_state = _source_state(source_root)
+    if source_state["kind"] == "archive" and not args.baseline_commit:
+        parser.error("Source archives require --baseline-commit")
+    commit = (
+        args.baseline_commit
+        or subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=source_root,
+            text=True,
+        ).strip()
+    )
     with tempfile.TemporaryDirectory(prefix="qwenpaw-footprint-") as directory:
         temporary = Path(directory)
         # Avoid inherited product overrides, credentials, user Python hooks,
         # config paths, or provider homes reaching the isolated import.
-        env = _isolated_env(temporary)
+        env = _isolated_env(temporary, source_root)
         for name in ("home", "cache", "config", "data", "work", "secrets"):
             (temporary / name).mkdir()
+        manifests = _seed(temporary, args.variant, args.plugin_dir)
         child = subprocess.run(
             [
                 sys.executable,
@@ -329,6 +699,10 @@ def main():
                 "--output",
                 str(args.output),
                 "--_child",
+                "--variant",
+                args.variant,
+                "--source-root",
+                str(source_root),
                 "--_commit",
                 commit,
             ],
@@ -341,6 +715,11 @@ def main():
         )
         report = json.loads(child.stdout)
         report["source_state"] = source_state
+        report["source_root"] = str(source_root)
+        report["driver_sha256"] = hashlib.sha256(
+            Path(__file__).read_bytes(),
+        ).hexdigest()
+        report["plugin_manifests"] = manifests
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n",

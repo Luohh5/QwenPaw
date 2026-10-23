@@ -97,6 +97,9 @@ function canExecute(plugin: FrontendPluginInfo): boolean {
 
 async function executePluginScript(plugin: FrontendPluginInfo): Promise<void> {
   const started = revision;
+  const harness =
+    Boolean(plugin.harnesses?.length) ||
+    harnessRegistry.getSnapshot().some((row) => row.plugin_id === plugin.id);
   const entryUrl = resolveUrl(plugin.id, plugin.frontend_entry!);
   const response = await fetch(entryUrl, { headers: authHeaders() });
   if (!response.ok) {
@@ -104,7 +107,16 @@ async function executePluginScript(plugin: FrontendPluginInfo): Promise<void> {
   }
 
   const source = await response.text();
-  if (started !== revision || !canExecute(plugin))
+  if (started !== revision) {
+    if (!harness) {
+      const current = (await fetchFrontendPlugins()).find(
+        (item) => item.id === plugin.id,
+      );
+      if (current && canExecute(current)) return executePluginScript(current);
+    }
+    throw new Error(`Plugin became unavailable before execution: ${plugin.id}`);
+  }
+  if (!canExecute(plugin))
     throw new Error(`Plugin became unavailable before execution: ${plugin.id}`);
   const blobUrl = URL.createObjectURL(
     new Blob([source], { type: "application/javascript" }),

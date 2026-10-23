@@ -5,6 +5,7 @@
 # Pytest fixtures are injected by their declared names.
 # pylint: disable=protected-access,redefined-outer-name
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -55,7 +56,10 @@ async def host(tmp_path):
         yield test_host
 
 
-async def test_third_harness_crud_and_workspace_chat_use_registry(host):
+async def test_third_harness_crud_and_workspace_chat_use_registry(
+    host,
+    tmp_path,
+):
     created = await host.request(
         "POST",
         "/api/agents",
@@ -83,6 +87,24 @@ async def test_third_harness_crud_and_workspace_chat_use_registry(host):
     assert any(
         block.text == "first" for item in events for block in item.content
     ), events
+    agent_file = tmp_path / "host/workspaces/third/agent.json"
+    account_file = tmp_path / "host/plugin-data/third-owner/account.json"
+    account_file.parent.mkdir(parents=True, exist_ok=True)
+    account_file.write_bytes(b'{"account":"retained"}')
+    agent_bytes = agent_file.read_bytes()
+    account_bytes = account_file.read_bytes()
+    removed = await host.uninstall("third-owner")
+    assert removed.clean and removed.quiescent
+    assert agent_file.read_bytes() == agent_bytes
+    assert account_file.read_bytes() == account_bytes
+    saved = await host.request("GET", "/api/agents/third")
+    assert saved.status == 200, saved.text
+    assert saved.json()["backend"] == "third-backend"
+    listed = await host.request("GET", "/api/agents")
+    row = next(
+        item for item in listed.json()["agents"] if item["id"] == "third"
+    )
+    assert row["backend_status"] == "missing"
     deleted = await host.request("DELETE", "/api/agents/third")
     assert deleted.status == 200, deleted.text
 
@@ -109,11 +131,82 @@ async def test_saved_unknown_backend_does_not_fall_back_to_native(host):
         fetched.status == 200
         and fetched.json()["backend"] == "unknown-backend"
     )
+    renamed = await host.request(
+        "PUT",
+        "/api/agents/saved",
+        json={
+            "id": "saved",
+            "name": "Still saved",
+            "backend": "unknown-backend",
+        },
+    )
+    assert renamed.status == 200, renamed.text
+    assert renamed.json()["backend"] == "unknown-backend"
+    assert renamed.json()["name"] == "Still saved"
     with pytest.raises(SDKError, match="backend_unavailable"):
         _ = [
             item
             async for item in host.stream_chat("Hello", workspace_id="saved")
         ]
+    deleted = await host.request("DELETE", "/api/agents/saved")
+    assert deleted.status == 200, deleted.text
+
+
+@pytest.mark.parametrize("unavailable", ["missing", "disabled"])
+async def test_backend_switch_checks_live_owner_before_saving(
+    host,
+    tmp_path,
+    unavailable,
+    monkeypatch,
+):
+    from qwenpaw.app.routers import agents as agent_routes
+
+    created = await host.request(
+        "POST",
+        "/api/agents",
+        json={"id": "switch", "name": "Native", "backend": "qwenpaw"},
+    )
+    assert created.status == 201, created.text
+    agent_file = tmp_path / "host/workspaces/switch/agent.json"
+    before = agent_file.read_bytes()
+    if unavailable == "disabled":
+        assert (await host.set_enabled("third-owner", False)).ok
+    loop = asyncio.get_running_loop()
+    original_catalog = agent_routes.backend_catalog
+
+    def catalog_on_loop(*args, **kwargs):
+        assert asyncio.get_running_loop() is loop
+        return original_catalog(*args, **kwargs)
+
+    monkeypatch.setattr(agent_routes, "backend_catalog", catalog_on_loop)
+    rejected = await host.request(
+        "PUT",
+        "/api/agents/switch",
+        json={
+            "id": "switch",
+            "name": "Native",
+            "backend": (
+                "unknown-backend"
+                if unavailable == "missing"
+                else "third-backend"
+            ),
+        },
+    )
+    assert rejected.status == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "backend_unavailable"
+    assert agent_file.read_bytes() == before
+    saved = await host.request("GET", "/api/agents/switch")
+    assert saved.status == 200 and saved.json()["backend"] == "qwenpaw"
+
+    if unavailable == "disabled":
+        assert (await host.set_enabled("third-owner", True)).ok
+    switched = await host.request(
+        "PUT",
+        "/api/agents/switch",
+        json={"id": "switch", "name": "Now third", "backend": "third-backend"},
+    )
+    assert switched.status == 200, switched.text
+    assert switched.json()["backend"] == "third-backend"
 
 
 async def test_disabled_backend_stays_manageable_but_cannot_run(host):

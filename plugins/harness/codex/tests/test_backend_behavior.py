@@ -334,6 +334,56 @@ async def test_turn_preserves_settings_and_attachments(
         await backend.close()
 
 
+@pytest.mark.parametrize(
+    ("sandbox", "approval_policy", "policy_type"),
+    [
+        ("danger-full-access", "never", "dangerFullAccess"),
+        ("workspace-write", "on-request", "workspaceWrite"),
+        ("read-only", "untrusted", "readOnly"),
+    ],
+)
+async def test_codex_permission_presets_reach_vendor_turn(
+    harness_context,
+    call_context,
+    codex_client,
+    sandbox,
+    approval_policy,
+    policy_type,
+):
+    backend = CodexBackend(harness_context, client=codex_client)
+    call = replace(
+        call_context(),
+        settings={"sandbox": sandbox, "approval_policy": approval_policy},
+    )
+    try:
+        _ = [
+            event
+            async for event in backend.run_turn(
+                call,
+                HarnessRunRequest("Review"),
+            )
+        ]
+        thread = next(
+            params
+            for method, params in codex_client.requests
+            if method == "thread/start"
+        )
+        turn = next(
+            params
+            for method, params in codex_client.requests
+            if method == "turn/start"
+        )
+        assert thread["sandbox"] == sandbox
+        assert (
+            thread["approvalPolicy"]
+            == turn["approvalPolicy"]
+            == (approval_policy)
+        )
+        assert turn["sandboxPolicy"]["type"] == policy_type
+    finally:
+        await backend.close()
+
+
 async def test_runtime_fingerprints_isolate_clients_and_resume_on_switch(
     harness_context,
     call_context,
@@ -464,12 +514,23 @@ async def test_commands_and_session_reset_use_the_same_native_thread(
         await backend.close()
 
 
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        ("approved", "accept"),
+        ("rejected", "decline"),
+        ("cancelled", "decline"),
+        ("timeout", "decline"),
+    ],
+)
 async def test_approval_uses_public_call_context(
     harness_context,
     call_context,
     codex_client,
+    outcome,
+    expected,
 ):
-    approve = AsyncMock(return_value="approved")
+    approve = AsyncMock(return_value=outcome)
     call = replace(call_context(), _request_approval=approve)
     backend = CodexBackend(harness_context, client=codex_client)
     try:
@@ -486,7 +547,7 @@ async def test_approval_uses_public_call_context(
                         },
                     },
                 )
-                assert decision == {"decision": "accept"}
+                assert decision == {"decision": expected}
                 permissions = {"network": {"enabled": True}}
                 granted = await codex_client.server_request_handler(
                     {
@@ -499,7 +560,12 @@ async def test_approval_uses_public_call_context(
                         },
                     },
                 )
-                assert granted == {"permissions": permissions, "scope": "turn"}
+                assert granted == {
+                    "permissions": (
+                        permissions if outcome == "approved" else {}
+                    ),
+                    "scope": "turn",
+                }
                 await codex_client.queue.put(
                     {
                         "method": "turn/completed",

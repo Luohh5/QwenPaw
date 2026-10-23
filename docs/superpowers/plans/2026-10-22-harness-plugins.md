@@ -79,10 +79,10 @@
 - [x] **Step 2：先测工具而非产品。** 为模块集合、计数、commit 记录和禁止真实厂商进程的行为写失败测试 `test_probe_records_modules_without_vendor_execution`。
 - [x] **Step 3：实现测量工具。** 使用新进程和临时工作目录，拦截厂商启动边界记录调用；绝不将整条 import 用时当作可节省的边际时间。
 - [x] **Step 4：验证工具。** Run: `python -m pytest tests/unit/harnesses/test_footprint_probe.py -q`；预期 PASS 且测试期间真实厂商进程数为 0。
-- [ ] **Step 5：在 `0db9a8e62` 保存基线。** 每个适用场景独立运行至少 5 次，保留原始数据与中位数；结果不足时记录原因，不填猜测数值。
+- [x] **Step 5：在 `0db9a8e62` 保存基线。** 原始 archive 在同一固定环境完成 startup/list/native-chat 各5次，浏览器原生设置场景另有5次；[最终CLI原始记录与median/max](../../research/harness-plugin-final-footprint.json)、[浏览器对照](../../research/harness-plugin-frontend-comparison.json)保留来源与范围。fresh process 不表示 OS 冷缓存。
 - [x] **Step 6：提交基线和测量工具。** 建议提交：`test: record harness extraction baseline`。
 
-**执行证据（2026-10-23）：** 工具与隔离回归 13 项通过；原始基线见 `docs/research/harness-plugin-baseline-raw/`，功能映射见 `harness-feature-test-inventory.json`。已冻结原始源码并完成 5 次模块导入、5 次真实 ASGI 就绪和 5 次 Agent 列表请求。Step 5 的模拟聊天、浏览器及发行物仍待补测；当前工具 CLI 的生命周期场景仍明确返回不可用，真实 ASGI 基线来自独立调查驱动，不冒充 CLI 已实现。
+**执行证据（2026-10-23）：** 工具与隔离回归 13 项通过；原始基线见 `docs/research/harness-plugin-baseline-raw/`，功能映射见 `harness-feature-test-inventory.json`。已冻结原始源码并完成 5 次模块导入、5 次真实 ASGI 就绪和 5 次 Agent 列表请求。该阶段的模拟聊天、浏览器及发行物尚未补齐，早期 CLI 明确返回不可用。最终 A6 已用同一生命周期驱动对原始 archive 和当前源码补齐 Step 5，早期记录仅作历史，不与最终环境混算。
 
 ## 总任务 B：给插件 SDK 增加 HarnessSpec
 
@@ -310,7 +310,7 @@
 
 **A5 代码检查点（2026-10-24）：** 独立产物/规范检查58项、核心SDK91项、实际ZIP插件Codex36项/Qoder27项通过，前端与网站构建、hooks通过。真实无厂商SDK的full环境完成macOS PyInstaller后端/CLI、helper Python与Node准备；实际包/PYZ未发现旧运行包和厂商SDK/CLI。代码审查发现的PyInstaller测试依赖已补齐并复审通过。Step 6仍未通过：本机冻结可执行文件即使在工具沙箱外也被SIGKILL，签名验证有效，原因仍待定位；Windows/Linux执行及真实账户验收无可用环境，不能由构建成功或模拟测试推断。保留这些缺口，继续独立的A6迁移和缺席验收。
 
-**A5 安装器后续修复：** 真实 helper 事务复现了 pip target 计划包含宿主同版本依赖而被误判重启的问题，现仅安装经 URL/SHA256 校验的缺失产物，保留非 target 的替换保护。冻结规范递归保留宿主依赖元数据。独立真实 wheel/ZIP + staged helper 的 Codex、Qoder 事务与 CLI 版本验证通过；该验证显式模拟了桌面路由，不等同于冻结可执行宿主验收。旧冻结包早于元数据修复，最终须重建，Step 6继续保持未完成。
+**A5 安装器后续修复：** 真实 helper 事务复现了 pip target 计划包含宿主同版本依赖而被误判重启的问题，现仅安装经 URL/SHA256 校验的缺失产物，保留非 target 的替换保护。冻结规范递归保留宿主依赖元数据。独立真实 wheel/ZIP + staged helper 的 Codex、Qoder 事务与 CLI 版本验证通过；该验证显式模拟了桌面路由，不等同于冻结可执行宿主验收。最终已在修复后重建并审计：10,437文件、每个PYZ32,587模块、六项必需元数据和1746个Console文件齐全，厂商/旧包根为0；实际隔离CLI仍SIGKILL -9无输出，各Mach-O签名验证有效，不推断OS原因或改security。Step 6运行验收继续未完成。
 
 ### A6 旧用户迁移、旧包删除和最终验收
 
@@ -327,61 +327,71 @@
 
 - 迁移命令：`python scripts/pack/migrate_legacy_harnesses.py --working-dir <dir> --plugin-dir <verified-local-packages> --dry-run`，确认离线依赖已准备后使用 `--apply`。
 - 输出 JSON 含需要的 plugin IDs、已有启停状态、可用包/版本、缺失依赖和执行结果；没有第三方 Agent 时计划为空。apply 走正式安装事务，不能通过复制目录绕开版本/依赖检查。
-- 升级器先 dry-run/准备产物，再 apply，完成后启动新宿主；缺包场景保留数据并提供明确安装动作。
+- 运维步骤先 dry-run/准备产物，再 apply，完成后启动新宿主；缺包场景保留数据并提供明确安装动作。本轮不改自动升级器协议；已安装 wheel/冻结 CLI 使用预先设置 `QWENPAW_WORKING_DIR` 的 `qwenpaw plugin migrate-legacy-harnesses`，与脚本共用一个实现。
 
-- [ ] **Step 1：写升级失败测试。** `test_native_only_upgrade_installs_nothing`、`test_upgrade_prepares_only_used_backend`、`test_upgrade_respects_explicit_disable`、`test_upgrade_missing_bundle_preserves_agents`、`test_upgrade_apply_is_idempotent`。
-- [ ] **Step 2：写数据/缺席失败测试。** `test_saved_agent_manageable_without_plugin`、`test_materialized_history_readable_without_plugin`、`test_reenable_resumes_original_provider_session`、`test_uninstall_keeps_account_and_data`；禁止静默 fallback。
-- [ ] **Step 3：写冷启动硬门禁。** 在新进程中禁止导入 `qwenpaw.harnesses`、两家厂商包和插件入口；拦截 binary 扫描/厂商进程启动，完成原生启动/Agent 列表/模拟聊天。禁用插件的 manifest 在场时也要通过；CI 安装了厂商 SDK 也不能掩盖这个门禁。
-- [ ] **Step 4：运行红灯。** Run: `python -m pytest tests/integration/test_harness_upgrade.py tests/integration/test_harness_absent.py -q`。
-- [ ] **Step 5：实现升级工具并删除旧包。** 只保留安装器迁移表和 PawPort 中属于迁移的厂商识别；生产运行注册表/Workspace/核心 UI 不得残留内置厂商工厂或 fallback。
+- [x] **Step 1：写升级失败测试。** `test_native_only_upgrade_installs_nothing`、`test_upgrade_prepares_only_used_backend`、`test_upgrade_respects_explicit_disable`、`test_upgrade_missing_bundle_preserves_agents`、`test_upgrade_apply_is_idempotent`。
+- [x] **Step 2：写数据/缺席失败测试。** `test_saved_agent_manageable_without_plugin`、`test_materialized_history_readable_without_plugin`、`test_reenable_resumes_original_provider_session`、`test_uninstall_keeps_account_and_data`；禁止静默 fallback。
+- [x] **Step 3：写冷启动硬门禁。** 在新进程中禁止导入 `qwenpaw.harnesses`、两家厂商包和插件入口；拦截 binary 扫描/厂商进程启动，完成原生启动/Agent 列表/模拟聊天。禁用插件的 manifest 在场时也要通过；CI 安装了厂商 SDK 也不能掩盖这个门禁。
+- [x] **Step 4：运行红灯。** Run: `python -m pytest tests/integration/test_harness_upgrade.py tests/integration/test_harness_absent.py -q`。
+- [x] **Step 5：实现升级工具并删除旧包。** 只保留安装器迁移表和 PawPort 中属于迁移的厂商识别；生产运行注册表/Workspace/核心 UI 不得残留内置厂商工厂或 fallback。
 - [ ] **Step 6：运行完整功能 checklist。** 使用下表逐项链接测试或真实验收记录；未经验证的项目保持未完成。
-- [ ] **Step 7：重跑减负对照。** 用 P0 工具和相同原生场景，对比无插件/禁用/仅 Codex/仅 Qoder；保存原始记录、文件清单、环境和中位数，不把运行优化混入结果。
+- [x] **Step 7：重跑减负对照。** 用 P0 工具和相同原生场景，对比无插件/禁用/仅 Codex/仅 Qoder；保存原始记录、文件清单、环境和中位数，不把运行优化混入结果。
 - [ ] **Step 8：验证并提交。** 重跑 Step 4、两个插件测试、B 契约、PawPort、前端构建、外部 wheel 作者验收和 A5 平台验收。建议提交：`refactor(harness): finish migration and verify optional footprint`。
+
+**A6 当前证据（2026-10-24）：** 升级/缺席先记录独立 RED，再通过真实离线 ZIP 安装、幂等、显式禁用、缺包/缺依赖保留数据；最终依赖门禁为 check-only。missing-owner Agent 可读/改名/删除但运行明确拒绝；两家真实插件在无真实厂商进程的正式 disable→enable 生命周期中均续接同一原生 session，卸载保留 Agent/account 字节。21 个旧运行文件及兼容别名已物理移除。Step 1 的缺包保护折入 `test_upgrade_prepares_only_used_backend`，Step 2 的具体测试归属见[验收矩阵](../../research/harness-plugin-acceptance.md)。
+
+[最终 SDK receipt](../../research/harness-sdk-final-acceptance.json)验证最终重产物的全新外部 wheel：strict mypy、228 作者测试（171s）、导出模板真实运行以及 wheel 前端 NodeNext/bundler/runtime 全通过；两个 unknown-marker 警告明确记录。源码复审与定向修复已通过质量审查。Step 6/8 保持未勾选，因为真实账户与冻结/其他平台运行仍未验收；更新产物文件审计已通过。Step 7 已完成15组×5次，共75个fresh-process样本；中断旧批次不计入。原始记录、环境、source origin/hash及median/max见[最终CLI对照](../../research/harness-plugin-final-footprint.json)。
+
+**最终定向回归：** vendor-free核心140通过（2项条件性apply另在双SDK组执行），双SDK显式迁移/缺席5通过，实际ZIP首轮Codex58/Qoder28通过；本地协议补齐后clean release-tree完整套件Codex66/Qoder36、shared bridge11及两进程restart每家1通过，HTTP7、ACP22、三种目录变体及每家正式ZIP安装各1通过。完整命令、包SHA与限制见[验收记录](../../research/harness-plugin-acceptance.md)。最终五次浏览器after已重新采集：body bytes中位数/最大值11,547,780→11,529,598，差18,182B（约17.8KiB）；不含API/headers，不表示wire、延迟或RSS节省。
+
+**最终采样：** 75样本里25次native chat均实际保存user/assistant历史，原16个old-runtime模块降为0；absent/disabled厂商entry为0，单插件仅执行自己的main声明。所有current state厂商SDK/adapter/probe/process为0。无插件startup ready中位数5512.7ms对5682.5ms，list/chat无统一耗时优势；RSS仅是本机live snapshot。独立完整default-core无SDK环境的[native-chat验收](../../research/harness-plugin-final-vendor-free-native.json)也通过，未混入双SDK同环境数值。Step 6/8仍等待真实账户与平台；最小无QwenPaw hello也复现SIGKILL，仅证明症状不限本程序，不推断根因。
 
 ## 整体功能 checklist
 
-每项填入测试名或验收报告路径。Codex/Qoder 两列独立勾选，不能一方通过推断另一方兼容。
+本表的 `[x]` 仅表示所链接的**协议/源码集成测试**满足该行要求，不代替真实账户或平台专行。两家独立勾选；共享宿主测试只证明共同桥接/归属边界。含未测子项的行保留 `[ ]`，同时列明已完成部分及缺口，不把部分证据当作整行通过。
 
 | 能力 | Codex | Qoder | 验证要求 |
 | --- | --- | --- | --- |
-| 插件安装/启用/禁用/重启后状态 | [ ] | [ ] | 正式 loader/lifecycle 和持久化配置 |
-| CLI 自动发现与手动路径 | [ ] | [ ] | 既有发现规则，缺失时提示插件/依赖 |
-| 账户与登录 | [ ] | [ ] | Codex OAuth/API key；Qoder 登录/PAT |
-| 模型与推理强度 | [ ] | [ ] | 保留选择、默认项和 Agent 设置 |
-| 文本、推理和工具流 | [ ] | [ ] | 开始/增量/结束、失败和取消终态 |
-| 图片/文件等既有附件能力 | [ ] | [ ] | MIME/路径/厂商格式 |
-| 宿主审批与厂商权限预设 | [ ] | [ ] | allow/ask/deny、超时/拒绝/取消、会话归属 |
-| 厂商原生 Skill/工具/MCP 能力 | [ ] | [ ] | 按各后端既有 capability，不虚构 Qoder MCP 发现 |
-| QwenPaw Skill/MCP 投影 | [ ] | [ ] | 工作区、渠道、工具白名单、秘密与 revision |
-| 命令与 new/clear | [ ] | [ ] | 厂商命令表与标准历史行为 |
-| 原生会话续接与旧映射升级 | [ ] | [ ] | 停止/重启/插件重启后使用同一 provider session |
-| 已保存历史与未物化历史恢复 | [ ] | [ ] | 前者无插件可读，后者经 SDK history |
-| 多工作区/用户/渠道隔离 | [ ] | [ ] | 同 session_id 并发，禁止串审批/凭据 |
-| 禁用/重载/卸载并发 | [ ] | [ ] | 活跃任务忙碌、显式中断、失败资源不可接管 |
-| PawPort 插件依赖与原迁移能力 | [ ] | [ ] | 缺失/禁用时提示；安装启用后原本地/在线路径正常，不提供无插件降级 |
-| macOS/Windows 最小冻结宿主安装 | [ ] | [ ] | 插件依赖和 CLI 资源，含错误/需重启分支 |
+| 插件安装/启用/禁用/重启后状态 | [x] [正式启停](../../../plugins/harness/codex/tests/test_plugin_contract.py#L96)、[两进程重启](../../../tests/integration/test_harness_process_restart.py#L108)（Codex选定环境1通过） | [x] [正式启停](../../../plugins/harness/qoder/tests/test_plugin_contract.py#L56)、[两进程重启](../../../tests/integration/test_harness_process_restart.py#L108)（Qoder选定环境1通过） | 各自两个不同Python进程，安装/禁用持久化→installed discovery→启用续接；fake厂商客户端，不代替冻结宿主 |
+| CLI 自动发现与手动路径 | [x] [test_reads_official_sdk_bundled_cli_path](../../../plugins/harness/codex/tests/test_discovery.py#L26)、[test_resolves_explicit_binary](../../../plugins/harness/codex/tests/test_discovery.py#L41) | [x] [test_prefers_python_sdk_bundled_cli](../../../plugins/harness/qoder/tests/test_discovery.py#L54)、[test_prefers_explicit_qoder_binary](../../../plugins/harness/qoder/tests/test_discovery.py#L23) | 文件/平台分支为受控发现测试，不表示 Windows/Linux 实机验收 |
+| 真实账户与登录 | [ ] [test_status_login_and_models_use_app_server](../../../plugins/harness/codex/tests/test_backend_behavior.py#L112) 已测协议；真实 OAuth/API key 未运行 | [ ] [test_status_token_and_read_only_vendor_skills](../../../plugins/harness/qoder/tests/test_backend_behavior.py#L79)及登录清理已测；真实 browser/PAT 未运行 | 真实账户专行保持未完成 |
+| 模型与推理强度 | [x] [test_status_login_and_models_use_app_server](../../../plugins/harness/codex/tests/test_backend_behavior.py#L112)、[test_turn_preserves_settings_and_attachments](../../../plugins/harness/codex/tests/test_backend_behavior.py#L280) | [x] [test_models_commands_and_explicit_unsupported_operations](../../../plugins/harness/qoder/tests/test_backend_behavior.py#L52)、[test_qoder_projects_scoped_skills_mcp_and_attachments](../../../plugins/harness/qoder/tests/test_backend_behavior.py#L127) | 模型/default/effort 协议；[共同选择器持久化请求](../../../console/src/pages/Chat/components/BackendModelSelector.test.tsx#L180) |
+| 文本、推理和工具流 | [x] [test_notification_conversion_keeps_reasoning_and_tool_outcome](../../../plugins/harness/codex/tests/test_backend_behavior.py#L30)、[test_failed_codex_turn_reaches_public_failed_stream](../../../plugins/harness/codex/tests/test_plugin_contract.py#L159)、[test_cancelling_turn_interrupts_native_turn](../../../plugins/harness/codex/tests/test_backend_behavior.py#L605) | [x] [test_maps_incremental_text_and_reasoning_without_duplicates](../../../plugins/harness/qoder/tests/test_event_mapper.py#L28)、[test_maps_terminal_results](../../../plugins/harness/qoder/tests/test_event_mapper.py#L98)、[test_live_approval_is_scoped_to_call_and_cancelled_with_turn](../../../plugins/harness/qoder/tests/test_backend_behavior.py#L355) | 开始/增量/结束、失败和取消；Codex失败RPC经真实adapter到公开failed事件 |
+| 图片/文件等既有附件能力 | [x] [test_turn_preserves_settings_and_attachments](../../../plugins/harness/codex/tests/test_backend_behavior.py#L280) | [x] [test_qoder_projects_scoped_skills_mcp_and_attachments](../../../plugins/harness/qoder/tests/test_backend_behavior.py#L127) | 类型/路径/厂商格式；Qoder 另测附件单独输入，非真实模型识图质量验收 |
+| 宿主审批与厂商权限预设 | [x] [test_codex_permission_presets_reach_vendor_turn](../../../plugins/harness/codex/tests/test_backend_behavior.py#L345)、[test_approval_uses_public_call_context](../../../plugins/harness/codex/tests/test_backend_behavior.py#L526) | [x] [test_qoder_permission_presets_reach_vendor_client](../../../plugins/harness/qoder/tests/test_backend_behavior.py#L497)、[test_qoder_permission_decisions_use_live_public_call](../../../plugins/harness/qoder/tests/test_backend_behavior.py#L439) | 各自权限预设、approved/rejected/cancelled/timeout厂商响应类型；[共同宿主身份与四种结果](../../../tests/unit/plugins/test_sdk_harness_bridge.py#L510) |
+| 厂商原生 Skill/工具/MCP 能力 | [x] [test_provider_discovery_keeps_read_only_skill_and_mcp_metadata](../../../plugins/harness/codex/tests/test_backend_behavior.py#L206) | [x] [test_status_token_and_read_only_vendor_skills](../../../plugins/harness/qoder/tests/test_backend_behavior.py#L79)、[test_models_commands_and_explicit_unsupported_operations](../../../plugins/harness/qoder/tests/test_backend_behavior.py#L52) | 按各自 capability；Qoder 原生 MCP discovery 明确 unsupported |
+| QwenPaw Skill/MCP 投影 | [x] [test_turn_preserves_settings_and_attachments](../../../plugins/harness/codex/tests/test_backend_behavior.py#L280)、[projection tests](../../../plugins/harness/codex/tests/test_projection.py) | [x] [test_qoder_projects_scoped_skills_mcp_and_attachments](../../../plugins/harness/qoder/tests/test_backend_behavior.py#L127) | 工作区/渠道/工具过滤、秘密/revision 的共同宿主证据：[test_harness_capabilities.py](../../../tests/unit/plugins/test_harness_capabilities.py)、[fresh capability context](../../../tests/unit/plugins/test_sdk_harness_bridge.py#L136) |
+| 命令与 new/clear | [x] [test_commands_and_session_reset_use_the_same_native_thread](../../../plugins/harness/codex/tests/test_backend_behavior.py#L455) | [x] [test_models_commands_and_explicit_unsupported_operations](../../../plugins/harness/qoder/tests/test_backend_behavior.py#L52)、[test_history_reset_and_capability_change_resume_the_same_identity](../../../plugins/harness/qoder/tests/test_backend_behavior.py#L226) | [共同公开桥接](../../../tests/unit/plugins/test_sdk_harness_bridge.py#L20)分别参数化`/new`、`/clear`，断言reset和保存历史；各自adapter验证native reset |
+| 原生会话续接与旧映射升级 | [x] [test_resume_existing_thread_mapping](../../../plugins/harness/codex/tests/test_state_migration.py#L38)、[两进程续接](../../../tests/integration/test_harness_process_restart.py#L108)（Codex） | [x] [test_qoder_mapping_migration_is_idempotent](../../../plugins/harness/qoder/tests/test_state_migration.py#L119)、[两进程续接](../../../tests/integration/test_harness_process_restart.py#L108)（Qoder） | 旧文件保护、映射升级与重启后原生ID续接；无真实厂商进程/账户 |
+| 已保存历史与未物化历史恢复 | [x] [test_archive_preserves_external_thread_metadata](../../../plugins/harness/codex/tests/test_state_migration.py#L198) | [x] [test_history_reset_and_capability_change_resume_the_same_identity](../../../plugins/harness/qoder/tests/test_backend_behavior.py#L226) | [materialized history 无插件可读](../../../tests/unit/plugins/test_sdk_harness_bridge.py#L418)，未物化经各自公开 history/reader 协议 |
+| 多工作区/用户/渠道隔离 | [x] [test_resume_existing_thread_mapping](../../../plugins/harness/codex/tests/test_state_migration.py#L38)、[test_approval_uses_public_call_context](../../../plugins/harness/codex/tests/test_backend_behavior.py#L526) | [x] [test_qoder_sessions_scoped_to_workspace_and_identity](../../../plugins/harness/qoder/tests/test_state_migration.py#L53)、[test_qoder_permission_decisions_use_live_public_call](../../../plugins/harness/qoder/tests/test_backend_behavior.py#L439) | [共同并发用例](../../../tests/unit/plugins/test_sdk_harness_bridge.py#L297)同时保持同session-ID双身份turn，检查独立MCP秘密/审批、拒绝错误actor；厂商用例另证公开结果转换 |
+| 禁用/重载/卸载并发 | [x] [test_force_unload_interrupts_live_codex_turn](../../../plugins/harness/codex/tests/test_plugin_contract.py#L208)、[turn cancellation](../../../plugins/harness/codex/tests/test_backend_behavior.py#L605) | [x] [test_force_unload_interrupts_live_qoder_turn](../../../plugins/harness/qoder/tests/test_plugin_contract.py#L107)、[turn cancellation](../../../plugins/harness/qoder/tests/test_backend_behavior.py#L355) | 活动真实插件turn经`interrupt_tasks=True`卸载，确认停止/断连和目录不可用；[busy stream](../../../tests/unit/plugins/test_sdk_harness_lifecycle.py#L24)、[failed close](../../../tests/unit/plugins/test_sdk_harness_lifecycle.py#L123)保留独立边界 |
+| PawPort 插件依赖与原迁移能力 | [x] [test_missing_or_disabled_plugin_blocks_import_before_scan](../../../tests/unit/portability/test_harness_plugin_requirement.py#L76)、[test_codex_provider_reuses_runtime_and_normalizes_inventory](../../../tests/unit/portability/test_migration_providers.py#L104) | [x] [相同前置门禁](../../../tests/unit/portability/test_harness_plugin_requirement.py#L76)、[test_qoder_archive_task_ids_are_mapped_to_execution_sessions](../../../tests/unit/portability/test_qoder_sessions.py#L134)、[test_qoder_custom_skill_plugin_uses_native_adapter](../../../tests/unit/portability/test_importer.py#L1634) | 本地/受控在线 archive、导入与缺失提示；无插件降级不存在，非 live-account 迁移验收 |
+| macOS/Windows 最小冻结宿主安装 | [ ] [最终冻结 runtime NOT_ACCEPTED](../../research/harness-plugin-final-frozen-runtime.json)；helper 路由部分验证不能代替冻结宿主安装 | [ ] 同样未完成；实际 Windows/Linux 无可用运行证据 | 文件清单已通过，实际 CLI SIGKILL -9；不推断原因或修改 security |
+
+本地协议补齐的完整命令与限制见[最终协议记录](../../research/harness-plugin-protocol-checklist.md)：clean release-tree Codex66、Qoder36，shared bridge11，两进程restart每家1通过。独立协议复审PASS，无Critical/Important问题。此表真实账户及冻结平台专行仍未完成，因此A6 Step 6/8不勾选。
 
 ## 最终减负 checklist
 
-- [ ] 无插件 core 环境可完成启动、原生 Agent CRUD 和模拟聊天。
-- [ ] 无插件/已禁用新进程：厂商 adapter/SDK/插件入口导入数为 0。
-- [ ] 同场景 CLI 探测和厂商子进程数为 0。
-- [ ] 无有效贡献时未挂载第三方管理网关，核心只提供轻量目录和不可用状态。
-- [ ] 核心前端不静态打包厂商配置/认证组件和厂商文案资源。
-- [ ] 禁用插件不请求/执行其前端入口，启停后无遗留组件贡献。
-- [ ] core wheel 与最小桌面包不包含厂商运行实现/SDK/CLI；文件清单有证据。
-- [ ] 仅安装 Codex 时无 Qoder 依赖，反向同样成立。
-- [ ] 已用过再停用时受管进程/任务/连接结束；不把 RSS 全释放作为承诺。
-- [ ] 相同基线场景有至少 5 次测量、中位数、最大值、原始记录与环境；无凭空节省数字。
+- [x] 无插件 core 环境可完成启动、原生 Agent CRUD 和模拟聊天。证据：[缺席硬门禁](../../../tests/integration/test_harness_absent.py)、[Agent 管理](../../../tests/unit/app/test_backend_dispatch.py)与实际工具 native-chat-persisted smoke。
+- [x] 无插件/已禁用新进程：厂商 adapter/SDK/插件入口导入数为 0。证据：缺席子进程在无 SDK/双 SDK 环境通过，禁用入口另有独立执行标记断言。
+- [x] 同场景 CLI 探测和厂商子进程数为 0。证据：[工具缺席/禁用/单插件目录回归](../../../tests/unit/harnesses/test_footprint_probe.py)；最终75样本各current state的厂商SDK/adapter/probe/process均为0，详见Step 7 receipt。
+- [x] 无有效贡献时未挂载第三方管理网关，核心只提供轻量目录和不可用状态。证据：[实际 HTTP](../../../tests/integration/test_harness_plugin_http.py)、[目录](../../../tests/unit/app/routers/test_backend_catalog.py)。
+- [x] 核心前端不静态打包厂商配置/认证组件和厂商文案资源。证据：A4 构建审计、[五次实际浏览器场景](../../research/harness-plugin-frontend-comparison.json)，[最终冻结包清单](../../research/harness-plugin-final-frozen-inventory.json)中的1746个Console文件与最终Console构建逐字节相同；不是与pre-final A4资产相同。
+- [x] 禁用插件不请求/执行其前端入口，启停后无遗留组件贡献。证据：[实际 Provider/loader](../../../console/src/plugins/usePluginLoader.test.ts)、[Harness 前端归属](../../../console/src/plugins/harnesses.test.ts)。
+- [x] core wheel 与最小桌面包不包含厂商运行实现/SDK/CLI；仅指文件清单，不代表运行验收。证据：[最终 wheel/sdist receipt](../../research/harness-sdk-final-acceptance.json)、[最终冻结清单](../../research/harness-plugin-final-frozen-inventory.json)。实际冻结CLI仍[未通过运行验收](../../research/harness-plugin-final-frozen-runtime.json)。
+- [x] 仅安装 Codex 时无 Qoder 依赖，反向同样成立。证据：[正式 ZIP 安装隔离](../../../tests/integration/test_harness_install_isolation.py)及两家独立 SDK 环境的插件契约。
+- [x] 已用过再停用时受管进程/任务/连接结束；不把 RSS 全释放作为承诺。证据：两家插件 cleanup/取消及正式启停协议测试；真实账户进程仍未验收。
+- [x] 相同基线场景有至少5次测量、中位数、最大值、原始记录与环境。证据：[最终15组×5对照](../../research/harness-plugin-final-footprint.json)与[数值表/限制](../../research/harness-plugin-acceptance.md#native-absence-and-footprint-evidence)。无插件RSS中位数本机降低3.55–4.66MiB；不表示普遍加速，无OS冷cache保证。
 
 ## 单 worker I/O 验收 checklist
 
-- [ ] 工厂声明与初始化不在事件循环执行状态文件读写或扫描；异步客户端和锁在原循环创建。
-- [ ] Codex/Qoder binary 发现、metadata 查找在明确异步调用边界运行，无顶层扫描。
-- [ ] 会话映射读写使用异步 helper；原子读改写受同一锁保护，取消后真实写入结束再释放。
-- [ ] Skill/MCP 文件枚举、内容读取/哈希和投影复制采用有界 I/O helper；不把 Driver/凭据服务或整个 resolver 移到线程。
-- [ ] 管理目录、Agent CRUD、PawPort 前置检查没有新增同步磁盘扫描；确需读取时使用异步入口。
-- [ ] 所选 I/O 操作被有控制地阻塞时，事件循环 heartbeat/无关 API 仍能推进；用事件协调的少量回归测试证明，不使用不稳定耗时阈值。
+- [x] 工厂声明与初始化不在事件循环执行状态文件读写或扫描；异步客户端和锁在原循环创建。 证据：[注册/工厂契约](../../../tests/unit/plugins/test_sdk_harness_registration.py)及两家 state/contract 测试。
+- [x] Codex/Qoder binary 发现、metadata 查找在明确异步调用边界运行，无顶层扫描。 证据：两家 discovery/contract 测试与 SDK-preinstalled 缺席/目录门禁。
+- [x] 会话映射读写使用异步 helper；原子读改写受同一锁保护，取消后真实写入结束再释放。 证据：两家 state_migration 测试（含 Qoder 重复取消 reset/rebuild）。
+- [x] Skill/MCP 文件枚举、内容读取/哈希和投影复制采用有界 I/O helper；不把 Driver/凭据服务或整个 resolver 移到线程。 证据：[能力解析](../../../tests/unit/plugins/test_harness_capabilities.py)、两家投影/行为测试与代码审查。
+- [x] 管理目录、Agent CRUD、PawPort 前置检查没有新增同步磁盘扫描；确需读取时使用异步入口。 证据：[PawPort 前置门禁](../../../tests/unit/portability/test_harness_plugin_requirement.py)、异步配置快照回归与 A3/A6 I/O 审查。
+- [x] 所选 I/O 操作被有控制地阻塞时，事件循环 heartbeat/无关 API 仍能推进；用事件协调的少量回归测试证明，不使用不稳定耗时阈值。 证据：公共 bridge 能力读取及两家 state 中的受控阻塞/重复取消用例。
 
 ## 完成定义与交付物
 

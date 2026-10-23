@@ -1,0 +1,138 @@
+{
+  "artifacts": {
+    "qwenpaw-2.3.0b1-py3-none-any.whl": {
+      "sha256": "1d2745dc2af383b606d9fa44d393bf88d01ba64d84c2977272c5e300bd077169",
+      "files": 1546
+    },
+    "qwenpaw-2.3.0b1.tar.gz": {
+      "sha256": "f1b8c73d9ff184ee84d52682a61cfed21c429c46d04b782f68b3fda25acd0b3e",
+      "files": 1827
+    }
+  },
+  "steps": [
+    {
+      "name": "installed-import",
+      "returncode": 0
+    },
+    {
+      "name": "public-author-types",
+      "returncode": 0
+    },
+    {
+      "name": "public-author-tests",
+      "returncode": 0
+    },
+    {
+      "name": "export-template",
+      "returncode": 0
+    },
+    {
+      "name": "export-frontend",
+      "returncode": 0
+    },
+    {
+      "name": "template-compliance",
+      "returncode": 0
+    },
+    {
+      "name": "template-real-runtime",
+      "returncode": 0
+    }
+  ],
+  "tests": [
+    "test_sdk_app_contract.py",
+    "test_sdk_app_task_storage.py",
+    "test_sdk_app_task_stream.py",
+    "test_sdk_app_tool_execution.py",
+    "test_sdk_author_host.py",
+    "test_sdk_channel_contract.py",
+    "test_sdk_channel_routing_contract.py",
+    "test_sdk_compliance_contract.py",
+    "test_sdk_context_lifecycle.py",
+    "test_sdk_context_services.py",
+    "test_sdk_event_contract.py",
+    "test_sdk_extension_contract.py",
+    "test_sdk_harness_author.py",
+    "test_sdk_harness_contract.py",
+    "test_sdk_install_transaction.py",
+    "test_sdk_market_contract.py",
+    "test_sdk_memory_contract.py",
+    "test_sdk_mode_skill_contract.py",
+    "test_sdk_provider_contract.py",
+    "test_sdk_resource_contract.py",
+    "test_sdk_storage_contract.py",
+    "test_sdk_storage_http_concurrency.py",
+    "test_sdk_tool_aggregation.py",
+    "test_sdk_workspace_contract.py"
+  ],
+  "environment": {
+    "import_path": "/private/tmp/qwenpaw-harness-sdk-a6-author-20261024/lib/python3.13/site-packages/qwenpaw/__init__.py",
+    "uv": "/private/tmp/qwenpaw-harness-sdk-a6-author-20261024/bin/uv",
+    "versions": {
+      "qwenpaw": "2.3.0b1",
+      "agentscope": "2.0.10",
+      "fastapi": "0.140.7",
+      "pytest": "9.1.1",
+      "uv": "0.8.15"
+    }
+  },
+  "frontend_export": "/private/tmp/qwenpaw-harness-sdk-a6-reviewed-external-20261024/frontend",
+  "scope": "Final reviewed A6 SDK 1.1 installed-wheel external author acceptance; not vendor live account or frozen-platform runtime acceptance",
+  "source": {
+    "base_commit": "18ab8749d",
+    "phase": "frozen after final unified fix wave; final-fix-review.md SOURCEQUALITYPASS",
+    "files": 1544,
+    "source_manifest_sha256": "43dcc328b211ab4d569396ebaf4d5b20005dcbaab1b6a95d1c0493b83c87317c",
+    "source_manifest_matches_checkout": true,
+    "artifacts": {
+      "qwenpaw-2.3.0b1.tar.gz": {
+        "path": "/private/tmp/qwenpaw-harness-a6-reviewed-artifacts-20261024/dist/qwenpaw-2.3.0b1.tar.gz",
+        "sha256": "f1b8c73d9ff184ee84d52682a61cfed21c429c46d04b782f68b3fda25acd0b3e",
+        "bytes": 10538987,
+        "files": 1827,
+        "legacy_runtime_or_vendor_payloads": 0
+      },
+      "qwenpaw-2.3.0b1-py3-none-any.whl": {
+        "path": "/private/tmp/qwenpaw-harness-a6-reviewed-artifacts-20261024/dist/qwenpaw-2.3.0b1-py3-none-any.whl",
+        "sha256": "1d2745dc2af383b606d9fa44d393bf88d01ba64d84c2977272c5e300bd077169",
+        "bytes": 11605169,
+        "files": 1546,
+        "legacy_runtime_or_vendor_payloads": 0
+      }
+    }
+  },
+  "public_author_tests": {
+    "passed": 228,
+    "warnings": 2,
+    "seconds": 171.0,
+    "repository_conftest": false,
+    "checkout_pythonpath": false
+  },
+  "frontend_from_installed_wheel": {
+    "NodeNext": {
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    "bundler": {
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    "runtime": {
+      "returncode": 0,
+      "stdout": "standalone runtime capability gates and encoded task routes passed\n",
+      "stderr": ""
+    }
+  },
+  "environment_notes": [
+    "Dedicated new isolated A6 author virtualenv with fixed validation dependencies; final reviewed wheel reinstalled non-editable with --no-deps after the last source fixes. No checkout import/PYTHONPATH/conftest. This is not the full default-core dependency environment.",
+    "Codex/Qoder SDKs absent; no live vendor account or paid model; existing local uv dependency tests run outside tool sandbox for macOS SystemConfiguration.",
+    "Two standalone unknown p1 marker warnings; all 228 author tests passed."
+  ],
+  "logs": {
+    "external": "/private/tmp/qwenpaw-harness-sdk-a6-reviewed-external-20261024/report.json",
+    "public_author": "/private/tmp/qwenpaw-harness-sdk-a6-reviewed-external-20261024/public-author-tests.log",
+    "frontend": "/private/tmp/qwenpaw-harness-sdk-a6-reviewed-frontend-20261024/results.json"
+  }
+}
