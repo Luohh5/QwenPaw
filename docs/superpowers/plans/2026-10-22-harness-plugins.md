@@ -75,12 +75,14 @@
 - 场景固定为 `native-startup`、`native-agent-list`、`native-chat`、`frontend-native`；一次运行使用一个全新进程/临时配置。工具不得创建真实厂商客户端。
 - 报告包含 commit、Python/平台、场景、ready_ms、process_rss_bytes、children_rss_bytes、modules、vendor_process_count、vendor_probe_count；前端网络字节和包清单附在最终报告，不伪造为 Python 指标。
 
-- [ ] **Step 1：锁定现有功能矩阵。** 将 A6 表格中的每项映射到现有测试和模拟客户端；补全缺口清单，特别是在线 archive、取消与能力投影。
-- [ ] **Step 2：先测工具而非产品。** 为模块集合、计数、commit 记录和禁止真实厂商进程的行为写失败测试 `test_probe_records_modules_without_vendor_execution`。
-- [ ] **Step 3：实现测量工具。** 使用新进程和临时工作目录，拦截厂商启动边界记录调用；绝不将整条 import 用时当作可节省的边际时间。
-- [ ] **Step 4：验证工具。** Run: `python -m pytest tests/unit/harnesses/test_footprint_probe.py -q`；预期 PASS 且测试期间真实厂商进程数为 0。
+- [x] **Step 1：锁定现有功能矩阵。** 将 A6 表格中的每项映射到现有测试和模拟客户端；补全缺口清单，特别是在线 archive、取消与能力投影。
+- [x] **Step 2：先测工具而非产品。** 为模块集合、计数、commit 记录和禁止真实厂商进程的行为写失败测试 `test_probe_records_modules_without_vendor_execution`。
+- [x] **Step 3：实现测量工具。** 使用新进程和临时工作目录，拦截厂商启动边界记录调用；绝不将整条 import 用时当作可节省的边际时间。
+- [x] **Step 4：验证工具。** Run: `python -m pytest tests/unit/harnesses/test_footprint_probe.py -q`；预期 PASS 且测试期间真实厂商进程数为 0。
 - [ ] **Step 5：在 `0db9a8e62` 保存基线。** 每个适用场景独立运行至少 5 次，保留原始数据与中位数；结果不足时记录原因，不填猜测数值。
-- [ ] **Step 6：提交基线和测量工具。** 建议提交：`test: record harness extraction baseline`。
+- [x] **Step 6：提交基线和测量工具。** 建议提交：`test: record harness extraction baseline`。
+
+**执行证据（2026-10-23）：** 工具与隔离回归 13 项通过；原始基线见 `docs/research/harness-plugin-baseline-raw/`，功能映射见 `harness-feature-test-inventory.json`。已冻结原始源码并完成 5 次模块导入、5 次真实 ASGI 就绪和 5 次 Agent 列表请求。Step 5 的模拟聊天、浏览器及发行物仍待补测；当前工具 CLI 的生命周期场景仍明确返回不可用，真实 ASGI 基线来自独立调查驱动，不冒充 CLI 已实现。
 
 ## 总任务 B：给插件 SDK 增加 HarnessSpec
 
