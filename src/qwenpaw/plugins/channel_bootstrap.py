@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+from functools import lru_cache
 import json
 import os
 import platform
@@ -181,6 +182,80 @@ def default_channel_preset():
     return preset
 
 
+@lru_cache(maxsize=8)
+def _bundle_dependency_fingerprint(identity, metadata):
+    """Cache metadata reads by file stat; paths never enter the digest."""
+    contents = [
+        (label, hashlib.sha256(path.read_bytes()).hexdigest())
+        for label, path, *_stat in metadata
+    ]
+    return hashlib.sha256(
+        json.dumps([identity, contents], separators=(",", ":")).encode(),
+    ).hexdigest()
+
+
+def plugin_runtime_site(runtime_root: Path, runtime=None) -> Path:
+    """Share an ABI site, isolated by bundled wheel identity on desktop."""
+    if runtime is None and getattr(sys, "frozen", False):
+        runtime = runtime_manifest()
+    identity = (
+        runtime[3]
+        if runtime is not None
+        else {
+            "version": list(sys.version_info[:2]),
+            "system": platform.system(),
+            "machine": platform.machine(),
+        }
+    )
+    major, minor = identity["version"]
+    bucket = (
+        f"py{major}.{minor}-{identity['system'].lower()}-"
+        f"{identity['machine'].lower()}"
+    )
+    target = runtime_root / bucket
+    if runtime is not None:
+        _root, manifest_path, _launcher_paths = _runtime_resource_context()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        bundle_identity = {
+            key: manifest[key]
+            for key in (
+                "python_runtime_release",
+                "host_wheel_sha256",
+                "official_index_sha256",
+            )
+        }
+        metadata = []
+        for index, site in enumerate(runtime[2]):
+            for distribution in sorted(site.glob("*.dist-info")):
+                for name in ("METADATA", "RECORD", "WHEEL"):
+                    path = distribution / name
+                    if not path.is_file():
+                        continue
+                    if not path.resolve().is_relative_to(site):
+                        raise ValueError("CHANNEL_RUNTIME_MANIFEST_INVALID")
+                    stat = path.stat()
+                    metadata.append(
+                        (
+                            f"{index}/{path.relative_to(site).as_posix()}",
+                            path,
+                            stat.st_mtime_ns,
+                            stat.st_ctime_ns,
+                            stat.st_size,
+                        ),
+                    )
+        # RECORD identifies payload changes even at the same package version.
+        # Only immutable bundle metadata participates, never user overlays.
+        fingerprint = _bundle_dependency_fingerprint(
+            json.dumps(
+                [identity, runtime[4], bundle_identity],
+                sort_keys=True,
+            ),
+            tuple(metadata),
+        )
+        target /= f"bundle-{fingerprint}"
+    return target / "site"
+
+
 def resolve_default_channel_runtime():
     """Provision an empty managed site under the environment lock."""
     from ..__version__ import __version__
@@ -190,8 +265,10 @@ def resolve_default_channel_runtime():
         plugin_install_lock,
     )
 
+    runtime = None
     if getattr(sys, "frozen", False):
-        executable, support, sites, identity, _preset = runtime_manifest()
+        runtime = runtime_manifest()
+        executable, support, sites, identity, _preset = runtime
     else:
         from .execution.environment import shared_dependency_paths
 
@@ -206,15 +283,13 @@ def resolve_default_channel_runtime():
     worker = support / "qwenpaw/channel_protocol/shared_worker.py"
     if not worker.is_file() or not worker.resolve().is_relative_to(support):
         raise ValueError("CHANNEL_RUNTIME_MISSING")
-    major, minor = identity["version"]
-    bucket = (
-        f"py{major}.{minor}-{identity['system'].lower()}-"
-        f"{identity['machine'].lower()}"
-    )
     config_path = get_config_path()
     data = _read_config_data(config_path) if config_path.exists() else {}
     send_timeouts = (data or {}).get("channel_send_timeouts", {})
-    target = config_path.parent / "plugin_runtime" / bucket / "site"
+    target = plugin_runtime_site(
+        config_path.parent / "plugin_runtime",
+        runtime,
+    )
     with plugin_install_lock(environment_install_lock_path(target)):
         if target.is_symlink():
             raise ValueError("CHANNEL_RUNTIME_TARGET_INVALID")

@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Installed CLI runtime discovery without the Desktop launcher."""
 
+# pylint: disable=protected-access
+
 from __future__ import annotations
 
 import hashlib
@@ -8,6 +10,7 @@ import json
 import os
 import platform
 from pathlib import Path
+import shutil
 import sys
 from types import SimpleNamespace
 
@@ -104,6 +107,195 @@ def test_installed_cli_discovers_validated_channel_runtime(installed_cli):
     assert settings.dependency_paths[0] == bundle.site
     assert settings.dependency_install_target.is_relative_to(bundle.working)
     assert settings.dependency_install_target.is_dir()
+
+
+def test_installed_runtime_excludes_retained_legacy_dependencies(
+    installed_cli,
+):
+    from qwenpaw.plugins.channel_bootstrap import (
+        resolve_default_channel_runtime,
+    )
+    from qwenpaw.plugins.execution.dependencies import _installed_metadata
+
+    bundle = installed_cli
+    bucket = (
+        f"py{sys.version_info.major}.{sys.version_info.minor}-"
+        f"{platform.system().lower()}-{platform.machine().lower()}"
+    )
+    legacy = bundle.working / "plugin_runtime" / bucket / "site"
+    contents = "Metadata-Version: 2.1\nName: bundled-sdk\nVersion: 1.0\n"
+    for site in (bundle.site, legacy):
+        metadata = site / "bundled_sdk-1.0.dist-info/METADATA"
+        metadata.parent.mkdir(parents=True)
+        metadata.write_text(contents)
+
+    settings = resolve_default_channel_runtime()
+    rows, invalid, _ = _installed_metadata(settings.dependency_paths)
+
+    assert not invalid
+    assert rows["bundled-sdk"]["metadata_path"] == str(
+        bundle.site / "bundled_sdk-1.0.dist-info",
+    )
+    assert legacy not in settings.dependency_paths
+    assert settings.dependency_install_target != legacy
+    assert (legacy / "bundled_sdk-1.0.dist-info/METADATA").read_text() == (
+        contents
+    )
+
+
+def test_installed_runtime_still_rejects_active_duplicate_dependencies(
+    installed_cli,
+):
+    from qwenpaw.plugins.channel_bootstrap import (
+        resolve_default_channel_runtime,
+    )
+    from qwenpaw.plugins.execution.dependencies import _installed_metadata
+
+    metadata = installed_cli.site / "bundled_sdk-1.0.dist-info/METADATA"
+    metadata.parent.mkdir()
+    metadata.write_text("Name: bundled-sdk\nVersion: 1.0\n")
+    settings = resolve_default_channel_runtime()
+    shutil.copytree(
+        metadata.parent,
+        settings.dependency_install_target / metadata.parent.name,
+    )
+
+    _, invalid, _ = _installed_metadata(settings.dependency_paths)
+
+    assert invalid == {"bundled-sdk": "DEPENDENCY_ENVIRONMENT_AMBIGUOUS"}
+
+
+def test_installed_runtime_reuses_site_after_bundle_relocation(
+    installed_cli,
+    tmp_path,
+    monkeypatch,
+):
+    from qwenpaw.plugins.channel_bootstrap import (
+        resolve_default_channel_runtime,
+    )
+
+    original = resolve_default_channel_runtime()
+    retained = original.dependency_install_target / "retained-sdk.txt"
+    retained.write_text("installed user dependency")
+    relocated = tmp_path / "relocated installation"
+    shutil.copytree(installed_cli.root, relocated)
+    monkeypatch.setattr(
+        sys,
+        "executable",
+        str(relocated / installed_cli.backend.relative_to(installed_cli.root)),
+    )
+
+    moved = resolve_default_channel_runtime()
+
+    assert moved.support_root.is_relative_to(relocated)
+    assert (
+        moved.dependency_install_target == original.dependency_install_target
+    )
+    assert retained.read_text() == "installed user dependency"
+
+
+def test_same_version_bundle_dependency_change_gets_new_site(installed_cli):
+    from qwenpaw.plugins.channel_bootstrap import (
+        resolve_default_channel_runtime,
+    )
+
+    metadata = installed_cli.site / "bundled_sdk-1.0.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text("Name: bundled-sdk\nVersion: 1.0\n")
+    record = metadata / "RECORD"
+    record.write_text("bundled_sdk.py,sha256=old-payload,20\n")
+    original = resolve_default_channel_runtime()
+    retained = original.dependency_install_target / "retained-sdk.txt"
+    retained.write_text("old bundle user dependency")
+    manifest_before = installed_cli.manifest_path.read_bytes()
+
+    record.write_text("bundled_sdk.py,sha256=new-payload,20\n")
+    updated = resolve_default_channel_runtime()
+
+    assert installed_cli.manifest_path.read_bytes() == manifest_before
+    assert (
+        updated.dependency_install_target != original.dependency_install_target
+    )
+    assert original.dependency_install_target not in updated.dependency_paths
+    assert not list(updated.dependency_install_target.iterdir())
+    assert retained.read_text() == "old bundle user dependency"
+
+
+def test_generic_loader_and_channels_share_frozen_site(
+    installed_cli,
+    monkeypatch,
+):
+    from qwenpaw.plugins import loader
+    from qwenpaw.plugins.channel_bootstrap import (
+        resolve_default_channel_runtime,
+    )
+    from qwenpaw.plugins.install_lock import environment_install_lock_path
+
+    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", installed_cli.working)
+    bucket = (
+        f"py{sys.version_info.major}.{sys.version_info.minor}-"
+        f"{platform.system().lower()}-{platform.machine().lower()}"
+    )
+    legacy = installed_cli.working / "plugin_runtime" / bucket / "site"
+    legacy.mkdir(parents=True)
+    previous = resolve_default_channel_runtime().dependency_install_target
+    custom = legacy.parent / "custom" / "site"
+    custom.mkdir(parents=True)
+    installed_cli.manifest["host_wheel_sha256"] = "1" * 64
+    installed_cli.save()
+    monkeypatch.setattr(
+        sys,
+        "path",
+        [str(legacy), str(previous), str(custom), *sys.path],
+    )
+    monkeypatch.setenv("QWENPAW_PLUGIN_SITE", str(legacy))
+    settings = resolve_default_channel_runtime()
+
+    assert loader._plugin_site_dir() == settings.dependency_install_target
+    assert loader._install_lock_path("ordinary-plugin") == (
+        environment_install_lock_path(settings.dependency_install_target)
+    )
+    loader._ensure_plugin_site_on_path()
+
+    assert sys.path[0] == str(settings.dependency_install_target)
+    assert os.environ["QWENPAW_PLUGIN_SITE"] == str(
+        settings.dependency_install_target,
+    )
+    assert str(legacy) not in sys.path
+    assert str(previous) not in sys.path
+    assert str(custom) in sys.path
+    assert legacy.is_dir()
+    assert previous.is_dir()
+    assert str(installed_cli.site) not in sys.path
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("python_runtime_release", "rebuilt-runtime"),
+        ("host_wheel_sha256", "1" * 64),
+    ],
+)
+def test_bundle_release_identity_change_gets_new_site(
+    installed_cli,
+    field,
+    value,
+):
+    from qwenpaw.plugins.channel_bootstrap import (
+        resolve_default_channel_runtime,
+    )
+
+    original = resolve_default_channel_runtime()
+    installed_cli.manifest[field] = value
+    installed_cli.save()
+
+    updated = resolve_default_channel_runtime()
+
+    assert updated.qwenpaw_version == original.qwenpaw_version
+    assert (
+        updated.dependency_install_target != original.dependency_install_target
+    )
+    assert original.dependency_install_target not in updated.dependency_paths
 
 
 def test_installed_click_preset_apply_persists_config(installed_cli):
@@ -300,3 +492,10 @@ def test_source_runtime_ignores_installed_layout(installed_cli, monkeypatch):
     settings = resolve_default_channel_runtime()
     assert settings.support_root != installed_cli.site
     assert settings.runtime_identity is None
+    bucket = (
+        f"py{sys.version_info.major}.{sys.version_info.minor}-"
+        f"{platform.system().lower()}-{platform.machine().lower()}"
+    )
+    assert settings.dependency_install_target == (
+        installed_cli.working / "plugin_runtime" / bucket / "site"
+    )

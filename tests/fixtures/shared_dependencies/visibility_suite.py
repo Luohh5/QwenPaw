@@ -2,6 +2,7 @@
 """Trusted active roots, separate consumer inventories and bounded workers."""
 
 import asyncio
+import hashlib
 import importlib
 from importlib import metadata
 import importlib.util
@@ -378,26 +379,59 @@ def test_frozen_default_runtime_uses_explicit_manifest_roots_only(
     user_site,
     monkeypatch,
 ):
-    import qwenpaw.plugins.channel_bootstrap as bootstrap
+    from qwenpaw.__version__ import __version__
 
-    explicit = tmp_path / "frozen-manifest-site"
-    explicit.mkdir()
+    resources = tmp_path / "Resources"
+    explicit = resources / "site"
+    worker = explicit / "qwenpaw/channel_protocol/shared_worker.py"
+    worker.parent.mkdir(parents=True)
+    worker.write_text("# readable worker support\n")
+    index = explicit / "qwenpaw/official_channels/index.json"
+    index.parent.mkdir()
+    index.write_text("{}")
+    executable = resources / "python"
+    executable.write_text("# controlled runtime\n")
     identity = {
         "version": list(sys.version_info[:2]),
+        "implementation": sys.implementation.name,
+        "cache_tag": sys.implementation.cache_tag,
+        "sys_platform": "darwin",
         "system": "Darwin",
         "machine": "arm64",
+        "supported_tags": ["py3-none-any"],
     }
+    manifest = resources / "runtime.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "host_version": __version__,
+                "preset": "light",
+                "python_executable": "python",
+                "support_root": "site",
+                "dependency_paths": ["site"],
+                "python": identity,
+                "python_runtime_release": "visibility-test",
+                "host_wheel_sha256": "0" * 64,
+                "official_index_sha256": hashlib.sha256(
+                    index.read_bytes(),
+                ).hexdigest(),
+            },
+        ),
+    )
+    for name, value in {
+        "QWENPAW_TAURI_RESOURCE_DIR": str(resources),
+        "QWENPAW_CHANNEL_RUNTIME_MANIFEST": str(manifest),
+        "QWENPAW_DESKTOP_PY_RUNTIME": str(executable),
+        "QWENPAW_CHANNEL_SUPPORT_ROOT": str(explicit),
+        "QWENPAW_CHANNEL_DEPENDENCY_PATHS": json.dumps([str(explicit)]),
+        "QWENPAW_CHANNEL_PRESET": "light",
+    }.items():
+        monkeypatch.setenv(name, value)
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(
-        bootstrap,
-        "runtime_manifest",
-        lambda: (
-            Path(sys.executable),
-            ROOT / "src",
-            (explicit,),
-            identity,
-            (),
-        ),
+        "qwenpaw.config.utils.WORKING_DIR",
+        tmp_path / "working",
     )
     runtime = resolve_default_channel_runtime()
     assert runtime.dependency_paths == (

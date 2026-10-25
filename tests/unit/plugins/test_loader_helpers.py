@@ -117,7 +117,7 @@ class TestIsDisabledPluginDir:
 class TestEnsurePluginSiteOnPath:
     def test_adds_site_when_frozen(self, working_dir, monkeypatch):
         monkeypatch.setattr(pl, "_is_frozen", lambda: True)
-        site_dir = pl._plugin_site_dir()
+        site_dir = working_dir / "managed-dependencies" / "site"
         # clean the dir from sys.path so the insertion path is exercised
         monkeypatch.setattr(
             pl.sys,
@@ -128,7 +128,7 @@ class TestEnsurePluginSiteOnPath:
 
         adds = []
         monkeypatch.setattr(_site, "addsitedir", lambda d: adds.append(d))
-        pl._ensure_plugin_site_on_path()
+        pl._ensure_plugin_site_on_path(site_dir)
         assert str(site_dir) in pl.sys.path
         assert pl.os.environ.get("QWENPAW_PLUGIN_SITE") == str(site_dir)
 

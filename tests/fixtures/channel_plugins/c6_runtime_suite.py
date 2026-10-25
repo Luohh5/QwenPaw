@@ -104,7 +104,8 @@ def test_frozen_runtime_uses_child_abi_and_site_support_without_probe(frozen):
     assert runtime.support_root == frozen.support
     assert runtime.runtime_identity == frozen.data["python"]
     assert (
-        runtime.dependency_install_target.parent.name == "py3.11-windows-amd64"
+        runtime.dependency_install_target.parent.parent.name
+        == "py3.11-windows-amd64"
     )
     assert runtime.dependency_paths == (
         frozen.support,

@@ -7,7 +7,6 @@ import inspect
 import json
 import logging
 import os
-import platform
 import shutil
 import subprocess
 import sys
@@ -118,13 +117,11 @@ def _remove_dir(path: Path | None) -> None:
 
 
 def _plugin_site_dir() -> Path:
-    """User-writable, ABI-bucketed directory holding installed plugin deps."""
-    bucket = (
-        f"py{sys.version_info.major}.{sys.version_info.minor}"
-        f"-{platform.system().lower()}-{platform.machine().lower()}"
-    )
-    site_dir = _plugin_runtime_dir() / bucket / "site"
-    return site_dir
+    """Use the same managed dependency target as channel workers."""
+    from .channel_bootstrap import plugin_runtime_site, runtime_manifest
+
+    runtime = runtime_manifest() if _is_frozen() else None
+    return plugin_runtime_site(_plugin_runtime_dir(), runtime)
 
 
 def _install_lock_path(plugin_id: str) -> Path:
@@ -250,9 +247,27 @@ def _ensure_plugin_site_on_path(
     if not _is_frozen():
         return
     try:
-        site = str(_plugin_site_dir() if site_dir is None else site_dir)
+        target = _plugin_site_dir() if site_dir is None else site_dir
     except Exception:
         return
+    if (
+        target.parent.name.startswith("bundle-")
+        and target.parent.parent.parent == _plugin_runtime_dir()
+    ):
+        bucket = target.parent.parent.resolve()
+        active = target.resolve()
+        paths = []
+        for entry in sys.path:
+            path = Path(_norm_realpath(entry))
+            managed = path == bucket / "site" or (
+                path.name == "site"
+                and path.parent.name.startswith("bundle-")
+                and path.parent.parent == bucket
+            )
+            if not managed or path == active:
+                paths.append(entry)
+        sys.path[:] = paths
+    site = str(target)
     # Expose the dir so plugins that spawn the bundled Python (e.g. the pet
     # desktop window) can put their installed deps on the child's PYTHONPATH.
     os.environ["QWENPAW_PLUGIN_SITE"] = site

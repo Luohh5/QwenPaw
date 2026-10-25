@@ -423,9 +423,31 @@ async def test_frozen_missing_readable_worker_rejects_before_writes(desktop):
 @pytest.mark.asyncio
 async def test_frozen_without_registered_settings_uses_launcher_manifest(
     manifest_desktop,
+    monkeypatch,
 ):
+    from qwenpaw.plugins.channel_bootstrap import (
+        resolve_default_channel_runtime,
+    )
+
     desktop = manifest_desktop
+    legacy = desktop.target
+    common = wheel(
+        desktop.payload.path.parent,
+        name="frozen-common-dependency",
+    )
+    host_site = desktop.resources / "binaries/qwenpaw-backend/_internal"
+    with zipfile.ZipFile(common.path) as archive:
+        archive.extractall(desktop.support)
+        archive.extractall(legacy)
+        archive.extractall(host_site)
+    monkeypatch.syspath_prepend(str(host_site))
+    desktop.requirements.write_text(
+        "frozen-local-sdk==2.0\nfrozen-common-dependency==2.0\n",
+    )
+    legacy_before = _contents(legacy)
     before = _contents(desktop.resources)
+    settings = resolve_default_channel_runtime()
+    target = settings.dependency_install_target
 
     decision = await desktop.loader._ensure_dependencies_installed(
         desktop.upload,
@@ -441,8 +463,21 @@ async def test_frozen_without_registered_settings_uses_launcher_manifest(
     assert all(
         spec.support_root == desktop.support for spec, _ in desktop.audits
     )
+    assert target != legacy
+    assert loader_module._plugin_site_dir() == target
+    assert all(
+        spec.dependency_paths == settings.dependency_paths
+        for spec, _ in desktop.audits
+    )
+    assert all(
+        legacy not in spec.dependency_paths for spec, _ in desktop.audits
+    )
+    assert os.environ["QWENPAW_PLUGIN_SITE"] == str(target)
+    assert str(target) in sys.path
+    assert str(legacy) not in sys.path
     module = importlib.import_module("frozen_local_sdk")
-    assert Path(module.__file__) == desktop.target / "frozen_local_sdk.py"
+    assert Path(module.__file__) == target / "frozen_local_sdk.py"
+    assert _contents(legacy) == legacy_before
     assert _contents(desktop.resources) == before
 
 
