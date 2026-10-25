@@ -11,6 +11,8 @@ import platform
 from pathlib import Path
 import sys
 
+from packaging.tags import parse_tag
+
 from .channel_adapter import ChannelRuntimeSettings
 
 
@@ -306,6 +308,20 @@ def resolve_default_channel_runtime():
     )
 
 
+def _runtime_python_abis(tags):
+    """Keep interpreter/ABI identity independent of host OS tag versions."""
+    try:
+        parsed = {tag for value in tags for tag in parse_tag(value)}
+    except ValueError:
+        raise ValueError("CHANNEL_RUNTIME_IDENTITY_MISMATCH") from None
+    if not parsed or any(
+        not tag.interpreter or not tag.abi or not tag.platform
+        for tag in parsed
+    ):
+        raise ValueError("CHANNEL_RUNTIME_IDENTITY_MISMATCH")
+    return {(tag.interpreter, tag.abi) for tag in parsed}
+
+
 def validate_runtime_identity(snapshot, identity, executable=None):
     """Reject the wrong child before admission writes dependencies."""
     if identity is None:
@@ -327,8 +343,11 @@ def validate_runtime_identity(snapshot, identity, executable=None):
         "platform_system": identity["system"],
         "platform_machine": identity["machine"],
     }
+    abi_matches = _runtime_python_abis(
+        identity["supported_tags"],
+    ) == _runtime_python_abis(snapshot.supported_tags)
     if (
         any(env.get(key) != value for key, value in expected.items())
-        or tuple(identity["supported_tags"]) != snapshot.supported_tags
+        or not abi_matches
     ):
         raise ValueError("CHANNEL_RUNTIME_IDENTITY_MISMATCH")

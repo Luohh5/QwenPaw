@@ -158,9 +158,8 @@ def test_c7_frozen_official_bundle_uses_validated_support_site(
     assert official_channels._resource_root() == expected
 
 
-def test_c7_manifest_identity_rejects_wrong_child_snapshot() -> None:
-    from qwenpaw.plugins.channel_bootstrap import validate_runtime_identity
-
+@pytest.fixture
+def child_identity():
     identity = {
         "version": [3, 11],
         "implementation": "cpython",
@@ -168,7 +167,10 @@ def test_c7_manifest_identity_rejects_wrong_child_snapshot() -> None:
         "sys_platform": "darwin",
         "system": "Darwin",
         "machine": "arm64",
-        "supported_tags": ["cp311-cp311-macosx_11_0_arm64"],
+        "supported_tags": [
+            "cp311-cp311-macosx_15_0_arm64",
+            "py3-none-any",
+        ],
     }
     snapshot = SimpleNamespace(
         executable="/controlled/python",
@@ -177,9 +179,51 @@ def test_c7_manifest_identity_rejects_wrong_child_snapshot() -> None:
             "implementation_name": "cpython",
             "sys_platform": "darwin",
             "platform_system": "Darwin",
-            "platform_machine": "x86_64",
+            "platform_machine": "arm64",
         },
         supported_tags=tuple(identity["supported_tags"]),
     )
+    return identity, snapshot
+
+
+def test_c7_manifest_identity_accepts_host_platform_tags(child_identity):
+    from qwenpaw.plugins.channel_bootstrap import validate_runtime_identity
+
+    identity, snapshot = child_identity
+    snapshot.supported_tags = (
+        "py3-none-any",
+        "cp311-cp311-macosx_26_0_arm64",
+        "cp311-cp311-macosx_15_0_arm64",
+    )
+    validate_runtime_identity(snapshot, identity, "/controlled/python")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("executable", "/different/python"),
+        ("python_version", "3.12"),
+        ("implementation_name", "pypy"),
+        ("sys_platform", "linux"),
+        ("platform_system", "Linux"),
+        ("platform_machine", "x86_64"),
+        (
+            "supported_tags",
+            ("cp311-cp311d-macosx_15_0_arm64", "py3-none-any"),
+        ),
+    ],
+)
+def test_c7_manifest_identity_rejects_wrong_child_snapshot(
+    child_identity,
+    field,
+    value,
+):
+    from qwenpaw.plugins.channel_bootstrap import validate_runtime_identity
+
+    identity, snapshot = child_identity
+    if field in {"executable", "supported_tags"}:
+        setattr(snapshot, field, value)
+    else:
+        snapshot.marker_environment[field] = value
     with pytest.raises(ValueError, match="CHANNEL_RUNTIME_IDENTITY_MISMATCH"):
         validate_runtime_identity(snapshot, identity, "/controlled/python")

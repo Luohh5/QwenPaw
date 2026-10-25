@@ -144,12 +144,16 @@ def test_frozen_runtime_fails_closed_without_fallback(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["install", "repair"])
+@pytest.mark.parametrize("build_identity", [False, True])
 async def test_default_fresh_site_supports_existing_HTTP_local_wheel_pipeline(
     transaction,
     monkeypatch,
     tmp_path,
     operation,
+    build_identity,
 ):
+    from packaging.tags import sys_tags
+
     from qwenpaw.plugins.channel_bootstrap import (
         resolve_default_channel_runtime,
     )
@@ -159,6 +163,32 @@ async def test_default_fresh_site_supports_existing_HTTP_local_wheel_pipeline(
     )
 
     runtime = resolve_default_channel_runtime()
+    if build_identity:
+        tags = list(sys_tags())
+        build_platform = {
+            "Darwin": f"macosx_15_0_{platform.machine()}",
+            "Linux": f"manylinux_2_17_{platform.machine()}",
+        }.get(platform.system(), tags[0].platform)
+        build_tags = list(
+            dict.fromkeys(
+                f"{tag.interpreter}-{tag.abi}-"
+                f"{build_platform if tag.platform != 'any' else 'any'}"
+                for tag in reversed(tags)
+            ),
+        )
+        assert build_tags != [str(tag) for tag in tags]
+        runtime = replace(
+            runtime,
+            runtime_identity={
+                "version": list(sys.version_info[:2]),
+                "implementation": sys.implementation.name,
+                "cache_tag": sys.implementation.cache_tag,
+                "sys_platform": sys.platform,
+                "system": platform.system(),
+                "machine": platform.machine(),
+                "supported_tags": build_tags,
+            },
+        )
     configure_runtime(transaction, monkeypatch, runtime)
     assert runtime.dependency_install_target.exists()
     assert not list(runtime.dependency_install_target.iterdir())
