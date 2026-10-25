@@ -379,7 +379,8 @@ def stage_channel_runtime(
 ) -> Path:
     """Return a validated runtime manifest; publish nothing on failure."""
     root = resource_dir.resolve(strict=True)
-    python = python.resolve(strict=True)
+    python = python.parent.resolve(strict=True) / python.name
+    python.resolve(strict=True).relative_to(root)
     executable = python.relative_to(root).as_posix()
     wheel = wheel.resolve(strict=True)
     name, version = _wheel_metadata(wheel)

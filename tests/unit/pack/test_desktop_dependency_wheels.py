@@ -113,6 +113,114 @@ def runtime_stager():
     return module
 
 
+@pytest.fixture
+def staged_runtime_inputs(tmp_path, monkeypatch, runtime_stager):
+    from qwenpaw.__version__ import __version__
+
+    root = tmp_path / "resources"
+    executable = root / "python/bin/python3.11"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"python runtime")
+    entry = executable.with_name("python3")
+    try:
+        entry.symlink_to(executable.name)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Creating symlinks requires Windows privilege")
+        raise
+    wheel = tmp_path / f"qwenpaw-{__version__}-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(
+            f"qwenpaw-{__version__}.dist-info/METADATA",
+            f"Name: qwenpaw\nVersion: {__version__}\n",
+        )
+        archive.writestr("qwenpaw/official_channels/index.json", "{}")
+    identity = {
+        "version": [3, 11],
+        "implementation": "cpython",
+        "cache_tag": "cpython-311",
+        "sys_platform": "darwin",
+        "system": "Darwin",
+        "machine": "arm64",
+        "supported_tags": ["py3-none-any"],
+    }
+    monkeypatch.setattr(
+        runtime_stager,
+        "_snapshot",
+        lambda *args: {"distributions": [], "python": identity},
+    )
+    monkeypatch.setattr(
+        runtime_stager,
+        "_validate_closure",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
+        runtime_stager,
+        "_validate_official_resources",
+        lambda *args: None,
+    )
+    return root, entry, wheel
+
+
+def test_runtime_entry_survives_symlink_materialization(
+    tmp_path,
+    monkeypatch,
+    runtime_stager,
+    staged_runtime_inputs,
+):
+    from qwenpaw.plugins.channel_bootstrap import runtime_manifest
+
+    root, entry, wheel = staged_runtime_inputs
+    manifest = runtime_stager.stage_channel_runtime(
+        python=entry,
+        wheel=wheel,
+        resource_dir=root,
+    )
+    assert json.loads(manifest.read_text())["python_executable"] == (
+        "python/bin/python3"
+    )
+    installed = shutil.copytree(root, tmp_path / "installed", symlinks=False)
+    entry = installed / "python/bin/python3"
+    support = installed / "binaries/channel-runtime/site"
+    assert entry.is_file() and not entry.is_symlink()
+    assert entry.resolve() != entry.with_name("python3.11").resolve()
+    for name, value in {
+        "QWENPAW_TAURI_RESOURCE_DIR": str(installed),
+        "QWENPAW_CHANNEL_RUNTIME_MANIFEST": str(
+            installed / manifest.relative_to(root),
+        ),
+        "QWENPAW_DESKTOP_PY_RUNTIME": str(entry),
+        "QWENPAW_CHANNEL_SUPPORT_ROOT": str(support),
+        "QWENPAW_CHANNEL_DEPENDENCY_PATHS": json.dumps([str(support)]),
+        "QWENPAW_CHANNEL_PRESET": "light",
+    }.items():
+        monkeypatch.setenv(name, value)
+    executable, actual_support, sites, _, preset = runtime_manifest()
+    assert executable == entry.resolve()
+    assert actual_support == support.resolve()
+    assert sites == (support.resolve(),)
+    assert preset == "light"
+
+
+def test_runtime_entry_rejects_symlink_outside_resources(
+    tmp_path,
+    runtime_stager,
+    staged_runtime_inputs,
+):
+    root, entry, wheel = staged_runtime_inputs
+    outside = tmp_path / "outside-python"
+    outside.write_bytes(b"outside runtime")
+    entry.unlink()
+    entry.symlink_to(outside)
+    with pytest.raises(ValueError):
+        runtime_stager.stage_channel_runtime(
+            python=entry,
+            wheel=wheel,
+            resource_dir=root,
+        )
+    assert not (root / "binaries/channel-runtime").exists()
+
+
 def test_wheel_metadata_ignores_vendored_distributions(
     tmp_path,
     runtime_stager,
