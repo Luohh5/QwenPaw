@@ -20,6 +20,13 @@ echo ""
 
 SIGN_MACOS_BUNDLE="${REPO_ROOT}/scripts/pack-tauri/sign_macos_bundle.sh"
 
+# Temporary read-only metadata probe, enabled only by the diagnostic workflow.
+metadata_snapshot() {
+    if [ -n "${MACOS_METADATA_DIAGNOSTICS:-}" ]; then
+        python "${REPO_ROOT}/scripts/pack-tauri/diagnose_macos_metadata.py" "$@" || true
+    fi
+}
+
 # Step 0: Prerequisites
 echo "== Step 0: Checking Prerequisites =="
 missing=()
@@ -93,6 +100,7 @@ echo ""
 # Step 2: Build PyInstaller backend
 echo "== Step 2: Building PyInstaller Backend =="
 bash scripts/pack-tauri/build_pyinstaller.sh
+metadata_snapshot tree 01-runtime-staged "${REPO_ROOT}/console/src-tauri/binaries"
 echo "PyInstaller backend built"
 echo ""
 
@@ -100,6 +108,7 @@ echo "== Step 2b: Signing PyInstaller Backend =="
 bash "${SIGN_MACOS_BUNDLE}" \
     "${REPO_ROOT}/console/src-tauri/binaries/qwenpaw-backend" \
     "${APPLE_SIGNING_IDENTITY}"
+metadata_snapshot tree 02-backend-signed "${REPO_ROOT}/console/src-tauri/binaries"
 echo "PyInstaller backend signed"
 echo ""
 
@@ -127,10 +136,12 @@ if [ ! -x "${HELPER_PATH}" ]; then
     exit 1
 fi
 
+metadata_snapshot tree 03-tauri-built "${APP_PATH}"
 echo "== Step 3b: Signing Final macOS App =="
 bash "${SIGN_MACOS_BUNDLE}" \
     "${APP_PATH}" \
     "${APPLE_SIGNING_IDENTITY}"
+metadata_snapshot tree 04-app-signed "${APP_PATH}"
 echo "Final macOS app signed and verified"
 echo ""
 
@@ -149,6 +160,7 @@ mkdir -p "${DIST_DIR}"
 # Match the legacy macOS package shape: one zip containing one .app bundle.
 cp -R "${APP_PATH}" "${DIST_DIR}/"
 STAGED_APP_PATH="${DIST_DIR}/$(basename "${APP_PATH}")"
+metadata_snapshot tree 05-app-copied "${STAGED_APP_PATH}"
 echo ".app copied to ${STAGED_APP_PATH}"
 
 # Create ZIP archive
@@ -166,6 +178,7 @@ fi
 
 if [ -f "${ZIP_NAME}" ]; then
     SIZE=$(du -sh "${ZIP_NAME}" | cut -f1)
+    metadata_snapshot zip 06-final-zip "${ZIP_NAME}"
     echo "Created ${ZIP_NAME} (${SIZE})"
 else
     echo "ERROR: Failed to create ZIP archive"

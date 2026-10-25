@@ -73,6 +73,7 @@ jobs:
 
       - name: Build Tauri macOS package
         env:
+          MACOS_METADATA_DIAGNOSTICS: ${{ runner.temp }}/macos-metadata-diagnostics
           NODE_OPTIONS: "--max-old-space-size=8192"
           # Authenticate the python-build-standalone release lookup in
           # stage_python_runtime.py to avoid anonymous API rate limits.
@@ -85,6 +86,15 @@ jobs:
         run: |
           chmod +x scripts/pack-tauri/build_macos_pyinstaller.sh
           bash scripts/pack-tauri/build_macos_pyinstaller.sh
+
+      - name: Upload macOS metadata diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-metadata-diagnostics
+          path: ${{ runner.temp }}/macos-metadata-diagnostics/*.json
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Verify desktop (Tauri macOS)
         timeout-minutes: 10
