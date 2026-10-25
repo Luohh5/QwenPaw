@@ -243,6 +243,7 @@ def _installed_metadata(sites):
     ):
         raise dependency_error("DEPENDENCY_REPAIR_REQUIRED")
     rows, invalid, observed = {}, {}, {}
+    canonical_sites = {canonical_environment_path(site) for site in sites}
     for distribution in metadata.distributions(path=list(sites)):
         # importlib.metadata exposes the on-disk metadata origin here.
         origin = Path(
@@ -263,7 +264,12 @@ def _installed_metadata(sites):
                 ] = "DEPENDENCY_METADATA_INVALID"
             continue
         try:
-            if not name or not version or str(origin.parent) not in sites:
+            if (
+                not name
+                or not version
+                or canonical_environment_path(origin.parent)
+                not in canonical_sites
+            ):
                 raise ValueError("invalid metadata")
             Version(version)
         except ValueError:

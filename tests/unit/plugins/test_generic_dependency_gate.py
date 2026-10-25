@@ -11,8 +11,10 @@ import hashlib
 from importlib import metadata
 import inspect
 import json
+from ntpath import normcase as native_windows_normcase
 import os
 from pathlib import Path
+import posixpath
 import sys
 import sysconfig
 import threading
@@ -31,6 +33,7 @@ from qwenpaw.plugins.dependency_usage import (
 )
 from qwenpaw.plugins.execution.dependencies import DependencySnapshot
 from qwenpaw.plugins.execution.dependencies import repair_marker
+from qwenpaw.plugins.execution import dependencies
 from qwenpaw.plugins.ownership import (
     RuntimeKey,
     RuntimeOwners,
@@ -546,6 +549,88 @@ async def test_withdrawn_host_protects_only_imported_requirements(
     result = await install(tmp_path, usage=usage, process=process)
     assert result.distributions["f32-sdk"]["version"] == "2.0"
     assert result.distributions["f32-imported"]["version"] == "1.0"
+
+
+def windows_normcase(path):
+    """Apply Windows case identity using host-compatible separators."""
+    return native_windows_normcase(path).replace("\\", os.sep)
+
+
+def test_host_metadata_accepts_windows_case_alias(tmp_path, monkeypatch):
+    site = tmp_path / "MixedCaseSite"
+    imported = evidence(site, versions={"f32-imported": "1.0"})
+    materialize_host_metadata(imported)
+    info = Path(imported.distributions["f32-imported"]["metadata_path"])
+    usage = DependencyUsageRegistry(RuntimeOwners())
+    token = declare(usage, "host", imported, ())
+    usage.observe_host(token, imported)
+    usage.withdraw(token)
+
+    def discover(*, path):
+        assert windows_normcase(str(site)) in path
+        return (metadata.PathDistribution(info),)
+
+    monkeypatch.setattr(os.path, "normcase", windows_normcase)
+    monkeypatch.setattr(metadata, "distributions", discover)
+    decision = gate.evaluate_shared_dependencies(
+        None,
+        imported,
+        plugin_id="candidate",
+        uses=usage.snapshot().uses,
+        install_target=site,
+    )
+    assert decision.already_satisfied, decision.reason
+    assert decision.missing == []
+    assert decision.unsupported == []
+    assert decision.host_conflicts == []
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "outside",
+        pytest.param(
+            "posix-case-alias",
+            marks=pytest.mark.skipif(
+                os.name == "nt",
+                reason="POSIX path identity is case-sensitive",
+            ),
+        ),
+        "duplicate-name",
+        "invalid-version",
+    ],
+)
+def test_installed_metadata_rejects_invalid_origins_and_headers(
+    tmp_path,
+    monkeypatch,
+    case,
+):
+    site = tmp_path / "MixedCaseSite"
+    imported = evidence(site, versions={"f32-imported": "1.0"})
+    materialize_host_metadata(imported)
+    info = Path(imported.distributions["f32-imported"]["metadata_path"])
+    if case == "duplicate-name":
+        with (info / "METADATA").open("a") as stream:
+            stream.write("Name: f32-imported\n")
+    elif case == "invalid-version":
+        (info / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: f32-imported\nVersion: invalid\n",
+        )
+    normcase = (
+        posixpath.normcase if case == "posix-case-alias" else windows_normcase
+    )
+    monkeypatch.setattr(os.path, "normcase", normcase)
+    monkeypatch.setattr(
+        metadata,
+        "distributions",
+        lambda *, path: (metadata.PathDistribution(info),),
+    )
+    root = tmp_path / "outside" if case == "outside" else site
+    sites = (windows_normcase(str(root)),)
+    rows, invalid, observed = dependencies._installed_metadata(sites)
+    assert rows == {}
+    assert invalid == {"f32-imported": "DEPENDENCY_METADATA_INVALID"}
+    assert observed == {}
 
 
 @pytest.mark.asyncio
