@@ -150,9 +150,16 @@ datas.append(
     ),
 )
 
-# Collect package metadata for packages that use importlib.metadata at runtime.
-# Keep this allowlist in sync when adding runtime dependencies that query
-# importlib.metadata, otherwise packaged sidecars may fail only after install.
+# The dependency gate needs complete host metadata, not only the packages
+# that query their own versions. Both desktop builds install qwenpaw[full].
+datas += runpy.run_path(str(Path(SPECPATH) / "collect_runtime_metadata.py"))[
+    "collect_runtime_metadata"
+](
+    ["qwenpaw[full]"],
+    copy_metadata,
+)
+
+# Preserve metadata for historical optional integrations when installed.
 _metadata_pkgs = [
     "qwenpaw",
     "fastmcp",

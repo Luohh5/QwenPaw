@@ -368,3 +368,38 @@ async def test_acquisition_files_settle_off_loop_before_staging_disappears(
     finally:
         release.set()
         await asyncio.gather(operation, return_exceptions=True)
+
+
+@pytest.mark.parametrize("location", ["bundle", "overlay", "venv"])
+def test_upgrade_resolution_pins_only_immutable_candidate_providers(
+    tmp_path,
+    location,
+):
+    from qwenpaw.plugins.dependency_upgrade import DependencyUpgradeManager
+
+    directory = tmp_path / "dependency_upgrades/operation"
+    directory.mkdir(parents=True)
+    sites = {
+        "bundle": tmp_path / "Resources/channel-runtime/site",
+        "overlay": tmp_path / "plugin_runtime/runtime/site",
+        "venv": tmp_path / "environment/site",
+    }
+    site = sites[location]
+    site.mkdir(parents=True)
+    if location == "venv":
+        (site.parent / "pyvenv.cfg").write_text("home = fixture\n")
+    snapshot = evidence(site, versions={"f32-sdk": "1.0"})
+    materialize_host_metadata(snapshot)
+    requirements = directory / "candidate.txt"
+    requirements.write_text("f32-sdk>=1\n")
+
+    _, command = DependencyUpgradeManager._prepare_resolution(
+        directory,
+        snapshot,
+        ["f32-sdk>=1"],
+        [],
+        requirements,
+    )
+
+    constraints = Path(command[command.index("--constraint") + 1]).read_text()
+    assert ("f32-sdk==1.0" in constraints) is (location == "bundle")

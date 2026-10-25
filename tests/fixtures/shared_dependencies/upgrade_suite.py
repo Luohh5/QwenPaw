@@ -3,6 +3,7 @@
 
 import asyncio
 import base64
+from dataclasses import replace
 import hashlib
 import importlib.util
 import json
@@ -404,6 +405,76 @@ def upgrade_manager(loader):
     from qwenpaw.plugins.dependency_upgrade import DependencyUpgradeManager
 
     return DependencyUpgradeManager(loader)
+
+
+@pytest.mark.asyncio
+async def test_packaged_conflict_refuses_before_wheel_resolution(
+    isolated_loader,
+    tmp_path,
+    monkeypatch,
+):
+    from qwenpaw.plugins.dependency_gate import SharedDependencyError
+
+    loader, _, site, _ = isolated_loader
+    packaged = tmp_path / "Resources/channel-runtime/site"
+    distribution(packaged, "upgrade-sdk", "1.0")
+    monkeypatch.setattr(
+        loader.registry,
+        "channel_runtime",
+        replace(
+            loader.registry.channel_runtime,
+            dependency_paths=(packaged, site),
+        ),
+    )
+    before = tree_bytes(packaged)
+
+    def no_solver(*args, **kwargs):
+        pytest.fail("A conflicting bundled dependency must refuse before pip")
+
+    monkeypatch.setattr(
+        loader, "_run_subprocess_with_streaming_log", no_solver
+    )
+    manager = upgrade_manager(loader)
+    with pytest.raises(SharedDependencyError) as error:
+        await manager.stage(channel_source(tmp_path / "incoming"))
+
+    assert error.value.reason_code == "DEPENDENCY_ENVIRONMENT_PROTECTED"
+    assert tree_bytes(packaged) == before
+    assert not list(manager.root.glob("*/operation.json"))
+
+
+@pytest.mark.asyncio
+async def test_user_overlay_upgrade_remains_reviewable(
+    isolated_loader,
+    tmp_path,
+    monkeypatch,
+):
+    loader, _, site, _ = isolated_loader
+    overlay = tmp_path / "host/plugin_runtime/runtime/site"
+    distribution(overlay, "upgrade-sdk", "1.0")
+    monkeypatch.setattr(
+        loader.registry,
+        "channel_runtime",
+        replace(
+            loader.registry.channel_runtime,
+            dependency_paths=(overlay, site),
+            dependency_install_target=overlay,
+        ),
+    )
+    before = tree_bytes(overlay)
+    manager = upgrade_manager(loader)
+    operation = await manager.stage(channel_source(tmp_path / "incoming"))
+
+    assert operation["status"] == "needs_confirmation"
+    assert operation["changes"] == [
+        {
+            "name": "upgrade-sdk",
+            "current_version": "1.0",
+            "target_version": "2.0",
+        }
+    ]
+    assert tree_bytes(overlay) == before
+    assert not (site / "upgrade_sdk.py").exists()
 
 
 def imported_sdk(loader, site):

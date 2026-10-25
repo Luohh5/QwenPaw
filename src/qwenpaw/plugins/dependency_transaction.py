@@ -201,6 +201,16 @@ def _owned(row, prefix):
     return files
 
 
+def dependency_site_is_mutable(site, prefix, managed_root):
+    """Keep bundled/system packages immutable; allow owned runtime targets."""
+    site, prefix = Path(site).resolve(), Path(prefix).resolve()
+    return not (prefix / "conda-meta").exists() and (
+        (prefix / "pyvenv.cfg").is_file()
+        and site.is_relative_to(prefix)
+        or site.is_relative_to(Path(managed_root).resolve())
+    )
+
+
 def prepare_payload(directory, snapshot, changed, destinations, files, wheels):
     """Authorize individual files only; never delete a package directory."""
     from email.parser import BytesParser
@@ -245,16 +255,10 @@ def prepare_payload(directory, snapshot, changed, destinations, files, wheels):
             ]
             name = re.sub(r"[-_.]+", "-", name).lower()
         site = Path(destinations[name]).resolve()
-        prefix = Path(snapshot["prefix"]).resolve()
-        if (
-            (prefix / "conda-meta").exists()
-            or not (
-                (prefix / "pyvenv.cfg").is_file()
-                and site.is_relative_to(prefix)
-            )
-            and not site.is_relative_to(
-                directory.parent.parent / "plugin_runtime",
-            )
+        if not dependency_site_is_mutable(
+            site,
+            snapshot["prefix"],
+            directory.parent.parent / "plugin_runtime",
         ):
             raise RuntimeError(
                 "DEPENDENCY_ENVIRONMENT_PROTECTED: use the environment owner's package manager.",

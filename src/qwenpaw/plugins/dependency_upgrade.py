@@ -14,7 +14,7 @@ import shutil
 import sys
 from uuid import uuid4
 
-from packaging.utils import parse_wheel_filename
+from packaging.utils import canonicalize_name, parse_wheel_filename
 
 from ..utils.io_utils import get_sync_path_lock, run_sync_io
 
@@ -454,7 +454,40 @@ class DependencyUpgradeManager:
         consumers,
         requirements_path,
     ):
-        from .dependency_transaction import environment_fingerprint
+        from packaging.requirements import Requirement
+
+        from .dependency_transaction import (
+            dependency_site_is_mutable,
+            environment_fingerprint,
+        )
+
+        protected = {
+            name
+            for name, row in snapshot.distributions.items()
+            if not dependency_site_is_mutable(
+                Path(row["metadata_path"]).parent,
+                snapshot.prefix,
+                directory.parent.parent / "plugin_runtime",
+            )
+        }
+        for value in requirements:
+            requirement = Requirement(value)
+            if requirement.marker and not requirement.marker.evaluate(
+                {**snapshot.marker_environment, "extra": ""},
+            ):
+                continue
+            name = canonicalize_name(requirement.name)
+            if name in protected and not requirement.specifier.contains(
+                snapshot.distributions[name]["version"],
+                prereleases=True,
+            ):
+                _refuse(
+                    "DEPENDENCY_ENVIRONMENT_PROTECTED",
+                    f"{name} {snapshot.distributions[name]['version']} is "
+                    f"bundled or environment-managed, but {requirement} is "
+                    "required. Update the desktop app or use the "
+                    "environment owner's package manager.",
+                )
 
         fingerprint = environment_fingerprint(snapshot.to_mapping())
         wheels_dir = directory / "wheels"
@@ -490,7 +523,7 @@ class DependencyUpgradeManager:
             "".join(
                 f"{name}=={row['version']}\n"
                 for name, row in snapshot.distributions.items()
-                if name not in closure
+                if name not in closure or name in protected
             ),
             encoding="utf-8",
         )

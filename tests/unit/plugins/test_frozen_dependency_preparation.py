@@ -4,6 +4,7 @@
 # pylint: disable=protected-access,redefined-outer-name
 
 from dataclasses import replace
+import ast
 import hashlib
 import importlib
 from importlib import metadata
@@ -11,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import runpy
 import shutil
 import sys
 import sysconfig
@@ -27,7 +29,7 @@ from qwenpaw.plugins.channel_adapter import ChannelRuntimeSettings
 from qwenpaw.plugins.execution import PluginProcess
 from qwenpaw.plugins.execution_backend import BackendBinding
 
-from .test_generic_dependency_gate import wheel
+from .test_generic_dependency_gate import declare, evidence, wheel
 
 pytestmark = pytest.mark.skipif(
     os.name == "nt",
@@ -500,3 +502,105 @@ async def test_source_dependency_audit_keeps_shared_interpreter_and_support(
     assert str(desktop.target) not in sys.path
     assert not list(desktop.target.iterdir())
     assert _contents(desktop.resources) == before
+
+
+@pytest.mark.asyncio
+async def test_frozen_metadata_closure_satisfies_hub_host_without_pip(
+    desktop,
+    monkeypatch,
+):
+    from qwenpaw.plugins.execution.dependencies import _installed_metadata
+
+    build_site = desktop.upload.parent / "build-site"
+    host_site = desktop.resources / "binaries/qwenpaw-backend/_internal"
+    for name, requires in (
+        ("qwenpaw", ("frozen-local-sdk==2.0", "httpx==2.0")),
+        ("httpx", ("frozen-common-dependency==2.0",)),
+        ("frozen-local-sdk", ("frozen-common-dependency==2.0",)),
+        ("frozen-common-dependency", ()),
+    ):
+        payload = wheel(
+            desktop.payload.path.parent,
+            name=name,
+            requires=requires,
+        )
+        with zipfile.ZipFile(payload.path) as archive:
+            archive.extractall(build_site)
+            if name != "qwenpaw":
+                archive.extractall(desktop.support)
+    # Execute the actual metadata collection section of the desktop spec,
+    # substituting only PyInstaller's data-copy descriptor boundary.
+    spec = (
+        Path(__file__).resolve().parents[3] / "scripts/pack-tauri/qwenpaw.spec"
+    )
+    nodes = ast.parse(spec.read_text()).body
+    selected = [
+        node
+        for node in nodes
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.For))
+        and any(
+            isinstance(item, ast.Name)
+            and item.id in {"copy_metadata", "_metadata_pkgs"}
+            for item in ast.walk(node)
+        )
+    ]
+    inventory = {
+        dist.metadata["Name"]: dist
+        for dist in metadata.distributions(path=[str(build_site)])
+    }
+
+    def installed(name):
+        if name not in inventory:
+            raise metadata.PackageNotFoundError(name)
+        return inventory[name]
+
+    namespace = {
+        "Path": Path,
+        "runpy": runpy,
+        "SPECPATH": str(spec.parent),
+        "PackageNotFoundError": metadata.PackageNotFoundError,
+        "copy_metadata": lambda name: [
+            (str(metadata.distribution(name)._path), "."),
+        ],
+        "datas": [],
+    }
+    with monkeypatch.context() as build:
+        build.setattr(metadata, "distribution", installed)
+        exec(
+            compile(ast.Module(body=selected, type_ignores=[]), spec, "exec"),
+            namespace,
+        )
+    copied = set(namespace["datas"])
+    for source, _ in copied:
+        shutil.copytree(source, host_site / Path(source).name)
+    host_rows, invalid, _ = _installed_metadata((str(host_site),))
+    assert not invalid
+    host = replace(
+        evidence(host_site, package_sites=(host_site, desktop.target)),
+        distributions={"httpx": host_rows["httpx"]},
+    )
+    usage = desktop.registry.dependency_usage
+    token = declare(usage, "aliyun-hub", host, ())
+    usage.observe_host(token, host)
+    usage.withdraw(token)
+    before = _contents(desktop.resources)
+
+    async def no_pip(*args, **kwargs):
+        pytest.fail("A complete packaged environment must not acquire wheels")
+
+    monkeypatch.setattr(desktop.loader, "_acquire_dependency_wheels", no_pip)
+    monkeypatch.syspath_prepend(str(host_site))
+    await desktop.loader._prepare_python_dependencies(
+        desktop.requirements,
+        "ordinary-plugin",
+    )
+    result = await desktop.loader._ensure_dependencies_installed(
+        desktop.upload,
+        "ordinary-plugin",
+        allow_install=True,
+    )
+
+    assert result.already_satisfied and not result.missing
+    assert "frozen-common-dependency" in desktop.audits[-1][1].distributions
+    assert _contents(desktop.resources) == before
+    assert not list(desktop.target.iterdir())
