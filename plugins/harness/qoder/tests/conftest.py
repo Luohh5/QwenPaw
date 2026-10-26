@@ -4,6 +4,8 @@
 # Pytest fixtures are injected by their declared names.
 # pylint: disable=redefined-outer-name
 
+import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +16,7 @@ from qoder_agent_sdk import (
     ResultMessage,
     StreamEvent,
     TextBlock,
+    Transport,
 )
 from qwenpaw.plugins.harnesses import HarnessCallContext, HarnessContext
 from qwenpaw.plugins.resources import ResourceOwner, ResourceScope
@@ -88,6 +91,85 @@ class FakeQoderClient:
 
     async def get_server_info(self):
         return self.server_info
+
+
+class QueuedQoderTransport(Transport):
+    """Replace CLI I/O while retaining the real SDK's shared response queue."""
+
+    def __init__(self, native_id):
+        self.native_id = native_id
+        self.messages = asyncio.Queue()
+        self.closed = False
+        self.close_failures = 0
+        self.interrupted = asyncio.Event()
+        self.release_interrupt = asyncio.Event()
+        self.release_interrupt.set()
+
+    async def connect(self):
+        pass
+
+    async def write(self, data):
+        message = json.loads(data)
+        if message["type"] == "control_request":
+            if message["request"]["subtype"] == "interrupt":
+                # Acknowledging control does not consume this ordinary result.
+                self.messages.put_nowait(self.result(error=True))
+                self.interrupted.set()
+                await self.release_interrupt.wait()
+            self.messages.put_nowait(
+                {
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": message["request_id"],
+                        "response": {},
+                    },
+                },
+            )
+        elif message["type"] == "user":
+            prompt = message["message"]["content"]
+            if prompt == "Keep counting":
+                self.messages.put_nowait(
+                    {
+                        "type": "stream_event",
+                        "uuid": "stream-1",
+                        "session_id": self.native_id,
+                        "event": {
+                            "type": "content_block_delta",
+                            "delta": {"type": "text_delta", "text": "1"},
+                        },
+                    },
+                )
+            else:
+                self.messages.put_nowait(self.result())
+
+    def result(self, *, error=False):
+        return {
+            "type": "result",
+            "subtype": "error_during_execution" if error else "success",
+            "duration_ms": 1,
+            "duration_api_ms": 1,
+            "is_error": error,
+            "num_turns": 1,
+            "session_id": self.native_id,
+            "result": "Operation aborted" if error else "AFTER_CANCEL_OK",
+        }
+
+    async def read_messages(self):
+        while True:
+            yield await self.messages.get()
+
+    async def close(self):
+        if self.close_failures:
+            self.close_failures -= 1
+            raise OSError("transport close failed")
+        self.closed = True
+
+    def is_ready(self):
+        return not self.closed
+
+    async def end_input(self):
+        pass
 
 
 @pytest.fixture()

@@ -15,9 +15,11 @@ import pytest
 from qoder_agent_sdk import (
     PermissionResultAllow,
     PermissionResultDeny,
+    QoderSDKClient,
     SessionMessage,
     ToolPermissionContext,
 )
+from qwenpaw.plugins import SDKError
 from qwenpaw.plugins.harnesses import (
     HarnessAttachment,
     HarnessAttachmentKind,
@@ -42,11 +44,88 @@ def backend_factory(harness_context, client_factory, monkeypatch):
             "configured",
         ),
     )
-    return lambda: QoderBackend(
+    return lambda factory=client_factory: QoderBackend(
         harness_context,
-        client_factory=client_factory,
+        client_factory=factory,
         binary="/fake/qodercli",
     )
+
+
+@pytest.mark.parametrize("disconnect_fails", [False, True])
+async def test_cancelled_turn_does_not_feed_aborted_result_to_next_turn(
+    backend_factory,
+    call_context,
+    harness_context,
+    disconnect_fails,
+):
+    from plugins.harness.qoder.tests.conftest import QueuedQoderTransport
+
+    clients, transports = [], []
+
+    def make_client(options):
+        transport = QueuedQoderTransport(options.resume or options.session_id)
+        if not transports:
+            transport.release_interrupt.clear()
+            transport.close_failures = int(disconnect_fails)
+        client = QoderSDKClient(options, transport=transport)
+        clients.append(client)
+        transports.append(transport)
+        return client
+
+    backend = backend_factory(make_client)
+    context = call_context()
+    started = asyncio.Event()
+
+    async def consume():
+        async for event in backend.run_turn(
+            context,
+            HarnessRunRequest("Keep counting"),
+        ):
+            if event.kind == HarnessEventKind.TEXT_DELTA:
+                started.set()
+
+    turn = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        turn.cancel()
+        await asyncio.wait_for(transports[0].interrupted.wait(), 2)
+        if not disconnect_fails:
+            turn.cancel()
+            await asyncio.sleep(0)
+            assert not turn.done()
+        transports[0].release_interrupt.set()
+        with pytest.raises(
+            SDKError if disconnect_fails else asyncio.CancelledError,
+        ):
+            await asyncio.wait_for(turn, 2)
+        events = [
+            event
+            async for event in backend.run_turn(
+                context,
+                HarnessRunRequest("Continue after cancellation"),
+            )
+        ]
+        assert [(event.kind, event.text) for event in events] == [
+            (HarnessEventKind.TEXT_DELTA, "AFTER_CANCEL_OK"),
+            (HarnessEventKind.COMPLETED, ""),
+        ]
+        native_id = clients[0].options.session_id
+        assert native_id
+        assert (
+            clients[-1].options.resume or clients[-1].options.session_id
+        ) == native_id
+        sessions = await harness_context.storage.aread_json(
+            "qoder_sessions.json",
+        )
+        assert sessions == {'["alice", "console", "chat-1"]': native_id}
+    finally:
+        if transports:
+            transports[0].release_interrupt.set()
+            transports[0].close_failures = 0
+        turn.cancel()
+        await asyncio.gather(turn, return_exceptions=True)
+        await backend.close()
+    assert all(transport.closed for transport in transports)
 
 
 async def test_models_commands_and_explicit_unsupported_operations(

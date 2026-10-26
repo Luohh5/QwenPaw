@@ -333,9 +333,18 @@ class QoderBackend:
 
     async def _evict_client(self, identity, client):
         """Retire a client and its matching cache entry in one operation."""
+        # A failed disconnect remains owned, but must never be reused.
+        self._client_keys.pop(identity, None)
         await self._disconnect(client)
         self._clients.pop(identity, None)
-        self._client_keys.pop(identity, None)
+
+    async def _interrupt_client(self, identity, client):
+        try:
+            await client.interrupt()
+        finally:
+            # SDK interrupt does not drain the cancelled turn's message FIFO.
+            # Reconnect with the persisted native ID for the next turn.
+            await self._evict_client(identity, client)
 
     async def _connect(self, client):
         try:
@@ -590,7 +599,7 @@ class QoderBackend:
                         yield event
             except (asyncio.CancelledError, GeneratorExit):
                 if client is not None:
-                    await finish(client.interrupt())
+                    await finish(self._interrupt_client(identity, client))
                 raise
             finally:
                 self._contexts.pop(identity, None)
