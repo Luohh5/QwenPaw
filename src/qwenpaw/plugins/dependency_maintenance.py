@@ -32,7 +32,7 @@ def current_capability():
     return capability_context.get() or os.environ.get(_CAPABILITY_ENV, "")
 
 
-def canonical(path):
+def _enumerated_path(path):
     """Recover filesystem spelling, without creating or caching directories.
 
     Missing suffixes are candidates only. Existing components must be readable
@@ -87,6 +87,92 @@ def canonical(path):
     return current
 
 
+def _existing_path(path):
+    """Query kernel spelling without requiring directory enumeration."""
+    if sys.platform == "darwin":
+        import fcntl
+
+        flags = getattr(os, "O_EVTONLY", 0x8000)
+    elif sys.platform.startswith("linux") and hasattr(os, "O_PATH"):
+        flags = os.O_PATH
+    else:
+        return _enumerated_path(path)
+    expected = path.stat()
+    descriptor = os.open(path, flags | getattr(os, "O_CLOEXEC", 0))
+    try:
+        if sys.platform == "darwin":
+            value = fcntl.fcntl(
+                descriptor,
+                getattr(fcntl, "F_GETPATH", 50),
+                bytes(1024),
+            ).split(b"\0", 1)[0]
+            actual = Path(os.fsdecode(value))
+        else:
+            try:
+                actual = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+            except OSError as exc:
+                if exc.errno not in {errno.ENOENT, errno.ENOTDIR}:
+                    raise
+                # No procfs: the old resolver must establish the same spelling
+                # or fail closed (including on search-only ancestors).
+                actual = _enumerated_path(path)
+        held = os.fstat(descriptor)
+        if (
+            held.st_nlink == 0
+            or not actual.is_absolute()
+            or any(
+                not os.path.samestat(held, value)
+                for value in (expected, path.stat(), actual.stat())
+            )
+        ):
+            raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+        return actual
+    finally:
+        os.close(descriptor)
+
+
+def canonical(path):
+    """Resolve existing identity; append only genuinely absent suffixes."""
+    ancestor = Path(path)
+    if not ancestor.is_absolute():
+        ancestor = Path.cwd() / ancestor
+    original = str(ancestor)
+    missing = []
+    while True:
+        try:
+            resolved = Path(os.path.realpath(ancestor, strict=True))
+            break
+        except FileNotFoundError:
+            # lstat distinguishes a missing name from a dangling symlink.
+            try:
+                ancestor.lstat()
+            except FileNotFoundError:
+                missing.append(ancestor.name)
+                ancestor = ancestor.parent
+            else:
+                raise
+    current = _existing_path(resolved)
+    if not os.path.samestat(ancestor.stat(), current.stat()):
+        raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+    suffix = tuple(reversed(missing))
+    result = current.joinpath(*suffix)
+    if os.path.realpath(ancestor, strict=True) != str(resolved):
+        raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+    # A candidate becoming real during resolution needs a new observation.
+    for index in range(len(missing)):
+        candidate = current.joinpath(*suffix[: index + 1])
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            continue
+        raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+    if os.path.realpath(original) != str(
+        resolved.joinpath(*reversed(missing)),
+    ):
+        raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+    return result
+
+
 def contains_environment_path(root, path):
     """Containment using actual spelling, even on case-sensitive Windows dirs."""
     parent = canonical(root).parts
@@ -99,6 +185,11 @@ def state_root():
     if _STATE_ROOT is None:
         override = os.environ.get(_STATE_ENV)
         if override:
+            if not Path(override).is_absolute():
+                raise RuntimeError(
+                    "DEPENDENCY_STATE_ROOT_UNAVAILABLE: "
+                    "QWENPAW_DEPENDENCY_STATE_DIR must be absolute.",
+                )
             root = canonical(override)
         else:
             if os.name == "nt":
@@ -106,7 +197,19 @@ def state_root():
             else:
                 import pwd
 
-                home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+                try:
+                    value = getattr(pwd.getpwuid(os.getuid()), "pw_dir", None)
+                except KeyError:
+                    value = None
+                if not value or not Path(value).is_absolute():
+                    value = os.environ.get("HOME")
+                if not value or not Path(value).is_absolute():
+                    raise RuntimeError(
+                        "DEPENDENCY_STATE_ROOT_UNAVAILABLE: provide a stable "
+                        "absolute startup HOME or an absolute shared "
+                        "QWENPAW_DEPENDENCY_STATE_DIR.",
+                    )
+                home = Path(value)
             root = canonical(home / ".qwenpaw" / "dependency-environments")
         _STATE_ROOT = root
         os.environ[_STATE_ENV] = str(root)

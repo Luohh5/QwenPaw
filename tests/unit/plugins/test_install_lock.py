@@ -224,6 +224,119 @@ class TestDegradedPaths:
 
 
 class TestEnvironmentIdentity:
+    @pytest.mark.skipif(_WINDOWS, reason="requires POSIX search permissions")
+    def test_search_only_ancestor_preserves_admission(self, tmp_path):
+        from qwenpaw.plugins import dependency_maintenance as maintenance
+
+        if os.geteuid() == 0:
+            pytest.skip("root bypasses directory permissions")
+        parent = tmp_path / "restricted"
+        site = parent / "site-packages"
+        site.mkdir(parents=True)
+        package = site / "module.py"
+        package.write_text("VALUE = 1")
+        parent.chmod(0o111)
+        try:
+            assert package.read_text() == "VALUE = 1"
+            try:
+                list(parent.iterdir())
+            except PermissionError:
+                pass
+            else:
+                pytest.skip("filesystem does not enforce search-only access")
+            assert maintenance.canonical(site) == site.resolve()
+            maintenance.lease_environment([site])
+            try:
+                assert maintenance.live_readers([site])
+                with pytest.raises(RuntimeError, match="BUSY"):
+                    with maintenance.maintenance([site], "test", "token"):
+                        pytest.fail("active reader admitted maintenance")
+            finally:
+                descriptor, lease = maintenance._READERS.pop(
+                    str(site.resolve()),
+                )
+                os.close(descriptor)
+                lease.unlink()
+            assert not maintenance.live_readers([site])
+            with maintenance.maintenance([site], "test", "token"):
+                pass
+            maintenance.clear_maintenance([site], "test")
+        finally:
+            parent.chmod(0o755)
+
+    @pytest.mark.skipif(_WINDOWS, reason="POSIX passwd home selection")
+    @pytest.mark.parametrize(
+        "selection",
+        ["passwd", "home", "explicit", "none"],
+    )
+    def test_state_root_selection_is_stable(
+        self,
+        tmp_path,
+        monkeypatch,
+        selection,
+    ):
+        import importlib.util
+        import pwd
+        from types import SimpleNamespace
+
+        from qwenpaw.plugins import dependency_maintenance as maintenance
+
+        spec = importlib.util.spec_from_file_location(
+            "fresh_dependency_maintenance",
+            maintenance.__file__,
+        )
+        fresh = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fresh)
+        home = tmp_path / "home"
+        passwd_home = tmp_path / "passwd-home"
+        override = tmp_path / "state"
+        monkeypatch.delenv(fresh._STATE_ENV, raising=False)
+        monkeypatch.delenv("HOME", raising=False)
+        if selection != "none":
+            monkeypatch.setenv("HOME", str(home))
+        if selection == "explicit":
+            monkeypatch.setenv(fresh._STATE_ENV, str(override))
+
+        def account(_uid):
+            if selection == "passwd":
+                return SimpleNamespace(pw_dir=str(passwd_home))
+            raise KeyError("uid not found")
+
+        monkeypatch.setattr(pwd, "getpwuid", account)
+        if selection == "none":
+            with pytest.raises(
+                RuntimeError,
+                match="DEPENDENCY_STATE_ROOT_UNAVAILABLE",
+            ):
+                fresh.state_root()
+            return
+        expected = (
+            override
+            if selection == "explicit"
+            else (passwd_home if selection == "passwd" else home)
+            / ".qwenpaw"
+            / "dependency-environments"
+        )
+        try:
+            assert fresh.state_root() == expected.resolve()
+            monkeypatch.setenv("HOME", str(tmp_path / "changed-home"))
+            monkeypatch.setenv(
+                fresh._STATE_ENV,
+                str(tmp_path / "changed-state"),
+            )
+            monkeypatch.setenv(
+                "QWENPAW_WORKING_DIR",
+                str(tmp_path / "changed-work"),
+            )
+            assert fresh.state_root() == expected.resolve()
+            site = tmp_path / "site"
+            site.mkdir()
+            fresh.lease_environment([site])
+            assert fresh.live_readers([site])
+            assert fresh._readers_dir(site).is_relative_to(expected.resolve())
+        finally:
+            fresh._close_readers()
+
     @pytest.mark.parametrize("alias_kind", ["symlink", "case", "distinct"])
     @pytest.mark.parametrize("owner", ["reader", "writer"])
     def test_site_aliases_share_one_cross_process_lock(
