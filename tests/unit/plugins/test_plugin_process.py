@@ -223,8 +223,23 @@ async def test_runtime_roots_interpreter_and_dependency_visible_in_worker(
         requirements_path=requirements,
         source_revision=digest(spec.code_root),
     )
+    from qwenpaw.envs import store
+    from qwenpaw.plugins import dependency_maintenance as maintenance
+
+    selected_root = maintenance.state_root()
+    key = "QWENPAW_DEPENDENCY_STATE_DIR"
+    store._apply_to_environ({key: str(tmp_path / "untrusted-state")})
+    assert maintenance.state_root() == selected_root
+    monkeypatch.setenv(key, str(tmp_path / "direct-mutation"))
     await process.start(spec)
     probe = await process.call("sample.probe", {})
+    assert Path(probe["dependency_state"]) == selected_root
+    assert any(
+        row["pid"] == probe["pid"] for row in maintenance.live_readers([site])
+    )
+    with pytest.raises(RuntimeError, match="BUSY"):
+        with maintenance.maintenance([site], "test", "token"):
+            pytest.fail("active worker allowed maintenance")
     assert probe["sdk"] == "offline-sdk" and probe["isolated"] == 1
     assert (
         Path(probe["executable"]).resolve()
@@ -379,23 +394,43 @@ async def test_frozen_ordinary_loader_gate_installs_missing_sdk_in_overlay(
         "PIP_CONFIG_FILE": os.devnull,
     }.items():
         monkeypatch.setenv(name, value)
-    packaged_assets = [
-        support,
-        packaged,
-        Path(runtime.python_executable).parent,
-        support.parent
-        / "runtime"
-        / (
-            "Lib/site-packages"
-            if os.name == "nt"
-            else (
-                f"lib/python{sys.version_info.major}.{sys.version_info.minor}/"
-                "site-packages"
+    from qwenpaw.plugins.dependency_maintenance import marker, repair_marker
+    from qwenpaw.plugins.dependency_context import DependencyEnvironmentContext
+    from qwenpaw.plugins.install_lock import environment_install_lock_path
+
+    resources = support.parent
+
+    def bundle_inventory():
+        # Signing covers the whole resource tree, including empty directories
+        # and coordination sidecars beside the packaged dependency sites.
+        return {
+            path.relative_to(resources).as_posix(): (
+                ("symlink", os.readlink(path))
+                if path.is_symlink()
+                else ("directory", None)
+                if path.is_dir()
+                else ("file", path.read_bytes())
             )
-        ),
-    ]
-    before = [digest(path) for path in packaged_assets]
-    manifest = (support.parent / "runtime.json").read_bytes()
+            for path in resources.rglob("*")
+        }
+
+    for site in runtime.dependency_paths:
+        for path in (
+            environment_install_lock_path(site),
+            marker(site),
+            repair_marker(site),
+        ):
+            assert not path.is_relative_to(resources)
+    native_site = Path(runtime.python_executable).parent.parent / (
+        "Lib/site-packages"
+        if os.name == "nt"
+        else f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+    )
+    context = DependencyEnvironmentContext.from_runtime(runtime)
+    assert context.protected(native_site)
+    assert not context.protected(runtime.dependency_install_target)
+
+    before = bundle_inventory()
     try:
         absent = await host.loader._ensure_dependencies_installed(
             source,
@@ -419,10 +454,10 @@ async def test_frozen_ordinary_loader_gate_installs_missing_sdk_in_overlay(
             allow_install=False,
         )
         assert checked.already_satisfied and not checked.missing
-        assert [digest(path) for path in packaged_assets] == before
-        assert (support.parent / "runtime.json").read_bytes() == manifest
+        assert bundle_inventory() == before
     finally:
         await host.loader.unload_plugin("ordinary-plugin")
         sys.modules.pop("sample_shared_sdk", None)
         importlib.invalidate_caches()
         await host.close()
+    assert bundle_inventory() == before

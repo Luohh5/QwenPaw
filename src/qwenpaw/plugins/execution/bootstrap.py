@@ -45,6 +45,7 @@ _STARTUP_ENVIRONMENT = (
             "USERPROFILE",
             "WINDIR",
             "QWENPAW_DEPENDENCY_MAINTENANCE",
+            "QWENPAW_DEPENDENCY_STATE_DIR",
         },
     )
     | NETWORK_PROXY_ENVIRONMENT

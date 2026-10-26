@@ -105,6 +105,15 @@ class ChannelRuntimeSettings:
 
 
 @dataclass(frozen=True)
+class PreparedProxyConfig:
+    """Detached execution values prepared before reserving runtime resources."""
+
+    description: Any
+    config: dict[str, Any]
+    private_env: dict[str, str]
+
+
+@dataclass(frozen=True)
 class ChannelDescription:
     """One plugin's metadata and source identity, without loading a driver."""
 
@@ -119,39 +128,29 @@ class ChannelDescription:
     name: str
     description: str
 
-    def create_proxy(
+    def prepare_proxy_config(
         self,
-        process,
         config: Mapping[str, Any],
         *,
-        python_executable: str,
-        support_root: Path,
-        instance_id: str,
-        generation: int,
-        qwenpaw_version: str,
-        dependency_paths: tuple[Path, ...] = (),
-        runtime_identity=None,
         workspace_dir: Path | None = None,
-        on_reply_sent=None,
-        display_config=None,
-        no_text_debounce: bool = True,
-        startup_timeout: float = 5.0,
-        shutdown_timeout: float = 2.0,
         config_source: str = "config",
-        connection_timeout: float | None = None,
-        send_timeout: float = DEFAULT_SEND_TIMEOUT,
+        no_text_debounce: bool = True,
         private_env: Mapping[str, str] | None = None,
         legacy_references: Mapping | None = None,
-    ):
-        """Validate light host config and construct an unstarted proxy."""
+        working_dir: Path | None = None,
+        legacy_state_dir: Path | None = None,
+        environment: Mapping[str, str] | None = None,
+    ) -> PreparedProxyConfig:
+        """Read, validate and project host context without runtime mutation."""
         from .channel_config import (
             channel_config_dict,
             validate_channel_config,
         )
         from ..app.channels.catalog import clean_channel_config
-        from ..app.channels.isolated_proxy import IsolatedChannelProxy
         from ..app.channels.process_supervisor import LaunchSpec
 
+        working_dir = Path.cwd() if working_dir is None else working_dir
+        environment = dict(os.environ) if environment is None else environment
         if config_source not in {"config", "env"}:
             raise ValueError("CONFIG_SOURCE_INVALID")
         raw = channel_config_dict(config)
@@ -179,7 +178,7 @@ class ChannelDescription:
         from .execution.bootstrap import validate_private_environment
         from .official_channel_catalog import official_channel_for_plugin
 
-        environment = validate_private_environment(
+        private_environment = validate_private_environment(
             {} if private_env is None else private_env,
         )
         official = official_channel_for_plugin(self.plugin_id)
@@ -188,8 +187,8 @@ class ChannelDescription:
         )
         from .official_execution_context import prepare_official_execution
 
-        legacy_root = None
-        if official_owner:
+        legacy_root = legacy_state_dir
+        if official_owner and legacy_root is None:
             from ..constant import WORKING_DIR
 
             legacy_root = WORKING_DIR
@@ -197,13 +196,48 @@ class ChannelDescription:
             self.descriptor.channel_key,
             values,
             official=official if official_owner else None,
-            working_dir=Path.cwd(),
+            working_dir=working_dir,
             legacy_state_dir=legacy_root,
-            environment=os.environ,
+            environment=environment,
             workspace_dir=workspace_dir,
             legacy_references=legacy_references,
         )
-        environment = validate_private_environment({**selected, **environment})
+        private_environment = validate_private_environment(
+            {**selected, **private_environment},
+        )
+        return PreparedProxyConfig(self, values, private_environment)
+
+    def create_proxy(
+        self,
+        process,
+        config: Mapping[str, Any],
+        *,
+        python_executable: str,
+        support_root: Path,
+        instance_id: str,
+        generation: int,
+        qwenpaw_version: str,
+        dependency_paths: tuple[Path, ...] = (),
+        runtime_identity=None,
+        workspace_dir: Path | None = None,
+        on_reply_sent=None,
+        display_config=None,
+        no_text_debounce: bool = True,
+        startup_timeout: float = 5.0,
+        shutdown_timeout: float = 2.0,
+        config_source: str = "config",
+        connection_timeout: float | None = None,
+        send_timeout: float = DEFAULT_SEND_TIMEOUT,
+        prepared_config: PreparedProxyConfig,
+    ):
+        """Construct an unstarted proxy from explicitly prepared host values."""
+        from ..app.channels.isolated_proxy import IsolatedChannelProxy
+        from ..app.channels.process_supervisor import LaunchSpec
+
+        if prepared_config.description is not self:
+            raise ValueError("CHANNEL_PREPARATION_STALE")
+        values = prepared_config.config
+        environment = prepared_config.private_env
         spec = LaunchSpec(
             python_executable=python_executable,
             support_root=Path(support_root),

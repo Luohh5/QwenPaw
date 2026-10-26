@@ -205,3 +205,42 @@ async def test_stop_releases_both_socket_readers_and_sessions(xiaoyi):
         conn._ws is None and conn._session is None for conn in connections
     )
     assert driver._platform is None
+
+
+def test_local_media_authorizes_workspace_and_rejects_outside(tmp_path):
+    from types import SimpleNamespace
+
+    native = module("xiaoyi", "platform")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    media = workspace / "media"
+    media.mkdir()
+    allowed = workspace / "附件 with space.txt"
+    allowed.write_text("local attachment")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("private")
+    platform = SimpleNamespace(_media_dir=media, _workspace_dir=workspace)
+    for uri in (str(allowed), allowed.as_uri()):
+        part = {"type": "file", "file_url": uri, "filename": allowed.name}
+        assert native.XiaoYiPlatform._media_part(platform, part)["file"] == {
+            "name": allowed.name,
+            "mimeType": "application/octet-stream",
+            "uri": uri,
+        }
+    for uri in (str(outside), outside.as_uri()):
+        with pytest.raises(
+            native.XiaoYiDeliveryError,
+            match="MEDIA_PATH_UNAUTHORIZED",
+        ):
+            native.XiaoYiPlatform._media_part(
+                platform,
+                {"type": "file", "file_url": uri},
+            )
+    for part in (
+        {"type": "image", "image_url": "https://example.test/image.png"},
+        {"type": "audio", "data": "YWJjZA=="},
+        {"type": "audio", "data": "data:audio/mpeg;base64,YWJjZA=="},
+    ):
+        assert native.XiaoYiPlatform._media_part(platform, part)["file"][
+            "uri"
+        ] == next(value for key, value in part.items() if key != "type")

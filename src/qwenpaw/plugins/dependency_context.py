@@ -9,6 +9,8 @@ from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 
+from .dependency_maintenance import canonical, contains_environment_path
+
 
 def host_bundle_identity():
     """Bind desktop recovery to the bundle independently of runtime policy."""
@@ -38,19 +40,49 @@ class DependencyEnvironmentContext:
             raise ValueError("CHANNEL_RUNTIME_TARGET_INVALID")
         immutable = (
             tuple(
-                Path(path).resolve()
+                canonical(path)
                 for path in runtime.dependency_paths
                 if target is None
-                or Path(path).resolve() != Path(target).resolve()
+                or str(canonical(path)) != str(canonical(target))
             )
             if runtime.runtime_identity is not None
             else ()
         )
+        if runtime.runtime_identity is not None:
+            executable = Path(runtime.python_executable).absolute()
+            native = None
+            if executable.name.lower() == "python.exe":
+                prefix = (
+                    executable.parent.parent
+                    if executable.parent.name.casefold() == "scripts"
+                    else executable.parent
+                )
+                prefix = canonical(prefix)
+                native = prefix / "Lib/site-packages"
+            elif executable.parent.name == "bin":
+                prefix = canonical(executable.parent.parent)
+                major, minor = runtime.runtime_identity["version"][:2]
+                native = prefix / f"lib/python{major}.{minor}/site-packages"
+            if native is not None and native.is_dir():
+                native = canonical(native)
+                if not contains_environment_path(prefix, native):
+                    raise ValueError("CHANNEL_RUNTIME_MANIFEST_INVALID")
+                if target is None or str(native) != str(canonical(target)):
+                    immutable = tuple(
+                        {
+                            str(path): path for path in (*immutable, native)
+                        }.values(),
+                    )
         return cls(
             str(Path(runtime.python_executable).absolute()),
             Path(runtime.support_root).resolve(),
-            tuple(Path(path).resolve() for path in runtime.dependency_paths),
-            Path(target).resolve() if target is not None else None,
+            tuple(
+                Path(key)
+                for key in dict.fromkeys(
+                    str(canonical(path)) for path in runtime.dependency_paths
+                )
+            ),
+            canonical(target) if target is not None else None,
             immutable,
             json.loads(json.dumps(dict(runtime.runtime_identity)))
             if runtime.runtime_identity is not None
@@ -62,16 +94,24 @@ class DependencyEnvironmentContext:
 
     @classmethod
     def from_snapshot(cls, snapshot):
+        sites = tuple(
+            Path(key)
+            for key in dict.fromkeys(
+                str(canonical(site))
+                for site in snapshot.dependency_sites or ()
+            )
+        )
+        prefix = canonical(snapshot.prefix)
         targets = [
-            Path(site)
-            for site in snapshot.dependency_sites or ()
-            if Path(site).name in {"site-packages", "dist-packages"}
-            and Path(site).is_relative_to(snapshot.prefix)
+            site
+            for site in sites
+            if site.name in {"site-packages", "dist-packages"}
+            and contains_environment_path(prefix, site)
         ]
         return cls(
             snapshot.executable,
             Path(__file__).resolve().parents[2],
-            tuple(Path(site) for site in snapshot.dependency_sites or ()),
+            sites,
             targets[0] if len(targets) == 1 else None,
         )
 
@@ -128,7 +168,7 @@ class DependencyEnvironmentContext:
 
     def protected(self, site):
         return any(
-            Path(site).resolve().is_relative_to(root)
+            contains_environment_path(root, site)
             for root in self.immutable_roots
         )
 

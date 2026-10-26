@@ -301,20 +301,38 @@ def resolve_default_channel_runtime(*, provision=True):
         config_path.parent / "plugin_runtime",
         runtime,
     )
-    if target.is_symlink():
-        raise ValueError("CHANNEL_RUNTIME_TARGET_INVALID")
+    from .dependency_maintenance import canonical, contains_environment_path
+
+    def validate_target():
+        if target.is_symlink():
+            raise ValueError("CHANNEL_RUNTIME_TARGET_INVALID")
+        resolved = canonical(target)
+        if any(contains_environment_path(site, resolved) for site in sites):
+            raise ValueError("CHANNEL_RUNTIME_TARGET_INVALID")
+        return resolved
+
+    selected = validate_target()
     if provision:
-        with plugin_install_lock(environment_install_lock_path(target)):
-            if target.is_symlink():
+        target.mkdir(parents=True, exist_ok=True)
+        selected = validate_target()
+        with plugin_install_lock(environment_install_lock_path(selected)):
+            if (
+                str(validate_target()) != str(selected)
+                or not selected.is_dir()
+            ):
                 raise ValueError("CHANNEL_RUNTIME_TARGET_INVALID")
-            target.mkdir(parents=True, exist_ok=True)
     return ChannelRuntimeSettings(
         python_executable=str(executable),
         support_root=support,
         qwenpaw_version=__version__,
         selected_channels=None,
-        dependency_paths=tuple(dict.fromkeys((*sites, target.resolve()))),
-        dependency_install_target=target.resolve(),
+        dependency_paths=tuple(
+            Path(key)
+            for key in dict.fromkeys(
+                str(canonical(path)) for path in (*sites, selected)
+            )
+        ),
+        dependency_install_target=selected,
         runtime_identity=identity if getattr(sys, "frozen", False) else None,
         send_timeouts=send_timeouts,
     )

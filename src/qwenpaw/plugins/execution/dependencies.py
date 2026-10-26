@@ -35,13 +35,16 @@ def valid_metadata_headers(message, required, optional=()) -> bool:
 
 def canonical_environment_path(target: str | Path) -> Path:
     """One identity for publication, admission, lock and repair paths."""
-    return Path(os.path.normcase(os.path.realpath(target)))
+    from ..dependency_maintenance import canonical
+
+    return canonical(target)
 
 
 def repair_marker(site: str | Path) -> Path:
     """Persistent evidence that an interrupted shared write needs repair."""
-    root = canonical_environment_path(Path(site))
-    return root.parent / f".{root.name}.dependencies-repair-required"
+    from ..dependency_maintenance import repair_marker as shared_marker
+
+    return shared_marker(site)
 
 
 @dataclass(frozen=True)
@@ -189,9 +192,14 @@ class DependencySnapshot:
 
 def protected_dependency_target(path):
     """Protect local stdlib/support while preserving actual package sites."""
-    target = Path(path).resolve()
+    target = canonical_environment_path(path)
+
+    def contains(root):
+        parts = Path(root).parts
+        return target.parts[: len(parts)] == parts
+
     package_roots = {
-        str(Path(path).resolve())
+        str(canonical_environment_path(path))
         for path in (
             sysconfig.get_path("purelib"),
             sysconfig.get_path("platlib"),
@@ -199,7 +207,7 @@ def protected_dependency_target(path):
         if path
     }
     standard = {
-        str(Path(path).resolve())
+        str(canonical_environment_path(path))
         for path in (
             sysconfig.get_path("stdlib"),
             sysconfig.get_path("platstdlib"),
@@ -208,14 +216,12 @@ def protected_dependency_target(path):
         if path
     }
     support = {
-        str(Path(__file__).resolve().parents[3]),
-        str(Path(__file__).resolve().parent),
+        str(canonical_environment_path(Path(__file__).resolve().parents[3])),
+        str(canonical_environment_path(Path(__file__).resolve().parent)),
     }
-    return any(
-        target.is_relative_to(root) for root in support - package_roots
-    ) or (
-        any(target.is_relative_to(root) for root in standard)
-        and not any(target.is_relative_to(root) for root in package_roots)
+    return any(contains(root) for root in support - package_roots) or (
+        any(contains(root) for root in standard)
+        and not any(contains(root) for root in package_roots)
     )
 
 
@@ -224,9 +230,11 @@ def dependency_sites(sites, *, explicit=(), distributions=()):
     del explicit, distributions
     return tuple(
         dict.fromkeys(
-            str(Path(path).resolve())
+            str(canonical_environment_path(path))
             for path in sites
-            if path and not protected_dependency_target(path)
+            if path
+            and Path(path).is_dir()
+            and not protected_dependency_target(path)
         ),
     )
 
@@ -243,12 +251,17 @@ def _installed_metadata(sites):
     ):
         raise dependency_error("DEPENDENCY_REPAIR_REQUIRED")
     rows, invalid, observed = {}, {}, {}
-    canonical_sites = {canonical_environment_path(site) for site in sites}
+    canonical_sites = {str(canonical_environment_path(site)) for site in sites}
+    # Resolve each metadata parent once per observation, never across installs.
+    parents = {}
     for distribution in metadata.distributions(path=list(sites)):
         # importlib.metadata exposes the on-disk metadata origin here.
         origin = Path(
             distribution._path,
         ).resolve()
+        parent = str(origin.parent)
+        if parent not in parents:
+            parents[parent] = str(canonical_environment_path(origin.parent))
         installed_metadata = distribution.metadata
         name = installed_metadata.get("Name")
         version = installed_metadata.get("Version")
@@ -267,8 +280,7 @@ def _installed_metadata(sites):
             if (
                 not name
                 or not version
-                or canonical_environment_path(origin.parent)
-                not in canonical_sites
+                or parents[parent] not in canonical_sites
             ):
                 raise ValueError("invalid metadata")
             Version(version)

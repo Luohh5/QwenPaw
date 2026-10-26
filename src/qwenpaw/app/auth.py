@@ -12,7 +12,7 @@ forgets their password, delete ``auth.json`` from ``SECRET_DIR`` and
 restart the service to re-register.
 
 Uses only Python stdlib (hashlib, hmac, secrets) to avoid adding new
-dependencies.  The password is stored as a salted PBKDF2-SHA256 hash in
+dependencies.  The password is stored as a salted SHA-256 hash in
 ``auth.json`` under ``SECRET_DIR``.
 """
 
@@ -26,9 +26,7 @@ import logging
 import os
 import re
 import secrets
-import threading
 import time
-from functools import wraps
 from typing import Optional
 from urllib.parse import unquote
 
@@ -48,23 +46,8 @@ from ..security.secret_store import (
     encrypt_dict_fields,
     is_encrypted,
 )
-from ..utils.logging import sanitize_log_value
-from ..utils.io_utils import run_sync_io
 
 logger = logging.getLogger(__name__)
-_AUTH_LOCK = threading.RLock()
-
-
-def _auth_transaction(operation):
-    """Keep authentication file reads and updates consistent across workers."""
-
-    @wraps(operation)
-    def locked(*args, **kwargs):
-        with _AUTH_LOCK:
-            return operation(*args, **kwargs)
-
-    return locked
-
 
 _RUNTIME_TOKEN_ENV = "QWENPAW_RUNTIME_INTERNAL_TOKEN"
 _RUNTIME_TOKEN_HEADER = "x-qwenpaw-runtime-token"
@@ -132,7 +115,7 @@ def _prepare_secret_parent(path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Password hashing (PBKDF2-HMAC-SHA256, no external deps)
+# Password hashing (salted SHA-256, no external deps)
 # ---------------------------------------------------------------------------
 
 
@@ -140,42 +123,17 @@ def _hash_password(
     password: str,
     salt: Optional[str] = None,
 ) -> tuple[str, str]:
-    """Return the versioned PBKDF2 hash and salt for *password*."""
+    """Hash *password* with *salt*.  Returns ``(hash_hex, salt_hex)``."""
     if salt is None:
         salt = secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        salt.encode("utf-8"),
-        600_000,
-    ).hex()
-    return f"pbkdf2_sha256$600000${digest}", salt
+    h = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    return h, salt
 
 
 def verify_password(password: str, stored_hash: str, salt: str) -> bool:
     """Verify *password* against a stored hash."""
-    if not isinstance(stored_hash, str) or not isinstance(salt, str):
-        return False
-    if stored_hash.startswith("pbkdf2_sha256$"):
-        try:
-            _, rounds, expected = stored_hash.split("$")
-            if int(rounds) != 600_000:
-                return False
-            digest = hashlib.pbkdf2_hmac(
-                "sha256",
-                password.encode("utf-8"),
-                salt.encode("utf-8"),
-                int(rounds),
-            ).hex()
-            return hmac.compare_digest(digest, expected)
-        except (ValueError, TypeError):
-            return False
-    # Read-only compatibility for existing accounts. Successful authentication
-    # immediately replaces this legacy digest with PBKDF2; never store it anew.
-    if re.fullmatch(r"[0-9a-f]{64}", stored_hash) is None:
-        return False
-    legacy = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
-    return hmac.compare_digest(legacy, stored_hash)
+    h, _ = _hash_password(password, salt)
+    return hmac.compare_digest(h, stored_hash)
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +141,6 @@ def verify_password(password: str, stored_hash: str, salt: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-@_auth_transaction
 def _get_jwt_secret() -> str:
     """Return the signing secret, creating one if absent."""
     data = _load_auth_data()
@@ -275,7 +232,6 @@ def verify_token(token: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-@_auth_transaction
 def _load_auth_data() -> dict:
     """Load ``auth.json`` from ``SECRET_DIR``.
 
@@ -314,7 +270,6 @@ def _load_auth_data() -> dict:
     return {}
 
 
-@_auth_transaction
 def _save_auth_data(data: dict) -> None:
     """Save ``auth.json`` to ``SECRET_DIR`` with restrictive permissions.
 
@@ -342,7 +297,6 @@ def _is_token_revoked(jti: str) -> bool:
     return jti in meta
 
 
-@_auth_transaction
 def _add_to_revocation_list(jti: str, exp: int) -> None:
     """Add a token ID to the revocation list with its expiry time.
 
@@ -369,7 +323,6 @@ def _add_to_revocation_list(jti: str, exp: int) -> None:
     _save_auth_data(data)
 
 
-@_auth_transaction
 def _clean_expired_revocations() -> None:
     """
     Remove expired tokens from the revocation list to prevent unbounded growth.
@@ -425,7 +378,6 @@ def has_registered_users() -> bool:
 # ---------------------------------------------------------------------------
 
 
-@_auth_transaction
 def register_user(
     username: str,
     password: str,
@@ -458,7 +410,7 @@ def register_user(
         data["jwt_secret"] = secrets.token_hex(32)
 
     _save_auth_data(data)
-    logger.info("User '%s' registered", sanitize_log_value(username))
+    logger.info("User '%s' registered", username)
     return create_token(username, expiry_seconds)
 
 
@@ -494,7 +446,6 @@ def auto_register_from_env() -> None:
         )
 
 
-@_auth_transaction
 def update_credentials(
     current_password: str,
     new_username: Optional[str] = None,
@@ -535,10 +486,7 @@ def update_credentials(
 
     data["user"] = user
     _save_auth_data(data)
-    logger.info(
-        "Credentials updated for user '%s'",
-        sanitize_log_value(user["username"]),
-    )
+    logger.info("Credentials updated for user '%s'", user["username"])
     return create_token(user["username"], expiry_seconds)
 
 
@@ -547,7 +495,6 @@ def update_credentials(
 # ---------------------------------------------------------------------------
 
 
-@_auth_transaction
 def authenticate(
     username: str,
     password: str,
@@ -573,11 +520,6 @@ def authenticate(
         and stored_salt
         and verify_password(password, stored_hash, stored_salt)
     ):
-        if not stored_hash.startswith("pbkdf2_sha256$"):
-            user["password_hash"], user["password_salt"] = _hash_password(
-                password,
-            )
-            _save_auth_data(data)
         return create_token(username, expiry_seconds)
     return None
 
@@ -608,7 +550,7 @@ def revoke_token(token: str) -> bool:
             return False
 
         _add_to_revocation_list(jti, exp)
-        logger.info("Token %s revoked", sanitize_log_value(jti[:8]))
+        logger.info("Token %s revoked", jti[:8])
 
         # Clean up expired tokens periodically
         _clean_expired_revocations()
@@ -619,7 +561,6 @@ def revoke_token(token: str) -> bool:
         return False
 
 
-@_auth_transaction
 def revoke_all_tokens() -> bool:
     """Revoke all existing tokens by rotating the JWT secret.
 
@@ -839,7 +780,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
     """Middleware that checks Bearer token on protected routes."""
 
     async def dispatch(self, request: Request, call_next):
-        if await run_sync_io(self._should_skip_auth, request):
+        if self._should_skip_auth(request):
             return await call_next(request)
 
         token = self._extract_token(request)
@@ -850,7 +791,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 media_type="application/json",
             )
 
-        user = await run_sync_io(verify_token, token)
+        user = verify_token(token)
         if user is None:
             return Response(
                 content='{"detail":"Invalid or expired token"}',

@@ -155,5 +155,6 @@ local-docs/
 docs-site/
 
 # Local review notes
+.local-review/
 docs/reviews/
 tmp/

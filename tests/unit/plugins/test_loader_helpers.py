@@ -64,7 +64,9 @@ class TestPluginRuntimeDirs:
         target = working_dir / "shared" / "site-packages"
         monkeypatch.setattr(pl, "_is_frozen", lambda: False)
         monkeypatch.setattr("sysconfig.get_path", lambda _name: str(target))
-        expected = working_dir / "shared" / ".site-packages.dependencies.lock"
+        from qwenpaw.plugins.install_lock import environment_install_lock_path
+
+        expected = environment_install_lock_path(target)
         assert pl._install_lock_path("my plugin/id") == expected
         assert pl._install_lock_path("demo-1.0") == expected
         assert not target.parent.exists()
@@ -77,7 +79,9 @@ class TestPluginRuntimeDirs:
         target = working_dir / "frozen-shared" / "site"
         monkeypatch.setattr(pl, "_is_frozen", lambda: True)
         monkeypatch.setattr(pl, "_plugin_site_dir", lambda: target)
-        expected = working_dir / "frozen-shared" / ".site.dependencies.lock"
+        from qwenpaw.plugins.install_lock import environment_install_lock_path
+
+        expected = environment_install_lock_path(target)
         assert pl._install_lock_path("my plugin/id") == expected
         assert pl._install_lock_path("demo-1.0") == expected
         assert not target.parent.exists()

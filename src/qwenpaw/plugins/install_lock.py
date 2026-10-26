@@ -63,9 +63,14 @@ async def environment_coordinator(targets):
     from ..utils.io_utils import run_sync_io
 
     targets = tuple(targets)
-    keys = await run_sync_io(
-        lambda: sorted({canonical_environment_path(path) for path in targets}),
-    )
+
+    def identities():
+        roots = [canonical_environment_path(path) for path in targets]
+        if any(not root.is_dir() for root in roots):
+            raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+        return sorted({str(root) for root in roots})
+
+    keys = await run_sync_io(identities)
     locks = _environment_locks.setdefault(asyncio.get_running_loop(), {})
     async with contextlib.AsyncExitStack() as stack:
         for key in keys:
@@ -133,8 +138,9 @@ class InstallLockError(RuntimeError):
 
 def environment_install_lock_path(target: Path) -> Path:
     """Key exclusion by the canonical write destination, across workspaces."""
-    root = canonical_environment_path(target)
-    return root.parent / f".{root.name}.dependencies.lock"
+    from .dependency_maintenance import _gate
+
+    return _gate(target)
 
 
 @contextlib.contextmanager
@@ -146,17 +152,14 @@ def plugin_install_lock(
     """Yield True only while holding exclusion; acquisition fails closed."""
     lock_path = Path(lock_path)
     suffix = ".dependencies.lock"
-    site = (
-        lock_path.parent / lock_path.name[1 : -len(suffix)]
-        if lock_path.name.startswith(".") and lock_path.name.endswith(suffix)
-        else None
-    )
-    if site is not None:
-        from .dependency_maintenance import check_admission
+    environment_lock = lock_path.name.startswith(
+        ".",
+    ) and lock_path.name.endswith(suffix)
+    if environment_lock:
+        from .dependency_maintenance import check_lock_admission
 
-        # An in-flight additive writer owns its repair marker. Wait for its
-        # exclusion before classifying that marker as inherited damage.
-        check_admission(site, check_repair=False)
+        # Wait for an additive writer before classifying its repair marker.
+        check_lock_admission(lock_path, check_repair=False)
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
@@ -183,8 +186,8 @@ def plugin_install_lock(
                 )
         except OSError as exc:
             raise InstallLockError("INSTALL_LOCK_UNAVAILABLE") from exc
-        if site is not None:
-            check_admission(site)
+        if environment_lock:
+            check_lock_admission(lock_path)
         yield True
     finally:
         if acquired:

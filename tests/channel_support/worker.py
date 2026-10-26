@@ -65,6 +65,7 @@ class Worker:
             "executable": sys.executable,
             "sdk": sdk,
             "source": __file__,
+            "dependency_state": os.environ["QWENPAW_DEPENDENCY_STATE_DIR"],
         }
 
     async def echo(self, params, _request):

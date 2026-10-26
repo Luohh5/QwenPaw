@@ -38,6 +38,7 @@ _PLAN_FIELDS = (
     "dependency_context",
     "continuation_command",
     "host_bundle_identity",
+    "dependency_state_dir",
 )
 
 
@@ -71,6 +72,7 @@ def authenticate_plan(directory, operation, *, seal=False):
                 "dependency_context",
                 "continuation_command",
                 "host_bundle_identity",
+                "dependency_state_dir",
             }
         },
         sort_keys=True,

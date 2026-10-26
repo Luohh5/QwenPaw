@@ -81,6 +81,9 @@ def run(directory=None):
     maintenance, transaction = _modules()
     operation = json.loads((directory / "operation.json").read_text())
     transaction.authenticate_plan(directory, operation)
+    if state_dir := operation.get("dependency_state_dir"):
+        os.environ["QWENPAW_DEPENDENCY_STATE_DIR"] = state_dir
+    maintenance.state_root()
     if transaction.reconcile_commit(directory, operation):
         return 0
     if directory.name != operation["id"] or not operation.get("approved"):

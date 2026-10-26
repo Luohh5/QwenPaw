@@ -512,3 +512,221 @@ async def test_real_approval_card_and_inbound_operator_decision(
     assert pending.future.done()
     assert pending.future.result() is ApprovalDecision.APPROVED
     assert ws.requests[-1].user_id == "alice" and not ws.model_calls
+
+
+@pytest.fixture(params=["azure_bot", "matrix"])
+def legacy_start(request, host, tmp_path, monkeypatch):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from qwenpaw.app.channels.manager import ChannelManager
+    from qwenpaw.plugins.architecture import PluginManifest
+    from qwenpaw.plugins.channel_adapter import describe_channel
+    from qwenpaw.plugins import azure_legacy, matrix_legacy
+
+    key = request.param
+    root = Path(__file__).resolve().parents[3]
+    source = root / "plugins" / "channel" / key
+    description = describe_channel(
+        source,
+        PluginManifest.from_dict(
+            json.loads((source / "plugin.json").read_text()),
+        ),
+    )
+    settings = replace(
+        host.registry.channel_runtime,
+        selected_channels=frozenset({key}),
+    )
+    row = host.registry.register_channel_descriptor(
+        description.plugin_id,
+        description,
+        runtime_settings=settings,
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", legacy)
+    values = (
+        {"enabled": True, "app_id": "app", "app_password": "secret"}
+        if key == "azure_bot"
+        else {
+            "enabled": True,
+            "homeserver": "https://matrix.test",
+            "user_id": "@alice:matrix.test",
+            "password": "secret",
+        }
+    )
+    config = {
+        "channels": {key: values},
+        "agents": {"profiles": {"default": {"workspace_dir": str(workspace)}}},
+    }
+    config_path = legacy / "config.json"
+    config_path.write_text(json.dumps(config))
+    reader = azure_legacy if key == "azure_bot" else matrix_legacy
+    reader_name = "_snapshot" if key == "azure_bot" else "read_json_snapshot"
+    filename = (
+        "azure_bot_refs.json"
+        if key == "azure_bot"
+        else "matrix_auth_state.json"
+    )
+    state = (
+        {"room": {"service_url": "https://bot.test"}}
+        if key == "azure_bot"
+        else {"user_id": "@alice:matrix.test", "device_id": "DEVICE"}
+    )
+    (legacy / filename).write_text(json.dumps(state))
+    capture_fn = (
+        azure_legacy.capture_azure_legacy
+        if key == "azure_bot"
+        else matrix_legacy.capture_matrix_legacy
+    )
+    capture = capture_fn(
+        config_path=config_path,
+        legacy_state_dir=legacy,
+        working_dir=legacy,
+    )
+    field = (
+        "legacy_reference_owner"
+        if key == "azure_bot"
+        else "legacy_state_owner"
+    )
+    manager = ChannelManager([])
+    manager._workspace_dir = workspace
+    manager._workspace_config = SimpleNamespace(channels={key: values})
+    manager._process = lambda _: None
+
+    async def start(channel):
+        pass
+
+    monkeypatch.setattr(manager, "_start_owned", start)
+    yield SimpleNamespace(
+        key=key,
+        manager=manager,
+        reader=reader,
+        reader_name=reader_name,
+        field=field,
+        capture=capture,
+        registry=host.registry,
+        row=row,
+    )
+    for channel in manager.channels:
+        manager._release_unstarted(channel)
+    manager.channels.clear()
+
+
+@pytest.mark.asyncio
+async def test_legacy_start_preparation_yields_and_keeps_authorization(
+    legacy_start,
+    monkeypatch,
+):
+    import threading
+
+    case = legacy_start
+    loop_thread = threading.get_ident()
+    calls, reserve_threads = [], []
+    original_reserve = case.registry.runtime_owners.reserve
+
+    def reserve(*args, **kwargs):
+        reserve_threads.append(threading.get_ident())
+        return original_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(case.registry.runtime_owners, "reserve", reserve)
+    entered, release = threading.Event(), threading.Event()
+    original = getattr(case.reader, case.reader_name)
+
+    def slow(*args, **kwargs):
+        calls.append(threading.get_ident())
+        entered.set()
+        assert release.wait(2), "event loop could not release legacy reader"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(case.reader, case.reader_name, slow)
+    task = asyncio.create_task(
+        case.manager._start_one_unlocked(
+            case.key,
+            case.manager._workspace_config,
+        ),
+    )
+    try:
+        await asyncio.wait_for(asyncio.to_thread(entered.wait, 2), 3)
+        assert entered.is_set() and not task.done()
+        release.set()
+        await task
+        authorization = case.manager.channels[0]._launch_spec.config[
+            case.field
+        ]
+        assert authorization["capture_id"] == case.capture["capture_id"]
+        assert authorization["owner"]["workspace_dir"] == str(
+            case.manager._workspace_dir,
+        )
+        digest_key = (
+            "refs_sha256" if case.key == "azure_bot" else "auth_sha256"
+        )
+        captured = (
+            case.capture["entries"][0]
+            if case.key == "azure_bot"
+            else case.capture
+        )
+        assert authorization[digest_key] == captured[digest_key]
+        assert calls and all(thread != loop_thread for thread in calls)
+        assert len(calls) == 1
+        assert reserve_threads == [loop_thread]
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["cancel", "disable", "unregister"])
+async def test_legacy_preparation_does_not_publish_stale_start(
+    legacy_start,
+    monkeypatch,
+    action,
+):
+    import threading
+
+    case = legacy_start
+    entered, release = threading.Event(), threading.Event()
+    original = getattr(case.reader, case.reader_name)
+
+    def slow(*args, **kwargs):
+        entered.set()
+        assert release.wait(2)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(case.reader, case.reader_name, slow)
+    reserves = []
+    original_reserve = case.registry.runtime_owners.reserve
+
+    def reserve(*args, **kwargs):
+        reserves.append(1)
+        return original_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(case.registry.runtime_owners, "reserve", reserve)
+    task = asyncio.create_task(
+        case.manager._start_one_unlocked(
+            case.key,
+            case.manager._workspace_config,
+        ),
+    )
+    try:
+        await asyncio.wait_for(asyncio.to_thread(entered.wait, 2), 3)
+        assert entered.is_set() and not task.done()
+        if action == "cancel":
+            task.cancel()
+        elif action == "disable":
+            case.row.global_enabled = False
+        else:
+            case.registry._channels.pop(case.key)
+        release.set()
+        expected = (
+            pytest.raises(asyncio.CancelledError)
+            if action == "cancel"
+            else pytest.raises(RuntimeError, match="CHANNEL_PREPARATION_STALE")
+        )
+        with expected:
+            await task
+        assert not case.manager.channels and not reserves
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)

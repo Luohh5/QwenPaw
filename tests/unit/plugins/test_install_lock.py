@@ -224,31 +224,56 @@ class TestDegradedPaths:
 
 
 class TestEnvironmentIdentity:
-    def test_site_aliases_share_one_cross_process_lock(self, tmp_path):
-        """Separate writers cannot evade exclusion through a site symlink."""
+    @pytest.mark.parametrize("alias_kind", ["symlink", "case", "distinct"])
+    @pytest.mark.parametrize("owner", ["reader", "writer"])
+    def test_site_aliases_share_one_cross_process_lock(
+        self,
+        tmp_path,
+        alias_kind,
+        owner,
+    ):
+        """Filesystem aliases share admission and independent sites do not."""
         import subprocess
         import sys
 
-        assert hasattr(lock_mod, "environment_install_lock_path")
-        site = tmp_path / "shared-site"
-        site.mkdir()
-        alias = tmp_path / "alias"
-        alias.symlink_to(site, target_is_directory=True)
+        from qwenpaw.plugins import dependency_maintenance as maintenance
+
+        site = tmp_path / "CaseParent" / "CaseSite"
+        site.mkdir(parents=True)
+        alias = tmp_path / "caseparent" / "casesite"
+        if alias_kind == "symlink":
+            alias = tmp_path / "alias"
+            alias.symlink_to(site, target_is_directory=True)
+        elif alias_kind == "case":
+            if not alias.exists() or not alias.samefile(site):
+                pytest.skip("requires a case-insensitive filesystem")
+        else:
+            if alias.exists():
+                pytest.skip("requires a case-sensitive filesystem")
+            alias.mkdir(parents=True)
+        same = alias_kind != "distinct"
         path = lock_mod.environment_install_lock_path(site)
-        assert path == lock_mod.environment_install_lock_path(alias)
+        assert (path == lock_mod.environment_install_lock_path(alias)) == same
         script = """import sys
 from pathlib import Path
+from qwenpaw.plugins import dependency_maintenance as m
 from qwenpaw.plugins.install_lock import (
-    environment_install_lock_path,plugin_install_lock,
+    environment_install_lock_path, plugin_install_lock,
 )
-with plugin_install_lock(environment_install_lock_path(Path(sys.argv[1]))):
-    print('held',flush=True)
+site = Path(sys.argv[1])
+if sys.argv[2] == 'reader':
+    m.lease_environment([site])
+    print('held', flush=True)
     sys.stdin.readline()
+else:
+    with plugin_install_lock(environment_install_lock_path(site)):
+        print('held', flush=True)
+        sys.stdin.readline()
 """
         source_root = str(Path(lock_mod.__file__).resolve().parents[2])
         script = f"import sys\nsys.path.insert(0, {source_root!r})\n" + script
         with subprocess.Popen(
-            [sys.executable, "-I", "-c", script, str(alias)],
+            [sys.executable, "-I", "-c", script, str(alias), owner],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -256,11 +281,24 @@ with plugin_install_lock(environment_install_lock_path(Path(sys.argv[1]))):
         ) as peer:
             try:
                 assert peer.stdout.readline().strip() == "held"
-                with pytest.raises(RuntimeError):
-                    with lock_mod.plugin_install_lock(path, timeout=0):
-                        (site / "sdk-mutated").touch()
-                assert not (site / "sdk-mutated").exists()
+                if owner == "reader":
+                    assert bool(maintenance.live_readers([site])) == same
+                operation = maintenance.maintenance([site], "test", "token")
+                if same:
+                    with pytest.raises(RuntimeError, match="BUSY"):
+                        with operation:
+                            (site / "sdk-mutated").touch()
+                    assert not (site / "sdk-mutated").exists()
+                else:
+                    with operation:
+                        pass
+                    maintenance.clear_maintenance([site], "test")
             finally:
                 peer.communicate("release\n", timeout=5)
-        with lock_mod.plugin_install_lock(path) as acquired:
-            assert acquired is True
+        assert not maintenance.live_readers([site])
+        with maintenance.maintenance([site], "test", "token"):
+            pass
+        maintenance.clear_maintenance([site], "test")
+        before = lock_mod.environment_install_lock_path(site)
+        (site / "package.py").write_text("updated")
+        assert lock_mod.environment_install_lock_path(site) == before

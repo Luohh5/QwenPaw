@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import hashlib
+import os
+from copy import deepcopy
 from itertools import groupby
 from pathlib import Path
 
@@ -158,6 +160,43 @@ def live_channel_managers() -> list[Any]:
     return managers
 
 
+def prepare_channel_proxy_config(
+    key,
+    workspace_config,
+    *,
+    workspace_dir,
+    config_source="config",
+):
+    """Explicit synchronous preparation for the synchronous factories."""
+    from ...plugins.registry import PluginRegistry
+    from .registry import selected_process_channels
+
+    if key not in selected_process_channels():
+        return None
+    row = PluginRegistry().get_channel_catalog_entry(key)
+    ch_cfg = channel_cfg_for_key(workspace_config, key)
+    if (
+        row is None
+        or row.runtime_settings is None
+        or not row.global_enabled
+        or not row.runtime_settings.allows(key)
+        or key not in get_available_channels()
+        or ch_cfg is None
+        or not channel_enabled(ch_cfg)
+    ):
+        raise RuntimeError("CHANNEL_UNAVAILABLE")
+    if workspace_dir is None:
+        raise RuntimeError("WORKSPACE_IDENTITY_REQUIRED")
+    return row.description_record.prepare_proxy_config(
+        deepcopy(ch_cfg),
+        workspace_dir=workspace_dir,
+        config_source=config_source,
+        no_text_debounce=getattr(ch_cfg, "no_text_debounce", True),
+        working_dir=Path.cwd(),
+        environment=dict(os.environ),
+    )
+
+
 def instantiate_channel(
     key: str,
     workspace_config: Any,
@@ -166,6 +205,7 @@ def instantiate_channel(
     on_last_dispatch: OnLastDispatch = None,
     workspace_dir: Path | None = None,
     config_source: str = "config",
+    prepared_config=None,
 ) -> BaseChannel:
     """Build one channel instance from workspace config (three-gate caller)."""
     from ...plugins.registry import PluginRegistry
@@ -189,6 +229,12 @@ def instantiate_channel(
             raise RuntimeError("CHANNEL_UNAVAILABLE")
         if workspace_dir is None:
             raise RuntimeError("WORKSPACE_IDENTITY_REQUIRED")
+        if (
+            prepared_config is None
+            or prepared_config.description is not row.description_record
+            or not row.runtime_settings.allows(key)
+        ):
+            raise RuntimeError("CHANNEL_PREPARATION_STALE")
         instance_id = (
             "channel:"
             + hashlib.sha256(
@@ -228,25 +274,10 @@ def instantiate_channel(
                 connection_timeout = 330.0
         try:
             if row.plugin_id == key == "wechat":
-                from ...config.channel_config_compat import (
-                    absolute_execution_paths,
-                )
                 from ...config.utils import load_config
-                from ...constant import WORKING_DIR
-                from ...plugins.channel_config import channel_config_dict
                 from .wechat_auth_custody import reserve_wechat_auth
 
-                values = channel_config_dict(ch_cfg)
-                values["bot_token_file"] = (
-                    values.get("bot_token_file")
-                    or WORKING_DIR / "wechat_bot_token"
-                )
-                working_dir = Path.cwd()
-                runtime_config = absolute_execution_paths(
-                    values,
-                    path_fields=("bot_token_file", "media_dir"),
-                    working_dir=working_dir,
-                )
+                runtime_config = prepared_config.config
                 workspace_id = getattr(workspace_config, "id", None)
                 if not workspace_id:
                     profiles = load_config().agents.profiles
@@ -293,6 +324,7 @@ def instantiate_channel(
                 shutdown_timeout=settings.shutdown_timeout,
                 send_timeout=settings.send_timeout_for(key),
                 config_source=config_source,
+                prepared_config=prepared_config,
             )
         except BaseException:
             from .wechat_auth_custody import release_wechat_auth
@@ -645,6 +677,12 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
                     on_last_dispatch=on_last_dispatch,
                     workspace_dir=workspace_dir,
                     config_source="env",
+                    prepared_config=prepare_channel_proxy_config(
+                        key,
+                        env_config,
+                        workspace_dir=workspace_dir,
+                        config_source="env",
+                    ),
                 ),
             )
         manager = cls(channels)
@@ -697,6 +735,11 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
                         process=process,
                         on_last_dispatch=on_last_dispatch,
                         workspace_dir=workspace_dir,
+                        prepared_config=prepare_channel_proxy_config(
+                            key,
+                            config,
+                            workspace_dir=workspace_dir,
+                        ),
                     ),
                 )
             except Exception as e:
@@ -1401,12 +1444,87 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
         workspace_dir = self._workspace_dir
         if workspace_dir is None and self._workspace is not None:
             workspace_dir = getattr(self._workspace, "workspace_dir", None)
+        effective_config = workspace_config or self._workspace_config
+        prepared_config = None
+        if key in selected_process_channels():
+            from ...utils.io_utils import run_sync_io
+            from ... import constant
+
+            row = registry.get_channel_catalog_entry(key)
+            ch_cfg = channel_cfg_for_key(effective_config, key)
+            if (
+                row is None
+                or row.runtime_settings is None
+                or not row.global_enabled
+                or not row.runtime_settings.allows(key)
+                or key not in get_available_channels()
+                or ch_cfg is None
+                or not channel_enabled(ch_cfg)
+            ):
+                raise RuntimeError("CHANNEL_UNAVAILABLE")
+            if workspace_dir is None:
+                raise RuntimeError("WORKSPACE_IDENTITY_REQUIRED")
+            description = row.description_record
+            original_settings = row.runtime_settings
+            settings = deepcopy(original_settings)
+            config_snapshot = deepcopy(ch_cfg)
+            workspace = self._workspace
+            manager_config = self._workspace_config
+            manager_dir = self._workspace_dir
+            resolved_workspace = Path(workspace_dir).expanduser().resolve()
+            working_dir = Path.cwd()
+            environment = dict(os.environ)
+            legacy_state_dir = constant.WORKING_DIR
+            prepared_config = await run_sync_io(
+                description.prepare_proxy_config,
+                config_snapshot,
+                workspace_dir=resolved_workspace,
+                working_dir=working_dir,
+                legacy_state_dir=legacy_state_dir,
+                environment=environment,
+                no_text_debounce=getattr(
+                    config_snapshot,
+                    "no_text_debounce",
+                    True,
+                ),
+            )
+            current_dir = self._workspace_dir
+            if current_dir is None and self._workspace is not None:
+                current_dir = getattr(self._workspace, "workspace_dir", None)
+            if (
+                self._stopping
+                or constant.WORKING_DIR != legacy_state_dir
+                or self._defer_channel_start
+                or self._workspace is not workspace
+                or self._workspace_config is not manager_config
+                or self._workspace_dir != manager_dir
+                or current_dir is None
+                or Path(current_dir).expanduser().resolve()
+                != resolved_workspace
+                or registry.get_channel_catalog_entry(key) is not row
+                or row.description_record is not description
+                or row.runtime_settings is not original_settings
+                or row.runtime_settings != settings
+                or not row.global_enabled
+                or key not in selected_process_channels()
+                or key not in get_available_channels()
+                or channel_cfg_for_key(effective_config, key)
+                != config_snapshot
+                or not registry.projector.start_allowed(
+                    "channel",
+                    key,
+                    row.plugin_id,
+                    self._workspace,
+                )
+            ):
+                raise RuntimeError("CHANNEL_PREPARATION_STALE")
         channel = instantiate_channel(
             key,
-            workspace_config or self._workspace_config,
+            effective_config,
             process=process,
             on_last_dispatch=self._on_last_dispatch,
             workspace_dir=workspace_dir,
+            prepared_config=prepared_config,
         )
         registered = False
         try:

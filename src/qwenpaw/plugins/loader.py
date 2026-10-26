@@ -940,19 +940,35 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 plugin_install_lock,
             )
 
-            def prepare_target():
-                if target.is_symlink():
-                    raise ValueError("CHANNEL_RUNTIME_TARGET_INVALID")
-                target.mkdir(parents=True, exist_ok=True)
-                return target.resolve()
+            from .dependency_maintenance import canonical
 
+            def validate_target():
+                if target.is_symlink() or context.protected(target):
+                    raise ValueError("CHANNEL_RUNTIME_TARGET_INVALID")
+                return canonical(target)
+
+            def prepare_target():
+                validate_target()
+                target.mkdir(parents=True, exist_ok=True)
+                return validate_target()
+
+            selected = await run_sync_io(prepare_target)
             async with async_lock(
                 plugin_install_lock(
-                    await run_sync_io(environment_install_lock_path, target),
+                    await run_sync_io(environment_install_lock_path, selected),
                 ),
             ):
-                target = await run_sync_io(prepare_target)
-            paths = tuple(dict.fromkeys((*paths, target)))
+                if str(await run_sync_io(validate_target)) != str(
+                    selected,
+                ) or not await run_sync_io(selected.is_dir):
+                    raise ValueError("CHANNEL_RUNTIME_TARGET_INVALID")
+                target = selected
+            paths = tuple(
+                Path(key)
+                for key in dict.fromkeys(
+                    str(canonical(path)) for path in (*paths, target)
+                )
+            )
             _ensure_plugin_site_on_path(target)
         await self._stop_preparation(plugin_id)
         cleanup = ExitStack()

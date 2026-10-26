@@ -355,7 +355,7 @@ def _refine_admission(usage, token, snapshot, plugin_id, *, pending=False):
 def _canonical_dependency_roots(paths):
     from .install_lock import canonical_environment_path
 
-    return {canonical_environment_path(path) for path in paths}
+    return {str(canonical_environment_path(path)) for path in paths}
 
 
 async def admit_shared_dependencies(
@@ -442,7 +442,15 @@ def evaluate_shared_dependencies(
         repair_marker,
         retains_installed_wheel_source,
     )
-    from .install_lock import canonical_environment_path as canonical
+    from .install_lock import canonical_environment_path
+
+    resolved = {}
+
+    def canonical(path):
+        key = str(path)
+        if key not in resolved:
+            resolved[key] = canonical_environment_path(path)
+        return resolved[key]
 
     parsed = (
         parse_requirements_file(requirements_file)
@@ -451,8 +459,10 @@ def evaluate_shared_dependencies(
     )
     missing, conflicts, unsupported = [], [], list(parsed.unsupported)
     affected = []
-    target = canonical(install_target) if install_target is not None else None
-    sites = {canonical(path) for path in snapshot.dependency_sites or ()}
+    target = (
+        str(canonical(install_target)) if install_target is not None else None
+    )
+    sites = {str(canonical(path)) for path in snapshot.dependency_sites or ()}
     host_inventories = {}
     host_dirty = False
     extra_requirements = tuple(extra_requirements)
@@ -537,10 +547,10 @@ def evaluate_shared_dependencies(
     for use in uses:
         environment, evidence = use.environment, use.snapshot
         visible = (
-            {canonical(path) for path in evidence.sites}
+            {str(canonical(path)) for path in evidence.sites}
             if evidence is not None
             else (
-                {canonical(path) for path in environment.sites}
+                {str(canonical(path)) for path in environment.sites}
                 if environment is not None
                 else None
             )
@@ -549,7 +559,7 @@ def evaluate_shared_dependencies(
             target not in (visible or set())
             if target is not None
             else not sites.intersection(
-                canonical(path) for path in environment.sites
+                str(canonical(path)) for path in environment.sites
             )
         ):
             continue
@@ -603,9 +613,11 @@ def evaluate_shared_dependencies(
                 fresh = inventory.get(name)
                 if fresh is None:
                     missing.append(f"{name}=={pin['version']}")
-                elif fresh["version"] != pin["version"] or canonical(
-                    fresh["metadata_path"],
-                ) != canonical(pin["metadata_path"]):
+                elif fresh["version"] != pin["version"] or (
+                    fresh["metadata_path"] != pin["metadata_path"]
+                    and str(canonical(fresh["metadata_path"]))
+                    != str(canonical(pin["metadata_path"]))
+                ):
                     conflicts.append(
                         f"host {use.plugin_id}: {name} origin/version differs",
                     )
@@ -625,7 +637,7 @@ def evaluate_shared_dependencies(
         relevant_rows = {
             name: row
             for name, row in snapshot.distributions.items()
-            if canonical(Path(row["metadata_path"]).parent)
+            if str(canonical(Path(row["metadata_path"]).parent))
             in ({target} if target is not None else visible or set())
         }
         for name, row in relevant_rows.items():
@@ -636,8 +648,11 @@ def evaluate_shared_dependencies(
                 continue
             if previous is not None and (
                 previous["version"] != row["version"]
-                or canonical(previous["metadata_path"])
-                != canonical(row["metadata_path"])
+                or (
+                    previous["metadata_path"] != row["metadata_path"]
+                    and str(canonical(previous["metadata_path"]))
+                    != str(canonical(row["metadata_path"]))
+                )
             ):
                 conflicts.append(
                     f"{use.origin} {use.plugin_id}: "
@@ -876,9 +891,10 @@ async def prepare_shared_dependencies(
             return (
                 snapshot.dependency_sites is not None
                 and not protected_dependency_target(target)
-                and target
-                in {canonical(path) for path in snapshot.dependency_sites}
-                and target in {canonical(path) for path in snapshot.sites}
+                and str(target)
+                in {str(canonical(path)) for path in snapshot.dependency_sites}
+                and str(target)
+                in {str(canonical(path)) for path in snapshot.sites}
             )
 
         if os.environ.get("QWENPAW_RUNTIME_PROVISIONER") == "local" or not (

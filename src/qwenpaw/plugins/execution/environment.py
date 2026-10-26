@@ -3,11 +3,12 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import site
 import sys
 import sysconfig
+
+from ..dependency_maintenance import canonical
 
 
 def shared_dependency_paths(paths=None) -> tuple[Path, ...]:
@@ -20,18 +21,13 @@ def shared_dependency_paths(paths=None) -> tuple[Path, ...]:
     if site.ENABLE_USER_SITE is True:
         user = site.getusersitepackages()
         candidates.extend([user] if isinstance(user, str) else user)
-    trusted = {
-        Path(os.path.normcase(os.path.realpath(path)))
-        for path in candidates
-        if path
-    }
+    trusted = {str(canonical(path)) for path in candidates if path}
     return tuple(
-        dict.fromkeys(
-            path
+        dict(
+            (str(path), path)
             for item in (sys.path if paths is None else paths)
             if item
-            and (path := Path(os.path.normcase(os.path.realpath(item))))
-            in trusted
+            and str(path := canonical(item)) in trusted
             and path.is_dir()
-        ),
+        ).values(),
     )

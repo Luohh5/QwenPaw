@@ -101,6 +101,9 @@ def _configure(
     custody = importlib.util.module_from_spec(lease_spec)
     sys.modules[lease_spec.name] = custody
     lease_spec.loader.exec_module(custody)
+    custody.state_root()
+    # Reuse this context if trusted support imports the module later.
+    sys.modules["qwenpaw.plugins.dependency_maintenance"] = custody
     custody.lease_environment(
         (*dependencies, *custody.host_sites()),
         parent_pid=int(sys.argv[1])

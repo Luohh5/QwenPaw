@@ -960,7 +960,10 @@ def retain_maintenance_assets(directory, operation, runtime):
             else sys.executable
         )
     )
+    from .dependency_maintenance import state_root
+
     operation.update(
+        dependency_state_dir=str(state_root()),
         continuation_python=os.path.abspath(sys.executable),
         worker_python=os.path.abspath(executable),
         support_root=str(assets.parents[1]),

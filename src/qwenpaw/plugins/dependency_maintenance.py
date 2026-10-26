@@ -19,6 +19,8 @@ import time
 from uuid import uuid4
 
 _READERS = {}
+_STATE_ENV = "QWENPAW_DEPENDENCY_STATE_DIR"
+_STATE_ROOT = None
 _CAPABILITY_ENV = "QWENPAW_DEPENDENCY_MAINTENANCE"
 capability_context = ContextVar(
     "dependency_maintenance_capability",
@@ -31,23 +33,104 @@ def current_capability():
 
 
 def canonical(path):
-    return Path(os.path.normcase(os.path.realpath(path)))
+    """Recover filesystem spelling, without creating or caching directories.
+
+    Missing suffixes are candidates only. Existing components must be readable
+    and remain the same objects throughout resolution; inode evidence is never
+    retained as the coordination key.
+    """
+    resolved = Path(os.path.realpath(path))
+    current = Path(os.path.normcase(resolved.anchor))
+    observed = [(current, current.stat())]
+    for index, part in enumerate(resolved.parts[1:], 1):
+        candidate = current / part
+        try:
+            expected = candidate.stat()
+        except FileNotFoundError:
+            # A dangling link is not an absent, unambiguous suffix.
+            if candidate.is_symlink():
+                raise
+            current = current.joinpath(*resolved.parts[index:])
+            break
+        with os.scandir(current) as entries:
+            match = next(
+                (entry for entry in entries if entry.name == part),
+                None,
+            )
+        if match is None:
+            with os.scandir(current) as entries:
+                match = next(
+                    (
+                        entry
+                        for entry in entries
+                        if os.path.samestat(
+                            expected,
+                            os.stat(entry.path, follow_symlinks=False),
+                        )
+                    ),
+                    None,
+                )
+        elif not os.path.samestat(
+            expected,
+            os.stat(match.path, follow_symlinks=False),
+        ):
+            raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+        if match is None or match.is_symlink():
+            raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+        current = current / match.name
+        observed.append((current, expected))
+    if os.path.realpath(path) != str(resolved) or any(
+        not os.path.samestat(before, component.stat())
+        for component, before in observed
+    ):
+        raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+    return current
+
+
+def contains_environment_path(root, path):
+    """Containment using actual spelling, even on case-sensitive Windows dirs."""
+    parent = canonical(root).parts
+    return canonical(path).parts[: len(parent)] == parent
+
+
+def state_root():
+    """Select once at trusted startup, before user configuration or leases."""
+    global _STATE_ROOT
+    if _STATE_ROOT is None:
+        override = os.environ.get(_STATE_ENV)
+        if override:
+            root = canonical(override)
+        else:
+            if os.name == "nt":
+                home = Path(os.environ["USERPROFILE"])
+            else:
+                import pwd
+
+                home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+            root = canonical(home / ".qwenpaw" / "dependency-environments")
+        _STATE_ROOT = root
+        os.environ[_STATE_ENV] = str(root)
+    return _STATE_ROOT
+
+
+def _sidecar(site, suffix):
+    root = canonical(site)
+    identity = hashlib.sha256(os.fsencode(root)).hexdigest()
+    return state_root() / identity / f".{root.name}.dependencies{suffix}"
 
 
 def marker(site):
-    root = canonical(site)
-    return root.parent / f".{root.name}.dependencies-maintenance"
+    return _sidecar(site, "-maintenance")
 
 
 def repair_marker(site):
-    root = canonical(site)
-    return root.parent / f".{root.name}.dependencies-repair-required"
+    return _sidecar(site, "-repair-required")
 
 
-def authorized(site):
+def _authorized(path):
     try:
         operation_id, token = current_capability().split(":", 1)
-        value = json.loads(marker(site).read_text())
+        value = json.loads(path.read_text())
         return (
             value["id"] == operation_id
             and value["token_hash"]
@@ -57,15 +140,34 @@ def authorized(site):
         return False
 
 
-def check_admission(site, *, check_repair=True):
-    if marker(site).exists() and not authorized(site):
+def authorized(site):
+    return _authorized(marker(site))
+
+
+def _check_admission(maintenance_path, repair_path, check_repair):
+    permitted = _authorized(maintenance_path)
+    if maintenance_path.exists() and not permitted:
         raise RuntimeError(
             "DEPENDENCY_MAINTENANCE_REQUIRED: shared environment is under maintenance.",
         )
-    if check_repair and repair_marker(site).exists() and not authorized(site):
+    if check_repair and repair_path.exists() and not permitted:
         raise RuntimeError(
             "DEPENDENCY_REPAIR_REQUIRED: recover with the retained absolute dependency worker script.",
         )
+
+
+def check_admission(site, *, check_repair=True):
+    _check_admission(marker(site), repair_marker(site), check_repair)
+
+
+def check_lock_admission(path, *, check_repair=True):
+    """Check installation barriers without reversing the hashed identity."""
+    stem = str(path)[: -len(".lock")]
+    _check_admission(
+        Path(stem + "-maintenance"),
+        Path(stem + "-repair-required"),
+        check_repair,
+    )
 
 
 def _try_lock(descriptor):
@@ -117,26 +219,21 @@ def file_lock(path, timeout=0, *, reader_site=None):
 
 
 def _gate(site):
-    root = canonical(site)
-    return root.parent / f".{root.name}.dependencies.lock"
+    return _sidecar(site, ".lock")
 
 
 def _readers_dir(site):
-    root = canonical(site)
-    return root.parent / f".{root.name}.dependencies-readers"
+    return _sidecar(site, "-readers")
 
 
 def lease_environment(sites, parent_pid=None, timeout=5):
     """Acquire before importing from sites; descriptors live until exit."""
     deadline = time.monotonic() + timeout
-    for root in sorted({canonical(site) for site in sites}):
-        if root in _READERS or not root.is_dir():
+    for identity in sorted({str(canonical(site)) for site in sites}):
+        root = Path(identity)
+        if identity in _READERS or not root.is_dir():
             continue
-        # Read-only system origins cannot be maintained by this user. They
-        # still reject an existing maintenance/repair marker, without writes.
         check_admission(root)
-        if not os.access(root, os.W_OK) or not os.access(root.parent, os.W_OK):
-            continue
         permitted = authorized(root)
 
         @contextmanager
@@ -160,7 +257,7 @@ def lease_environment(sites, parent_pid=None, timeout=5):
                     yield
 
         with admission():
-            if root in _READERS:
+            if identity in _READERS:
                 continue
             check_admission(root)
             path = _readers_dir(root) / (
@@ -178,7 +275,7 @@ def lease_environment(sites, parent_pid=None, timeout=5):
                     ).encode(),
                 )
                 check_admission(root)
-                _READERS[root] = (descriptor, path)
+                _READERS[identity] = (descriptor, path)
             except BaseException:
                 os.close(descriptor)
                 path.unlink(missing_ok=True)
@@ -232,10 +329,16 @@ def live_readers(sites, ignore_pid=None):
 @contextmanager
 def maintenance(sites, operation_id, capability, *, ignore_pid=None):
     """Keep the admission barrier after writer locks are released."""
-    sites = sorted({canonical(site) for site in sites})
+    sites = [
+        Path(key) for key in sorted({str(canonical(site)) for site in sites})
+    ]
     with ExitStack() as stack:
         for root in sites:
+            if not root.is_dir():
+                raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
             stack.enter_context(file_lock(_gate(root)))
+            if str(canonical(root)) != str(root) or not root.is_dir():
+                raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
             check_admission(root)
         value = {
             "id": operation_id,

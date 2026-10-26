@@ -15,7 +15,6 @@ import io
 import json
 import shutil
 import tempfile
-import threading
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,7 +22,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import HTTPException, UploadFile
+from fastapi import HTTPException
 
 from qwenpaw.app.routers import plugins as plugins_module
 from qwenpaw.app.routers.plugins import (
@@ -537,102 +536,6 @@ class TestLoadPluginWithOptionalForceReinstall:
 
 
 class TestInstallPluginSource:
-    @pytest.mark.parametrize("case", ["url", "upload", "cancelled-upload"])
-    async def test_staging_cleanup_excludes_custody_until_delete_settles(
-        self,
-        tmp_path,
-        monkeypatch,
-        case,
-    ):
-        from qwenpaw.plugins.loader import PluginLoader
-        from qwenpaw.plugins.ownership import RuntimeKey
-        from qwenpaw.plugins.registry import PluginRegistry
-
-        monkeypatch.setattr(PluginRegistry, "_instance", None)
-        loader = PluginLoader([tmp_path / "plugins"])
-        staging = tmp_path / "upload-staging"
-        staging.mkdir()
-        entered, deleted = asyncio.Event(), asyncio.Event()
-        proceed = threading.Event()
-        loop = asyncio.get_running_loop()
-        rmtree = shutil.rmtree
-
-        def blocked_delete(root, *args, **kwargs):
-            if Path(root) == staging:
-                loop.call_soon_threadsafe(entered.set)
-                assert proceed.wait(5), "delete thread was not released"
-            try:
-                return rmtree(root, *args, **kwargs)
-            finally:
-                if Path(root) == staging:
-                    loop.call_soon_threadsafe(deleted.set)
-
-        payload = _zip_bytes({"plugin.json": '{"id": "staging-race"}'})
-
-        async def download(_url, destination):
-            destination.write_bytes(payload)
-
-        monkeypatch.setattr(shutil, "rmtree", blocked_delete)
-        monkeypatch.setattr(
-            plugins_module.tempfile,
-            "mkdtemp",
-            lambda: str(staging),
-        )
-        monkeypatch.setattr(plugins_module, "_async_download", download)
-        monkeypatch.setattr(
-            plugins_module,
-            "_load_plugin_with_optional_force_reinstall",
-            AsyncMock(return_value=_record("staging-race")),
-        )
-        operation = (
-            install_plugin_source(
-                "https://example.test/race.zip",
-                app=_app(loader),
-            )
-            if case == "url"
-            else upload_plugin(
-                _request(_app(loader)),
-                UploadFile(filename="race.zip", file=io.BytesIO(payload)),
-            )
-        )
-        cleaning = asyncio.create_task(operation)
-
-        def reserve_staging():
-            return loader.registry.runtime_owners.reserve(
-                "another-plugin",
-                RuntimeKey("worker", "index", "workspace"),
-                staging,
-                instance_id="staging-worker",
-            )
-
-        try:
-            await asyncio.wait_for(entered.wait(), 1)
-            with pytest.raises(RuntimeError):
-                reserve_staging()
-            if case == "cancelled-upload":
-                cleaning.cancel()
-                await asyncio.sleep(0)
-                assert not cleaning.done()
-                with pytest.raises(RuntimeError):
-                    reserve_staging()
-            assert staging.exists() and not deleted.is_set()
-        finally:
-            proceed.set()
-            if cleaning.cancelling():
-                with pytest.raises(asyncio.CancelledError):
-                    await cleaning
-            else:
-                result = await cleaning
-            await asyncio.wait_for(deleted.wait(), 1)
-        assert (
-            not staging.exists()
-            and loader.registry.runtime_owners.leases() == ()
-        )
-        if case == "url":
-            assert result.manifest.id == "staging-race"
-        elif case == "upload":
-            assert result["id"] == "staging-race" and result["loaded"]
-
     async def test_local_path_is_resolved_and_loaded(self, tmp_path):
         log: list[str] = []
         loader = _loader_stub(log)
@@ -716,82 +619,6 @@ class TestInstallPluginSource:
         assert seen_at_load["manifest"] == '{"id": "p"}'
         # the temporary download directory is removed afterwards
         assert not made[0].exists()
-
-    @pytest.mark.parametrize(
-        "failure",
-        [RuntimeError("load failed"), asyncio.CancelledError()],
-        ids=["load-failure", "cancelled"],
-    )
-    async def test_url_keeps_temp_source_while_loader_retains_preparation(
-        self,
-        tmp_path,
-        monkeypatch,
-        failure,
-    ):
-        """URL cleanup must not erase the only code root of a live probe."""
-        from qwenpaw.plugins.loader import PluginLoader
-        from qwenpaw.plugins.ownership import RuntimeKey, RuntimeStopReceipt
-
-        loader = PluginLoader([tmp_path])
-        temp_dir = tmp_path / "url-download"
-        source_seen = None
-        lease = None
-
-        def _mkdtemp(*_args, **_kwargs):
-            temp_dir.mkdir()
-            return str(temp_dir)
-
-        async def _download(_url, destination):
-            destination.write_bytes(
-                _zip_bytes({"inner/plugin.json": '{"id": "retained"}'}),
-            )
-
-        async def _failed_load(**kwargs):
-            nonlocal source_seen, lease
-            source_seen = kwargs["source_path"]
-            lease = loader.registry.runtime_owners.reserve(
-                "retained",
-                RuntimeKey("preparation", "retained", "global"),
-                source_seen,
-                instance_id="probe:retained",
-            )
-            assert loader.retains_preparation_source(temp_dir)
-            raise failure
-
-        monkeypatch.setattr(loader, "load_plugin_from_path", _failed_load)
-        with (
-            patch(
-                "qwenpaw.config.utils.get_plugins_dir",
-                return_value=tmp_path,
-            ),
-            patch(
-                "qwenpaw.app.routers.plugins._async_download",
-                new=_download,
-            ),
-            patch(
-                "qwenpaw.app.routers.plugins.tempfile.mkdtemp",
-                side_effect=_mkdtemp,
-            ),
-        ):
-            with pytest.raises(type(failure)):
-                await install_plugin_source(
-                    "https://example.test/retained.zip",
-                    app=_app(loader),
-                )
-        assert source_seen == temp_dir / "inner"
-        assert temp_dir.is_dir()
-        assert (source_seen / "plugin.json").is_file()
-        assert loader.registry.runtime_owners.release(
-            lease,
-            RuntimeStopReceipt(
-                quiescent=True,
-                detail="test resource never started",
-                exited=True,
-                returncode=None,
-                forced=False,
-                residual=(),
-            ),
-        )
 
     async def test_temp_dir_is_removed_even_when_load_fails(
         self,

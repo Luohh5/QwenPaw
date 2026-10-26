@@ -9,11 +9,12 @@ from contextlib import asynccontextmanager
 import hashlib
 import json
 import logging
-from pathlib import Path
-from urllib.parse import unquote, urlparse
+from pathlib import Path, PureWindowsPath
 import uuid
 
 import aiohttp
+
+from qwenpaw.utils.media_paths import local_media_path
 
 from .codec import (
     build_artifact_msg,
@@ -513,19 +514,15 @@ class XiaoYiPlatform:
             return None
         field, name, mime = defaults[kind]
         uri = part.get(field, "")
-        parsed = urlparse(uri)
-        local = (
-            Path(unquote(parsed.path))
-            if parsed.scheme == "file"
-            else (
-                Path(uri).expanduser()
-                if not parsed.scheme
-                and (
-                    kind != "audio" or uri.startswith(("/", "~", "./", "../"))
-                )
-                else None
-            )
-        )
+        local_path = local_media_path(uri)
+        local = None
+        if local_path is not None and (
+            kind != "audio"
+            or uri.startswith(("file://", "/", "~", "./", "../"))
+            or Path(local_path).is_absolute()
+            or PureWindowsPath(local_path).is_absolute()
+        ):
+            local = Path(local_path).expanduser()
         if local is not None:
             roots = [self._media_dir.resolve()]
             if self._workspace_dir is not None:
