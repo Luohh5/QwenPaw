@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """DingTalk native callbacks, sends, cards and SDK cleanup."""
 import asyncio
+import hashlib
 import json
 from types import SimpleNamespace as NS
 import aiohttp
 import pytest
 import pytest_asyncio
 from dingtalk_stream import CallbackMessage
-from qwenpaw.channel_protocol.models import SendParams
+from qwenpaw.channel_protocol.models import ResponseFinishParams, SendParams
+from qwenpaw.channel_protocol.response_receipts import receipt_key
 from tests.channel_support.driver import bind, module
 
 pytestmark = pytest.mark.asyncio
@@ -238,6 +240,12 @@ async def test_dm_and_group_mention_parse_and_reply_webhook(native, group):
     assert (await send(rt, event["response_handle"]))[
         "state"
     ] == "acknowledged"
+    assert (await send(rt, event["response_handle"]))[
+        "state"
+    ] == "acknowledged"
+    conflict = await send(rt, event["response_handle"], "changed")
+    assert conflict["reason_code"] == "DELIVERY_CONFLICT"
+    assert len([row for kind, row in rt.rows if kind == "webhook"]) == 1
     row = next(row for kind, row in rt.rows if kind == "webhook")
     assert row["url"] == WEBHOOK
     assert "answer" in json.dumps(row["body"])
@@ -279,6 +287,18 @@ async def test_stream_card_final_reply_uses_original_card(native):
     rt = native
     event = await ingress(rt, message("stream", group=True))
     handle = event["response_handle"]
+    prepare = {
+        **rt.identity,
+        "response_handle": handle,
+        "delivery_id": hashlib.sha256(
+            (handle + ":prepare").encode(),
+        ).hexdigest(),
+    }
+    for _ in range(2):
+        assert (
+            await rt.peer.methods["channel.response.prepare"](prepare, None)
+        )["state"] == "acknowledged"
+    assert len([row for kind, row in rt.rows if kind == "create"]) == 1
     assert (
         await send(
             rt,
@@ -311,6 +331,61 @@ async def test_stream_card_final_reply_uses_original_card(native):
         updates[-1]["content"] == "final answer" and updates[-1]["isFinalize"]
     )
     assert len([row for kind, row in rt.rows if kind == "deliver"]) == 1
+
+
+async def test_failed_feedback_archives_current_receipt_and_replays(
+    native,
+    monkeypatch,
+):
+    rt = native
+    calls = []
+
+    async def fail_emotion(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise RuntimeError("emotion result lost")
+
+    monkeypatch.setattr(rt.driver._platform, "_send_emotion", fail_emotion)
+    event = await ingress(rt, message("feedback"))
+    handle = event["response_handle"]
+    prepare = {
+        **rt.identity,
+        "response_handle": handle,
+        "delivery_id": hashlib.sha256(
+            (handle + ":prepare").encode(),
+        ).hexdigest(),
+    }
+    assert (await rt.peer.methods["channel.response.prepare"](prepare, None))[
+        "state"
+    ] == "acknowledged"
+    assert (await send(rt, handle))["state"] == "acknowledged"
+    finish = ResponseFinishParams.from_mapping(
+        {**rt.identity, "response_handle": handle, "outcome": "completed"},
+    )
+    await rt.peer.methods["channel.response.finish"](finish, None)
+    stored = rt.peer.receipts.get(receipt_key(rt.driver._state_key, handle))
+    assert stored is not None
+    archived = await rt.driver._archived(handle)
+    assert archived.to_mapping() == stored
+    assert rt.driver._routes.snapshot(handle) is None
+    assert len(archived.resource_refs) == 3
+    for ref in archived.resource_refs:
+        attrs = dict(ref.attributes)
+        assert attrs["state"] == "unknown"
+        assert (
+            attrs["fingerprint"]
+            == hashlib.sha256(
+                ("dingtalk.feedback:" + ref.resource_id).encode(),
+            ).hexdigest()
+        )
+    assert len(calls) == 3
+    restored = await rt.driver._feedback(
+        archived,
+        {"message_id": "feedback", "conversation_id": "cid-original"},
+        "🤔Thinking",
+    )
+    assert restored == archived
+    assert len(calls) == 3
+    assert len([row for kind, row in rt.rows if kind == "webhook"]) == 1
 
 
 async def test_legal_approval_command_uses_authenticated_native_sender(native):

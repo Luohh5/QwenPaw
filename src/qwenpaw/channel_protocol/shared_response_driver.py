@@ -779,10 +779,6 @@ class SharedResponseDriver:
             side_effect_possible=False,
         )
 
-    def _legacy_prepare_operation(self, params):
-        """Read exact legacy intent without authorizing arbitrary conflicts."""
-        return None
-
     @staticmethod
     def _operation_fingerprint(params):
         return hashlib.sha256(
@@ -810,16 +806,7 @@ class SharedResponseDriver:
         )
         if previous:
             attrs = dict(previous.attributes)
-            legacy = (
-                self._legacy_prepare_operation(params)
-                if isinstance(params, ResponsePrepareOperation)
-                and attrs.get("operation") == "stream.start"
-                else None
-            )
-            if attrs["fingerprint"] != fingerprint and (
-                legacy is None
-                or attrs["fingerprint"] != self._operation_fingerprint(legacy)
-            ):
+            if attrs["fingerprint"] != fingerprint:
                 return self._result(
                     delivery_id,
                     "failed",
