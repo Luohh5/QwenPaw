@@ -396,6 +396,14 @@ class ChannelBackend:
         settings = self.runtime_for(description)
         return settings.dependency_install_target if settings else None
 
+    def dependency_environment(self, description, _snapshot):
+        from .dependency_context import DependencyEnvironmentContext
+
+        settings = self.runtime_for(description)
+        if settings is None:
+            self.require_selection(description.manifest)
+        return DependencyEnvironmentContext.from_runtime(settings)
+
     def require_selection(self, manifest):
         if self.runtime_for(manifest) is None:
             raise ChannelRuntimeNotIntegratedError(

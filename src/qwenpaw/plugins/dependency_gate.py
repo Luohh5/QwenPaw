@@ -743,6 +743,9 @@ async def prepare_shared_dependencies(
     wheels=(),
     lock_timeout: float = 300.0,
     expected_snapshot=None,
+    wheel_tags=None,
+    installer_python=None,
+    collision_sites=(),
 ):
     """Coordinate, audit, query current usage and publish safe additions."""
     from contextlib import AsyncExitStack
@@ -893,11 +896,28 @@ async def prepare_shared_dependencies(
                 ),
             )
         try:
+            from dataclasses import replace
+
             files, proposed = await run_sync_io(
                 validate_additions,
                 tuple(wheels),
-                snapshot,
+                replace(
+                    snapshot,
+                    supported_tags=wheel_tags or snapshot.supported_tags,
+                    executable=installer_python or snapshot.executable,
+                    sites=tuple(
+                        dict.fromkeys(
+                            (*snapshot.sites, *map(str, collision_sites)),
+                        ),
+                    ),
+                ),
                 target,
+            )
+            proposed = replace(
+                proposed,
+                supported_tags=snapshot.supported_tags,
+                executable=snapshot.executable,
+                sites=snapshot.sites,
             )
         except Exception as exc:
             code = getattr(exc, "reason_code", "DEPENDENCY_PLAN_UNVERIFIED")

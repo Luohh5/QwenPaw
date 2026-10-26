@@ -223,6 +223,50 @@ class DependencyUpgradeManager:
             manifest,
         )
 
+    async def _environment(self, binding, snapshot, operation=None):
+        from .dependency_context import DependencyEnvironmentContext
+
+        factory = getattr(binding.backend, "dependency_environment", None)
+        context = (
+            await run_sync_io(
+                factory,
+                binding.description,
+                snapshot,
+            )
+            if factory is not None
+            else await run_sync_io(
+                DependencyEnvironmentContext.from_snapshot,
+                snapshot,
+            )
+        )
+        if factory is None:
+            target_factory = getattr(
+                binding.backend,
+                "dependency_install_target",
+                None,
+            )
+            if target_factory is not None:
+                context = replace(
+                    context,
+                    install_target=await run_sync_io(
+                        target_factory,
+                        binding.description,
+                        snapshot,
+                    ),
+                )
+        if (
+            operation is not None
+            and operation.get("dependency_context") is not None
+        ):
+            pinned = DependencyEnvironmentContext.from_mapping(
+                operation["dependency_context"],
+            )
+            if context.to_mapping() != pinned.to_mapping():
+                raise RuntimeError(
+                    "DEPENDENCY_PLAN_STALE: dependency context changed.",
+                )
+        return context
+
     async def _consumers(self, binding, snapshot):
         """Installed declarations participate even when currently inactive."""
         consumers = []
@@ -453,6 +497,7 @@ class DependencyUpgradeManager:
         requirements,
         consumers,
         requirements_path,
+        context=None,
     ):
         from packaging.requirements import Requirement
 
@@ -461,15 +506,23 @@ class DependencyUpgradeManager:
             environment_fingerprint,
         )
 
+        immutable = (
+            context.immutable_providers() if context is not None else {}
+        )
         protected = {
             name
             for name, row in snapshot.distributions.items()
-            if not dependency_site_is_mutable(
+            if (
+                context is not None
+                and context.protected(Path(row["metadata_path"]).parent)
+            )
+            or not dependency_site_is_mutable(
                 Path(row["metadata_path"]).parent,
                 snapshot.prefix,
                 directory.parent.parent / "plugin_runtime",
             )
         }
+        protected.update(immutable)
         for value in requirements:
             requirement = Requirement(value)
             if requirement.marker and not requirement.marker.evaluate(
@@ -477,13 +530,19 @@ class DependencyUpgradeManager:
             ):
                 continue
             name = canonicalize_name(requirement.name)
+            if name in immutable and not requirement.specifier.contains(
+                immutable[name]["version"],
+                prereleases=True,
+            ):
+                context.refuse_immutable_provider(name, immutable[name])
+            row = snapshot.distributions.get(name) or immutable.get(name)
             if name in protected and not requirement.specifier.contains(
-                snapshot.distributions[name]["version"],
+                row["version"],
                 prereleases=True,
             ):
                 _refuse(
                     "DEPENDENCY_ENVIRONMENT_PROTECTED",
-                    f"{name} {snapshot.distributions[name]['version']} is "
+                    f"{name} {row['version']} is "
                     f"bundled or environment-managed, but {requirement} is "
                     "required. Update the desktop app or use the "
                     "environment owner's package manager.",
@@ -524,11 +583,19 @@ class DependencyUpgradeManager:
                 f"{name}=={row['version']}\n"
                 for name, row in snapshot.distributions.items()
                 if name not in closure or name in protected
+            )
+            + "".join(
+                f"{name}=={row['version']}\n"
+                for name, row in immutable.items()
+                if name not in snapshot.distributions
+                or row["version"] != snapshot.distributions[name]["version"]
             ),
             encoding="utf-8",
         )
         command = [
-            snapshot.executable,
+            context.python_executable
+            if context is not None
+            else snapshot.executable,
             "-I",
             "-m",
             "pip",
@@ -554,7 +621,12 @@ class DependencyUpgradeManager:
         requirements,
         consumers,
         target,
+        context=None,
+        wheel_tags=None,
     ):
+        immutable = (
+            context.immutable_providers() if context is not None else {}
+        )
         wheels = []
         changed = {}
         for path in sorted((directory / "wheels").glob("*.whl")):
@@ -563,6 +635,8 @@ class DependencyUpgradeManager:
             old = snapshot.distributions.get(name)
             if old and old["version"] == str(version):
                 continue
+            if name in immutable:
+                context.refuse_immutable_provider(name, immutable[name])
             if name in changed:
                 _refuse(
                     "DEPENDENCY_PLAN_UNVERIFIED",
@@ -584,7 +658,13 @@ class DependencyUpgradeManager:
         # collisions are checked below against exact installed ownership.
         clean = replace(
             snapshot,
-            sites=(),
+            sites=tuple(map(str, context.immutable_roots))
+            if context is not None
+            else (),
+            supported_tags=wheel_tags or snapshot.supported_tags,
+            executable=context.python_executable
+            if context is not None
+            else snapshot.executable,
             distributions={
                 name: row
                 for name, row in snapshot.distributions.items()
@@ -601,6 +681,11 @@ class DependencyUpgradeManager:
         for name in changed:
             old, row = changed[name], proposed.distributions[name]
             site = Path(old["metadata_path"]).parent if old else Path(target)
+            if context is not None and context.protected(site):
+                _refuse(
+                    "DEPENDENCY_ENVIRONMENT_PROTECTED",
+                    "Bundled dependencies cannot be replaced; update the desktop app.",
+                )
             destinations[name] = str(site.resolve())
             proposed.distributions[name]["metadata_path"] = str(
                 site / Path(row["metadata_path"]).name,
@@ -699,15 +784,14 @@ class DependencyUpgradeManager:
                     "Actual dependency environment is unavailable.",
                 )
             consumers = await self._consumers(binding, snapshot)
-            target = binding.backend.dependency_install_target(
-                binding.description,
-                snapshot,
-            )
+            context = await self._environment(binding, snapshot)
+            target = context.install_target
             if target is None:
                 _refuse(
                     "DEPENDENCY_PLAN_UNVERIFIED",
                     "The dependency installation site is ambiguous.",
                 )
+            wheel_tags = await run_sync_io(context.inspect_executor)
             requirements = list(binding.description.requirements)
             fingerprint, command = await run_sync_io(
                 self._prepare_resolution,
@@ -716,6 +800,7 @@ class DependencyUpgradeManager:
                 requirements,
                 consumers,
                 binding.description.requirements_path,
+                context,
             )
             result = await run_sync_io(
                 self.loader._run_subprocess_with_streaming_log,
@@ -735,6 +820,8 @@ class DependencyUpgradeManager:
                 requirements,
                 consumers,
                 target,
+                context,
+                wheel_tags,
             )
             from .dependency_transaction import imported_changes
 
@@ -806,6 +893,7 @@ class DependencyUpgradeManager:
                     str(path.resolve()) for path in self.loader.plugin_dirs
                 ],
                 "runtime": runtime_data,
+                "dependency_context": context.to_mapping(),
                 "approved": False,
             }
             await run_sync_io(self._seal_operation, directory, operation)
@@ -833,6 +921,9 @@ class DependencyUpgradeManager:
 def retain_maintenance_assets(directory, operation, runtime):
     """Recovery must remain executable before any online file can change."""
     candidates = [Path(__file__).resolve().parent]
+    context = operation.get("dependency_context")
+    if context is not None:
+        candidates.append(Path(context["support_root"]) / "qwenpaw/plugins")
     if runtime is not None:
         candidates.append(Path(runtime["support_root"]) / "qwenpaw/plugins")
     names = (
@@ -860,17 +951,58 @@ def retain_maintenance_assets(directory, operation, runtime):
     worker.mkdir(exist_ok=True)
     for name in names:
         shutil.copy2(assets / name, worker / name)
-    frozen = bool(getattr(sys, "frozen", False))
     executable = (
-        runtime["python_executable"]
-        if frozen and runtime is not None
-        else sys.executable
+        context["python_executable"]
+        if context
+        else (
+            runtime["python_executable"]
+            if bool(getattr(sys, "frozen", False)) and runtime is not None
+            else sys.executable
+        )
     )
     operation.update(
-        continuation_python=os.path.abspath(executable),
+        continuation_python=os.path.abspath(sys.executable),
         worker_python=os.path.abspath(executable),
         support_root=str(assets.parents[1]),
     )
+    if bool(getattr(sys, "frozen", False)):
+        from .dependency_context import host_bundle_identity
+
+        operation["host_bundle_identity"] = host_bundle_identity()
+        operation["continuation_command"] = [
+            os.path.abspath(sys.executable),
+            "--internal-dependency-continue",
+            str(directory.resolve()),
+        ]
+
+
+def run_native_continuation(directory, phase):
+    """Authenticate a private frozen-host entry before desktop startup."""
+    from .dependency_transaction import authenticate_plan
+    from .dependency_maintenance import authorized, current_capability
+
+    directory = Path(directory).resolve()
+    operation = json.loads((directory / "operation.json").read_text())
+    authenticate_plan(directory, operation)
+    expected = [
+        os.path.abspath(sys.executable),
+        "--internal-dependency-continue",
+        str(directory),
+    ]
+    if (
+        phase not in {"0", "1"}
+        or operation.get("continuation_command") != expected
+        or not operation.get("approved")
+        or current_capability()
+        != operation["id"] + ":" + operation["capability"]
+        or not all(authorized(site) for site in operation["payload"]["sites"])
+    ):
+        raise RuntimeError("DEPENDENCY_APPROVAL_REQUIRED")
+    from .dependency_context import host_bundle_identity
+
+    if host_bundle_identity() != operation.get("host_bundle_identity"):
+        raise RuntimeError("DEPENDENCY_PLAN_STALE: desktop bundle changed.")
+    asyncio.run(continue_operation(directory, preflight=phase == "1"))
 
 
 def schedule_maintenance(manager, directory, operation, *, loop=None):
@@ -989,6 +1121,8 @@ async def continue_operation(directory, *, preflight=False):
         observed = await binding.backend.audit_dependencies(
             binding.description,
         )
+        context = await manager._environment(binding, observed, operation)
+        await run_sync_io(context.inspect_executor)
         if preflight:
             if (
                 environment_fingerprint(observed.to_mapping())

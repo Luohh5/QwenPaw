@@ -35,6 +35,9 @@ _PLAN_FIELDS = (
     "continuation_python",
     "worker_python",
     "support_root",
+    "dependency_context",
+    "continuation_command",
+    "host_bundle_identity",
 )
 
 
@@ -59,7 +62,17 @@ def authenticate_plan(directory, operation, *, seal=False):
             "DEPENDENCY_PLAN_STALE: invalid operation identity.",
         )
     message = json.dumps(
-        {key: operation[key] for key in _PLAN_FIELDS},
+        {
+            key: operation[key]
+            for key in _PLAN_FIELDS
+            if key in operation
+            or key
+            not in {
+                "dependency_context",
+                "continuation_command",
+                "host_bundle_identity",
+            }
+        },
         sort_keys=True,
     ).encode()
     signature = hmac.new(
@@ -870,6 +883,9 @@ async def apply_operation(manager, operation_id):
             fresh = await binding.backend.audit_dependencies(
                 binding.description,
             )
+            if operation.get("dependency_context") is not None:
+                context = await manager._environment(binding, fresh, operation)
+                await run_sync_io(context.inspect_executor)
             await run_sync_io(
                 _verify_reviewed_plan,
                 directory,

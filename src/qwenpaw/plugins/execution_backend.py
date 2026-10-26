@@ -83,6 +83,8 @@ class ExecutionBackend(Protocol):
 
     Executable admission additionally uses optional dependency_targets and
     audit_dependencies capabilities. Static discovery needs neither hook.
+    Optional dependency_environment(description, snapshot) selects host-owned
+    installer policy independently of actual consumer audit evidence.
     Optional validate_config_update(description, config) checks eligibility
     without execution before configuration teardown, including disabled rows.
     """

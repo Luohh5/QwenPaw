@@ -196,6 +196,30 @@ def _bundle_dependency_fingerprint(identity, metadata):
     ).hexdigest()
 
 
+def dependency_metadata_identity(sites, identity):
+    """Fingerprint immutable metadata with stable site-relative labels."""
+    metadata = []
+    for index, site in enumerate(sites):
+        for distribution in sorted(site.glob("*.dist-info")):
+            for name in ("METADATA", "RECORD", "WHEEL"):
+                path = distribution / name
+                if not path.is_file():
+                    continue
+                if not path.resolve().is_relative_to(site):
+                    raise ValueError("CHANNEL_RUNTIME_MANIFEST_INVALID")
+                stat = path.stat()
+                metadata.append(
+                    (
+                        f"{index}/{path.relative_to(site).as_posix()}",
+                        path,
+                        stat.st_mtime_ns,
+                        stat.st_ctime_ns,
+                        stat.st_size,
+                    ),
+                )
+    return _bundle_dependency_fingerprint(identity, tuple(metadata))
+
+
 def plugin_runtime_site(runtime_root: Path, runtime=None) -> Path:
     """Share an ABI site, isolated by bundled wheel identity on desktop."""
     if runtime is None and getattr(sys, "frozen", False):
@@ -226,40 +250,21 @@ def plugin_runtime_site(runtime_root: Path, runtime=None) -> Path:
                 "official_index_sha256",
             )
         }
-        metadata = []
-        for index, site in enumerate(runtime[2]):
-            for distribution in sorted(site.glob("*.dist-info")):
-                for name in ("METADATA", "RECORD", "WHEEL"):
-                    path = distribution / name
-                    if not path.is_file():
-                        continue
-                    if not path.resolve().is_relative_to(site):
-                        raise ValueError("CHANNEL_RUNTIME_MANIFEST_INVALID")
-                    stat = path.stat()
-                    metadata.append(
-                        (
-                            f"{index}/{path.relative_to(site).as_posix()}",
-                            path,
-                            stat.st_mtime_ns,
-                            stat.st_ctime_ns,
-                            stat.st_size,
-                        ),
-                    )
         # RECORD identifies payload changes even at the same package version.
         # Only immutable bundle metadata participates, never user overlays.
-        fingerprint = _bundle_dependency_fingerprint(
+        fingerprint = dependency_metadata_identity(
+            runtime[2],
             json.dumps(
                 [identity, runtime[4], bundle_identity],
                 sort_keys=True,
             ),
-            tuple(metadata),
         )
         target /= f"bundle-{fingerprint}"
     return target / "site"
 
 
-def resolve_default_channel_runtime():
-    """Provision an empty managed site under the environment lock."""
+def resolve_default_channel_runtime(*, provision=True):
+    """Select runtime policy; provisioning also reads channel send policy."""
     from ..__version__ import __version__
     from ..config.utils import get_config_path, _read_config_data
     from .install_lock import (
@@ -286,16 +291,23 @@ def resolve_default_channel_runtime():
     if not worker.is_file() or not worker.resolve().is_relative_to(support):
         raise ValueError("CHANNEL_RUNTIME_MISSING")
     config_path = get_config_path()
-    data = _read_config_data(config_path) if config_path.exists() else {}
+    data = (
+        _read_config_data(config_path)
+        if provision and config_path.exists()
+        else {}
+    )
     send_timeouts = (data or {}).get("channel_send_timeouts", {})
     target = plugin_runtime_site(
         config_path.parent / "plugin_runtime",
         runtime,
     )
-    with plugin_install_lock(environment_install_lock_path(target)):
-        if target.is_symlink():
-            raise ValueError("CHANNEL_RUNTIME_TARGET_INVALID")
-        target.mkdir(parents=True, exist_ok=True)
+    if target.is_symlink():
+        raise ValueError("CHANNEL_RUNTIME_TARGET_INVALID")
+    if provision:
+        with plugin_install_lock(environment_install_lock_path(target)):
+            if target.is_symlink():
+                raise ValueError("CHANNEL_RUNTIME_TARGET_INVALID")
+            target.mkdir(parents=True, exist_ok=True)
     return ChannelRuntimeSettings(
         python_executable=str(executable),
         support_root=support,

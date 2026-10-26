@@ -332,6 +332,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 get_instance=self.lifecycle.get_instance,
                 drop_instance=self.lifecycle.drop_instance,
                 unregister_plugin=unregister,
+                dependency_environment=self._dependency_environment,
             ),
         )
         self._channel_backend = ChannelBackend(
@@ -357,6 +358,34 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
 
     def _channel_runtime_for(self, manifest):
         return self._channel_backend.runtime_for(manifest)
+
+    def _dependency_environment(self, snapshot=None):
+        """Select host installation policy independently of plugin kind."""
+        from .dependency_context import DependencyEnvironmentContext
+        from .execution.environment import shared_dependency_paths
+
+        if _is_frozen():
+            from .channel_bootstrap import resolve_default_channel_runtime
+
+            runtime = self.registry.channel_runtime
+            if runtime is None:
+                runtime = resolve_default_channel_runtime(provision=False)
+            if (
+                runtime.runtime_identity is None
+                or runtime.dependency_install_target is None
+            ):
+                raise ValueError("CHANNEL_RUNTIME_MISSING")
+            context = DependencyEnvironmentContext.from_runtime(runtime)
+            _ensure_plugin_site_on_path(context.install_target)
+            return context
+        if snapshot is not None:
+            return DependencyEnvironmentContext.from_snapshot(snapshot)
+        return DependencyEnvironmentContext(
+            sys.executable,
+            Path(__file__).resolve().parents[2],
+            shared_dependency_paths(),
+            None,
+        )
 
     async def _binding_for_record(self, record):
         """Describe missing bindings off-loop; retain record writes here."""
@@ -886,7 +915,6 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         )
         from .execution import PluginLaunchSpec, PluginProcess
         from .execution.bootstrap import _hash_code_root
-        from .execution.environment import shared_dependency_paths
         from ..utils.io_utils import run_sync_io
 
         if os.environ.get("QWENPAW_RUNTIME_PROVISIONER") == "local":
@@ -894,22 +922,16 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 "Shared runtime requires explicit administrator repair",
             )
         frozen = _is_frozen()
-        runtime = None
-        target = None
-        python = sys.executable
-        host_paths = tuple(sys.path)
-
-        def inspect_environment():
-            return (
-                Path(__file__).resolve().parents[2],
-                shared_dependency_paths(host_paths) if not frozen else (),
-                (source_path or requirements_file.parent).resolve(),
-            )
-
-        support, paths, root = await run_sync_io(inspect_environment)
+        context = await run_sync_io(self._dependency_environment)
+        target = context.install_target
+        python = context.python_executable
+        support = context.support_root
+        paths = context.dependency_paths
+        root = await run_sync_io(
+            (source_path or requirements_file.parent).resolve,
+        )
         if frozen:
             from .channel_bootstrap import (
-                resolve_default_channel_runtime,
                 validate_runtime_identity,
             )
             from .install_lock import (
@@ -917,20 +939,6 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 environment_install_lock_path,
                 plugin_install_lock,
             )
-
-            runtime = self.registry.channel_runtime
-            if runtime is None:
-                runtime = await run_sync_io(
-                    resolve_default_channel_runtime,
-                )
-            if (
-                runtime.runtime_identity is None
-                or runtime.dependency_install_target is None
-            ):
-                raise ValueError("CHANNEL_RUNTIME_MISSING")
-            python = runtime.python_executable
-            support = runtime.support_root
-            target = Path(runtime.dependency_install_target)
 
             def prepare_target():
                 if target.is_symlink():
@@ -944,7 +952,8 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 ),
             ):
                 target = await run_sync_io(prepare_target)
-            paths = tuple(dict.fromkeys((*runtime.dependency_paths, target)))
+            paths = tuple(dict.fromkeys((*paths, target)))
+            _ensure_plugin_site_on_path(target)
         await self._stop_preparation(plugin_id)
         cleanup = ExitStack()
         try:
@@ -1007,8 +1016,12 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 DependencyDeclaration(
                     plugin_id,
                     spec.source_revision,
-                    tuple(str(item) for item in requirements.requirements)
-                    + tuple(requirements.unsupported),
+                    ()
+                    if frozen
+                    else (
+                        tuple(str(item) for item in requirements.requirements)
+                        + tuple(requirements.unsupported)
+                    ),
                     None,
                 ),
             )
@@ -1016,11 +1029,11 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
 
             def observe(snapshot):
                 nonlocal identity_error
-                if runtime is not None:
+                if context.runtime_identity is not None:
                     try:
                         validate_runtime_identity(
                             snapshot,
-                            runtime.runtime_identity,
+                            context.runtime_identity,
                             python,
                         )
                     except ValueError as exc:
@@ -1031,6 +1044,21 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             process.dependency_observer = observe
             snapshot = (await process.audit(spec)).snapshot
             observe(snapshot)
+            wheel_tags = snapshot.supported_tags if frozen else None
+            audit_process = process
+            if frozen:
+                from types import SimpleNamespace
+
+                async def host_audit(_spec):
+                    observed = await self._python_backend.audit_dependencies(
+                        SimpleNamespace(source_path=root),
+                    )
+                    return SimpleNamespace(snapshot=observed)
+
+                # A worker proves installer identity. Ordinary plugin code
+                # executes in this host, whose metadata also fences additions.
+                audit_process = SimpleNamespace(audit=host_audit)
+                snapshot = (await audit_process.audit(spec)).snapshot
             # A selected interpreter can expose package sites absent from the
             # host's sys.path (including an active user site). Retain its real
             # audited roots before the additive writer admits another audit.
@@ -1038,21 +1066,19 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
 
             await run_sync_io(
                 lease_environment,
-                snapshot.dependency_sites or (),
+                (target,) if frozen else snapshot.dependency_sites or (),
             )
             from .dependency_usage import current_admission_token
 
             if not frozen:
-                targets = [
-                    Path(site)
-                    for site in snapshot.dependency_sites or ()
-                    if Path(site).name in {"site-packages", "dist-packages"}
-                    and Path(site).is_relative_to(snapshot.prefix)
-                ]
-                target = targets[0] if len(targets) == 1 else None
+                context = await run_sync_io(
+                    self._dependency_environment,
+                    snapshot,
+                )
+                target = context.install_target
             try:
                 await prepare_shared_dependencies(
-                    process,
+                    audit_process,
                     spec,
                     plugin_id=plugin_id,
                     requirements_file=requirements_file,
@@ -1072,13 +1098,15 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                         "DEPENDENCY_ENVIRONMENT_AMBIGUOUS",
                     ) from exc
                 await self._acquire_dependency_wheels(
-                    process,
+                    audit_process,
                     spec,
                     snapshot,
                     target,
                     plugin_id,
                     requirements_file,
                     source_path=root,
+                    wheel_tags=wheel_tags,
+                    dependency_context=context if frozen else None,
                 )
             if frozen:
                 _ensure_plugin_site_on_path(target)
@@ -1108,6 +1136,8 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         requirements_file,
         *,
         source_path=None,
+        wheel_tags=None,
+        dependency_context=None,
     ):
         """Build/stage wheels; the shared gate owns actual package writes."""
         import hashlib
@@ -1130,6 +1160,35 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             )
 
         usage = self.registry.dependency_usage
+        immutable = (
+            await run_sync_io(dependency_context.immutable_providers)
+            if dependency_context is not None
+            else {}
+        )
+        if immutable:
+            from .dependency_gate import parse_requirements_file
+            from .execution.dependencies import _dependency_closure
+
+            parsed = await run_sync_io(
+                parse_requirements_file,
+                requirements_file,
+            )
+            for name, requirement in _dependency_closure(
+                [str(item) for item in parsed.requirements],
+                {**immutable, **snapshot.distributions},
+                snapshot.marker_environment,
+            ):
+                if name in immutable and (
+                    name not in snapshot.distributions
+                    or not requirement.specifier.contains(
+                        immutable[name]["version"],
+                        prereleases=True,
+                    )
+                ):
+                    dependency_context.refuse_immutable_provider(
+                        name,
+                        immutable[name],
+                    )
         cleanup = ExitStack()
         try:
             temporary = await run_sync_io(
@@ -1147,6 +1206,13 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     "".join(
                         f"{name}=={row['version']}\n"
                         for name, row in observed.distributions.items()
+                    )
+                    + "".join(
+                        f"{name}=={row['version']}\n"
+                        for name, row in immutable.items()
+                        if name not in observed.distributions
+                        or row["version"]
+                        != observed.distributions[name]["version"]
                     ),
                     encoding="utf-8",
                 )
@@ -1225,7 +1291,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 )
 
             def collect_wheels():
-                return tuple(
+                wheels = tuple(
                     WheelAddition(
                         path,
                         hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -1234,6 +1300,14 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     if str(parse_wheel_filename(path.name)[0])
                     not in snapshot.distributions
                 )
+                for item in wheels:
+                    name = str(parse_wheel_filename(item.path.name)[0])
+                    if name in immutable:
+                        dependency_context.refuse_immutable_provider(
+                            name,
+                            immutable[name],
+                        )
+                return wheels
 
             wheels = await run_sync_io(collect_wheels)
             await prepare_shared_dependencies(
@@ -1250,6 +1324,11 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 install_target=target,
                 wheels=wheels,
                 expected_snapshot=snapshot,
+                wheel_tags=wheel_tags,
+                installer_python=spec.python_executable,
+                collision_sites=dependency_context.immutable_roots
+                if dependency_context
+                else (),
             )
         finally:
             await run_sync_io(cleanup.close)

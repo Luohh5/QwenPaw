@@ -14,6 +14,7 @@ from pathlib import Path
 import platform
 import runpy
 import shutil
+import subprocess
 import sys
 import sysconfig
 from types import SimpleNamespace
@@ -119,9 +120,23 @@ def desktop(tmp_path, monkeypatch, fresh_registry):
     # Desktop Resources are not writable. In particular, reader custody must
     # not create mutable lease sidecars beside packaged dependency sites.
     support.parent.chmod(0o555)
+    frozen_loader.parents[3].chmod(0o555)
     loader = loader_module.PluginLoader(
         [tmp_path / "plugins"],
         channel_runtime=settings,
+    )
+    host_audits = []
+    host_audit = loader._python_backend.audit_dependencies
+
+    async def observe_host(description):
+        snapshot = await host_audit(description)
+        host_audits.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(
+        loader._python_backend,
+        "audit_dependencies",
+        observe_host,
     )
     yield SimpleNamespace(
         loader=loader,
@@ -133,9 +148,11 @@ def desktop(tmp_path, monkeypatch, fresh_registry):
         requirements=requirements,
         payload=payload,
         audits=audits,
+        host_audits=host_audits,
         registry=fresh_registry,
     )
     support.parent.chmod(0o755)
+    frozen_loader.parents[3].chmod(0o755)
     assert not fresh_registry.runtime_owners.leases("ordinary-plugin")
     sys.modules.pop("frozen_local_sdk", None)
     sys.modules.pop("frozen_common_dependency", None)
@@ -233,10 +250,12 @@ async def test_frozen_missing_dependency_uses_real_worker_and_host_overlay(
 
     assert decision.already_satisfied and not decision.missing
     assert not decision.allow_install
-    assert len(desktop.audits) >= 2
+    assert desktop.audits
     assert "frozen-local-sdk" not in desktop.audits[0][1].distributions
+    assert len(desktop.host_audits) >= 2
+    assert "frozen-local-sdk" not in desktop.host_audits[0].distributions
     assert (
-        desktop.audits[-1][1].distributions["frozen-local-sdk"]["version"]
+        desktop.host_audits[-1].distributions["frozen-local-sdk"]["version"]
         == "2.0"
     )
     assert all(
@@ -303,9 +322,11 @@ async def test_frozen_packaged_dependency_is_reused_without_acquisition(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("worker_has_common", [True, False])
 async def test_frozen_sdk_install_retains_host_transitive_provider(
     desktop,
     monkeypatch,
+    worker_has_common,
 ):
     host_site = desktop.resources / "binaries/qwenpaw-backend/_internal"
     common = wheel(
@@ -315,7 +336,8 @@ async def test_frozen_sdk_install_retains_host_transitive_provider(
     )
     with zipfile.ZipFile(common.path) as archive:
         archive.extractall(host_site)
-        archive.extractall(desktop.support)
+        if worker_has_common:
+            archive.extractall(desktop.support)
     wheel(
         desktop.payload.path.parent,
         name="frozen-local-sdk",
@@ -332,7 +354,9 @@ async def test_frozen_sdk_install_retains_host_transitive_provider(
         allow_install=True,
     )
     assert decision.already_satisfied
-    assert "frozen-common-dependency" in desktop.audits[-1][1].distributions
+    assert (
+        "frozen-common-dependency" in desktop.audits[-1][1].distributions
+    ) is worker_has_common
     backend = desktop.loader._python_backend
     description = backend.describe(
         desktop.upload,
@@ -639,3 +663,324 @@ async def test_frozen_metadata_closure_satisfies_hub_host_without_pip(
     assert "frozen-common-dependency" in desktop.audits[-1][1].distributions
     assert _contents(desktop.resources) == before
     assert not list(desktop.target.iterdir())
+
+
+def test_frozen_ordinary_upgrade_uses_the_prepared_managed_site(tmp_path):
+    """Direct install, review and offline continuation share a frozen target."""
+    root = Path(__file__).resolve().parents[3]
+    helper = root / "tests/fixtures/shared_dependencies/frozen_upgrade_host.py"
+    result = subprocess.run(
+        [sys.executable, "-I", str(helper), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads((tmp_path / "report.json").read_text())
+    directory = Path(report["directory"])
+    stored = json.loads((directory / "operation.json").read_text())
+    assert stored["approved"] and stored["status"] == "waiting_restart"
+    assert stored["worker_python"] == report["python"]
+    assert (
+        stored["environment"]["executable"]
+        == stored["continuation_command"][0]
+    )
+    assert stored["environment"]["executable"] != report["python"]
+    context = stored["dependency_context"]
+    assert context["python_executable"] == report["python"]
+    assert context["install_target"] == report["target"]
+    assert str(Path(report["host_site"])) in stored["environment"]["sites"]
+    assert "frozen-host-leaf" not in report["worker_packages"]
+    assert "frozen-host-leaf==1.0" in report["constraints"]
+    assert stored["proposed"]["frozen-host-leaf"]["version"] == "1.0"
+    assert report["solver_python"] == report["python"]
+
+    from qwenpaw.plugins.dependency_transaction import authenticate_plan
+
+    stored["dependency_context"]["install_target"] = str(tmp_path / "other")
+    with pytest.raises(RuntimeError, match="DEPENDENCY_PLAN_STALE"):
+        authenticate_plan(directory, stored)
+
+    before = _contents(Path(report["resources"]))
+    legacy = _contents(Path(report["legacy"]))
+    unauthorized = subprocess.run(
+        [*stored["continuation_command"], "1"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+        env={
+            name: value
+            for name, value in os.environ.items()
+            if name != "QWENPAW_DEPENDENCY_MAINTENANCE"
+        },
+    )
+    assert unauthorized.returncode != 0
+    assert "DEPENDENCY_APPROVAL_REQUIRED" in unauthorized.stderr
+    assert (
+        "dependency command reached desktop startup" not in unauthorized.stderr
+    )
+    assert _contents(Path(report["resources"])) == before
+    result = subprocess.run(
+        [
+            report["python"],
+            "-I",
+            "-S",
+            str(directory / "worker/dependency_worker.py"),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    operation = json.loads((directory / "operation.json").read_text())
+    assert result.returncode == 0, (
+        result.stdout + result.stderr + str(operation.get("error"))
+    )
+    assert operation["status"] == "succeeded", operation.get("error")
+    assert operation["result"]["id"] == "ordinary-plugin"
+    assert operation["result"]["status"] == "inactive"
+    assert not (tmp_path / "activation.json").exists()
+    activated = subprocess.run(
+        [stored["continuation_command"][0], "--fixture-activate"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    assert activated.returncode == 0, activated.stdout + activated.stderr
+    target = Path(report["target"])
+    assert not (target / "frozen_local_sdk-1.0.dist-info").exists()
+    assert (target / "frozen_local_sdk-2.0.dist-info/METADATA").is_file()
+    assert not (target / "frozen_host_leaf.py").exists()
+    script = target / "bin/frozen-sdk-2.0"
+    assert os.fsencode(report["python"]) in script.read_bytes()
+    launched = subprocess.run(
+        [str(script)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert launched.returncode == 0, launched.stdout + launched.stderr
+    assert launched.stdout.strip() == report["python"]
+    activation = json.loads((tmp_path / "activation.json").read_text())
+    assert activation == {
+        "version": "2.0",
+        "origin": str(target / "frozen_local_sdk.py"),
+    }
+    assert _contents(Path(report["resources"])) == before
+    assert _contents(Path(report["legacy"])) == legacy
+
+
+@pytest.mark.asyncio
+async def test_frozen_ordinary_packaged_upgrade_refuses_before_resolution(
+    manifest_desktop,
+    monkeypatch,
+):
+    from qwenpaw.plugins.dependency_gate import SharedDependencyError
+    from qwenpaw.plugins.dependency_upgrade import DependencyUpgradeManager
+
+    desktop = manifest_desktop
+    host_site = desktop.resources / "binaries/qwenpaw-backend/_internal"
+    old = wheel(
+        desktop.payload.path.parent,
+        name="frozen-local-sdk",
+        version="1.0",
+    )
+    with zipfile.ZipFile(old.path) as archive:
+        archive.extractall(host_site)
+        archive.extractall(desktop.support)
+    monkeypatch.syspath_prepend(str(host_site))
+    monkeypatch.setattr(sys, "prefix", str(desktop.resources))
+    monkeypatch.setattr(sys, "executable", str(desktop.resources / "backend"))
+    monkeypatch.setattr(
+        sys,
+        "path",
+        [path for path in sys.path if "site-packages" not in path],
+    )
+    (desktop.upload / "plugin.json").write_text(
+        json.dumps(
+            {
+                "id": "ordinary-plugin",
+                "version": "1.0",
+                "entry": {},
+            },
+        ),
+    )
+
+    def refuse_solver(*_args, **_kwargs):
+        pytest.fail("A conflicting packaged provider must refuse before pip")
+
+    monkeypatch.setattr(
+        desktop.loader,
+        "_run_subprocess_with_streaming_log",
+        refuse_solver,
+    )
+    manager = DependencyUpgradeManager(desktop.loader)
+    manager.root = desktop.upload.parent / "working/dependency_upgrades"
+    before = _contents(desktop.resources)
+
+    with pytest.raises(SharedDependencyError) as refused:
+        await manager.stage(desktop.upload)
+
+    assert refused.value.reason_code == "DEPENDENCY_ENVIRONMENT_PROTECTED"
+    assert "frozen-local-sdk" in str(refused.value)
+    assert _contents(desktop.resources) == before
+    assert not list(manager.root.glob("*/operation.json"))
+    assert not list(desktop.target.iterdir())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["direct", "upgrade"])
+async def test_frozen_worker_only_packaged_provider_cannot_be_overlaid(
+    desktop,
+    monkeypatch,
+    operation,
+):
+    from qwenpaw.plugins.dependency_gate import SharedDependencyError
+    from qwenpaw.plugins.dependency_upgrade import DependencyUpgradeManager
+
+    old = wheel(
+        desktop.payload.path.parent,
+        name="frozen-local-sdk",
+        version="1.0",
+    )
+    with zipfile.ZipFile(old.path) as archive:
+        archive.extractall(desktop.support)
+    (desktop.upload / "plugin.json").write_text(
+        json.dumps(
+            {
+                "id": "ordinary-plugin",
+                "version": "1.0",
+                "entry": {},
+            },
+        ),
+    )
+    monkeypatch.setattr(sys, "prefix", str(desktop.resources))
+    monkeypatch.setattr(sys, "executable", str(desktop.resources / "backend"))
+    monkeypatch.setattr(
+        sys,
+        "path",
+        [path for path in sys.path if "site-packages" not in path],
+    )
+    before = _contents(desktop.resources)
+    manager = DependencyUpgradeManager(desktop.loader)
+    manager.root = desktop.upload.parent / "working/dependency_upgrades"
+
+    with pytest.raises(SharedDependencyError) as refused:
+        if operation == "direct":
+            await desktop.loader._prepare_python_dependencies(
+                desktop.requirements,
+                "ordinary-plugin",
+            )
+        else:
+            await manager.stage(desktop.upload)
+
+    assert (
+        refused.value.reason_code == "DEPENDENCY_ENVIRONMENT_PROTECTED"
+    ), str(refused.value)
+    assert _contents(desktop.resources) == before
+    assert not list(desktop.target.iterdir())
+    assert not list(manager.root.glob("*/operation.json"))
+
+
+@pytest.mark.asyncio
+async def test_frozen_immutable_metadata_change_invalidates_reviewed_upgrade(
+    desktop,
+    monkeypatch,
+):
+    from qwenpaw.plugins.dependency_upgrade import DependencyUpgradeManager
+
+    for name, version, site in (
+        ("frozen-local-sdk", "1.0", desktop.target),
+        ("frozen-policy", "1.0", desktop.support),
+    ):
+        payload = wheel(
+            desktop.payload.path.parent,
+            name=name,
+            version=version,
+        )
+        with zipfile.ZipFile(payload.path) as archive:
+            archive.extractall(site)
+    (desktop.upload / "plugin.json").write_text(
+        json.dumps(
+            {
+                "id": "ordinary-plugin",
+                "version": "1.0",
+                "entry": {},
+            },
+        ),
+    )
+    monkeypatch.setattr(sys, "prefix", str(desktop.resources))
+    monkeypatch.setattr(sys, "executable", str(desktop.resources / "backend"))
+    stdlib = Path(sysconfig.get_path("stdlib"))
+    monkeypatch.setattr(
+        sys,
+        "path",
+        [str(stdlib), str(stdlib / "lib-dynload")],
+    )
+    manager = DependencyUpgradeManager(desktop.loader)
+    manager.root = desktop.upload.parent / "working/dependency_upgrades"
+    operation = await manager.stage(desktop.upload)
+    stored = manager._read(operation["id"])
+    assert stored["dependency_context"]["immutable_identity"]
+    policy = desktop.support / "frozen_policy-1.0.dist-info/METADATA"
+    policy.write_bytes(
+        policy.read_bytes() + b"Summary: same-version policy changed\n",
+    )
+    before = _contents(desktop.target)
+    resources = _contents(desktop.resources)
+    binding = await manager._binding(desktop.upload)
+    actual = await binding.backend.audit_dependencies(binding.description)
+    assert actual.distributions["frozen-local-sdk"]["version"] == "1.0"
+    assert "frozen-policy" not in actual.distributions
+    assert actual.to_mapping() == stored["environment"]
+
+    applied = await manager.apply(operation["id"])
+
+    assert applied["status"] == "failed"
+    assert applied["error"]["code"] == "DEPENDENCY_PLAN_STALE"
+    assert _contents(desktop.target) == before
+    assert _contents(desktop.resources) == resources
+    assert not (desktop.target / "frozen_local_sdk-2.0.dist-info").exists()
+
+
+@pytest.mark.asyncio
+async def test_frozen_worker_only_module_alias_cannot_be_overlaid(
+    desktop,
+    monkeypatch,
+):
+    from qwenpaw.plugins.dependency_gate import SharedDependencyError
+
+    bundled = wheel(
+        desktop.payload.path.parent,
+        name="frozen-private-sdk",
+        version="1.0",
+        module="frozen_local_sdk",
+    )
+    with zipfile.ZipFile(bundled.path) as archive:
+        archive.extractall(desktop.support)
+    monkeypatch.setattr(sys, "prefix", str(desktop.resources))
+    monkeypatch.setattr(sys, "executable", str(desktop.resources / "backend"))
+    stdlib = Path(sysconfig.get_path("stdlib"))
+    monkeypatch.setattr(
+        sys,
+        "path",
+        [str(stdlib), str(stdlib / "lib-dynload")],
+    )
+    before = _contents(desktop.resources)
+
+    with pytest.raises(SharedDependencyError) as refused:
+        await desktop.loader._prepare_python_dependencies(
+            desktop.requirements,
+            "ordinary-plugin",
+        )
+
+    assert refused.value.reason_code == "DEPENDENCY_RESTART_REQUIRED"
+    assert not list(desktop.target.iterdir())
+    assert _contents(desktop.resources) == before
+    assert "frozen-private-sdk" not in desktop.host_audits[-1].distributions
+    assert "frozen_local_sdk" not in sys.modules

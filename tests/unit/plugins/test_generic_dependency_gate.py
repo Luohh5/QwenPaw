@@ -174,11 +174,12 @@ async def test_alias_exclusion_keeps_independent_targets_free(
     assert admitted.is_set()
 
 
-def wheel(tmp_path, name="f32-sdk", version="2.0", requires=()):
+def wheel(tmp_path, name="f32-sdk", version="2.0", requires=(), module=None):
     package = name.replace("-", "_")
+    module = module or package
     info = f"{package}-{version}.dist-info"
     files = {
-        f"{package}.py": b"VALUE = 'safe-local-addition'\n",
+        f"{module}.py": b"VALUE = 'safe-local-addition'\n",
         f"{info}/METADATA": (
             f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
             + "".join(f"Requires-Dist: {req}\n" for req in requires)
@@ -187,7 +188,7 @@ def wheel(tmp_path, name="f32-sdk", version="2.0", requires=()):
             b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\n"
             b"Tag: py3-none-any\n"
         ),
-        f"{info}/top_level.txt": (package + "\n").encode(),
+        f"{info}/top_level.txt": (module + "\n").encode(),
     }
     entries = []
     for member, data in files.items():

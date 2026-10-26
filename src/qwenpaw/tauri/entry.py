@@ -389,6 +389,13 @@ def main() -> None:
     # trackers do not re-enter the backend entry point.
     mp.freeze_support()
     _abort_unhandled_multiprocessing_child(sys.argv[1:])
+    if sys.argv[1:2] == ["--internal-dependency-continue"]:
+        if len(sys.argv) != 4:
+            raise RuntimeError("DEPENDENCY_APPROVAL_REQUIRED")
+        from qwenpaw.plugins.dependency_upgrade import run_native_continuation
+
+        run_native_continuation(sys.argv[2], sys.argv[3])
+        return
     if _is_frozen_desktop() and _looks_like_python_invocation(sys.argv[1:]):
         _reexec_as_bundled_python(sys.argv[1:])
         return

@@ -205,6 +205,7 @@ class PythonServices:
     get_instance: Callable
     drop_instance: Callable
     unregister_plugin: Callable
+    dependency_environment: Callable | None = None
 
 
 class PythonBackend:
@@ -248,16 +249,20 @@ class PythonBackend:
             for path in dependency_sites(path for path in sys.path if path)
         )
 
-    @staticmethod
-    def dependency_install_target(_description, snapshot):
+    def dependency_environment(self, _description, snapshot):
+        from .dependency_context import DependencyEnvironmentContext
+
+        factory = getattr(self.services, "dependency_environment", None)
+        if factory is not None:
+            return factory(snapshot)
+        return DependencyEnvironmentContext.from_snapshot(snapshot)
+
+    def dependency_install_target(self, description, snapshot):
         """Use one actual interpreter site, never overlay another provider."""
-        targets = [
-            Path(site)
-            for site in snapshot.dependency_sites or ()
-            if Path(site).name in {"site-packages", "dist-packages"}
-            and Path(site).is_relative_to(snapshot.prefix)
-        ]
-        return targets[0] if len(targets) == 1 else None
+        return self.dependency_environment(
+            description,
+            snapshot,
+        ).install_target
 
     async def prepare(
         self,
@@ -316,6 +321,10 @@ class PythonBackend:
         from ..utils.io_utils import run_sync_io
         from .execution.dependencies import observe_dependencies
 
+        context = None
+        factory = getattr(self.services, "dependency_environment", None)
+        if factory is not None:
+            context = await run_sync_io(factory)
         for _ in range(2):
             cwd = os.getcwd()
             paths = _host_paths(cwd)
@@ -327,6 +336,10 @@ class PythonBackend:
                     "dependency_paths": (),
                 },
             )
+            if context is not None and context.runtime_identity is not None:
+                from .channel_bootstrap import validate_runtime_identity
+
+                validate_runtime_identity(snapshot, context.runtime_identity)
             if _host_paths(os.getcwd()) == paths:
                 return snapshot
         raise RuntimeError("Host dependency paths changed during audit")
