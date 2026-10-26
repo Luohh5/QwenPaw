@@ -22,8 +22,7 @@ import pytest
 
 from qwenpaw.providers import provider_manager as _provider_manager_module
 
-# Isolated payload suites have explicit subprocess wrappers. Recursing into
-# their conftests here would expose them to this process's SDK replacements.
+# Fixture data is loaded explicitly by tests, never collected as a suite.
 collect_ignore = ["fixtures"]
 
 

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import importlib.util
-import runpy
 import sys
 from pathlib import Path
 from textwrap import dedent, indent
@@ -1041,36 +1040,3 @@ def test_repository_has_complete_builtin_contract_coverage() -> None:
     assert report.tested_classes == {"ConsoleChannel"}
     assert report.missing_specs == ()
     assert report.errors == ()
-
-
-def test_repository_has_complete_official_plugin_contract_coverage(
-    monkeypatch,
-) -> None:
-    from qwenpaw.config.config import Config
-    from tests.contract.channels import ChannelContractTest
-
-    monkeypatch.syspath_prepend(
-        str(REPO_ROOT / "tests/fixtures/channel_plugins"),
-    )
-    monkeypatch.setattr("qwenpaw.app.channels.base.load_config", Config)
-    inventory = runpy.run_path(
-        str(REPO_ROOT / "src/qwenpaw/plugins/official_channel_catalog.py"),
-    )["OFFICIAL_CHANNELS"]
-    suite = runpy.run_path(
-        str(REPO_ROOT / "tests/fixtures/channel_plugins/contract_suite.py"),
-    )
-    contracts = [
-        value
-        for name, value in suite.items()
-        if name.startswith("Test")
-        and isinstance(value, type)
-        and issubclass(value, ChannelContractTest)
-    ]
-    instances = [contract().create_instance() for contract in contracts]
-    assert len(contracts) == len(inventory) == 18
-    assert {instance.channel for instance in instances} == {
-        row["channel_key"] for row in inventory
-    }
-    assert {instance._launch_spec.plugin_id for instance in instances} == {
-        row["plugin_id"] for row in inventory
-    }

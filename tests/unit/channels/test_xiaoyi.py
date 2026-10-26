@@ -1,151 +1,207 @@
 # -*- coding: utf-8 -*-
-"""Current owners for all66 preserved legacy XiaoYi responsibilities.
+"""XiaoYi socket authentication and routed A2A replies."""
 
-Original bytes/oracles and approved lifecycle changes remain in the frozen
-XiaoYi oracle maps. Private, formal-host and generic semantic cases run in
-separate interpreters; no old BaseChannel compatibility implementation.
-"""
+import asyncio
+import base64
+import hashlib
+import hmac
+import json
 
-import os
-from pathlib import Path
-import subprocess
-import sys
-
+from aiohttp import web, WSMsgType
 import pytest
-
-TARGETS = [
-    "xiaoyi_pure_suite.py",
-    "xiaoyi_native_suite.py",
-    "xiaoyi_remaining_native_suite.py",
-    "xiaoyi_closeout_contract_suite.py",
-    (
-        "xiaoyi_closeout_suite.py::test_formal_zip_loader_worker_queue_"
-        "runs_actual_agent_and_finishes_native_task"
-    ),
-    (
-        "xiaoyi_closeout_suite.py::test_legacy_from_env_values_and_"
-        "defaults_retarget_to_public_reader"
-    ),
-    (
-        "xiaoyi_closeout_suite.py::test_doctor_public_entry_keeps_both_"
-        "hosts_and_timeout_without_legacy_import"
-    ),
-    (
-        "xiaoyi_closeout_suite.py::test_formal_two_workspaces_same_"
-        "platform_account_isolate_workers_and_old_identity"
-    ),
-    (
-        "xiaoyi_closeout_suite.py::test_formal_enabled_candidate_failure_"
-        "rolls_back_source_and_actual_agent_delivery"
-    ),
-    (
-        "xiaoyi_closeout_suite.py::test_original_proactive_target_native_"
-        "destination_survives_generic_handle"
-    ),
-    (
-        "xiaoyi_closeout_suite.py::test_formal_acl_rejects_before_agent_"
-        "but_allowed_actor_reaches_real_queue"
-    ),
-    (
-        "xiaoyi_closeout_suite.py::test_formal_uninstall_keeps_user_"
-        "config_data_and_passive_public_api_without_worker"
-    ),
-    (
-        "xiaoyi_closeout_suite.py::test_raw_legacy_allowlist_fixture_"
-        "projection_diagnostic"
-    ),
-    (
-        "xiaoyi_closeout_suite.py::test_missing_task_api_strict_but_"
-        "ordinary_completed_response_tolerant"
-    ),
-    (
-        "xiaoyi_closeout_suite.py::test_request_meta_session_or_user_"
-        "fallback_reaches_exact_native_target"
-    ),
-    (
-        "xiaoyi_last_oracles_suite.py::test_unique_backup_inbound_retains_"
-        "backup_response_route"
-    ),
-    (
-        "xiaoyi_last_oracles_suite.py::test_formal_native_session_"
-        "metadata_prefix_sender_fallback_and_enabled_get"
-    ),
-    (
-        "xiaoyi_last_oracles_suite.py::test_lifecycle_fences_api_media_"
-        "and_ordinary_with_zero_native_effects"
-    ),
-    (
-        "xiaoyi_last_oracles_suite.py::test_actual_host_dual_socket_"
-        "refusal_strict_api_tolerant_ordinary"
-    ),
-    (
-        "xiaoyi_open_failure_boundary_suite.py::test_generic_safe_target_"
-        "failure_is_truthful_ordinary_failure_but_api_stays_rpc_error"
-    ),
-    (
-        "xiaoyi_open_failure_boundary_suite.py::test_non_optin_uncertain_"
-        "internal_or_malformed_open_failure_never_becomes_success"
-    ),
-    (
-        "xiaoyi_open_failure_boundary_suite.py::test_approval_target_"
-        "failure_never_uses_ordinary_tolerance"
-    ),
-    (
-        "xiaoyi_open_failure_boundary_suite.py::test_cancel_actual_"
-        "pending_open_preserves_cancellation_and_no_effect"
-    ),
-    (
-        "xiaoyi_open_failure_boundary_suite.py::test_real_disable_retires_"
-        "pending_open_without_tolerated_success"
-    ),
-    (
-        "semantic_event_pure_suite.py::test_original_empty_content_"
-        "retains_rendered_fallback"
-    ),
-    (
-        "semantic_event_pure_suite.py::test_original_hidden_tool_results_"
-        "keep_media_without_placeholder"
-    ),
-    (
-        "semantic_event_pure_suite.py::test_original_scroll_headline_"
-        "variants_do_not_escape"
-    ),
-    (
-        "semantic_event_pure_suite.py::test_original_text_extraction_"
-        "keeps_message_provenance"
-    ),
-]
+from tests.channel_support.driver import bind, module
+from tests.channel_support.protocol import eventually, finish, send
 
 
-@pytest.mark.parametrize("target", TARGETS)
-def test_xiaoyi_current_business_oracles(tmp_path, target):
-    directory = (
-        Path(__file__).resolve().parents[2] / "fixtures/channel_plugins"
-    )
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            "-m",
-            "pytest",
-            "-p",
-            "pytest_asyncio.plugin",
-            "--confcutdir",
-            str(directory),
-            str(directory / target),
-            "-q",
-        ],
-        env={
-            **os.environ,
-            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
-            "PIP_NO_INDEX": "1",
-            "QWENPAW_WORKING_DIR": str(tmp_path / "work"),
-            "QWENPAW_SECRET_DIR": str(tmp_path / "secret"),
-            "QWENPAW_BACKUP_DIR": str(tmp_path / "backup"),
+def inbound(message="message-A", session="session-A"):
+    return {
+        "agentId": "local-agent",
+        "method": "message/stream",
+        "id": "request-A",
+        "params": {
+            "sessionId": session,
+            "id": "task-A",
+            "message": {
+                "messageId": message,
+                "parts": [{"kind": "text", "text": "hello"}],
+            },
         },
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
+    }
+
+
+@pytest.fixture
+async def xiaoyi(tmp_path, monkeypatch):
+    connections, headers, frames = {}, {}, []
+
+    async def gateway(request):
+        name = request.match_info["name"]
+        headers[name] = dict(request.headers)
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        connections[name] = ws
+        async for frame in ws:
+            if frame.type == WSMsgType.TEXT:
+                frames.append((name, json.loads(frame.data)))
+        return ws
+
+    app = web.Application()
+    app.router.add_get("/ws/{name}", gateway)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    native = module("xiaoyi", "platform")
+    monkeypatch.setattr(
+        native,
+        "DEFAULT_WS_URL",
+        f"ws://127.0.0.1:{port}/ws/primary",
     )
-    assert result.returncode == 0, result.stdout + result.stderr
+    monkeypatch.setattr(
+        native,
+        "DEFAULT_WS_URL_BACKUP",
+        f"ws://127.0.0.1:{port}/ws/backup",
+    )
+    driver = module("xiaoyi").XiaoYiDriver()
+    peer, identity = bind("xiaoyi", driver, tmp_path)
+    try:
+        await driver.start(
+            dict(
+                enabled=True,
+                ak="local-ak",
+                sk="local-sk",
+                agent_id="local-agent",
+                workspace_dir=str(tmp_path),
+            ),
+        )
+        await eventually(lambda: len(connections) == 2)
+        yield driver, peer, identity, connections, headers, frames
+    finally:
+        await driver.stop()
+        for ws in connections.values():
+            await ws.close()
+        await runner.cleanup()
+
+
+def results(value):
+    return [
+        (server, json.loads(frame["msgDetail"])["result"])
+        for server, frame in value[5]
+        if frame.get("msgType") == "agent_response"
+    ]
+
+
+async def receive(value, server="primary", **kwargs):
+    _, peer, _, connections, _, _ = value
+    await connections[server].send_json(inbound(**kwargs))
+    await eventually(lambda: bool(peer.batches))
+    return peer.batches[-1]["events"][0]
+
+
+async def test_both_connections_authenticate_with_hmac_and_native_init(xiaoyi):
+    _, _, _, _, headers, frames = xiaoyi
+    for name in ("primary", "backup"):
+        fields = {key.lower(): val for key, val in headers[name].items()}
+        expected = base64.b64encode(
+            hmac.new(
+                b"local-sk",
+                fields["x-ts"].encode(),
+                hashlib.sha256,
+            ).digest(),
+        ).decode()
+        assert (
+            fields["x-access-key"] == "local-ak"
+            and fields["x-agent-id"] == "local-agent"
+        )
+        assert fields["x-sign"] == expected and fields["x-ts"].isdigit()
+    await eventually(
+        lambda: len(
+            [f for _, f in frames if f.get("msgType") == "clawd_bot_init"],
+        )
+        == 2,
+    )
+    assert all(
+        json.loads(f["msgDetail"])["agentId"] == "local-agent"
+        for _, f in frames
+        if f.get("msgType") == "clawd_bot_init"
+    )
+
+
+@pytest.mark.parametrize("server", ["primary", "backup"])
+async def test_native_text_keeps_session_task_and_same_server_reply(
+    xiaoyi,
+    server,
+):
+    driver, peer, identity, _, _, _ = xiaoyi
+    event = await receive(xiaoyi, server)
+    assert event["content_parts"] == [{"type": "text", "text": "hello"}]
+    assert event["metadata"]["session_id"] == "xiaoyi:session-A"
+    assert event["metadata"]["task_id"] == "task-A"
+    assert (
+        driver._route_attrs(event["response_handle"])["server_name"] == server
+    )
+    assert (await send(peer, identity, event["response_handle"]))[
+        "state"
+    ] == "acknowledged"
+    await eventually(lambda: len(results(xiaoyi)) == 1)
+    actual_server, result = results(xiaoyi)[0]
+    assert actual_server == server and result["taskId"] == "task-A"
+    assert result["artifact"]["parts"] == [
+        {"kind": "text", "text": "native answer"},
+    ]
+
+
+async def test_completed_response_sends_status_then_final_empty_artifact_once(
+    xiaoyi,
+):
+    _, peer, identity, _, _, _ = xiaoyi
+    event = await receive(xiaoyi)
+    await send(peer, identity, event["response_handle"])
+    await finish(peer, identity, event["response_handle"])
+    await eventually(lambda: len(results(xiaoyi)) == 3)
+    rows = [result for _, result in results(xiaoyi)]
+    assert [result["kind"] for result in rows] == [
+        "artifact-update",
+        "status-update",
+        "artifact-update",
+    ]
+    assert (
+        rows[1]["status"]["state"] == "completed" and rows[1]["final"] is False
+    )
+    assert rows[2]["final"] is True and rows[2]["artifact"]["parts"] == [
+        {"kind": "text", "text": ""},
+    ]
+    await finish(peer, identity, event["response_handle"])
+    assert len(results(xiaoyi)) == 3
+
+
+async def test_one_primary_disconnect_falls_back_to_backup_for_reply(xiaoyi):
+    driver, peer, identity, connections, _, _ = xiaoyi
+    event = await receive(xiaoyi)
+    await connections["primary"].close()
+    await eventually(lambda: not driver._platform._conn_primary.connected)
+    assert driver._platform._conn_backup.connected
+    assert (await send(peer, identity, event["response_handle"]))[
+        "state"
+    ] == "acknowledged"
+    await eventually(lambda: len(results(xiaoyi)) == 1)
+    assert results(xiaoyi)[0][0] == "backup"
+
+
+async def test_stop_releases_both_socket_readers_and_sessions(xiaoyi):
+    driver, _, _, _, _, _ = xiaoyi
+    platform = driver._platform
+    connections = [platform._conn_primary, platform._conn_backup]
+    tasks = [
+        task
+        for conn in connections
+        for task in (conn._receive_task, conn._heartbeat_task)
+    ]
+    sessions = [conn._session for conn in connections]
+    await driver.stop()
+    assert all(task.done() for task in tasks)
+    assert all(session.closed for session in sessions)
+    assert all(
+        conn._ws is None and conn._session is None for conn in connections
+    )
+    assert driver._platform is None

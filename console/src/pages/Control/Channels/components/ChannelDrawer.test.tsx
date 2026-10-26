@@ -393,7 +393,12 @@ describe("ChannelDrawer qrcode auth callbacks", () => {
     const onSubmit = vi.fn();
     const onSubmitSnapshot = vi.fn().mockResolvedValue(true);
     return {
-      ...renderDrawer({ activeKey: channel, onSubmit, onSubmitSnapshot }),
+      ...renderDrawer({
+        activeKey: channel,
+        isBuiltin: false,
+        onSubmit,
+        onSubmitSnapshot,
+      }),
       onSubmit,
       onSubmitSnapshot,
     };
@@ -701,6 +706,7 @@ describe("ChannelDrawer matrix submit", () => {
     const onSubmit = vi.fn();
     renderDrawer({
       activeKey: "matrix",
+      isBuiltin: false,
       onSubmit,
       initialValues: {
         homeserver: "https://matrix.org",
@@ -724,6 +730,7 @@ describe("ChannelDrawer matrix submit", () => {
     const onSubmit = vi.fn();
     renderDrawer({
       activeKey: "matrix",
+      isBuiltin: false,
       onSubmit,
       initialValues: {
         homeserver: "https://matrix.org",
