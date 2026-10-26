@@ -346,6 +346,12 @@
 
 **最终采样：** 75样本里25次native chat均实际保存user/assistant历史，原16个old-runtime模块降为0；absent/disabled厂商entry为0，单插件仅执行自己的main声明。所有current state厂商SDK/adapter/probe/process为0。无插件startup ready中位数5512.7ms对5682.5ms，list/chat无统一耗时优势；RSS仅是本机live snapshot。独立完整default-core无SDK环境的[native-chat验收](../../research/harness-plugin-final-vendor-free-native.json)也通过，未混入双SDK同环境数值。Step 6/8仍等待真实账户与平台；最小无QwenPaw hello也复现SIGKILL，仅证明症状不限本程序，不推断根因。
 
+**真实验收增补（2026-10-26）：** 用户提供的 9099 普通 Python 服务已验证两家插件继承现有登录、模型列表、真实文本/图片/文件、原生工具流、取消后继续对话与原生会话 ID 保持；Qoder 另通过真实工具审批。独立临时 ASGI 服务验证两家正式 ZIP 安装、停用/启用、卸载/重装和宿主进程重启后的真实会话续接，未重启或干扰用户的 9099。
+
+真实取消暴露的 Qoder 旧响应队列复用问题已修复（`4d7c19901`）；中断后关闭客户端并保留原生会话映射，独立干净插件树 38 测试及 9099 重测通过。停用后公开接口误报空 completed 的宿主问题已修复（`f4c2240ce`）；独立 SSE/Task 回归、相关 92 测试、新 wheel 的两条回归及真实独立 ASGI 停用场景通过。两个修复均经独立源码复核及实际提交 hooks。新增 Qoder ZIP 仅更新在用户指定目录；两个 ZIP 的 22 个载荷均与当前源码逐字节一致。
+
+本次新 wheel/sdist 已构建，1,544 个输入文件与当前源码匹配，相对 10 月 24 日核心仅 ConsoleChannel 改变。前述 10 月 24 日性能、完整 SDK 作者测试和冻结包记录保留其快照归属，不当作新包的完整运行证明。详细操作、当前 ZIP/wheel SHA 和剩余步骤见本地[真实验收记录](../../research/harness-plugin-live-acceptance-20261026.md)；按用户要求，验收报告与原始数据留在本地，不纳入 Git。9099 加载宿主修复需用户重启；新登录各入口、Codex 真实审批及冻结/其他平台仍待验，因此 A6 Step 6/8 保持未勾选。
+
 ## 整体功能 checklist
 
 本表的 `[x]` 仅表示所链接的**协议/源码集成测试**满足该行要求，不代替真实账户或平台专行。两家独立勾选；共享宿主测试只证明共同桥接/归属边界。含未测子项的行保留 `[ ]`，同时列明已完成部分及缺口，不把部分证据当作整行通过。
