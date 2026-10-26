@@ -32,12 +32,6 @@ class ChannelRuntimeNotIntegratedError(RuntimeError):
     """A descriptor operation was refused before transaction work began."""
 
 
-def require_channel_runtime_integrated(manifest: PluginManifest) -> None:
-    """Refuse mutation until Channel activation/transactions are wired."""
-    if manifest.entry.descriptor is not None:
-        raise ChannelRuntimeNotIntegratedError(CHANNEL_RUNTIME_NOT_INTEGRATED)
-
-
 def _contained_file(root: Path, relative: str) -> Path:
     path = root / relative
     if not path.resolve().is_relative_to(root):
@@ -266,6 +260,7 @@ class ChannelDescription:
         return IsolatedChannelProxy(
             process,
             launch_spec=spec,
+            descriptor=self.descriptor,
             workspace_dir=workspace_dir,
             on_reply_sent=on_reply_sent,
             display_config=display_config,

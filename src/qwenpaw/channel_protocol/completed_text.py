@@ -6,7 +6,7 @@ import json
 
 from ..plugins.execution.models import _closed, _object, _string
 from .errors import ProtocolValidationError
-from .framing import FramingLimits
+from ..plugins.execution.framing import FramingLimits
 
 
 def _capacity():

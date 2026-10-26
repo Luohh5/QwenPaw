@@ -195,21 +195,6 @@ class IsolatedChannelProxy(BaseChannel):
         if not self._endpoint_ingress_open and service is not None:
             service.pause()
 
-    def __new__(cls, process, *, launch_spec, **kwargs):
-        target_class = cls
-        if cls is IsolatedChannelProxy:
-            descriptor = SharedChannelDescriptor.load(
-                launch_spec.descriptor_path,
-            )
-            if "channel.generic.v1" not in descriptor.capabilities:
-                from .legacy_isolated_proxy import legacy_proxy_class
-
-                target_class = legacy_proxy_class(descriptor.channel_key)
-        return object.__new__(target_class)
-
-    def _configure_response(self, config):
-        """Optional frozen compatibility hook."""
-
     def _normalize_event(self, event):
         payload = normalize_inbound_event(event)
         payload["content_parts"] = Message(
@@ -222,6 +207,7 @@ class IsolatedChannelProxy(BaseChannel):
         process,
         *,
         launch_spec: LaunchSpec,
+        descriptor: SharedChannelDescriptor,
         channel_process: ChannelProcess | None = None,
         workspace_dir: Path | None = None,
         on_reply_sent=None,
@@ -235,7 +221,6 @@ class IsolatedChannelProxy(BaseChannel):
         ):
             raise ValueError("Connection timeout must be finite and positive")
         self._connection_timeout = connection_timeout
-        descriptor = SharedChannelDescriptor.load(launch_spec.descriptor_path)
         if descriptor.channel_key != launch_spec.channel_key:
             raise ValueError("IDENTITY_MISMATCH")
         self.channel = descriptor.channel_key
@@ -245,7 +230,6 @@ class IsolatedChannelProxy(BaseChannel):
             launch_spec.enabled and config.get("enabled", True),
         )
         self.bot_prefix = str(config.get("bot_prefix") or "")
-        self._configure_response(config)
         super().__init__(
             process,
             on_reply_sent=on_reply_sent,
@@ -367,6 +351,7 @@ class IsolatedChannelProxy(BaseChannel):
         no_text_debounce=True,
         *,
         launch_spec,
+        descriptor: SharedChannelDescriptor,
         channel_process=None,
         workspace_dir=None,
     ):
@@ -379,6 +364,7 @@ class IsolatedChannelProxy(BaseChannel):
         return cls(
             process,
             launch_spec=replace(launch_spec, config=values),
+            descriptor=descriptor,
             channel_process=channel_process,
             workspace_dir=workspace_dir,
             on_reply_sent=on_reply_sent,

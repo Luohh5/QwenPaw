@@ -22,7 +22,12 @@ from .errors import (
     SecretHandleInvalidError,
 )
 from .artifacts import code_root_digest
-from .framing import FrameReader, FramedTransport, FramingLimits, encode_frame
+from ..plugins.execution.framing import (
+    FrameReader,
+    FramedTransport,
+    FramingLimits,
+    encode_frame,
+)
 from .host import CoreEndpointRegistry
 from .models import (
     ApprovalCardParams,
@@ -33,13 +38,11 @@ from .models import (
     EndpointParams,
     EventBatchAck,
     EventBatchParams,
-    HelloParams,
     HostStateParams,
     IdentityParams,
     InboundEvent,
     OutboundOperation,
     OutboundResult,
-    PROTOCOL_VERSION,
     ReactionParams,
     RejectedEvent,
     RpcErrorObject,
@@ -129,13 +132,11 @@ __all__ = [
     "EndpointParams",
     "EventBatchAck",
     "EventBatchParams",
-    "HelloParams",
     "HostStateParams",
     "IdentityParams",
     "InboundEvent",
     "OutboundOperation",
     "OutboundResult",
-    "PROTOCOL_VERSION",
     "CoreEndpointRegistry",
     "ReactionParams",
     "RejectedEvent",

@@ -78,6 +78,27 @@ async def test_official_discovery_and_disabled_config_are_static(
         "voice",
         "sip",
     } <= set(official)
+    from qwenpaw.channel_protocol.errors import ProtocolValidationError
+    from qwenpaw.plugins.architecture import PluginManifest
+    from qwenpaw.plugins.channel_adapter import describe_channel
+    from qwenpaw.channel_protocol.shared import validate_channel_contract
+
+    sources = Path(__file__).resolve().parents[3] / "plugins" / "channel"
+    descriptors = list(sources.glob("*/channel.json"))
+    assert len(descriptors) == 18
+    for path in descriptors:
+        description = describe_channel(
+            path.parent,
+            PluginManifest.from_dict(
+                json.loads(
+                    (path.parent / "plugin.json").read_text(encoding="utf-8"),
+                ),
+            ),
+        )
+        assert "channel.generic.v1" in description.descriptor.capabilities
+    for key in ("feishu", "dingtalk"):
+        with pytest.raises(ProtocolValidationError, match="contract required"):
+            validate_channel_contract(key, ())
     source = host.artifact()
     shutil.copytree(source, host.installed)
     persist_plugin_settings(
@@ -103,6 +124,86 @@ async def test_official_discovery_and_disabled_config_are_static(
         "untouched": 7,
     }
     assert not attempts and not host.ledger.exists()
+
+    from dataclasses import replace
+    from qwenpaw.app.channels.isolated_proxy import IsolatedChannelProxy
+    from qwenpaw.channel_protocol.shared import SharedChannelDescriptor
+
+    description = row.description_record
+    prepared = description.prepare_proxy_config({"enabled": False})
+
+    def forbid_descriptor_load(*args, **kwargs):
+        raise AssertionError("Proxy construction reloaded channel.json")
+
+    with monkeypatch.context() as construction:
+        construction.setattr(
+            SharedChannelDescriptor,
+            "load",
+            forbid_descriptor_load,
+        )
+        proxy = description.create_proxy(
+            None,
+            prepared.config,
+            python_executable=sys.executable,
+            support_root=description.code_root,
+            instance_id="prepared-descriptor",
+            generation=1,
+            qwenpaw_version="1.0.0",
+            prepared_config=prepared,
+        )
+        assert proxy.descriptor is description.descriptor
+        assert proxy.channel == description.descriptor.channel_key
+        configured = IsolatedChannelProxy.from_config(
+            None,
+            prepared.config,
+            launch_spec=proxy._launch_spec,
+            descriptor=description.descriptor,
+        )
+        assert configured.descriptor is description.descriptor
+        with pytest.raises(ValueError, match="^IDENTITY_MISMATCH$"):
+            IsolatedChannelProxy(
+                None,
+                launch_spec=replace(
+                    proxy._launch_spec,
+                    channel_key="different-channel",
+                ),
+                descriptor=description.descriptor,
+            )
+
+
+def test_runner_hello_requires_shared_identity():
+    from packaging.markers import default_environment
+    from qwenpaw.channel_protocol.errors import ProtocolValidationError
+    from qwenpaw.channel_protocol.models import validate_method_params
+
+    dedicated = {
+        "protocol_version": 1,
+        "qwenpaw_version": "1.0.0",
+        "channel_key": "feishu",
+        "instance_id": "worker",
+        "source_revision": "a" * 64,
+        "environment_spec_id": "old-spec",
+        "environment_id": "old-environment",
+        "lock_sha256": "b" * 64,
+        "python_abi": "cp311-cp311",
+        "platform_tag": "linux_x86_64",
+        "capabilities": ["channel.generic.v1"],
+    }
+    with pytest.raises(ProtocolValidationError):
+        validate_method_params("runner.hello", dedicated)
+    shared = dict(dedicated)
+    for key in ("environment_spec_id", "environment_id", "lock_sha256"):
+        shared.pop(key)
+    shared.update(
+        protocol_version=2,
+        dependency_mode="shared",
+        generation=1,
+        dependencies=[],
+        marker_environment=default_environment(),
+    )
+    assert (
+        validate_method_params("runner.hello", shared).to_mapping() == shared
+    )
 
 
 @pytest.mark.asyncio

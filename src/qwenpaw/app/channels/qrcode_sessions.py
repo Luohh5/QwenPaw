@@ -16,7 +16,7 @@ from time import monotonic
 from typing import Any
 from uuid import uuid4
 
-from fastapi import HTTPException, Request
+from fastapi import HTTPException
 
 from ...channel_protocol.management import (
     MANAGEMENT_CAPABILITIES,
@@ -81,24 +81,6 @@ def _read_scope(workspace_id, channel_key, principal_id=None):
         config,
         principal_id,
     )
-
-
-def resolve_channel_management_scope(
-    request: Request,
-    channel_key: str,
-) -> ChannelManagementScope:
-    """Resolve the existing agent selection without constructing a
-    Workspace.
-    """
-    workspace_id = (
-        getattr(request.state, "agent_id", None)
-        or request.headers.get("X-Agent-Id")
-        or load_config().agents.active_agent
-        or "default"
-    )
-    user = getattr(request.state, "user", None)
-    principal = user.get("username") if isinstance(user, dict) else None
-    return _read_scope(workspace_id, channel_key, principal)
 
 
 async def resolve_channel_management_scope_async(request, channel_key):

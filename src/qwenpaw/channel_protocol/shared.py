@@ -493,13 +493,10 @@ def validate_channel_contract(channel_key: str, capabilities) -> None:
             reason_code="CHANNEL_CONTRACT_UNSUPPORTED",
         )
     if not contracts:
-        from .legacy_contract import accepts_legacy_contract
-
-        if not accepts_legacy_contract(channel_key):
-            raise ProtocolValidationError(
-                "Channel contract required",
-                reason_code="CHANNEL_CONTRACT_UNSUPPORTED",
-            )
+        raise ProtocolValidationError(
+            "Channel contract required",
+            reason_code="CHANNEL_CONTRACT_UNSUPPORTED",
+        )
 
 
 def validate_shared_hello(

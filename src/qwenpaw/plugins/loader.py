@@ -124,20 +124,6 @@ def _plugin_site_dir() -> Path:
     return plugin_runtime_site(_plugin_runtime_dir(), runtime)
 
 
-def _install_lock_path(plugin_id: str) -> Path:
-    """Compatibility helper; exclusion follows the shared write root."""
-    from .install_lock import environment_install_lock_path
-    import sysconfig
-
-    del plugin_id
-    target = (
-        _plugin_site_dir()
-        if _is_frozen()
-        else Path(sysconfig.get_path("purelib"))
-    )
-    return environment_install_lock_path(target)
-
-
 def _norm_realpath(path: Any) -> str:
     """``realpath`` + ``normcase`` for cross-platform path identity.
 

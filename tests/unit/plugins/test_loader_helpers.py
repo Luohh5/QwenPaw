@@ -56,36 +56,6 @@ class TestPluginRuntimeDirs:
             str(site)
         )
 
-    def test_normal_install_lock_is_shared_by_environment(
-        self,
-        working_dir,
-        monkeypatch,
-    ):
-        target = working_dir / "shared" / "site-packages"
-        monkeypatch.setattr(pl, "_is_frozen", lambda: False)
-        monkeypatch.setattr("sysconfig.get_path", lambda _name: str(target))
-        from qwenpaw.plugins.install_lock import environment_install_lock_path
-
-        expected = environment_install_lock_path(target)
-        assert pl._install_lock_path("my plugin/id") == expected
-        assert pl._install_lock_path("demo-1.0") == expected
-        assert not target.parent.exists()
-
-    def test_frozen_install_lock_is_shared_by_environment(
-        self,
-        working_dir,
-        monkeypatch,
-    ):
-        target = working_dir / "frozen-shared" / "site"
-        monkeypatch.setattr(pl, "_is_frozen", lambda: True)
-        monkeypatch.setattr(pl, "_plugin_site_dir", lambda: target)
-        from qwenpaw.plugins.install_lock import environment_install_lock_path
-
-        expected = environment_install_lock_path(target)
-        assert pl._install_lock_path("my plugin/id") == expected
-        assert pl._install_lock_path("demo-1.0") == expected
-        assert not target.parent.exists()
-
 
 class TestResolvedPluginManifestPath:
     def test_missing_dir_raises(self, tmp_path):

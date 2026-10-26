@@ -28,7 +28,7 @@ from ..plugins.execution.models import (  # pylint: disable=unused-import
     parse_rpc_message,
     CancelParams,
 )
-from .identifiers import validate_channel_key, validate_digest
+from .identifiers import validate_channel_key
 from .management import ManagementRequest
 from .completed_text import RawCompletedTextSources
 
@@ -40,7 +40,6 @@ UNKNOWN_ACTOR_CAPABILITY = "event.unknown_actor.v1"
 APPROVAL_RESOLUTION_CAPABILITY = "send.approval_resolution.v1"
 TEXT_MERGE_CAPABILITY = "channel.text_merge.v1"
 AUTH_QRCODE_CAPABILITY = "channel.auth.qrcode.v1"
-PROTOCOL_VERSION = 1
 MAX_METHOD_LENGTH = 128
 MAX_RESPONSE_HANDLE_LENGTH = 512
 MAX_AUTH_SCAN_URL_LENGTH = 4096
@@ -129,110 +128,6 @@ def _optional_integer(
 
 
 RpcMessage = RpcRequest | RpcResponse | RpcNotification
-
-
-@dataclass(frozen=True)
-class HelloParams:
-    """Runner identity and protocol capability handshake."""
-
-    protocol_version: int
-    qwenpaw_version: str
-    channel_key: str
-    instance_id: str
-    source_revision: str
-    environment_spec_id: str
-    environment_id: str
-    lock_sha256: str
-    python_abi: str
-    platform_tag: str
-    capabilities: tuple[str, ...] = ()
-
-    def to_mapping(self) -> dict[str, Any]:
-        """Encode handshake parameters."""
-        return {
-            "protocol_version": self.protocol_version,
-            "qwenpaw_version": self.qwenpaw_version,
-            "channel_key": self.channel_key,
-            "instance_id": self.instance_id,
-            "source_revision": self.source_revision,
-            "environment_spec_id": self.environment_spec_id,
-            "environment_id": self.environment_id,
-            "lock_sha256": self.lock_sha256,
-            "python_abi": self.python_abi,
-            "platform_tag": self.platform_tag,
-            "capabilities": list(self.capabilities),
-        }
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "HelloParams":
-        """Validate handshake parameters."""
-        data = _object(value)
-        allowed = {
-            "protocol_version",
-            "qwenpaw_version",
-            "channel_key",
-            "instance_id",
-            "source_revision",
-            "environment_spec_id",
-            "environment_id",
-            "lock_sha256",
-            "python_abi",
-            "platform_tag",
-            "capabilities",
-        }
-        _closed(data, allowed)
-        protocol_version = _integer(
-            _required(data, "protocol_version"),
-            "protocol_version",
-            minimum=1,
-        )
-        qwenpaw_version = _string(
-            data.get("qwenpaw_version"),
-            "qwenpaw_version",
-        )
-        channel_key = validate_channel_key(
-            _string(data.get("channel_key"), "channel_key"),
-        )
-        instance_id = _string(data.get("instance_id"), "instance_id")
-        source_value = _string(
-            _required(data, "source_revision"),
-            "source_revision",
-        )
-        try:
-            source_revision = validate_digest(
-                source_value,
-                name="Source revision",
-            )
-        except DescriptorValidationError as exc:
-            raise _error(
-                str(exc),
-                path=("source_revision",),
-            ) from exc
-        environment_spec_id = _string(
-            data.get("environment_spec_id"),
-            "environment_spec_id",
-        )
-        environment_id = _string(data.get("environment_id"), "environment_id")
-        lock_sha256 = validate_digest(
-            _string(data.get("lock_sha256"), "lock_sha256"),
-            name="Lock digest",
-        )
-        python_abi = _string(data.get("python_abi"), "python_abi")
-        platform_tag = _string(data.get("platform_tag"), "platform_tag")
-        capabilities = _capabilities(data.get("capabilities"))
-        return cls(
-            protocol_version=protocol_version,
-            qwenpaw_version=qwenpaw_version,
-            channel_key=channel_key,
-            instance_id=instance_id,
-            source_revision=source_revision,
-            environment_spec_id=environment_spec_id,
-            environment_id=environment_id,
-            lock_sha256=lock_sha256,
-            python_abi=python_abi,
-            platform_tag=platform_tag,
-            capabilities=capabilities,
-        )
 
 
 def _capabilities(value: object) -> tuple[str, ...]:
@@ -1729,7 +1624,6 @@ class HostStateParams(IdentityParams):
 METHOD_SCHEMAS: dict[str, type[Any]] = {
     "channel.auth.required": AuthRequiredParams,
     "channel.management.execute": ManagementRequest,
-    "runner.hello": HelloParams,
     "channel.health": IdentityParams,
     "channel.generation_status": IdentityParams,
     "channel.stop": IdentityParams,
@@ -1752,11 +1646,7 @@ METHOD_SCHEMAS: dict[str, type[Any]] = {
 
 def validate_method_params(method: str, params: object) -> Any:
     """Validate params for a registered method, if one has a DTO."""
-    if (
-        method == "runner.hello"
-        and isinstance(params, Mapping)
-        and params.get("dependency_mode") == "shared"
-    ):
+    if method == "runner.hello":
         from .shared import SharedHelloParams
 
         return SharedHelloParams.from_mapping(params)
