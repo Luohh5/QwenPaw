@@ -479,7 +479,8 @@ async def test_local_install_enable_uses_installed_code_and_offline_dependency(
     def offline(command, *, timeout, plugin_id):
         calls.append(command)
         assert (
-            command[1:5] == ["-I", "-m", "pip", "wheel"] and plugin_id == KEY
+            command[1:6] == ["-I", "-B", "-m", "pip", "wheel"]
+            and plugin_id == KEY
         )
         return subprocess.run(
             [*command, "--no-index", "--find-links", str(wheels)],

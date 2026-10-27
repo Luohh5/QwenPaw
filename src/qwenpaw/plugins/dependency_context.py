@@ -216,7 +216,14 @@ class DependencyEnvironmentContext:
             "supported_tags=[str(t) for t in sys_tags()])))"
         )
         result = subprocess.run(
-            [self.python_executable, "-I", "-c", code, str(self.support_root)],
+            [
+                self.python_executable,
+                "-I",
+                "-B",
+                "-c",
+                code,
+                str(self.support_root),
+            ],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,

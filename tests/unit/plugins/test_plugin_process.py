@@ -1003,3 +1003,37 @@ async def test_frozen_ordinary_loader_gate_installs_missing_sdk_in_overlay(
             importlib.invalidate_caches()
             await host.close()
     assert bundle_inventory() == before
+
+
+def test_executor_inspection_preserves_immutable_support_tree(tmp_path):
+    import shutil
+    import packaging
+    from qwenpaw.plugins.dependency_context import DependencyEnvironmentContext
+
+    support = tmp_path / "Bundle.app/Contents/Resources/site"
+    support.mkdir(parents=True)
+    shutil.copytree(
+        Path(packaging.__file__).parent,
+        support / "packaging",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    before = {
+        p.relative_to(support): p.read_bytes()
+        for p in support.rglob("*")
+        if p.is_file()
+    }
+    context = DependencyEnvironmentContext(
+        sys.executable,
+        support,
+        (support,),
+        None,
+        (support,),
+    )
+    assert context.inspect_executor()
+    after = {
+        p.relative_to(support): p.read_bytes()
+        for p in support.rglob("*")
+        if p.is_file()
+    }
+    assert set(after) == set(before)
+    assert all(after[path] == value for path, value in before.items())

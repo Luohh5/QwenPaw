@@ -600,6 +600,7 @@ class DependencyUpgradeManager:
             if context is not None
             else snapshot.executable,
             "-I",
+            "-B",
             "-m",
             "pip",
             "wheel",
@@ -1036,7 +1037,7 @@ def schedule_maintenance(manager, directory, operation, *, loop=None):
     restart = getattr(manager.loader, "dependency_upgrade_restart", None)
     operation["restart"] = restart
     script = worker / "dependency_worker.py"
-    command = [operation["worker_python"], "-I", "-S", str(script)]
+    command = [operation["worker_python"], "-I", "-B", "-S", str(script)]
     operation["instructions"] = [
         "Stop this backend and its channel processes through their service manager, "
         "and keep them stopped during maintenance. For Supervisor's app program: "

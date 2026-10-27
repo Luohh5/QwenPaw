@@ -1372,6 +1372,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             command = [
                 spec.python_executable,
                 "-I",
+                "-B",
                 "-m",
                 "pip",
                 "wheel",

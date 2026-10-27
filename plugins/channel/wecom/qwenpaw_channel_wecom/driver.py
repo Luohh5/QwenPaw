@@ -575,6 +575,7 @@ class WeComDriver(SharedResponseDriver):
                                 ref
                                 for ref in snapshot.resource_refs
                                 if ref.kind == "wecom.delivery"
+                                and ref not in compact.resource_refs
                                 and dict(ref.attributes).get("unsettled")
                                 == "true"
                             ),

@@ -212,10 +212,14 @@ class SharedResponseDriver:
             await self._write_checkpoint()
 
     async def _retire_archived(self, handle):
+        await self._release_local_response(handle)
         async with self._checkpoint_lock:
             if self._routes.snapshot(handle) is not None:
                 self._evict(handle)
                 await self._write_checkpoint()
+
+    async def _release_local_response(self, handle):
+        """Release local resources without repeating native effects."""
 
     def bind(self, context):
         self._context = context
@@ -1057,6 +1061,7 @@ class SharedResponseDriver:
             if not self._evictable(snapshot):
                 await self._archive(self._compact_receipt(snapshot))
             return
+        unknown_cleanup = False
         for ref in snapshot.resource_refs:
             resource = dict(ref.attributes)
             if (
@@ -1078,7 +1083,8 @@ class SharedResponseDriver:
                 or resource.get("unsettled") == "true"
                 or resource.get("cleanup") == "unknown"
             ):
-                raise RuntimeError("STREAM_CLEANUP_UNKNOWN")
+                unknown_cleanup = True
+                continue
             sequences = [int(resource.get("sequence", "0"))]
             sequences.extend(
                 int(dict(attempt.attributes).get("sequence", "0"))
@@ -1108,7 +1114,13 @@ class SharedResponseDriver:
                         resource,
                     )
                     await self._checkpoint()
-                raise
+                    raise
+                unknown_cleanup = True
+                continue
+            except Exception:
+                # The durable intent fences a cleanup whose result was lost.
+                unknown_cleanup = True
+                continue
             resource.update(final="true", cleanup="complete")
             snapshot = self._record_cleanup(
                 snapshot,
@@ -1116,7 +1128,10 @@ class SharedResponseDriver:
                 resource,
             )
             await self._checkpoint()
-        snapshot = await await_send(self._before_cleanup_complete(snapshot))
+        if not unknown_cleanup:
+            snapshot = await await_send(
+                self._before_cleanup_complete(snapshot),
+            )
         candidate = self._routes.cleanup_candidate(
             snapshot.response_handle,
             snapshot.outcome,
@@ -1124,6 +1139,7 @@ class SharedResponseDriver:
         candidate = self._compact_receipt(candidate)
         if not self._evictable(candidate):
             await self._archive(candidate)
+            await self._retire_archived(candidate.response_handle)
         else:
             await self._checkpoint(candidate)
             self._routes.commit_cleanup(candidate)
@@ -1167,11 +1183,68 @@ class SharedResponseDriver:
             if ref.kind == self._kind + ".attempt"
             and dict(ref.attributes).get("state") == "unknown"
         )
+        unsettled = tuple(
+            ref
+            for ref in snapshot.resource_refs
+            if ref.kind == self._kind + ".delivery"
+            and (
+                dict(ref.attributes).get("unsettled") == "true"
+                or dict(ref.attributes).get("cleanup") == "unknown"
+                or any(
+                    dict(attempt.attributes).get("target_delivery_id")
+                    == ref.resource_id
+                    for attempt in unknown
+                )
+            )
+        )
+        evidence = (*unknown, *unsettled)
+        if unsettled:
+            # COMPLETE means local retirement; native uncertainty is preserved.
+            evidence += snapshot.route_refs
+            evidence += tuple(
+                ref
+                for ref in snapshot.resource_refs
+                if ref.kind
+                in {self._kind + ".route", self._kind + ".local_retirement"}
+            )
+            evidence += (
+                ResponseResourceRef.create(
+                    self._kind + ".local_retirement",
+                    snapshot.response_handle,
+                    {"cleanup": "local_only"},
+                ),
+            )
+            for ref in unsettled:
+                attrs = dict(ref.attributes)
+                if attrs.get("cleanup") != "unknown":
+                    continue
+                digest = hashlib.sha256(
+                    json.dumps(
+                        [snapshot.response_handle, ref.to_mapping()],
+                        sort_keys=True,
+                    ).encode(),
+                ).hexdigest()
+                evidence += (
+                    ResponseResourceRef.create(
+                        self._kind + ".attempt",
+                        "cleanup:" + digest,
+                        {
+                            "fingerprint": digest,
+                            "operation": "stream.cleanup",
+                            "state": "unknown",
+                            "reason_code": "STREAM_CLEANUP_UNKNOWN",
+                            "target_delivery_id": ref.resource_id,
+                            "sequence": attrs.get("sequence", "0"),
+                        },
+                    ),
+                )
         return replace(
             snapshot,
             route_refs=(),
-            resource_refs=unknown,
-            expires_at_ms=(2**63 - 1) if unknown else snapshot.expires_at_ms,
+            resource_refs=tuple(sorted(set(evidence))),
+            expires_at_ms=(2**63 - 1)
+            if evidence
+            else snapshot.expires_at_ms,
         )
 
     def _evictable(self, snapshot):

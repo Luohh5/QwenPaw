@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Run by absolute path with -I -S: never import the environment being changed."""
+"""Run by absolute path with -I -B -S: never import the environment being changed."""
 
 from __future__ import annotations
 
@@ -55,6 +55,7 @@ def _continue(directory, operation, *, preflight=False):
         else [
             operation["continuation_python"],
             "-I",
+            "-B",
             "-c",
             code,
             operation["support_root"],

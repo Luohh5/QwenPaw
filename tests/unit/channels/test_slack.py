@@ -236,3 +236,110 @@ async def test_stop_closes_socket_and_owned_connection_tasks(slack):
     assert task.done() and watch.done() and not platform._sdk_tasks
     assert driver._platform is None
     await driver.stop()
+
+
+@pytest.mark.parametrize("unknown_at", ["end", "cleanup"])
+async def test_unknown_stream_retires_to_durable_receipt(
+    tmp_path,
+    monkeypatch,
+    unknown_at,
+):
+    import json
+    import qwenpaw.channel_protocol.shared_response_driver as shared
+    from tests.channel_support.protocol import finish, open_route
+    from qwenpaw.plugins.execution.errors import RpcError
+
+    monkeypatch.setattr(shared, "_MAX_ROUTES", 1)
+    driver = module("slack").SlackDriver()
+    error = module("slack", "utils").SlackDeliveryError
+    updates = []
+
+    class Platform:
+        async def start_stream(self, route, kind):
+            return {"ts": "1.0", "channel_id": "D123", "final": "false"}
+
+        async def update_stream(self, resource, text, *, final):
+            updates.append(dict(resource))
+            raise error("UPDATE_UNKNOWN", side_effect_possible=True)
+
+    peer, identity = bind("slack", driver, tmp_path)
+    driver._platform = Platform()
+    driver._connected = True
+    driver._config = {"streaming_enabled": True}
+    handle = await open_route(peer, identity, "D123")
+    await send(
+        peer,
+        identity,
+        handle,
+        delivery="start",
+        operation="stream.start",
+        stream_type="message",
+    )
+    ending = dict(
+        delivery="end",
+        operation="stream.end",
+        stream_type="message",
+        target_delivery_id="start",
+        sequence=1,
+        accumulated_text="hello",
+    )
+    if unknown_at == "end":
+        assert (await send(peer, identity, handle, **ending))[
+            "state"
+        ] == "unknown"
+
+    def unavailable(*args):
+        raise OSError("receipt storage unavailable")
+
+    # Failure to archive must retain the live terminal checkpoint.
+    monkeypatch.setattr(peer.receipts, "put", unavailable)
+    with pytest.raises(RpcError) as failure:
+        await finish(peer, identity, handle)
+    assert failure.value.data["reason_code"] == "RESPONSE_FINISH_FAILED"
+    assert driver._routes.snapshots()
+    assert not peer.receipts.list()
+    stale = json.loads(json.dumps(peer.state))
+    original = driver._routes.snapshot(handle)
+    unknown_refs = {
+        ref.resource_id: dict(ref.attributes)
+        for ref in original.resource_refs
+        if dict(ref.attributes).get("state") == "unknown"
+    }
+    assert len(updates) == 1
+    replacement = module("slack").SlackDriver()
+    replacement._platform = driver._platform
+    restored, _ = bind("slack", replacement, tmp_path)
+    restored.state = stale
+    await replacement._restore_responses()
+    await replacement._state_changed("connected")
+    assert not replacement._routes.snapshots()
+    refs = restored.receipts.list()[0]["value"]["resource_refs"]
+    delivery = next(row for row in refs if row["kind"] == "slack.delivery")
+    assert delivery["attributes"].get("final") != "true"
+    assert delivery["attributes"].get("cleanup") != "complete"
+    assert any(
+        row["kind"] == "slack.attempt"
+        and row["attributes"]["state"] == "unknown"
+        and len(row["attributes"]["fingerprint"]) == 64
+        for row in refs
+    )
+    if unknown_at == "end":
+        assert unknown_refs
+    for key, attrs in unknown_refs.items():
+        assert (
+            next(row for row in refs if row["resource_id"] == key)[
+                "attributes"
+            ]
+            == attrs
+        )
+    # SQLite fences a duplicate finish and an old live checkpoint.
+    await finish(restored, identity, handle)
+    restored.state = stale
+    await replacement._restore_responses()
+    assert not replacement._routes.snapshots()
+    if unknown_at == "end":
+        assert (await send(restored, identity, handle, **ending))[
+            "state"
+        ] == "unknown"
+    assert len(updates) == 1
+    await open_route(restored, identity, "D123")

@@ -428,3 +428,83 @@ async def test_driver_native_text_roundtrip_reaches_original_room(
         await driver.stop()
     assert driver._platform is None and not driver._connected
     assert sync_task.done() and platform._client is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_typing_stop_retires_only_its_local_owner(
+    hs,
+    platform_factory,
+    tmp_path,
+    monkeypatch,
+):
+    import hashlib
+    from tests.channel_support.protocol import finish, open_route
+
+    platform = platform_factory()
+    await ready(hs, platform)
+    driver = module("matrix").MatrixDriver()
+    peer, identity = bind("matrix", driver, tmp_path)
+    driver._platform, driver._connected = platform, True
+    native = platform._client.room_typing
+    stops = []
+
+    async def typing(room_id, **kwargs):
+        if not kwargs["typing_state"]:
+            stops.append(room_id)
+            if len(stops) == 1:
+                raise OSError("native stop outcome unknown")
+        return await native(room_id, **kwargs)
+
+    monkeypatch.setattr(platform._client, "room_typing", typing)
+
+    async def prepare(room):
+        handle = await open_route(peer, identity, room)
+        await peer.methods["channel.response.prepare"](
+            {
+                **identity.to_mapping(),
+                "response_handle": handle,
+                "delivery_id": hashlib.sha256(
+                    (handle + ":prepare").encode(),
+                ).hexdigest(),
+            },
+            None,
+        )
+        return handle
+
+    other_room = "!other:example.com"
+    other = await prepare(other_room)
+    other_task = platform._typing_tasks[other_room]
+    handle = await prepare(ROOM)
+    old_task = platform._typing_tasks[ROOM]
+    await finish(peer, identity, handle)
+    assert peer.receipts.list() and not driver._routes.snapshot(handle)
+    assert handle not in platform._typing_owners
+    assert old_task.done() and ROOM not in platform._typing_tasks
+    assert platform._typing_owners == {other: other_room}
+    assert platform._typing_tasks[other_room] is other_task
+    assert not other_task.done()
+    await finish(peer, identity, handle)
+    assert stops == [ROOM]
+    subsequent = await prepare(ROOM)
+    subsequent_task = platform._typing_tasks[ROOM]
+    # Re-retiring the archived owner must preserve a new owner in its room.
+    await finish(peer, identity, handle)
+    assert platform._typing_owners == {other: other_room, subsequent: ROOM}
+    assert platform._typing_tasks[ROOM] is subsequent_task
+    assert not subsequent_task.done() and stops == [ROOM]
+    await finish(peer, identity, subsequent)
+    assert stops == [ROOM, ROOM]
+    assert subsequent_task.done() and ROOM not in platform._typing_tasks
+    assert platform._typing_owners == {other: other_room}
+    await finish(peer, identity, other)
+    assert other_task.done() and not platform._typing_owners
+    first, second = await prepare(ROOM), await prepare(ROOM)
+    shared_task = platform._typing_tasks[ROOM]
+    before = stops.copy()
+    await driver._release_local_response(first)
+    assert platform._typing_owners == {second: ROOM}
+    assert platform._typing_tasks[ROOM] is shared_task
+    assert not shared_task.done() and stops == before
+    await finish(peer, identity, second)
+    assert shared_task.done() and not platform._typing_owners
+    assert not platform._typing_tasks and stops == [*before, ROOM]

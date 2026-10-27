@@ -244,6 +244,10 @@ class TelegramDriver(SharedResponseDriver):
     async def _perform_stream_cleanup(self, ref, resource, sequence):
         await self._require_connected().delete_stream(resource)
 
+    async def _release_local_response(self, handle):
+        if self._platform is not None:
+            await self._platform.stop_typing(handle)
+
     async def _before_cleanup_complete(self, snapshot):
         if self._platform is not None:
             await self._platform.stop_typing(snapshot.response_handle)

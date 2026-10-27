@@ -223,7 +223,7 @@ def test_dependency_installer_security_versions(
             "chosen-python",
             isolated=True,
         )
-        expected = ["chosen-python", "-I", "-m", "pip", "--version"]
+        expected = ["chosen-python", "-I", "-B", "-m", "pip", "--version"]
     else:
         check = partial(runtime_environment.require_uv, "chosen-uv")
         expected = ["chosen-uv", "--version"]
@@ -284,7 +284,14 @@ async def test_controlled_wheels_use_certifi_floor_without_editing_source(
     def inspect_resolution(command, **_kwargs):
         events.append("wheel")
         assert events == ["checked", "wheel"]
-        assert command[:5] == ["chosen-python", "-I", "-m", "pip", "wheel"]
+        assert command[:6] == [
+            "chosen-python",
+            "-I",
+            "-B",
+            "-m",
+            "pip",
+            "wheel",
+        ]
         assert "install" not in command
         effective = Path(command[command.index("-r") + 1])
         assert effective != requirements

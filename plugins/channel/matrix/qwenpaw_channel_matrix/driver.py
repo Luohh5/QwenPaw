@@ -357,6 +357,10 @@ class MatrixDriver(SharedResponseDriver):
             # response has no additional Matrix edit effect to replay.
             self._assert_stream_settled(resource["owner"], ref.resource_id)
 
+    async def _release_local_response(self, handle):
+        if self._platform is not None:
+            await self._platform.stop_typing(handle, local_only=True)
+
     def _compact_receipt(self, snapshot):
         compact = super()._compact_receipt(snapshot)
         if any(
@@ -373,6 +377,7 @@ class MatrixDriver(SharedResponseDriver):
                                 ref
                                 for ref in snapshot.resource_refs
                                 if ref.kind == "matrix.delivery"
+                                and ref not in compact.resource_refs
                                 and dict(ref.attributes).get("unsettled")
                                 == "true"
                             ),

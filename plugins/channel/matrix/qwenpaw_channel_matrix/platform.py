@@ -2523,7 +2523,7 @@ class MatrixPlatform:
                     self._typing_renewal_loop(room_id),
                 )
 
-    async def stop_typing(self, owner, room_id=None):
+    async def stop_typing(self, owner, room_id=None, *, local_only=False):
         async with self._typing_lock:
             room_id = self._typing_owners.get(owner) or room_id
             if room_id is None:
@@ -2540,6 +2540,11 @@ class MatrixPlatform:
             if task is not None and task is not asyncio.current_task():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+            if local_only:
+                # Retire local ownership without repeating an uncertain stop.
+                self._typing_owners.pop(owner, None)
+                self._typing_tasks.pop(room_id, None)
+                return
             try:
                 if self._client is None:
                     raise MatrixDeliveryError("NOT_CONNECTED")
