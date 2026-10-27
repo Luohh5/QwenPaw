@@ -16,10 +16,13 @@ export type ChannelSaveJob = Readonly<{
   formRevision: number;
 }>;
 
-const requestScope = (scope?: ChannelRequestScope) =>
-  scope
+const requestScope = (scope?: ChannelRequestScope | string) => {
+  if (typeof scope === "string")
+    return scope ? { headers: { "X-Agent-Id": scope } } : {};
+  return scope
     ? { headers: { "X-Agent-Id": scope.agentId }, signal: scope.signal }
     : {};
+};
 
 /**
  * Localized text: either a plain string, or a mapping from locale code
@@ -87,13 +90,13 @@ export const channelApi = {
       body: JSON.stringify({ enabled: true }),
     });
   },
-  listChannelTypes: (scope?: ChannelRequestScope) =>
+  listChannelTypes: (scope?: ChannelRequestScope | string) =>
     request<string[]>("/config/channels/types", requestScope(scope)),
 
-  listChannels: (scope?: ChannelRequestScope) =>
+  listChannels: (scope?: ChannelRequestScope | string) =>
     request<ChannelConfig>("/config/channels", requestScope(scope)),
 
-  listChannelSchemas: (scope?: ChannelRequestScope) =>
+  listChannelSchemas: (scope?: ChannelRequestScope | string) =>
     request<Record<string, ChannelSchema>>(
       "/config/channels/schemas",
       requestScope(scope),

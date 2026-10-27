@@ -33,7 +33,10 @@ import {
 import styles from "../index.module.less";
 import { useAgentStore } from "../../../../stores/agentStore";
 import { openExternalLink } from "../../../../utils/openExternalLink";
-import { captureChannelSaveJob } from "./channelConfig";
+import {
+  captureChannelSaveJob,
+  normalizeChannelSubmitValues,
+} from "./channelConfig";
 import {
   resumePendingPluginInstalls,
   runPluginInstall,
@@ -256,6 +259,12 @@ export function ChannelDrawer({
       ),
     [agentId, message, onRuntimeChange, t],
   );
+  const formInitialValues: Record<string, unknown> = {
+    ...(activeKey !== "console" ? { no_text_debounce: true } : {}),
+    ...(activeKey === "sip" ? { sip_mode: "dev", sip_transport: "UDP" } : {}),
+    ...(activeKey === "mqtt" ? { transport: "tcp", qos: "2" } : {}),
+    ...initialValues,
+  };
   const matrixAuthMethod = Form.useWatch("auth_method", form);
   const isMatrixPasswordAuth = matrixAuthMethod === "password";
   const feishuDomain = (Form.useWatch("domain", form) as string) || "feishu";
@@ -928,7 +937,6 @@ export function ChannelDrawer({
             <Form.Item
               name="transport"
               label={t("channels.sipTransport")}
-              initialValue="tcp"
               rules={[{ required: true }]}
             >
               <Select>
@@ -948,7 +956,6 @@ export function ChannelDrawer({
             <Form.Item
               name="qos"
               label={t("channels.fieldQoS")}
-              initialValue="2"
               rules={[{ required: true }]}
             >
               <Select>
@@ -1110,7 +1117,6 @@ export function ChannelDrawer({
               name="sip_mode"
               label={t("channels.sipMode")}
               tooltip={t("channels.sipModeTooltip")}
-              initialValue="dev"
             >
               <Select
                 options={[
@@ -1166,11 +1172,7 @@ export function ChannelDrawer({
                 placeholder="5061"
               />
             </Form.Item>
-            <Form.Item
-              name="sip_transport"
-              label={t("channels.sipTransport")}
-              initialValue="UDP"
-            >
+            <Form.Item name="sip_transport" label={t("channels.sipTransport")}>
               <Select
                 options={[
                   { value: "UDP", label: "UDP" },
@@ -1979,7 +1981,15 @@ export function ChannelDrawer({
     enqueue?: (save: () => Promise<boolean>) => void,
   ) => {
     if (!activeKey) return undefined;
-    const values = structuredClone(form.getFieldsValue(true));
+    const readValues = () => {
+      const values = form.getFieldsValue();
+      // QR providers can return credentials without a visible form item.
+      for (const field of authorization.current?.fields ?? [])
+        values[field] = form.getFieldValue(field);
+      return values;
+    };
+    // Ignore unregistered drafts while retaining this authorization batch.
+    const values = structuredClone(readValues());
     const validationValues = JSON.stringify(values);
     const generation = scopeGeneration.current;
     const capturedAuthorization = authorization.current
@@ -1990,10 +2000,11 @@ export function ChannelDrawer({
           custody: authorization.current.custody,
         }
       : undefined;
-    const { auth_method, ...rest } = values;
+    const snapshot = { ...initialValues, ...values };
+    const { auth_method, ...rest } = snapshot;
     const body =
       activeKey !== "matrix"
-        ? values
+        ? snapshot
         : auth_method === "password"
         ? { ...rest, access_token: "" }
         : auth_method === "token"
@@ -2002,7 +2013,7 @@ export function ChannelDrawer({
     const job = captureChannelSaveJob({
       agentId,
       channel: activeKey,
-      body: { ...initialValues, ...body },
+      body: normalizeChannelSubmitValues(activeKey, body),
       authSession: capturedAuthorization?.provenance.token,
       formRevision: formRevision.current,
     });
@@ -2012,7 +2023,7 @@ export function ChannelDrawer({
     const current = () =>
       currentScope() &&
       job.formRevision === formRevision.current &&
-      JSON.stringify(form.getFieldsValue(true)) === validationValues;
+      JSON.stringify(readValues()) === validationValues;
     try {
       await form.validateFields();
     } catch (error) {
@@ -2191,7 +2202,7 @@ export function ChannelDrawer({
           form={form}
           layout="vertical"
           className={styles.channelForm}
-          initialValues={initialValues}
+          initialValues={formInitialValues}
           onFinishFailed={() =>
             setExpandedSections([
               "credentials",
@@ -2213,7 +2224,7 @@ export function ChannelDrawer({
             <Switch disabled={activeKey === "console"} />
           </Form.Item>
 
-          {renderKnownChannelFields(activeKey) ??
+          {renderKnownChannelFields(channelSchema?.form_kind ?? activeKey) ??
             (isBuiltin ? null : renderCustomExtraFields(initialValues))}
 
           <Collapse
@@ -2350,11 +2361,11 @@ export function ChannelDrawer({
                         renderAccessControlFields()}
                       {activeKey !== "console" && (
                         <Form.Item
+                          className={styles.noTextDebounceItem}
                           name="no_text_debounce"
                           label={t("channels.noTextDebounce")}
                           valuePropName="checked"
                           tooltip={t("channels.noTextDebounceTooltip")}
-                          initialValue={true}
                         >
                           <Switch />
                         </Form.Item>

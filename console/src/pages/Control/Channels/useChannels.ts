@@ -1,68 +1,96 @@
-import { useState, useLayoutEffect, useCallback, useMemo, useRef } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import api from "../../../api";
 import type { ChannelSchema } from "../../../api/modules/channel";
 import { useAgentStore } from "../../../stores/agentStore";
 
+type Channels = Record<string, Record<string, unknown>>;
+type ChannelsUpdater = Channels | ((current: Channels) => Channels);
+
 export function useChannels() {
-  const [channels, setChannels] = useState<
-    Record<string, Record<string, unknown>>
-  >({});
+  const { selectedAgent } = useAgentStore();
+  const agentId = selectedAgent || "default";
+  const loadedAgentRef = useRef<string | null>(null);
+  const generation = useRef(0);
+  const controller = useRef<AbortController>();
+  const [channels, setChannelsState] = useState<Channels>({});
   const [channelTypes, setChannelTypes] = useState<string[]>([]);
   const [channelSchemas, setChannelSchemas] = useState<
     Record<string, ChannelSchema>
   >({});
+  const [loadedAgentId, setLoadedAgentId] = useState<string | null>(null);
+  const [viewAgentId, setViewAgentId] = useState(agentId);
   const [schemasLoading, setSchemasLoading] = useState(true);
   const [loading, setLoading] = useState(true);
-  const generation = useRef(0);
-  const controller = useRef<AbortController>();
+  const [error, setError] = useState<Error | null>(null);
 
-  const fetchChannels = useCallback(async (schemasOnly = false) => {
-    const agentId = useAgentStore.getState().selectedAgent || "default";
+  const fetchChannels = useCallback(async (target?: boolean | string) => {
+    const selected = useAgentStore.getState().selectedAgent || "default";
+    const requestAgentId = typeof target === "string" ? target : selected;
+    if (requestAgentId !== selected) return;
+    const schemasOnly = target === true && loadedAgentRef.current === selected;
     const requestGeneration = ++generation.current;
     controller.current?.abort();
     const currentController = new AbortController();
     controller.current = currentController;
-    const scope = { agentId, signal: currentController.signal };
-    const current = () =>
-      requestGeneration === generation.current &&
+    const scope = { agentId: requestAgentId, signal: currentController.signal };
+    const isCurrent = () =>
+      generation.current === requestGeneration &&
       !currentController.signal.aborted &&
-      (useAgentStore.getState().selectedAgent || "default") === agentId;
+      (useAgentStore.getState().selectedAgent || "default") === requestAgentId;
+
+    setViewAgentId(requestAgentId);
     setSchemasLoading(true);
-    setLoading(!schemasOnly);
+    if (!schemasOnly) {
+      loadedAgentRef.current = null;
+      setLoadedAgentId(null);
+      setLoading(true);
+      setError(null);
+    }
+    // Schema availability must not delay core loading or its error recovery.
+    const schemasRequest = (async () => {
+      try {
+        const schemas = await api.listChannelSchemas(scope);
+        if (isCurrent()) setChannelSchemas(schemas ?? {});
+      } catch {
+        if (isCurrent()) setChannelSchemas({});
+      } finally {
+        if (isCurrent()) setSchemasLoading(false);
+      }
+    })();
+
     if (!schemasOnly) {
       try {
         const [data, types] = await Promise.all([
           api.listChannels(scope),
           api.listChannelTypes(scope),
         ]);
-        if (!current()) return;
-        if (data)
-          setChannels(
-            data as unknown as Record<string, Record<string, unknown>>,
-          );
-        if (types) setChannelTypes(types);
-      } catch (error) {
-        if (current()) console.error("❌ Failed to load channels:", error);
+        if (!isCurrent()) return;
+        setChannelsState((data ?? {}) as unknown as Channels);
+        setChannelTypes(types ?? []);
+        loadedAgentRef.current = requestAgentId;
+        setLoadedAgentId(requestAgentId);
+      } catch (reason) {
+        if (!isCurrent()) return;
+        console.error("Failed to load channels:", reason);
+        setChannelsState({});
+        setChannelTypes([]);
+        setChannelSchemas({});
+        setError(
+          reason instanceof Error
+            ? reason
+            : new Error("Failed to load channels"),
+        );
       } finally {
-        if (current()) setLoading(false);
+        if (isCurrent()) setLoading(false);
       }
     }
-    if (!current()) return;
-    // Fetch schemas separately so failures don't block core channel loading
-    try {
-      const schemas = await api.listChannelSchemas(scope);
-      if (current() && schemas) setChannelSchemas(schemas);
-    } catch {
-      // Plugin system may not be available; non-critical
-      if (current()) setChannelSchemas({});
-    } finally {
-      if (current()) setSchemasLoading(false);
-    }
+    await schemasRequest;
   }, []);
 
   useLayoutEffect(() => {
     const changeScope = () => {
-      setChannels({});
+      loadedAgentRef.current = null;
+      setChannelsState({});
       setChannelTypes([]);
       setChannelSchemas({});
       void fetchChannels();
@@ -74,12 +102,47 @@ export function useChannels() {
     changeScope();
     return () => {
       unsubscribe();
+      loadedAgentRef.current = null;
       generation.current += 1;
       controller.current?.abort();
     };
   }, [fetchChannels]);
 
-  // Built-in channels come first (in a fixed order), then custom channels
+  const canMutate = useCallback(
+    (ownerAgentId: string) =>
+      (useAgentStore.getState().selectedAgent || "default") === ownerAgentId &&
+      loadedAgentRef.current === ownerAgentId,
+    [],
+  );
+
+  const setChannels = useCallback(
+    (ownerAgentId: string, updater: ChannelsUpdater) => {
+      if (!canMutate(ownerAgentId)) return false;
+      const updateGeneration = generation.current;
+      setChannelsState((current) => {
+        if (generation.current !== updateGeneration || !canMutate(ownerAgentId))
+          return current;
+        return typeof updater === "function" ? updater(current) : updater;
+      });
+      return true;
+    },
+    [canMutate],
+  );
+
+  const currentAgentLoaded = loadedAgentId === agentId;
+  const currentChannels = useMemo(
+    () => (currentAgentLoaded ? channels : {}),
+    [channels, currentAgentLoaded],
+  );
+  const currentChannelTypes = useMemo(
+    () => (currentAgentLoaded ? channelTypes : []),
+    [channelTypes, currentAgentLoaded],
+  );
+  const currentChannelSchemas = useMemo(
+    () => (currentAgentLoaded ? channelSchemas : {}),
+    [channelSchemas, currentAgentLoaded],
+  );
+
   const builtinOrder = useMemo(
     () => [
       "console",
@@ -102,31 +165,39 @@ export function useChannels() {
   const orderedKeys = useMemo(() => {
     const keys = Array.from(
       new Set([
-        ...channelTypes,
-        ...Object.keys(channels),
-        ...Object.keys(channelSchemas),
+        ...currentChannelTypes,
+        ...Object.keys(currentChannels),
+        ...Object.keys(currentChannelSchemas),
       ]),
     );
     return [
-      ...builtinOrder.filter((k) => keys.includes(k)),
-      ...keys.filter((k) => !builtinOrder.includes(k)),
+      ...builtinOrder.filter((key) => keys.includes(key)),
+      ...keys.filter((key) => !builtinOrder.includes(key)),
     ];
-  }, [builtinOrder, channelTypes, channels, channelSchemas]);
+  }, [
+    builtinOrder,
+    currentChannelTypes,
+    currentChannels,
+    currentChannelSchemas,
+  ]);
 
-  // Read isBuiltin from API response
   const isBuiltin = useCallback(
-    (key: string) => Boolean(channels[key]?.isBuiltin),
-    [channels],
+    (key: string) => Boolean(currentChannels[key]?.isBuiltin),
+    [currentChannels],
   );
 
   return {
-    channels,
-    channelTypes,
-    channelSchemas,
-    schemasLoading,
+    agentId,
+    channels: currentChannels,
+    channelTypes: currentChannelTypes,
+    channelSchemas: currentChannelSchemas,
+    schemasLoading: viewAgentId === agentId ? schemasLoading : true,
     orderedKeys,
     isBuiltin,
-    loading,
+    loading: viewAgentId === agentId ? loading : true,
+    error: viewAgentId === agentId ? error : null,
+    ready: currentAgentLoaded && !loading && error === null,
+    canMutate,
     fetchChannels,
     setChannels,
   };

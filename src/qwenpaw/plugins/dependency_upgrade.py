@@ -17,6 +17,7 @@ from uuid import uuid4
 from packaging.utils import canonicalize_name, parse_wheel_filename
 
 from ..utils.io_utils import get_sync_path_lock, run_sync_io
+from ..utils.runtime_environment import CERTIFI_REQUIREMENT, require_pip
 
 from .dependency_gate import (
     GateDecision,
@@ -506,6 +507,7 @@ class DependencyUpgradeManager:
             environment_fingerprint,
         )
 
+        requirements = [*requirements, CERTIFI_REQUIREMENT]
         immutable = (
             context.immutable_providers() if context is not None else {}
         )
@@ -624,6 +626,7 @@ class DependencyUpgradeManager:
         context=None,
         wheel_tags=None,
     ):
+        requirements = [*requirements, CERTIFI_REQUIREMENT]
         immutable = (
             context.immutable_providers() if context is not None else {}
         )
@@ -802,6 +805,11 @@ class DependencyUpgradeManager:
                 binding.description.requirements_path,
                 context,
             )
+            if not await run_sync_io(require_pip, command[0], isolated=True):
+                _refuse(
+                    "DEPENDENCY_INSTALLER_UNAVAILABLE",
+                    "pip is missing from the selected dependency environment.",
+                )
             result = await run_sync_io(
                 self.loader._run_subprocess_with_streaming_log,
                 command,

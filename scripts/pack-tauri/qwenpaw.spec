@@ -150,6 +150,9 @@ datas.append(
     ),
 )
 
+# The native Code Mode worker runs under the bundled standalone CPython.
+datas.append((str(SRC / "modes/coding/_worker.py"), "qwenpaw/modes/coding"))
+
 # The dependency gate needs complete host metadata, not only the packages
 # that query their own versions. Both desktop builds install qwenpaw[full].
 datas += runpy.run_path(str(Path(SPECPATH) / "collect_runtime_metadata.py"))[

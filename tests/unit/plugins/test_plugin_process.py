@@ -261,7 +261,11 @@ async def test_shared_upgrade_replaces_provider_or_restores_exact_old_tree(
     import zipfile
 
     from qwenpaw.plugins.dependency_upgrade import DependencyUpgradeManager
-    from tests.channel_support.host import Host, local_wheel
+    from tests.channel_support.host import (
+        Host,
+        local_certifi_wheel,
+        local_wheel,
+    )
 
     host = Host(tmp_path, monkeypatch)
     site = tmp_path / "plugin_runtime/site"
@@ -292,11 +296,13 @@ async def test_shared_upgrade_replaces_provider_or_restores_exact_old_tree(
             "raise RuntimeError('new source cannot initialize')\n",
         )
     wheel = next(local_wheel(tmp_path / "new", value="1.0").glob("*.whl"))
+    certifi_wheel = local_certifi_wheel(wheel.parent)
 
     def resolve(command, **kwargs):
         assert "wheel" in command and "install" not in command
         target = Path(command[command.index("--wheel-dir") + 1])
         shutil.copy2(wheel, target / wheel.name)
+        shutil.copy2(certifi_wheel, target / certifi_wheel.name)
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
     monkeypatch.setattr(
@@ -354,7 +360,11 @@ async def test_frozen_ordinary_loader_gate_installs_missing_sdk_in_overlay(
     from qwenpaw.plugins.channel_bootstrap import (
         resolve_default_channel_runtime,
     )
-    from tests.channel_support.host import Host, local_wheel
+    from tests.channel_support.host import (
+        Host,
+        local_certifi_wheel,
+        local_wheel,
+    )
 
     monkeypatch.setattr(sys, "path", sys.path.copy())
     host = Host(tmp_path, monkeypatch)
@@ -387,6 +397,7 @@ async def test_frozen_ordinary_loader_gate_installs_missing_sdk_in_overlay(
         "plugin = Plugin()\n",
     )
     wheels = local_wheel(tmp_path / "wheels")
+    local_certifi_wheel(wheels)
     for name, value in {
         "PIP_NO_INDEX": "1",
         "PIP_FIND_LINKS": str(wheels),
@@ -407,9 +418,11 @@ async def test_frozen_ordinary_loader_gate_installs_missing_sdk_in_overlay(
             path.relative_to(resources).as_posix(): (
                 ("symlink", os.readlink(path))
                 if path.is_symlink()
-                else ("directory", None)
-                if path.is_dir()
-                else ("file", path.read_bytes())
+                else (
+                    ("directory", None)
+                    if path.is_dir()
+                    else ("file", path.read_bytes())
+                )
             )
             for path in resources.rglob("*")
         }
@@ -456,8 +469,11 @@ async def test_frozen_ordinary_loader_gate_installs_missing_sdk_in_overlay(
         assert checked.already_satisfied and not checked.missing
         assert bundle_inventory() == before
     finally:
-        await host.loader.unload_plugin("ordinary-plugin")
-        sys.modules.pop("sample_shared_sdk", None)
-        importlib.invalidate_caches()
-        await host.close()
+        try:
+            if host.loader.get_loaded_plugin("ordinary-plugin") is not None:
+                await host.loader.unload_plugin("ordinary-plugin")
+        finally:
+            sys.modules.pop("sample_shared_sdk", None)
+            importlib.invalidate_caches()
+            await host.close()
     assert bundle_inventory() == before

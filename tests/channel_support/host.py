@@ -369,14 +369,14 @@ class Host:
         await ws.channel_manager.start_all()
 
 
-def local_wheel(directory, version="1.0", value="offline-sdk"):
+def _local_dependency_wheel(directory, name, version, payload):
     directory.mkdir(parents=True, exist_ok=True)
-    info = f"sample_shared_sdk-{version}.dist-info"
+    module = name.replace("-", "_")
+    info = f"{module}-{version}.dist-info"
     files = {
-        "sample_shared_sdk.py": f"VALUE = {value!r}\n".encode(),
+        **payload,
         f"{info}/METADATA": (
-            "Metadata-Version: 2.1\nName: sample-shared-sdk\n"
-            f"Version: {version}\n"
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
         ).encode(),
         f"{info}/WHEEL": (
             b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\n"
@@ -384,18 +384,47 @@ def local_wheel(directory, version="1.0", value="offline-sdk"):
         ),
     }
     records = []
-    for name, data in files.items():
+    for filename, data in files.items():
         digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest())
         records.append(
-            f"{name},sha256={digest.decode().rstrip('=')},{len(data)}\n",
+            f"{filename},sha256={digest.decode().rstrip('=')},{len(data)}\n",
         )
     files[f"{info}/RECORD"] = (
         "".join(records) + f"{info}/RECORD,,\n"
     ).encode()
-    with zipfile.ZipFile(
-        directory / f"sample_shared_sdk-{version}-py3-none-any.whl",
-        "w",
-    ) as archive:
-        for name, data in files.items():
-            archive.writestr(name, data)
+    path = directory / f"{module}-{version}-py3-none-any.whl"
+    with zipfile.ZipFile(path, "w") as archive:
+        for filename, data in files.items():
+            archive.writestr(filename, data)
+    return path
+
+
+def local_wheel(directory, version="1.0", value="offline-sdk"):
+    _local_dependency_wheel(
+        directory,
+        "sample-shared-sdk",
+        version,
+        {"sample_shared_sdk.py": f"VALUE = {value!r}\n".encode()},
+    )
     return directory
+
+
+def local_certifi_wheel(directory):
+    """Synthetic dependency transaction data; this does not test TLS."""
+    from importlib.metadata import version as installed_version
+    from packaging.version import Version
+
+    # pip wheel collects explicitly requested roots even when installed.
+    # Match any newer installed pin as well as the minimum security floor.
+    version = str(
+        max(
+            Version(installed_version("certifi")),
+            Version("2026.10.19"),
+        ),
+    )
+    return _local_dependency_wheel(
+        directory,
+        "certifi",
+        version,
+        {"certifi_fixture.txt": b"Synthetic transaction fixture; not TLS.\n"},
+    )

@@ -20,6 +20,8 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from packaging.requirements import Requirement
 
+from ..utils.runtime_environment import CERTIFI_REQUIREMENT, require_pip
+
 from .architecture import PluginManifest, PluginRecord, PluginType
 from .execution_backend import (
     BackendBinding,
@@ -1161,6 +1163,17 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 plugin_id=plugin_id,
             )
 
+        runtime = getattr(self.registry, "channel_runtime", None)
+        if (
+            dependency_context is None
+            and getattr(runtime, "runtime_identity", None) is not None
+        ):
+            from .dependency_context import DependencyEnvironmentContext
+
+            dependency_context = await run_sync_io(
+                DependencyEnvironmentContext.from_runtime,
+                runtime,
+            )
         usage = self.registry.dependency_usage
         immutable = (
             await run_sync_io(dependency_context.immutable_providers)
@@ -1176,7 +1189,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 requirements_file,
             )
             for name, requirement in _dependency_closure(
-                [str(item) for item in parsed.requirements],
+                [
+                    *(str(item) for item in parsed.requirements),
+                    CERTIFI_REQUIREMENT,
+                ],
                 {**immutable, **snapshot.distributions},
                 snapshot.marker_environment,
             ):
@@ -1202,6 +1218,18 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             )
             staging = Path(temporary)
             constraints = staging / "constraints.txt"
+            resolver = staging / "requirements.txt"
+
+            def prepare_requirements():
+                resolver.write_text(
+                    requirements_file.read_text(encoding="utf-8")
+                    + "\n"
+                    + CERTIFI_REQUIREMENT
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+            await run_sync_io(prepare_requirements)
 
             def constrain(observed):
                 constraints.write_text(
@@ -1219,6 +1247,39 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     encoding="utf-8",
                 )
 
+            if not await run_sync_io(
+                require_pip,
+                spec.python_executable,
+                isolated=True,
+            ):
+                if _is_frozen() or (
+                    dependency_context is not None
+                    and dependency_context.runtime_identity is not None
+                ):
+                    raise RuntimeError(
+                        "DEPENDENCY_INSTALLER_UNAVAILABLE: bundled pip is "
+                        "missing; update QwenPaw Desktop.",
+                    )
+                # ensurepip uses bundled wheels, without upgrading installed
+                # packages. Only a missing installer authorizes this retry.
+                bootstrap = await run(
+                    [spec.python_executable, "-I", "-m", "ensurepip"],
+                )
+                if not bootstrap.returncode:
+                    snapshot = (await process.audit(spec)).snapshot
+                if bootstrap.returncode or not await run_sync_io(
+                    require_pip,
+                    spec.python_executable,
+                    isolated=True,
+                ):
+                    raise SharedDependencyError(
+                        GateDecision(
+                            False,
+                            False,
+                            reason="DEPENDENCY_INSTALLER_UNAVAILABLE",
+                            reason_code="DEPENDENCY_INSTALLER_UNAVAILABLE",
+                        ),
+                    )
             await run_sync_io(constrain, snapshot)
             command = [
                 spec.python_executable,
@@ -1233,29 +1294,9 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 "--constraint",
                 str(constraints),
                 "-r",
-                str(requirements_file),
+                str(resolver),
             ]
             result = await run(command)
-            if result.returncode and result.stdout.strip() == (
-                f"{spec.python_executable}: No module named pip"
-            ):
-                # ensurepip uses bundled wheels, without upgrading installed
-                # packages. Only a missing installer authorizes this retry.
-                bootstrap = await run(
-                    [spec.python_executable, "-I", "-m", "ensurepip"],
-                )
-                if bootstrap.returncode:
-                    raise SharedDependencyError(
-                        GateDecision(
-                            False,
-                            False,
-                            reason="DEPENDENCY_INSTALLER_UNAVAILABLE",
-                            reason_code="DEPENDENCY_INSTALLER_UNAVAILABLE",
-                        ),
-                    )
-                snapshot = (await process.audit(spec)).snapshot
-                await run_sync_io(constrain, snapshot)
-                result = await run(command)
             if result.returncode:
                 unpinned = command.copy()
                 index = unpinned.index("--constraint")
@@ -1316,7 +1357,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 process,
                 spec,
                 plugin_id=plugin_id,
-                requirements_file=requirements_file,
+                requirements_file=resolver,
                 usage_registry=usage,
                 admission_token=current_admission_token(
                     usage,

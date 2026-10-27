@@ -21,6 +21,7 @@ from packaging.version import InvalidVersion, Version
 from ..__version__ import __version__
 from ..constant import WORKING_DIR
 from ..config.utils import read_last_api
+from ..utils.runtime_environment import require_pip, require_uv
 from ..utils.runtime_api import api_client
 from .process_utils import (
     _base_url,
@@ -585,6 +586,7 @@ def run_update_worker(plan_path: str | Path) -> int:
     commands = [plan["command"]]
     if plan.get("prepare_channels_command"):
         commands.append(plan["prepare_channels_command"])
+    commands = [[str(part) for part in command] for command in commands]
 
     _wait_for_process_exit(plan.get("launcher_pid"))
 
@@ -597,8 +599,16 @@ def run_update_worker(plan_path: str | Path) -> int:
 
     try:
         for command in commands:
+            if command[1:3] == ["-m", "pip"]:
+                if not require_pip(command[0]):
+                    raise RuntimeError(
+                        "pip is missing from the update environment",
+                    )
+            elif command[1:3] == ["pip", "install"]:
+                require_uv(command[0])
+        for command in commands:
             with subprocess.Popen(
-                [str(part) for part in command],
+                command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 **_subprocess_text_kwargs(),
@@ -610,7 +620,7 @@ def run_update_worker(plan_path: str | Path) -> int:
                 return_code = proc.wait()
             if return_code:
                 break
-    except FileNotFoundError as exc:
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         click.echo(f"[qwenpaw] Update failed: {exc}")
         return_code = 1
     finally:
