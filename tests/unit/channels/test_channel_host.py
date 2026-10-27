@@ -205,6 +205,263 @@ def test_runner_hello_requires_shared_identity():
         validate_method_params("runner.hello", shared).to_mapping() == shared
     )
 
+    from qwenpaw.channel_protocol.shared import validate_shared_hello
+
+    expected = {
+        name: shared[name]
+        for name in (
+            "channel_key",
+            "instance_id",
+            "generation",
+            "source_revision",
+            "qwenpaw_version",
+        )
+    }
+    expected.update(
+        capabilities=("channel.generic.v1",),
+        expected_requirements=(),
+    )
+    assert validate_shared_hello(shared, **expected).to_mapping() == shared
+    for field, value, reason in (
+        ("channel_key", "other", "CHANNEL_KEY_MISMATCH"),
+        ("instance_id", "old-worker", "INSTANCE_ID_MISMATCH"),
+        ("generation", 2, "GENERATION_MISMATCH"),
+        ("source_revision", "c" * 64, "SOURCE_REVISION_MISMATCH"),
+        ("capabilities", [], "CAPABILITY_MISMATCH"),
+    ):
+        with pytest.raises(ProtocolValidationError) as rejected:
+            validate_shared_hello({**shared, field: value}, **expected)
+        assert rejected.value.reason_code == reason
+    with pytest.raises(ProtocolValidationError) as rejected:
+        validate_shared_hello(
+            shared,
+            **{**expected, "expected_requirements": ("missing-sdk==1",)},
+        )
+    assert rejected.value.reason_code == "DEPENDENCY_UNSATISFIED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["run", "audit", "probe", "manage"])
+async def test_execution_preparation_yields_and_consumes_session_snapshot(
+    host,
+    monkeypatch,
+    mode,
+):
+    import threading
+    from dataclasses import replace
+    from qwenpaw.__version__ import __version__
+    from qwenpaw.app.channels.process_supervisor import ChannelProcess
+    from qwenpaw.plugins.architecture import PluginManifest
+    from qwenpaw.plugins.channel_adapter import describe_channel
+
+    source = host.artifact()
+    if mode == "manage":
+        with (source / "sample.py").open("a") as stream:
+            stream.write(
+                "\nasync def manage(request):\n"
+                "    result = request.to_mapping()\n"
+                "    result.pop('parameters')\n"
+                "    result.pop('timeout_ms')\n"
+                "    return dict(result, outcome='ok', reason_code=None,\n"
+                "                result={'scan_url': 'https://example.test/scan',\n"
+                "                        'continuation': 'opaque'})\n"
+                "Driver.manage = staticmethod(manage)\n",
+            )
+    description = describe_channel(
+        source,
+        PluginManifest.from_dict(
+            json.loads((source / "plugin.json").read_text()),
+        ),
+    )
+    prepared = description.prepare_proxy_config({"enabled": True})
+    proxy = description.create_proxy(
+        None,
+        prepared.config,
+        python_executable=sys.executable,
+        support_root=Path(__file__).resolve().parents[3] / "src",
+        instance_id="preparation",
+        generation=1,
+        qwenpaw_version=__version__,
+        prepared_config=prepared,
+    )
+    spec = replace(proxy._launch_spec, workspace_id="test-workspace")
+    process = ChannelProcess()
+    entered, release = threading.Event(), threading.Event()
+    loop_thread = threading.get_ident()
+    read_text, open_worker = Path.read_text, process._open
+    metadata = {source / "channel.json", source / "requirements.txt"}
+    opened = False
+
+    def read(path, *args, **kwargs):
+        if path in metadata:
+            assert not opened, "session consumer re-read metadata"
+            assert (
+                threading.get_ident() != loop_thread
+            ), "metadata read on event loop"
+            entered.set()
+            assert release.wait(5), "preparation barrier was not released"
+        return read_text(path, *args, **kwargs)
+
+    async def open_session(*args, **kwargs):
+        nonlocal opened
+        opened = True
+        return await open_worker(*args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setattr(process, "_open", open_session)
+    method = {"run": "start", "manage": "start_management"}.get(mode, mode)
+    start = getattr(process, method)
+    pending = asyncio.create_task(start(spec))
+    try:
+        await eventually(lambda: entered.is_set() or pending.done())
+        if pending.done():
+            await pending
+        assert entered.is_set()
+        assert await asyncio.sleep(0, result="responsive") == "responsive"
+        with pytest.raises(process.error_type, match="PROCESS_OWNED"):
+            await process.start(spec)
+        release.set()
+        await pending
+        assert opened and process.dependency_snapshot is not None
+        if mode == "audit":
+            assert (
+                process.observed_hello is None
+            )  # Audit never imports the driver.
+        else:
+            assert (
+                process.observed_hello["source_revision"]
+                == spec.source_revision
+            )
+            assert process.observed_hello["generation"] == spec.generation
+        if mode == "manage":
+            from qwenpaw.channel_protocol.management import MANAGEMENT_METHOD
+            from uuid import uuid4
+
+            request = {
+                name: getattr(spec, name)
+                for name in (
+                    "plugin_id",
+                    "workspace_id",
+                    "channel_key",
+                    "instance_id",
+                    "generation",
+                    "source_revision",
+                )
+            }
+            request.update(
+                request_id=str(uuid4()),
+                operation="qrcode.fetch",
+                timeout_ms=1000,
+                parameters={"config": {}},
+            )
+            unsupported = {
+                **request,
+                "operation": "connection.verify",
+                "parameters": {"config": {}, "level": "reachability"},
+            }
+            with pytest.raises(
+                process.error_type,
+                match="MANAGEMENT_UNSUPPORTED",
+            ):
+                await process.call(MANAGEMENT_METHOD, unsupported)
+            result = await process.call(MANAGEMENT_METHOD, request)
+            assert result["outcome"] == "ok"
+            assert result["result"]["continuation"] == "opaque"
+    finally:
+        release.set()
+        await asyncio.gather(pending, return_exceptions=True)
+        stopped = await process.stop()
+        assert stopped.exited and not stopped.residual
+
+
+@pytest.mark.asyncio
+async def test_preparation_cancellation_retains_custody_and_rejects_changed_source(
+    host,
+    monkeypatch,
+):
+    import threading
+    from qwenpaw.__version__ import __version__
+    from qwenpaw.app.channels.process_supervisor import ChannelProcess
+    from qwenpaw.plugins.architecture import PluginManifest
+    from qwenpaw.plugins.channel_adapter import describe_channel
+
+    source = host.artifact()
+    description = describe_channel(
+        source,
+        PluginManifest.from_dict(
+            json.loads((source / "plugin.json").read_text()),
+        ),
+    )
+    prepared = description.prepare_proxy_config({"enabled": True})
+    proxy = description.create_proxy(
+        None,
+        prepared.config,
+        python_executable=sys.executable,
+        support_root=Path(__file__).resolve().parents[3] / "src",
+        instance_id="cancel-preparation",
+        generation=1,
+        qwenpaw_version=__version__,
+        prepared_config=prepared,
+    )
+    spec, process = proxy._launch_spec, ChannelProcess()
+    entered, release = threading.Event(), threading.Event()
+    prepare = process._prepare_spec
+
+    def blocked(value):
+        entered.set()
+        assert release.wait(5), "preparation barrier was not released"
+        return prepare(value)
+
+    monkeypatch.setattr(process, "_prepare_spec", blocked)
+    pending = asyncio.create_task(process.start(spec))
+    try:
+        await eventually(entered.is_set)
+        pending.cancel()
+        stopped = await process.stop(timeout=0.05)
+        assert not stopped.exited and "STARTUP_PENDING" in stopped.residual
+        assert not pending.done()
+        with pytest.raises(process.error_type, match="PROCESS_OWNED"):
+            await process.start(spec)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        stopped = await process.stop()
+        assert stopped.exited and not stopped.residual
+        assert process._process is None
+        code = source / "sample.py"
+        original = code.read_text()
+        for path, replacement in (
+            (code, original + "\n# changed after approval\n"),
+            (source / "requirements.txt", "unexpected-dependency==1\n"),
+        ):
+            previous = path.read_text()
+            entered.clear()
+            release.clear()
+            pending = asyncio.create_task(process.start(spec))
+            await eventually(entered.is_set)
+            path.write_text(replacement)
+            release.set()
+            with pytest.raises(
+                process.error_type,
+                match="^SOURCE_REVISION_MISMATCH$",
+            ):
+                await pending
+            assert process._process is None
+            assert process.observed_hello is None
+            path.write_text(previous)
+            stopped = await process.stop()
+            assert stopped.exited and not stopped.residual
+        monkeypatch.setattr(process, "_prepare_spec", prepare)
+        await process.start(spec)
+        assert (
+            process.observed_hello["source_revision"] == spec.source_revision
+        )
+    finally:
+        release.set()
+        await asyncio.gather(pending, return_exceptions=True)
+        stopped = await process.stop()
+        assert stopped.exited and not stopped.residual
+
 
 @pytest.mark.asyncio
 async def test_local_install_enable_uses_installed_code_and_offline_dependency(
@@ -300,6 +557,7 @@ async def test_real_agent_stream_final_reply_and_saved_session(host):
 @pytest.mark.asyncio
 async def test_workspace_messages_sessions_reply_targets_and_acl_are_isolated(
     host,
+    monkeypatch,
 ):
     from qwenpaw.app.channels.access_control import get_access_control_store
 
@@ -310,6 +568,24 @@ async def test_workspace_messages_sessions_reply_targets_and_acl_are_isolated(
     get_access_control_store(two.workspace_dir).add_to_blacklist(
         KEY,
         "blocked",
+    )
+    import threading
+    from qwenpaw.app.channels.access_control import AccessControlStore
+
+    loop_thread = threading.get_ident()
+    decide = AccessControlStore.check_or_add_pending
+    decisions = []
+
+    def checked_decision(store, *args, **kwargs):
+        assert threading.get_ident() != loop_thread
+        result = decide(store, *args, **kwargs)
+        decisions.append(result)
+        return result
+
+    monkeypatch.setattr(
+        AccessControlStore,
+        "check_or_add_pending",
+        checked_decision,
     )
     await host.real_agent(one, reply="answer:one")
     await host.real_agent(two, reply="answer:two")
@@ -322,6 +598,7 @@ async def test_workspace_messages_sessions_reply_targets_and_acl_are_isolated(
     await host.emit(one, "one", room="one-room", text="first")
     await host.emit(two, "two", room="two-room", text="second")
     await host.emit(two, "denied", sender="blocked", room="blocked-room")
+    await host.emit(two, "pending", sender="new-user", room="pending-room")
     for ws in (one, two):
         assert await ws.channel_manager._queue_manager.drain()
     assert [request.input[0].content[0].text for request in one.requests] == [
@@ -348,6 +625,10 @@ async def test_workspace_messages_sessions_reply_targets_and_acl_are_isolated(
         chat.session_id
         for chat in await two.chat_manager.list_chats(channel=KEY)
     } == {"two-room"}
+    assert {"allow", "blocked", "pending"} <= set(decisions)
+    pending = get_access_control_store(two.workspace_dir).get_all_pending()
+    assert [entry["user_id"] for entry in pending] == ["new-user"]
+    assert not session_path(two, "pending-room", "new-user").exists()
     for ws, room, input_text in (
         (one, "one-room", "first"),
         (two, "two-room", "second"),

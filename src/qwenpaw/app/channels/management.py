@@ -229,6 +229,8 @@ class ChannelManagementService:
                         code_root=description.code_root,
                         descriptor_path=description.descriptor_path,
                         source_revision=description.source_revision,
+                        descriptor=description.descriptor,
+                        requirements=description.requirements,
                         channel_key=channel_key,
                         instance_id=lease.instance_id,
                         generation=lease.generation,

@@ -415,25 +415,41 @@ class BaseChannel(ABC):
         if not is_group and not self.access_control_dm:
             return False
 
-        store = self._get_acl_store()
-        channel_key = self.channel
+        from ...utils.io_utils import run_sync_io
 
-        # ── Whitelist / blacklist / pending decision ────────────────────
-        if store.is_whitelisted(channel_key, sender_id):
-            return False  # allowed
+        workspace = self._workspace
+        identity = self._identity() if hasattr(self, "_identity") else None
 
-        if store.is_blacklisted(channel_key, sender_id):
-            deny_msg = self._acl_msg("blocked")
-        else:
-            first_message = self._extract_query_from_payload(payload)
-            username = meta.get("user_name") or ""
-            store.add_pending(
-                channel_key,
-                sender_id,
-                first_message,
-                username=username,
+        def current():
+            return self._workspace is workspace and (
+                identity is None
+                or (self._identity() == identity and self._ingress_open)
             )
-            deny_msg = self._acl_msg("pending", sender_id=sender_id)
+
+        cached = getattr(self, "_acl_cached_store", None)
+        store = cached[1] if cached and cached[0] is workspace else None
+        if store is None:
+            workspace_dir = (
+                Path(workspace.workspace_dir)
+                if workspace is not None
+                else None
+            )
+            store = await run_sync_io(get_access_control_store, workspace_dir)
+            if not current():
+                return True
+            self._acl_cached_store = (workspace, store)
+        decision = await run_sync_io(
+            store.check_or_add_pending,
+            self.channel,
+            sender_id,
+            self._extract_query_from_payload(payload),
+            username=meta.get("user_name") or "",
+        )
+        if not current():
+            return True
+        if decision == "allow":
+            return False
+        deny_msg = self._acl_msg(decision, sender_id=sender_id)
 
         # ── Send deny message back via the channel's own send() ─────────
         try:

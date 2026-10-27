@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 from collections.abc import Mapping
+from copy import deepcopy
+from ...channel_protocol.artifacts import code_root_digest
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,7 @@ from ...channel_protocol.shared import (
     SharedChannelDescriptor,
     validate_shared_hello,
     validate_channel_contract,
+    _read_requirements,
 )
 
 
@@ -37,6 +40,8 @@ class LaunchSpec:
     code_root: Path
     descriptor_path: Path
     source_revision: str
+    descriptor: SharedChannelDescriptor
+    requirements: tuple[str, ...]
     channel_key: str
     instance_id: str
     generation: int
@@ -180,7 +185,7 @@ class ChannelProcess(PluginProcess):
                 )
             ):
                 raise self.error_type("IDENTITY_MISMATCH")
-            descriptor = SharedChannelDescriptor.load(spec.descriptor_path)
+            descriptor = spec.descriptor
             if (
                 MANAGEMENT_CAPABILITIES[request.operation]
                 not in descriptor.capabilities
@@ -215,19 +220,61 @@ class ChannelProcess(PluginProcess):
             },
         )
 
+    def _snapshot_spec(self, spec):
+        return replace(
+            super()._snapshot_spec(spec),
+            descriptor=SharedChannelDescriptor.from_mapping(
+                spec.descriptor.to_mapping(),
+            ),
+            runtime_identity=(
+                deepcopy(dict(spec.runtime_identity))
+                if spec.runtime_identity is not None
+                else None
+            ),
+        )
+
     def _validate_spec(self, spec):
         self._validate_launch(spec)
+        descriptor = spec.descriptor
+        validate_channel_contract(
+            descriptor.channel_key,
+            descriptor.capabilities,
+        )
+        self._identity(spec)
+
+    def _prepare_spec(self, spec):
+        self._validate_launch_paths(spec)
         path = Path(spec.descriptor_path)
         if not path.is_absolute() or not path.exists():
             raise ChannelProcessError("LAUNCH_PATH_INVALID")
         if not path.resolve().is_relative_to(Path(spec.code_root).resolve()):
             raise ChannelProcessError("DESCRIPTOR_OUTSIDE_CODE_ROOT")
         descriptor = SharedChannelDescriptor.load(spec.descriptor_path)
-        validate_channel_contract(
-            descriptor.channel_key,
-            descriptor.capabilities,
+        requirements_path = path.parent / descriptor.requirements_file
+        root = Path(spec.code_root).resolve()
+        if not requirements_path.resolve().is_relative_to(root):
+            raise self.error_type("DEPENDENCY_PATH_INVALID")
+        requirements = _read_requirements(requirements_path)
+        if (
+            descriptor.to_mapping() != spec.descriptor.to_mapping()
+            or descriptor.channel_key != spec.channel_key
+            or requirements != spec.requirements
+            or code_root_digest(root) != spec.source_revision
+        ):
+            raise self.error_type("SOURCE_REVISION_MISMATCH")
+        return replace(
+            spec,
+            support_root=Path(spec.support_root).resolve(),
+            code_root=root,
+            descriptor_path=path.resolve(),
+            dependency_paths=tuple(
+                Path(p).resolve() for p in spec.dependency_paths
+            ),
+            descriptor=descriptor,
+            requirements=requirements,
+            config=deepcopy(dict(spec.config)),
+            runtime_identity=deepcopy(spec.runtime_identity),
         )
-        self._identity(spec)
 
     def _packet(self, spec):
         packet = {
@@ -244,19 +291,16 @@ class ChannelProcess(PluginProcess):
         }
         packet.update(
             {
-                name: str(Path(getattr(spec, name)).resolve())
+                name: str(getattr(spec, name))
                 for name in ("support_root", "code_root", "descriptor_path")
             },
         )
         packet["dependency_paths"] = [
-            str(Path(path).resolve()) for path in spec.dependency_paths
+            str(path) for path in spec.dependency_paths
         ]
-        descriptor = SharedChannelDescriptor.load(spec.descriptor_path)
+        descriptor = spec.descriptor
         packet["requirements_path"] = str(
-            (
-                Path(spec.descriptor_path).parent
-                / descriptor.requirements_file
-            ).resolve(),
+            (Path(spec.descriptor_path).parent / descriptor.requirements_file),
         )
         packet["config"] = dict(spec.config)
         packet["private_env"] = spec.private_env
@@ -278,7 +322,7 @@ class ChannelProcess(PluginProcess):
 
     async def _hello(self, hello, _request):
         spec = self._spec
-        descriptor = SharedChannelDescriptor.load(spec.descriptor_path)
+        descriptor = spec.descriptor
         validate_shared_hello(
             hello,
             channel_key=spec.channel_key,
@@ -287,8 +331,7 @@ class ChannelProcess(PluginProcess):
             source_revision=spec.source_revision,
             qwenpaw_version=spec.qwenpaw_version,
             capabilities=descriptor.capabilities,
-            requirements_path=Path(spec.descriptor_path).parent
-            / descriptor.requirements_file,
+            expected_requirements=spec.requirements,
         )
         self.observed_hello = (
             hello.to_mapping() if hasattr(hello, "to_mapping") else dict(hello)

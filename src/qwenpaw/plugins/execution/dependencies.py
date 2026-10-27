@@ -369,7 +369,7 @@ def observe_dependencies(packet: Mapping[str, Any]) -> DependencySnapshot:
     excluded = {Path(packet["code_root"]).resolve()}
     sites = tuple(
         dict.fromkeys(
-            str(Path(item).resolve())
+            str(canonical_environment_path(item))
             for item in packet["_audit_sites"]
             if item
             and Path(item).is_dir()

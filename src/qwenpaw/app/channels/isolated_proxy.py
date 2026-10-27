@@ -350,11 +350,13 @@ class IsolatedChannelProxy(BaseChannel):
         display_config=None,
         no_text_debounce=True,
         *,
-        launch_spec,
-        descriptor: SharedChannelDescriptor,
+        launch_spec: LaunchSpec | None = None,
+        descriptor: SharedChannelDescriptor | None = None,
         channel_process=None,
         workspace_dir=None,
     ):
+        if launch_spec is None or descriptor is None:
+            raise ValueError("CHANNEL_PREPARATION_REQUIRED")
         values = (
             config.model_dump()
             if hasattr(config, "model_dump")
@@ -691,7 +693,28 @@ class IsolatedChannelProxy(BaseChannel):
                 # admission. Consumption still rechecks changing ACL policy.
                 # The same IPC batch retry must not repeat the denial effect;
                 # a fresh platform push is a fresh admission decision.
-                if await BaseChannel._access_control_gate(self, payload):
+                blocked = await BaseChannel._access_control_gate(self, payload)
+                try:
+                    self._check_identity(event)
+                except ValueError:
+                    rejected.append(
+                        RejectedEvent(
+                            event.event_id,
+                            "STALE_GENERATION",
+                            False,
+                        ),
+                    )
+                    continue
+                if not self._ingress_open:
+                    rejected.append(
+                        RejectedEvent(
+                            event.event_id,
+                            "CHANNEL_STOPPING",
+                            True,
+                        ),
+                    )
+                    continue
+                if blocked:
                     denial = RejectedEvent(
                         event.event_id,
                         "ACCESS_DENIED",

@@ -18,6 +18,8 @@ import threading
 import time
 from uuid import uuid4
 
+from ...utils.io_utils import run_sync_io
+
 from .errors import (
     FrameClosedError,
     FrameLimitError,
@@ -77,6 +79,8 @@ class PayloadStore:
         self._owned = {}
         self._writing = set()
         self._jobs = {}
+        self._deleting = {}
+        self._cleanup_job = None
         self._identities = {}
         self._directories = {}
         try:
@@ -123,6 +127,11 @@ class PayloadStore:
                     path.rmdir()
             root.rmdir()
             raise
+
+    @classmethod
+    async def acreate(cls, limits=None):
+        """Create off-loop; callers settle assignment before cancellation."""
+        return await run_sync_io(cls.create, limits)
 
     def launch_context(self):
         return {
@@ -253,12 +262,20 @@ class PayloadStore:
         else:
             os.unlink(name, dir_fd=self._directories[direction])
 
-    def _sweep(self):
-        if self._disposed:
-            return
-        self._check_directories()
-        for token in tuple(self._owned):
-            if token not in self._writing:
+    async def _sweep(self, deadline):
+        tokens = tuple(
+            token
+            for token in self._owned
+            if token not in self._writing and token not in self._deleting
+        )
+        cutoff = self._cutoff(deadline)
+
+        def inspect(abort):
+            self._check_deadline(cutoff, abort)
+            self._check_directories()
+            missing = []
+            for token in tokens:
+                self._check_deadline(cutoff, abort)
                 exists = False
                 for suffix in (".json", ".part"):
                     try:
@@ -267,10 +284,14 @@ class PayloadStore:
                     except FileNotFoundError:
                         pass
                 if not exists:
-                    self._owned.pop(token)
+                    missing.append(token)
+            return missing
+
+        for token in await self._io(inspect, deadline):
+            if token not in self._writing and token not in self._deleting:
+                self._owned.pop(token, None)
 
     def pending_snapshot(self):
-        self._sweep()
         return {
             "direction": self.direction,
             "pending_files": len(self._owned),
@@ -297,7 +318,14 @@ class PayloadStore:
         if abort.is_set() or time.monotonic() >= deadline:
             raise FrameTimeoutError("payload I/O deadline expired")
 
-    async def _io(self, function, deadline, *, orphan=None):
+    @staticmethod
+    def _cutoff(deadline):
+        return time.monotonic() + max(
+            0,
+            deadline - asyncio.get_running_loop().time(),
+        )
+
+    async def _io(self, function, deadline, *, orphan=None, settled=None):
         if self._closed:
             raise FrameClosedError("payload store is closed")
         abort = threading.Event()
@@ -306,13 +334,15 @@ class PayloadStore:
         abandoned = False
 
         def complete(task):
-            self._jobs.pop(task, None)
             try:
                 task.result()
             except BaseException:
                 pass
+            if settled is not None:
+                settled()
             if abandoned and orphan is not None:
                 orphan()
+            self._jobs.pop(task, None)
 
         job.add_done_callback(complete)
         try:
@@ -341,7 +371,9 @@ class PayloadStore:
             _strict_json(message)
         except (ValueError, TypeError, RecursionError) as exc:
             raise FrameProtocolError("payload is not strict JSON") from exc
-        self._sweep()
+        await self._sweep(deadline)
+        if self._closed:
+            raise FrameClosedError("payload store is closed")
         if (
             len(self._owned) >= self.limits.max_pending_files
             or sum(self._owned.values()) + len(body)
@@ -352,49 +384,53 @@ class PayloadStore:
         self._owned[token] = len(body)
         self._writing.add(token)
 
+        cutoff = self._cutoff(deadline)
+
         def write(abort):
-            try:
-                self._check_deadline(deadline, abort)
-                fd = self._open(self.direction, token + ".part", create=True)
-                with os.fdopen(fd, "wb") as output:
-                    for offset in range(0, len(body), 65536):
-                        self._check_deadline(deadline, abort)
-                        output.write(body[offset : offset + 65536])
-                    output.flush()
-                    if os.name == "nt":
-                        os.chmod(
-                            self._path(self.direction, token + ".part"),
-                            0o400,
-                        )
-                    else:
-                        os.fchmod(output.fileno(), 0o400)
-                self._check_deadline(deadline, abort)
-                # Atomic publication must never replace an existing token.
-                self._check_directories()
+            self._check_deadline(cutoff, abort)
+            fd = self._open(self.direction, token + ".part", create=True)
+            with os.fdopen(fd, "wb") as output:
+                for offset in range(0, len(body), 65536):
+                    self._check_deadline(cutoff, abort)
+                    output.write(body[offset : offset + 65536])
+                output.flush()
                 if os.name == "nt":
-                    os.link(
+                    os.chmod(
                         self._path(self.direction, token + ".part"),
-                        self._path(self.direction, token + ".json"),
+                        0o400,
                     )
                 else:
-                    directory = self._directories[self.direction]
-                    os.link(
-                        token + ".part",
-                        token + ".json",
-                        src_dir_fd=directory,
-                        dst_dir_fd=directory,
-                        follow_symlinks=False,
-                    )
-                self._unlink(self.direction, token + ".part")
-                if os.name == "nt":
-                    # Windows readonly is shared by hard links; restore it
-                    # after removing the staging name, before ref visibility.
-                    self._path(self.direction, token + ".json").chmod(0o400)
-            finally:
-                self._writing.discard(token)
+                    os.fchmod(output.fileno(), 0o400)
+            self._check_deadline(cutoff, abort)
+            # Atomic publication must never replace an existing token.
+            self._check_directories()
+            if os.name == "nt":
+                os.link(
+                    self._path(self.direction, token + ".part"),
+                    self._path(self.direction, token + ".json"),
+                )
+            else:
+                directory = self._directories[self.direction]
+                os.link(
+                    token + ".part",
+                    token + ".json",
+                    src_dir_fd=directory,
+                    dst_dir_fd=directory,
+                    follow_symlinks=False,
+                )
+            self._unlink(self.direction, token + ".part")
+            if os.name == "nt":
+                # Windows readonly is shared by hard links; restore it
+                # after removing the staging name, before ref visibility.
+                self._path(self.direction, token + ".json").chmod(0o400)
 
         try:
-            await self._io(write, deadline, orphan=lambda: self.discard(token))
+            await self._io(
+                write,
+                deadline,
+                settled=lambda: self._writing.discard(token),
+                orphan=lambda: self.discard(token),
+            )
         except BaseException:
             if token not in self._writing:
                 self.discard(token)
@@ -410,18 +446,47 @@ class PayloadStore:
         return json.dumps(reference, separators=(",", ":")), token
 
     def discard(self, token):
-        """Remove only a locally allocated reference known not to be visible."""
-        if token not in self._owned or token in self._writing:
-            return
-        try:
-            for suffix in (".part", ".json"):
-                try:
-                    self._unlink(self.direction, token + suffix)
-                except FileNotFoundError:
-                    pass
-        except (OSError, FrameProtocolError):
-            return
-        self._owned.pop(token, None)
+        """Register deletion; capacity stays owned until confirmed removed."""
+        if self._cleanup_job is not None:
+            return self._cleanup_job
+        if self._disposed or token not in self._owned:
+            return None
+        if token in self._deleting:
+            return self._deleting[token]
+        if token in self._writing:
+            return None
+
+        def remove():
+            try:
+                for suffix in (".part", ".json"):
+                    try:
+                        self._unlink(self.direction, token + suffix)
+                    except FileNotFoundError:
+                        pass
+                return True
+            except (OSError, FrameProtocolError):
+                return False
+
+        job = asyncio.create_task(asyncio.to_thread(remove))
+        self._jobs[job] = threading.Event()
+        self._deleting[token] = job
+
+        def complete(task):
+            try:
+                if task.result():
+                    self._owned.pop(token, None)
+            except BaseException:
+                pass
+            self._deleting.pop(token, None)
+            self._jobs.pop(task, None)
+
+        job.add_done_callback(complete)
+        return job
+
+    async def adiscard(self, token):
+        job = self.discard(token)
+        if job is not None:
+            await asyncio.shield(job)
 
     async def read(self, message, *, deadline):
         self.validate_message(message)
@@ -460,8 +525,10 @@ class PayloadStore:
             raise FrameProtocolError("invalid payload reference")
         name = reference["id"] + ".json"
 
+        cutoff = self._cutoff(deadline)
+
         def load(abort):
-            self._check_deadline(deadline, abort)
+            self._check_deadline(cutoff, abort)
             try:
                 fd = self._open(self._incoming, name)
             except OSError as exc:
@@ -480,7 +547,7 @@ class PayloadStore:
                 chunks, digest = [], hashlib.sha256()
                 remaining = reference["byte_length"]
                 while remaining:
-                    self._check_deadline(deadline, abort)
+                    self._check_deadline(cutoff, abort)
                     chunk = source.read(min(65536, remaining))
                     if not chunk:
                         raise FrameProtocolError("truncated payload file")
@@ -495,7 +562,7 @@ class PayloadStore:
                 _strict_json(result)
             except (ValueError, UnicodeError, RecursionError) as exc:
                 raise FrameProtocolError("invalid payload JSON") from exc
-            self._check_deadline(deadline, abort)
+            self._check_deadline(cutoff, abort)
             self._unlink(self._incoming, name)
             return result
 
@@ -512,63 +579,109 @@ class PayloadStore:
             os.close(fd)
             self._directories.pop(name)
 
+    def _cleanup_files(self, deadline, abort):
+        closed = []
+        try:
+            self._check_deadline(deadline, abort)
+            if self._owner:
+                try:
+                    root_info = self.root.lstat()
+                except FileNotFoundError:
+                    root_info = None
+                if root_info is not None:
+                    if (
+                        self._reparse(root_info)
+                        or (root_info.st_dev, root_info.st_ino)
+                        != self._identities["root"]
+                    ):
+                        return False, closed
+                    for direction in ("h2w", "w2h"):
+                        directory = self.root / direction
+                        try:
+                            info = directory.lstat()
+                        except FileNotFoundError:
+                            continue
+                        if (
+                            self._reparse(info)
+                            or (info.st_dev, info.st_ino)
+                            != self._identities[direction]
+                        ):
+                            return False, closed
+                        for path in directory.iterdir():
+                            self._check_deadline(deadline, abort)
+                            if path.is_dir():
+                                return False, closed
+                            self._unlink(direction, path.name)
+                    for direction in ("h2w", "w2h"):
+                        self._check_deadline(deadline, abort)
+                        try:
+                            (self.root / direction).rmdir()
+                        except FileNotFoundError:
+                            pass
+                    self._check_deadline(deadline, abort)
+                    self.root.rmdir()
+            for name, fd in tuple(self._directories.items()):
+                self._check_deadline(deadline, abort)
+                os.close(fd)
+                closed.append(name)
+            return True, closed
+        except (OSError, FrameProtocolError, FrameTimeoutError):
+            return False, closed
+
     async def cleanup(self, *, deadline):
-        """Host-only disposal after the worker tree exits; retain on failure."""
+        """Fence admission, drain every successor, then exclusively dispose."""
         if self._disposed:
             return True
         self.close()
-        pending = [job for job in self._jobs if not job.done()]
-        if pending:
+        loop = asyncio.get_running_loop()
+        while self._jobs:
+            if loop.time() >= deadline:
+                return False
             _, pending = await asyncio.wait(
-                pending,
-                timeout=max(0, deadline - asyncio.get_running_loop().time()),
+                tuple(self._jobs),
+                timeout=max(0, deadline - loop.time()),
             )
             if pending:
                 return False
-        if not self._owner:
-            self._close_handles()
-            self._disposed = True
+            # Completion callbacks may register orphan deletion successors.
+            await asyncio.sleep(0)
+        if self._disposed:
             return True
-        try:
-            try:
-                root_info = self.root.lstat()
-            except FileNotFoundError:
-                self._close_handles()
-                self._owned.clear()
-                self._disposed = True
-                return True
-            if (
-                self._reparse(root_info)
-                or (root_info.st_dev, root_info.st_ino)
-                != self._identities["root"]
-            ):
-                return False
-            for direction in ("h2w", "w2h"):
-                directory = self.root / direction
-                if not directory.exists():
-                    continue
-                info = directory.lstat()
-                if (
-                    self._reparse(info)
-                    or (info.st_dev, info.st_ino)
-                    != self._identities[direction]
-                ):
-                    return False
-                for path in (self.root / direction).iterdir():
-                    if asyncio.get_running_loop().time() >= deadline:
-                        return False
-                    if path.is_dir():
-                        return False
-                    self._unlink(direction, path.name)
-            for direction in ("h2w", "w2h"):
-                try:
-                    (self.root / direction).rmdir()
-                except FileNotFoundError:
-                    pass
-            self.root.rmdir()
-            self._close_handles()
-            self._owned.clear()
-            self._disposed = True
-            return True
-        except (OSError, FrameProtocolError):
+        if loop.time() >= deadline:
             return False
+        abort = threading.Event()
+        job = asyncio.create_task(
+            asyncio.to_thread(
+                self._cleanup_files,
+                self._cutoff(deadline),
+                abort,
+            ),
+        )
+        self._cleanup_job = job
+        self._jobs[job] = abort
+
+        def complete(task):
+            try:
+                disposed, closed = task.result()
+                for name in closed:
+                    self._directories.pop(name, None)
+                if disposed:
+                    self._owned.clear()
+                    self._disposed = True
+            except BaseException:
+                pass
+            self._cleanup_job = None
+            self._jobs.pop(task, None)
+
+        job.add_done_callback(complete)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(job),
+                max(0, deadline - loop.time()),
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            abort.set()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return False
+        return self._disposed

@@ -285,15 +285,19 @@ async def _managed_connectivity_notes(cfg, timeout):
     from ..plugins.registry import PluginRegistry
     from ..plugins.official_channels import resolve_default_channel_runtime
 
+    from ..utils.io_utils import run_sync_io
+
     handled, notes = set(), []
     try:
-        runtime = (
-            PluginRegistry().channel_runtime
-            or resolve_default_channel_runtime()
+        runtime = PluginRegistry().channel_runtime or await run_sync_io(
+            resolve_default_channel_runtime,
         )
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         runtime = None
-    loader = PluginLoader([get_plugins_dir()], channel_runtime=runtime)
+    loader = await PluginLoader.create(
+        [get_plugins_dir()],
+        channel_runtime=runtime,
+    )
     service = ChannelManagementService(loader)
     controls = set(LaunchSpec.__dataclass_fields__) - {"config", "enabled"}
     controls.update(

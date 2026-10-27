@@ -522,6 +522,7 @@ class DependencyUpgradeManager:
                 Path(row["metadata_path"]).parent,
                 snapshot.prefix,
                 directory.parent.parent / "plugin_runtime",
+                context.to_mapping() if context is not None else None,
             )
         }
         protected.update(immutable)
@@ -626,6 +627,9 @@ class DependencyUpgradeManager:
         context=None,
         wheel_tags=None,
     ):
+        from .dependency_maintenance import canonical
+        from .dependency_transaction import visible_distributions
+
         requirements = [*requirements, CERTIFI_REQUIREMENT]
         immutable = (
             context.immutable_providers() if context is not None else {}
@@ -683,13 +687,15 @@ class DependencyUpgradeManager:
         changes = []
         for name in changed:
             old, row = changed[name], proposed.distributions[name]
-            site = Path(old["metadata_path"]).parent if old else Path(target)
+            site = canonical(
+                Path(old["metadata_path"]).parent if old else target,
+            )
             if context is not None and context.protected(site):
                 _refuse(
                     "DEPENDENCY_ENVIRONMENT_PROTECTED",
                     "Bundled dependencies cannot be replaced; update the desktop app.",
                 )
-            destinations[name] = str(site.resolve())
+            destinations[name] = str(site)
             proposed.distributions[name]["metadata_path"] = str(
                 site / Path(row["metadata_path"]).name,
             )
@@ -708,14 +714,9 @@ class DependencyUpgradeManager:
         )
         for consumer in consumers:
             evidence = consumer["environment"]
-            visible = set(evidence["dependency_sites"])
             merged = dict(evidence["distributions"])
             merged.update(
-                {
-                    name: row
-                    for name, row in inventory.items()
-                    if str(Path(row["metadata_path"]).parent) in visible
-                },
+                visible_distributions(inventory, evidence["dependency_sites"]),
             )
             cls._compatible(
                 consumer["requirements"],
@@ -741,6 +742,7 @@ class DependencyUpgradeManager:
                 )
                 for item in wheels
             ],
+            context.to_mapping() if context is not None else None,
         )
         return changed, changes, inventory, payload
 
@@ -831,9 +833,11 @@ class DependencyUpgradeManager:
                 context,
                 wheel_tags,
             )
-            from .dependency_transaction import imported_changes
+            from .dependency_transaction import imported_changes_async
 
-            requires_restart = bool(imported_changes(payload)) or any(
+            requires_restart = bool(
+                await imported_changes_async(payload),
+            ) or any(
                 consumer["origin"] == "host"
                 and set(changed).intersection(
                     name
@@ -1091,6 +1095,8 @@ async def continue_operation(directory, *, preflight=False):
         environment_fingerprint,
         verify_payload,
         atomic_json,
+        visible_distributions,
+        verify_providers,
     )
 
     directory = Path(directory).resolve()
@@ -1114,7 +1120,7 @@ async def continue_operation(directory, *, preflight=False):
                 runtime["selected_channels"],
             )
         runtime = ChannelRuntimeSettings(**runtime)
-    loader = PluginLoader(
+    loader = await PluginLoader.create(
         [Path(path) for path in operation["plugin_dirs"]],
         channel_runtime=runtime,
     )
@@ -1136,25 +1142,27 @@ async def continue_operation(directory, *, preflight=False):
         await run_sync_io(context.inspect_executor)
         if preflight:
             if (
-                environment_fingerprint(observed.to_mapping())
+                await run_sync_io(
+                    environment_fingerprint,
+                    observed.to_mapping(),
+                )
                 != operation["environment_fingerprint"]
             ):
                 raise RuntimeError(
                     "DEPENDENCY_PLAN_STALE: environment changed after review.",
                 )
-            verify_payload(directory, operation)
+            await run_sync_io(verify_payload, directory, operation)
             consumers = await manager._consumers(binding, observed)
             manager._check_reviewed_usage(operation, consumers, offline=True)
             for consumer in consumers:
                 evidence = consumer["environment"]
                 inventory = dict(evidence["distributions"])
                 inventory.update(
-                    {
-                        name: row
-                        for name, row in operation["proposed"].items()
-                        if str(Path(row["metadata_path"]).parent)
-                        in evidence["dependency_sites"]
-                    },
+                    await run_sync_io(
+                        visible_distributions,
+                        operation["proposed"],
+                        evidence["dependency_sites"],
+                    ),
                 )
                 manager._compatible(
                     consumer["requirements"],
@@ -1162,19 +1170,12 @@ async def continue_operation(directory, *, preflight=False):
                     evidence["marker_environment"],
                 )
             return
-        for change in operation["changes"]:
-            actual = observed.distributions.get(change["name"])
-            if (
-                actual is None
-                or actual != operation["proposed"][change["name"]]
-            ):
-                # Transport arrays and persisted tuples have equivalent data.
-                if actual is None or _digest(dict(actual)) != _digest(
-                    operation["proposed"][change["name"]],
-                ):
-                    raise RuntimeError(
-                        "DEPENDENCY_VERIFICATION_FAILED: fresh dependency provider differs.",
-                    )
+        await run_sync_io(
+            verify_providers,
+            observed.distributions,
+            operation["proposed"],
+            operation["changes"],
+        )
         manager._compatible(
             binding.description.requirements,
             observed.distributions,

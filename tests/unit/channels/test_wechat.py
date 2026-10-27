@@ -245,3 +245,170 @@ async def test_stop_cancels_poll_and_closes_clients(runtime):
     assert poll.done()
     assert platform._client is platform._poll_client is None
     assert rt.driver._platform is None and not rt.driver._connected
+
+
+@pytest.mark.parametrize("entry", ["config", "dynamic", "cancel"])
+async def test_auth_admission_scans_off_loop_and_releases_claims(
+    tmp_path,
+    monkeypatch,
+    entry,
+):
+    import threading
+    import sys
+
+    from qwenpaw.app.channels import wechat_auth_custody as custody
+    from qwenpaw.app.channels.isolated_proxy import IsolatedChannelProxy
+    from qwenpaw.app.channels.manager import ChannelManager
+    from qwenpaw.config.config import (
+        Config,
+        AgentProfileConfig,
+        AgentProfileRef,
+        save_agent_config,
+    )
+    from qwenpaw.config.utils import load_config, save_config
+    from qwenpaw.plugins.architecture import PluginManifest
+    from qwenpaw.plugins.channel_adapter import (
+        ChannelRuntimeSettings,
+        describe_channel,
+    )
+    from tests.channel_support.host import Host
+
+    case = Host(tmp_path, monkeypatch)
+    root = load_config()
+    for name in ("other-one", "other-two"):
+        directory = tmp_path / name
+        directory.mkdir()
+        root.agents.profiles[name] = AgentProfileRef(
+            id=name,
+            workspace_dir=str(directory),
+        )
+        save_config(root)
+        save_agent_config(name, AgentProfileConfig(id=name, name=name))
+    save_config(root)
+    managers = []
+    entered, release = threading.Event(), threading.Event()
+    dynamic = entry in {"dynamic", "cancel"}
+    loop_thread = threading.get_ident()
+    scan = custody._read_wechat_auth_evidence
+    scans = []
+    started = []
+
+    def read(*args):
+        scans.append(threading.get_ident())
+        entered.set()
+        assert release.wait(5), "auth scan blocked the event loop"
+        return scan(*args)
+
+    async def start(channel):
+        assert channel._wechat_auth_claims
+        started.append(channel)
+
+    monkeypatch.setattr(custody, "_read_wechat_auth_evidence", read)
+    monkeypatch.setattr(IsolatedChannelProxy, "start", start)
+    source = Path(__file__).resolve().parents[3] / "plugins/channel/wechat"
+    description = describe_channel(
+        source,
+        PluginManifest.from_dict(
+            json.loads((source / "plugin.json").read_text()),
+        ),
+    )
+    case.registry.register_channel_descriptor(
+        "wechat",
+        description,
+        runtime_settings=ChannelRuntimeSettings(
+            python_executable=sys.executable,
+            support_root=source.parents[2] / "src",
+            qwenpaw_version="test",
+            selected_channels=frozenset({"wechat"}),
+        ),
+    )
+
+    async def process(request):
+        if False:
+            yield request
+
+    async def build(name):
+        directory = tmp_path / name
+        directory.mkdir()
+        values = {
+            "enabled": True,
+            "bot_token": "shared-account",
+            "bot_token_file": str(directory / "token"),
+        }
+        config = Config.model_validate({"channels": {"wechat": values}})
+        manager = ChannelManager.from_config(
+            process,
+            config,
+            workspace_dir=directory,
+            defer_process_channels=dynamic,
+        )
+        managers.append(manager)
+        return manager, config
+
+    async def launch(manager, config):
+        await manager.start_all()
+        if dynamic:
+            return await manager.start_one("wechat", config)
+        await asyncio.gather(*tuple(manager._start_tasks))
+
+    try:
+        baseline = len(case.registry.runtime_owners.leases())
+        first, config = await build("first")
+        pending = asyncio.create_task(launch(first, config))
+        async with asyncio.timeout(5):
+            while not entered.is_set() and not pending.done():
+                await asyncio.sleep(0.001)
+        if pending.done():
+            await pending
+        assert entered.is_set()
+        assert not pending.done()
+        if entry == "cancel":
+            pending.cancel()
+            await asyncio.sleep(0)
+            assert not pending.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            assert not started
+            assert len(case.registry.runtime_owners.leases()) == baseline
+            return
+        if dynamic:
+            second, second_config = await build("second")
+            competing = asyncio.create_task(launch(second, second_config))
+            async with asyncio.timeout(5):
+                while len(scans) < 2 and not competing.done():
+                    await asyncio.sleep(0.001)
+            assert len(scans) >= 2
+            release.set()
+            results = await asyncio.gather(
+                pending,
+                competing,
+                return_exceptions=True,
+            )
+            failures = [r for r in results if isinstance(r, BaseException)]
+            assert len(failures) == 1
+            assert "ACCOUNT_IN_USE" in str(failures[0])
+        else:
+            release.set()
+            await pending
+            second, second_config = await build("second")
+            await launch(second, second_config)
+        assert scans and loop_thread not in scans
+        claims = started[0]._wechat_auth_claims
+        assert claims
+        assert len(started) == 1
+        assert all(
+            claim in case.registry.runtime_owners.leases() for claim in claims
+        )
+        for manager in managers:
+            await manager.stop_all()
+        assert not any(
+            lease.key.kind == "wechat_auth"
+            for lease in case.registry.runtime_owners.leases()
+        )
+    finally:
+        release.set()
+        for manager in managers:
+            await manager.stop_all()
+        await case.close()
+    assert len(case.registry.runtime_owners.leases()) == baseline

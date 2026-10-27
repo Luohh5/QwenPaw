@@ -561,7 +561,7 @@ async def lifespan(  # pylint: disable=too-many-statements,too-many-branches
             except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 logger.exception("Official channel runtime unavailable")
                 channel_runtime = None
-            plugin_loader = PluginLoader(
+            plugin_loader = await PluginLoader.create(
                 plugin_dirs,
                 channel_runtime=channel_runtime,
             )

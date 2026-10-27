@@ -300,9 +300,10 @@ async def prepare_channel_upgrade():
     }
     if not selected:
         return {}
-    loader = PluginLoader(
+
+    loader = await PluginLoader.create(
         [get_plugins_dir()],
-        channel_runtime=resolve_default_channel_runtime(),
+        channel_runtime=await run_sync_io(resolve_default_channel_runtime),
     )
     errors = {}
     try:

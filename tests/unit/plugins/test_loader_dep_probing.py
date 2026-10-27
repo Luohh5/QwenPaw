@@ -462,3 +462,188 @@ async def test_mutable_missing_pip_is_rechecked_and_reaudited_after_bootstrap(
     )
     assert events == ["check", "bootstrap", "audit", "check", "wheel", "gate"]
     assert requirements.read_text(encoding="utf-8") == "sample-sdk==1\n"
+
+
+@pytest.mark.asyncio
+async def test_async_loader_leases_before_loop_registry_publication(
+    tmp_path,
+    monkeypatch,
+):
+    import asyncio
+    import threading
+    from qwenpaw.plugins import dependency_maintenance, loader as loader_mod
+
+    loop_thread = threading.get_ident()
+    events = []
+    started, release = threading.Event(), threading.Event()
+    runtime = SimpleNamespace(
+        python_executable="chosen-python",
+        support_root=tmp_path,
+        dependency_paths=(tmp_path / "site",),
+        dependency_install_target=tmp_path / "site",
+        runtime_identity={"protocol": 1},
+    )
+    original_registry = loader_mod.PluginRegistry
+
+    def lease(paths):
+        assert threading.get_ident() != loop_thread
+        assert paths == runtime.dependency_paths
+        events.append("lease")
+        started.set()
+        assert release.wait(3)
+
+    class Registry(original_registry):
+        _instance = None
+
+        def __init__(self):
+            assert threading.get_ident() == loop_thread
+            assert events == ["lease"]
+            events.append("registry")
+            super().__init__()
+
+        def configure_channel_runtime(self, settings):
+            assert threading.get_ident() == loop_thread
+            assert settings is runtime
+            events.append("publish")
+
+    monkeypatch.setattr(dependency_maintenance, "lease_environment", lease)
+    monkeypatch.setattr(loader_mod, "PluginRegistry", Registry)
+    creation = asyncio.create_task(
+        loader_mod.PluginLoader.create([tmp_path], channel_runtime=runtime),
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        assert events == ["lease"]
+        assert not creation.done()
+    finally:
+        release.set()
+    result = await asyncio.wait_for(creation, 5)
+    assert isinstance(result.registry, Registry)
+    assert events == ["lease", "registry", "publish"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["identity", "origin"])
+async def test_dependency_import_resolution_rejects_changed_module(
+    tmp_path,
+    monkeypatch,
+    change,
+):
+    import asyncio
+    import sys
+    import threading
+    from types import ModuleType
+    from qwenpaw.plugins import dependency_transaction as transaction
+
+    name = "_qwenpaw_stale_dependency_test"
+    source = str(tmp_path / "sdk.py")
+    module = ModuleType(name)
+    module.__file__ = source
+    monkeypatch.setitem(sys.modules, name, module)
+    original = transaction._imported_changes
+    started, release = threading.Event(), threading.Event()
+    loop_thread = threading.get_ident()
+
+    def resolve(payload, modules):
+        assert threading.get_ident() != loop_thread
+        started.set()
+        assert release.wait(3)
+        return original(payload, modules)
+
+    monkeypatch.setattr(transaction, "_imported_changes", resolve)
+    probe = asyncio.create_task(
+        transaction.imported_changes_async({"old": {source: {}}}),
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        if change == "origin":
+            module.__file__ = str(tmp_path / "replacement.py")
+        else:
+            replacement = ModuleType(name)
+            replacement.__file__ = source
+            sys.modules[name] = replacement
+    finally:
+        release.set()
+    with pytest.raises(RuntimeError, match="DEPENDENCY_PLAN_STALE"):
+        await asyncio.wait_for(probe, 5)
+
+
+@pytest.mark.asyncio
+async def test_async_dependency_targets_reject_changed_host_paths(
+    tmp_path,
+    monkeypatch,
+):
+    import sys
+    from qwenpaw.plugins.python_backend import PythonBackend
+
+    backend = PythonBackend(SimpleNamespace())
+    admission = await backend.dependency_targets_async(None)
+    monkeypatch.setattr(sys, "path", [*sys.path, str(tmp_path / "new-site")])
+    with pytest.raises(RuntimeError, match="IDENTITY_CHANGED"):
+        admission.validate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale", [False, True])
+async def test_frozen_dependency_path_preparation_and_loop_publication(
+    tmp_path,
+    monkeypatch,
+    stale,
+):
+    import asyncio
+    import os
+    import sys
+    import threading
+    from qwenpaw.plugins import loader as loader_mod
+
+    root = tmp_path / "runtime"
+    bucket = root / "python"
+    target = bucket / "bundle-new" / "site"
+    old = bucket / "bundle-old" / "site"
+    paths = [str(old), str(bucket / "site"), str(tmp_path / "host")]
+    monkeypatch.setattr(sys, "path", paths[:])
+    monkeypatch.setenv("QWENPAW_PLUGIN_SITE", "before")
+    monkeypatch.setattr(loader_mod, "_is_frozen", lambda: True)
+    monkeypatch.setattr(loader_mod, "_plugin_runtime_dir", lambda: root)
+    loop_thread = threading.get_ident()
+    started, release = threading.Event(), threading.Event()
+    prepare = loader_mod._prepare_plugin_site_path
+    publish = loader_mod._publish_plugin_site_path
+    publications = []
+
+    def resolve(site, snapshot):
+        assert threading.get_ident() != loop_thread
+        assert tuple(snapshot) == tuple(paths)
+        result = prepare(site, snapshot)
+        assert sys.path == paths
+        assert os.environ["QWENPAW_PLUGIN_SITE"] == "before"
+        started.set()
+        assert release.wait(3)
+        return result
+
+    def commit(prepared):
+        assert threading.get_ident() == loop_thread
+        publications.append(prepared)
+        publish(prepared)
+
+    monkeypatch.setattr(loader_mod, "_prepare_plugin_site_path", resolve)
+    monkeypatch.setattr(loader_mod, "_publish_plugin_site_path", commit)
+    pending = asyncio.create_task(
+        loader_mod._ensure_plugin_site_on_path_async(target),
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        if stale:
+            sys.path.append(str(tmp_path / "concurrent-site"))
+    finally:
+        release.set()
+    if stale:
+        with pytest.raises(RuntimeError, match="IDENTITY_CHANGED"):
+            await asyncio.wait_for(pending, 5)
+        assert not publications
+        assert os.environ["QWENPAW_PLUGIN_SITE"] == "before"
+    else:
+        await asyncio.wait_for(pending, 5)
+        assert len(publications) == 1
+        assert sys.path == [str(target), str(tmp_path / "host")]
+        assert os.environ["QWENPAW_PLUGIN_SITE"] == str(target)

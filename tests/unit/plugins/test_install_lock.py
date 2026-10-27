@@ -415,3 +415,90 @@ else:
         before = lock_mod.environment_install_lock_path(site)
         (site / "package.py").write_text("updated")
         assert lock_mod.environment_install_lock_path(site) == before
+
+
+@pytest.mark.asyncio
+async def test_async_lock_cancellation_waits_for_real_acquisition(lock_path):
+    """A cancelled waiter cannot leave a late acquired descriptor locked."""
+    import asyncio
+    import threading
+    from contextlib import contextmanager
+
+    lock_path.parent.mkdir(parents=True)
+    peer = _hold(lock_path)
+    started = threading.Event()
+    claims = []
+    task = None
+
+    @contextmanager
+    def acquire():
+        started.set()
+        with lock_mod.plugin_install_lock(lock_path, timeout=5) as acquired:
+            yield acquired
+
+    async def waiter():
+        async with lock_mod.async_lock(
+            acquire(),
+            on_acquired=lambda value: claims.append(
+                (value, asyncio.current_task()),
+            ),
+        ):
+            pytest.fail("cancelled waiter entered its body")
+
+    try:
+        task = asyncio.create_task(waiter())
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        _release(peer)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 5)
+    assert claims == [(True, task)]
+    competitor = _hold(lock_path)
+    _release(competitor)
+
+
+@pytest.mark.asyncio
+async def test_async_lock_release_is_schedulable_and_exclusive(lock_path):
+    """Release completion stays protected while the loop can make progress."""
+    import asyncio
+    import threading
+
+    entered_exit = threading.Event()
+    finish_exit = threading.Event()
+    underlying = lock_mod.plugin_install_lock(lock_path)
+    exits = []
+
+    class SlowRelease:
+        def __enter__(self):
+            return underlying.__enter__()
+
+        def __exit__(self, *error):
+            exits.append(error)
+            entered_exit.set()
+            assert finish_exit.wait(3)
+            return underlying.__exit__(*error)
+
+    async def owner():
+        async with lock_mod.async_lock(SlowRelease()):
+            with pytest.raises(OSError):
+                _hold(lock_path)
+
+    task = asyncio.create_task(owner())
+    try:
+        assert await asyncio.to_thread(entered_exit.wait, 2)
+        assert not task.done()
+        with pytest.raises(OSError):
+            _hold(lock_path)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        finish_exit.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 5)
+    assert len(exits) == 1
+    competitor = _hold(lock_path)
+    _release(competitor)

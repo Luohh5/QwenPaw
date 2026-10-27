@@ -509,7 +509,7 @@ def validate_shared_hello(
     qwenpaw_version: str,
     python_abi: str | None = None,
     platform_tag: str | None = None,
-    requirements_path: str | Path | None = None,
+    expected_requirements: tuple[str, ...],
     capabilities: tuple[str, ...] | None = None,
 ) -> SharedHelloParams:
     """Check child observations against the parent's authoritative launch."""
@@ -530,9 +530,10 @@ def validate_shared_hello(
                 f"Shared hello {field} mismatch",
                 reason_code=reason,
             )
-    if requirements_path is not None and tuple(
-        row.requirement for row in parsed.dependencies
-    ) != _read_requirements(requirements_path):
+    if (
+        tuple(row.requirement for row in parsed.dependencies)
+        != expected_requirements
+    ):
         raise ProtocolValidationError(
             "Shared dependency declaration mismatch",
             reason_code="DEPENDENCY_UNSATISFIED",

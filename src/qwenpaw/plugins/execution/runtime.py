@@ -64,9 +64,15 @@ def _dependencies(
     path: str | Path | None,
     environment: Mapping[str, str],
     versions: Mapping[str, str | None] | None = None,
+    *,
+    expected_requirements: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     rows = []
-    for value in _requirements(path):
+    for value in (
+        _requirements(path)
+        if expected_requirements is None
+        else expected_requirements
+    ):
         requirement = Requirement(value)
         name = str(canonicalize_name(requirement.name))
         installed = None
@@ -107,7 +113,12 @@ def _dependencies(
     return rows
 
 
-def validate_hello(hello: Any, spec: Any) -> None:
+def validate_hello(
+    hello: Any,
+    spec: Any,
+    *,
+    expected_requirements: tuple[str, ...],
+) -> None:
     """Fence handshake against the trusted parent launch and declarations."""
     identity = PluginIdentity(
         spec.plugin_id,
@@ -168,6 +179,7 @@ def validate_hello(hello: Any, spec: Any) -> None:
             spec.requirements_path,
             environment,
             {row["name"]: row["installed_version"] for row in rows},
+            expected_requirements=expected_requirements,
         )
     except (KeyError, TypeError):
         raise ProtocolValidationError("invalid dependency evidence") from None

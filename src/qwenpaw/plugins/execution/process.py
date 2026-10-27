@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -12,6 +13,8 @@ import math
 import os
 from pathlib import Path
 from typing import Any
+
+from ...utils.io_utils import run_async_to_completion, run_sync_io
 
 from .bootstrap import (
     BootstrapError,
@@ -25,7 +28,7 @@ from .payloads import PayloadLimits, PayloadStore
 from .models import PluginIdentity
 from .process_tree import ProcessTree
 from .rpc import RpcCallNotSent, RpcPeer
-from .runtime import validate_hello
+from .runtime import validate_hello, _requirements
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,7 @@ class PluginLaunchSpec:
     config: Mapping[str, Any] = field(repr=False)
     dependency_paths: tuple[Path, ...] = ()
     requirements_path: Path | None = None
+    requirements: tuple[str, ...] = ()
     enabled: bool = True
     startup_timeout: float = 5.0
     shutdown_timeout: float = 2.0
@@ -206,6 +210,7 @@ class PluginProcess:
         ):
             raise self.error_type("PROCESS_OWNED")
         spec = replace(spec, config={}, enabled=True, restart_limit=0)
+        spec = self._snapshot_spec(spec)
         self._validate_spec(spec)
         self._spec, self._generation, self._mode = spec, spec.generation, mode
         self._restart_enabled = False
@@ -254,7 +259,7 @@ class PluginProcess:
         if params["identity"] != self._identity(self._spec).to_mapping():
             raise self.error_type("IDENTITY_MISMATCH")
         snapshot = DependencySnapshot.from_mapping(params["snapshot"])
-        excluded = (Path(self._spec.code_root).resolve(),)
+        excluded = (self._spec.code_root,)
         if any(
             Path(site).is_relative_to(root)
             for site in snapshot.sites
@@ -337,6 +342,7 @@ class PluginProcess:
         if not spec.enabled:
             self._state = "disabled"
             return self.health_snapshot()
+        spec = self._snapshot_spec(spec)
         self._validate_spec(spec)
         self._mode = mode
         self.dependency_snapshot = self.observed_hello = None
@@ -362,6 +368,13 @@ class PluginProcess:
             raise
         self._monitor_task = asyncio.create_task(self._monitor())
         return self.health_snapshot()
+
+    def _snapshot_spec(self, spec):
+        return replace(
+            spec,
+            config=deepcopy(dict(spec.config)),
+            private_env=dict(spec.private_env),
+        )
 
     def _validate_launch(self, spec: Any) -> None:
         try:
@@ -390,22 +403,6 @@ class PluginProcess:
             self._identity(spec)
         except ValueError:
             raise self.error_type("LAUNCH_INVALID") from None
-        for value in (
-            spec.python_executable,
-            spec.support_root,
-            spec.code_root,
-            *spec.dependency_paths,
-        ):
-            path = Path(str(value))
-            if not path.is_absolute() or not path.exists():
-                raise self.error_type("LAUNCH_PATH_INVALID")
-        for value in (
-            spec.support_root,
-            spec.code_root,
-            *spec.dependency_paths,
-        ):
-            if not Path(value).is_dir():
-                raise self.error_type("LAUNCH_PATH_INVALID")
         if (
             not isinstance(spec.source_revision, str)
             or len(spec.source_revision) != 64
@@ -425,6 +422,9 @@ class PluginProcess:
             )
         ):
             raise self.error_type("ENTRYPOINT_INVALID")
+
+    def _prepare_spec(self, spec):
+        self._validate_launch_paths(spec)
         if spec.requirements_path is not None:
             path = Path(spec.requirements_path)
             if (
@@ -436,6 +436,42 @@ class PluginProcess:
             ):
                 raise self.error_type("DEPENDENCY_PATH_INVALID")
 
+        return replace(
+            spec,
+            support_root=Path(spec.support_root).resolve(),
+            code_root=Path(spec.code_root).resolve(),
+            dependency_paths=tuple(
+                Path(p).resolve() for p in spec.dependency_paths
+            ),
+            requirements_path=(
+                Path(spec.requirements_path).resolve()
+                if spec.requirements_path is not None
+                else None
+            ),
+            requirements=_requirements(spec.requirements_path),
+            config=deepcopy(dict(spec.config)),
+        )
+
+    def _validate_launch_paths(self, spec):
+        if not self._worker_path(spec).is_file():
+            raise self.error_type("BOOTSTRAP_UNAVAILABLE")
+        for value in (
+            spec.python_executable,
+            spec.support_root,
+            spec.code_root,
+            *spec.dependency_paths,
+        ):
+            path = Path(str(value))
+            if not path.is_absolute() or not path.exists():
+                raise self.error_type("LAUNCH_PATH_INVALID")
+        for value in (
+            spec.support_root,
+            spec.code_root,
+            *spec.dependency_paths,
+        ):
+            if not Path(value).is_dir():
+                raise self.error_type("LAUNCH_PATH_INVALID")
+
     def _packet(self, spec: PluginLaunchSpec) -> bytes:
         packet = {
             name: getattr(spec, name)
@@ -444,17 +480,17 @@ class PluginProcess:
         packet.update(self._identity(spec).to_mapping())
         packet.update(
             {
-                name: str(Path(getattr(spec, name)).resolve())
+                name: str(getattr(spec, name))
                 for name in ("support_root", "code_root")
             },
         )
         packet["requirements_path"] = (
-            str(Path(spec.requirements_path).resolve())
+            str(spec.requirements_path)
             if spec.requirements_path is not None
             else None
         )
         packet["dependency_paths"] = [
-            str(Path(path).resolve()) for path in spec.dependency_paths
+            str(path) for path in spec.dependency_paths
         ]
         packet["config"] = dict(spec.config)
         packet["private_env"] = getattr(spec, "private_env", {})
@@ -505,8 +541,16 @@ class PluginProcess:
         self._last_error = None
         self._forced = False
         self._cleanup_task = None
+        self._ready = None
+        self.observed_hello = None
         try:
-            await asyncio.wait_for(self._open(spec), spec.startup_timeout)
+
+            async def prepare_and_open():
+                prepared = await run_sync_io(self._prepare_spec, spec)
+                self._spec = prepared
+                await self._open(prepared)
+
+            await asyncio.wait_for(prepare_and_open(), spec.startup_timeout)
             self._state = "ready"
         except BaseException as exc:
             self._last_error = (
@@ -522,11 +566,12 @@ class PluginProcess:
             raise self.error_type(self._last_error) from None
 
     async def _open(self, spec: PluginLaunchSpec) -> None:
-        self._payloads = PayloadStore.create(self._payload_limits)
+        async def create_payloads():
+            self._payloads = await PayloadStore.acreate(self._payload_limits)
+
+        await run_async_to_completion(create_payloads())
         packet = self._packet(spec)
         worker = self._worker_path(spec)
-        if not worker.is_file():
-            raise self.error_type("BOOTSTRAP_UNAVAILABLE")
         self._ready = asyncio.get_running_loop().create_future()
         environment = {
             name: value
@@ -649,7 +694,11 @@ class PluginProcess:
 
     async def _hello(self, hello: Any, _request: Any) -> dict[str, bool]:
         assert self._spec is not None
-        validate_hello(hello, self._spec)
+        validate_hello(
+            hello,
+            self._spec,
+            expected_requirements=self._spec.requirements,
+        )
         self.observed_hello = dict(hello)
         return {"accepted": True}
 
@@ -839,7 +888,11 @@ class PluginProcess:
     async def _cleanup(self, budget: float, *, graceful: bool) -> StopResult:
         if self._cleanup_task is None or (
             self._cleanup_task.done()
-            and (self._process is not None or self._spawn_task is not None)
+            and (
+                self._process is not None
+                or self._spawn_task is not None
+                or self._payloads is not None
+            )
         ):
             self._cleanup_task = asyncio.create_task(
                 self._cleanup_owned(budget, graceful=graceful),

@@ -16,9 +16,11 @@ import os
 from pathlib import Path
 import sys
 import time
+import threading
 from uuid import uuid4
 
 _READERS = {}
+_READERS_LOCK = threading.Lock()
 _STATE_ENV = "QWENPAW_DEPENDENCY_STATE_DIR"
 _STATE_ROOT = None
 _CAPABILITY_ENV = "QWENPAW_DEPENDENCY_MAINTENANCE"
@@ -330,6 +332,12 @@ def _readers_dir(site):
 
 
 def lease_environment(sites, parent_pid=None, timeout=5):
+    """Serialize process-owned reader publication, including worker callers."""
+    with _READERS_LOCK:
+        _lease_environment(sites, parent_pid, timeout)
+
+
+def _lease_environment(sites, parent_pid=None, timeout=5):
     """Acquire before importing from sites; descriptors live until exit."""
     deadline = time.monotonic() + timeout
     for identity in sorted({str(canonical(site)) for site in sites}):
@@ -448,22 +456,26 @@ def maintenance(sites, operation_id, capability, *, ignore_pid=None):
             "token_hash": hashlib.sha256(capability.encode()).hexdigest(),
         }
         created = []
-        for root in sites:
-            path = marker(root)
-            if path.exists() and authorized(root):
-                continue
-            with path.open("x", encoding="utf-8") as stream:
-                os.chmod(path, 0o600)
-                json.dump(value, stream)
-                stream.flush()
-                os.fsync(stream.fileno())
-            created.append(path)
-        if live_readers(sites, ignore_pid):
+        try:
+            for root in sites:
+                path = marker(root)
+                if path.exists() and authorized(root):
+                    continue
+                with path.open("x", encoding="utf-8") as stream:
+                    created.append(path)
+                    os.chmod(path, 0o600)
+                    json.dump(value, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            if live_readers(sites, ignore_pid):
+                raise RuntimeError(
+                    "DEPENDENCY_ENVIRONMENT_BUSY: another backend or child still uses the environment.",
+                )
+        except BaseException:
+            # No mutation has started; all gates still exclude other writers.
             for path in created:
-                path.unlink()
-            raise RuntimeError(
-                "DEPENDENCY_ENVIRONMENT_BUSY: another backend or child still uses the environment.",
-            )
+                path.unlink(missing_ok=True)
+            raise
         yield
 
 

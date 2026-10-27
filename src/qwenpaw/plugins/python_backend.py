@@ -31,6 +31,16 @@ from .module_isolation import (
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class _DependencyTargets:
+    targets: tuple
+    path_snapshot: tuple
+
+    def validate(self):
+        if tuple(sys.path) != self.path_snapshot:
+            raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+
+
 class _EntryPointNotFoundError(FileNotFoundError):
     """Missing declared source, distinct from failures inside plugin code."""
 
@@ -248,6 +258,20 @@ class PythonBackend:
             Path(path)
             for path in dependency_sites(path for path in sys.path if path)
         )
+
+    @staticmethod
+    async def dependency_targets_async(_description):
+        from .execution.dependencies import dependency_sites
+        from ..utils.io_utils import run_sync_io
+
+        paths = tuple(sys.path)
+        targets = await run_sync_io(
+            dependency_sites,
+            tuple(p for p in paths if p),
+        )
+        prepared = _DependencyTargets(tuple(Path(p) for p in targets), paths)
+        prepared.validate()
+        return prepared
 
     def dependency_environment(self, _description, snapshot):
         from .dependency_context import DependencyEnvironmentContext

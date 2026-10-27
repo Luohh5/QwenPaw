@@ -223,21 +223,27 @@ class _DependencyAdmission:
     released: bool = False
 
 
-def _ensure_plugin_site_on_path(
-    site_dir: Path | None = None,
-) -> None:
-    """Put the plugin-deps site dir on ``sys.path`` (idempotent).
+def _runtime_environment_snapshot(runtime):
+    if runtime is None:
+        return None
+    return (
+        runtime.python_executable,
+        runtime.support_root,
+        tuple(runtime.dependency_paths),
+        runtime.dependency_install_target,
+        json.dumps(runtime.runtime_identity, sort_keys=True),
+    )
 
-    Only relevant for the frozen desktop build, where plugin dependencies are
-    installed into a user-writable target dir; in normal installs they go into
-    the active environment, so this is a no-op.
-    """
-    if not _is_frozen():
-        return
+
+def _prepare_plugin_site_path(site_dir, path_snapshot):
+    """Resolve the complete frozen path edit without touching global state."""
     try:
         target = _plugin_site_dir() if site_dir is None else site_dir
     except Exception:
-        return
+        # Preserve the optional bootstrap path probe; the dependency gate
+        # remains responsible for reporting invalid runtime policy.
+        return None
+    paths = list(path_snapshot)
     if (
         target.parent.name.startswith("bundle-")
         and target.parent.parent.parent == _plugin_runtime_dir()
@@ -245,7 +251,7 @@ def _ensure_plugin_site_on_path(
         bucket = target.parent.parent.resolve()
         active = target.resolve()
         paths = []
-        for entry in sys.path:
+        for entry in path_snapshot:
             path = Path(_norm_realpath(entry))
             managed = path == bucket / "site" or (
                 path.name == "site"
@@ -254,14 +260,45 @@ def _ensure_plugin_site_on_path(
             )
             if not managed or path == active:
                 paths.append(entry)
-        sys.path[:] = paths
     site = str(target)
-    # Expose the dir so plugins that spawn the bundled Python (e.g. the pet
-    # desktop window) can put their installed deps on the child's PYTHONPATH.
+    if site not in paths:
+        paths.insert(0, site)
+    return site, paths
+
+
+def _publish_plugin_site_path(prepared):
+    if prepared is None:
+        return
+    site, paths = prepared
+    sys.path[:] = paths
     os.environ["QWENPAW_PLUGIN_SITE"] = site
-    if site not in sys.path:
-        sys.path.insert(0, site)
     importlib.invalidate_caches()
+
+
+def _ensure_plugin_site_on_path(site_dir=None):
+    if _is_frozen():
+        _publish_plugin_site_path(
+            _prepare_plugin_site_path(site_dir, tuple(sys.path)),
+        )
+
+
+async def _ensure_plugin_site_on_path_async(site_dir=None, *, validate=None):
+    from ..utils.io_utils import run_sync_io
+
+    if not _is_frozen():
+        return
+    paths = tuple(sys.path)
+    site_environment = os.environ.get("QWENPAW_PLUGIN_SITE")
+    prepared = await run_sync_io(_prepare_plugin_site_path, site_dir, paths)
+    if (
+        tuple(sys.path) != paths
+        or os.environ.get("QWENPAW_PLUGIN_SITE") != site_environment
+        or not _is_frozen()
+    ):
+        raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+    if validate is not None:
+        validate()
+    _publish_plugin_site_path(prepared)
 
 
 class PluginLoader:  # pylint: disable=too-many-public-methods
@@ -344,6 +381,35 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             self._channel_backend,
         )
 
+    @classmethod
+    async def create(cls, plugin_dirs, *, channel_runtime=None):
+        """Acquire process lifetime runtime custody before loop publication."""
+        from ..utils.io_utils import run_sync_io
+        from .dependency_maintenance import lease_environment
+
+        if channel_runtime is not None:
+            identity = _runtime_environment_snapshot(channel_runtime)
+            await run_sync_io(lease_environment, identity[2])
+            if _runtime_environment_snapshot(channel_runtime) != identity:
+                raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+        loader = cls(plugin_dirs)
+        if channel_runtime is not None:
+            loader.registry.configure_channel_runtime(channel_runtime)
+        return loader
+
+    async def _publish_dependency_site(self, target):
+        runtime = self.registry.channel_runtime
+        identity = _runtime_environment_snapshot(runtime)
+
+        def validate():
+            if (
+                self.registry.channel_runtime is not runtime
+                or _runtime_environment_snapshot(runtime) != identity
+            ):
+                raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+
+        await _ensure_plugin_site_on_path_async(target, validate=validate)
+
     def _channel_runtime_for(self, manifest):
         return self._channel_backend.runtime_for(manifest)
 
@@ -364,7 +430,6 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             ):
                 raise ValueError("CHANNEL_RUNTIME_MISSING")
             context = DependencyEnvironmentContext.from_runtime(runtime)
-            _ensure_plugin_site_on_path(context.install_target)
             return context
         if snapshot is not None:
             return DependencyEnvironmentContext.from_snapshot(snapshot)
@@ -649,7 +714,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         """
         from ..utils.io_utils import run_sync_io
 
-        _ensure_plugin_site_on_path()
+        await self._publish_dependency_site(None)
         from .execution.dependencies import repair_marker
         from .dependency_maintenance import authorized
 
@@ -910,7 +975,26 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 "Shared runtime requires explicit administrator repair",
             )
         frozen = _is_frozen()
+        runtime = self.registry.channel_runtime
+        runtime_identity = _runtime_environment_snapshot(runtime)
+
+        def validate_runtime_selection():
+            if (
+                self.registry.channel_runtime is not runtime
+                or _runtime_environment_snapshot(runtime) != runtime_identity
+                or _is_frozen() != frozen
+            ):
+                raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+
+        async def publish_site(target):
+            validate_runtime_selection()
+            await _ensure_plugin_site_on_path_async(
+                target,
+                validate=validate_runtime_selection,
+            )
+
         context = await run_sync_io(self._dependency_environment)
+        validate_runtime_selection()
         target = context.install_target
         python = context.python_executable
         support = context.support_root
@@ -951,13 +1035,17 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 ) or not await run_sync_io(selected.is_dir):
                     raise ValueError("CHANNEL_RUNTIME_TARGET_INVALID")
                 target = selected
-            paths = tuple(
-                Path(key)
-                for key in dict.fromkeys(
-                    str(canonical(path)) for path in (*paths, target)
+
+            def resolve_paths():
+                return tuple(
+                    Path(key)
+                    for key in dict.fromkeys(
+                        str(canonical(path)) for path in (*paths, target)
+                    )
                 )
-            )
-            _ensure_plugin_site_on_path(target)
+
+            paths = await run_sync_io(resolve_paths)
+            await publish_site(target)
         await self._stop_preparation(plugin_id)
         cleanup = ExitStack()
         try:
@@ -1113,7 +1201,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     dependency_context=context if frozen else None,
                 )
             if frozen:
-                _ensure_plugin_site_on_path(target)
+                await publish_site(target)
             return GateDecision(False, True, reason="already satisfied")
         except Exception:
             if identity_error is not None:
@@ -1506,9 +1594,25 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
 
         admission = admission or _DependencyAdmission(binding)
         if admission.token is None:
+            prepare = getattr(
+                binding.backend,
+                "dependency_targets_async",
+                None,
+            )
+            prepared = (
+                await prepare(description) if prepare is not None else None
+            )
             hints = getattr(binding.backend, "dependency_targets", None)
-            targets = hints(description) if hints is not None else ()
+            targets = (
+                prepared.targets
+                if prepared is not None
+                else hints(description)
+                if hints is not None
+                else ()
+            )
             async with environment_coordinator(targets):
+                if prepared is not None:
+                    prepared.validate()
                 admission.token = usage.declare(
                     description.dependency_declaration(),
                     pending=pending,
@@ -2719,7 +2823,13 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         if self._has_runtime_custody(plugin_id):
             raise RuntimeError("CHANNEL_INSTANCE_STILL_OWNED; needs_restart")
         try:
-            marker = json.loads(marker_path(plugin_id).read_text())
+            marker = await run_sync_io(
+                lambda: json.loads(marker_path(plugin_id).read_text()),
+            )
+            if self._has_runtime_custody(plugin_id):
+                raise RuntimeError(
+                    "CHANNEL_INSTANCE_STILL_OWNED; needs_restart",
+                )
             with self.registry.runtime_owners.mutation(
                 backup,
                 parse_optional_absolute(marker.get("target_path")),
@@ -3010,7 +3120,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             return failed
         from .updates import live_prepared_backup
 
-        backup = backup or live_prepared_backup(plugin_id)
+        backup = backup or await run_sync_io(live_prepared_backup, plugin_id)
+        if self._has_runtime_custody(plugin_id):
+            failed.errors.append("CHANNEL_INSTANCE_STILL_OWNED; needs_restart")
+            return failed
         if backup is not None and backup.exists():
             try:
                 await self._restore_failed_swap(
@@ -3440,7 +3553,11 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
 
         from .updates import live_prepared_backup
 
-        old_source = live_prepared_backup(plugin_id) or target_dir
+        old_source = (
+            await run_sync_io(live_prepared_backup, plugin_id) or target_dir
+        )
+        if not self.lifecycle.delegate.owns_commit(plugin_id):
+            raise RuntimeError("PLUGIN_OPERATION_SUPERSEDED")
         if await asyncio.to_thread((old_source / "plugin.json").is_file):
             target_manifest_path = await asyncio.to_thread(
                 resolved_plugin_manifest_path,

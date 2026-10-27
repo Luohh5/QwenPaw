@@ -37,24 +37,41 @@ _environment_locks: WeakKeyDictionary = WeakKeyDictionary()
 
 
 @contextlib.asynccontextmanager
-async def async_lock(lock):
-    """Settle threaded acquisition before cancellation releases custody."""
-    from .execution.process import _settle
+async def async_lock(lock, *, on_acquired=None):
+    """Settle fd-based entry and exit; never use thread-affine contexts.
 
-    acquisition = asyncio.create_task(asyncio.to_thread(lock.__enter__))
-    try:
-        await asyncio.shield(acquisition)
-    except asyncio.CancelledError:
+    The custody callback runs in the original task even on late acquisition.
+    """
+    import sys
+    from ..utils.io_utils import run_sync_io
+
+    acquisition = asyncio.create_task(run_sync_io(lock.__enter__))
+    cancelled = False
+    while not acquisition.done():
         try:
-            await _settle(acquisition)
-        finally:
-            if not acquisition.cancelled() and acquisition.exception() is None:
-                lock.__exit__(None, None, None)
-        raise
+            await asyncio.shield(acquisition)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException:
+            break
+    if cancelled:
+        if not acquisition.cancelled() and acquisition.exception() is None:
+            try:
+                if on_acquired is not None:
+                    on_acquired(acquisition.result())
+            finally:
+                await run_sync_io(lock.__exit__, None, None, None)
+        raise asyncio.CancelledError
+    value = acquisition.result()
     try:
-        yield
-    finally:
-        lock.__exit__(None, None, None)
+        if on_acquired is not None:
+            on_acquired(value)
+        yield value
+    except BaseException:
+        if not await run_sync_io(lock.__exit__, *sys.exc_info()):
+            raise
+    else:
+        await run_sync_io(lock.__exit__, None, None, None)
 
 
 @contextlib.asynccontextmanager

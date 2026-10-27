@@ -274,29 +274,7 @@ def instantiate_channel(
                 connection_timeout = 330.0
         try:
             if row.plugin_id == key == "wechat":
-                from ...config.utils import load_config
-                from .wechat_auth_custody import reserve_wechat_auth
-
                 runtime_config = prepared_config.config
-                workspace_id = getattr(workspace_config, "id", None)
-                if not workspace_id:
-                    profiles = load_config().agents.profiles
-                    matches = [
-                        agent_id
-                        for agent_id, profile in profiles.items()
-                        if Path(profile.workspace_dir).expanduser().resolve()
-                        == Path(workspace_dir).expanduser().resolve()
-                    ]
-                    workspace_id = (
-                        matches[0] if len(matches) == 1 else str(workspace_dir)
-                    )
-                claims = reserve_wechat_auth(
-                    plugin_registry,
-                    owner=lease,
-                    workspace_id=workspace_id,
-                    workspace_dir=workspace_dir,
-                    config=runtime_config,
-                )
             plugin_registry.dependency_usage.bind(lease, row.dependency_token)
             channel = row.description_record.create_proxy(
                 process,
@@ -343,6 +321,12 @@ def instantiate_channel(
         channel.bind_dependency_usage(plugin_registry.dependency_usage, lease)
         channel._runtime_lease = lease
         channel._wechat_auth_claims = claims
+        channel._auth_workspace_config = workspace_config
+        channel._auth_config_source = config_source
+        channel._auth_config_snapshot = deepcopy(ch_cfg)
+        channel._auth_settings = settings
+        channel._auth_settings_snapshot = deepcopy(settings)
+        channel._auth_description = row.description_record
         channel._registration = row
         channel._admission_timeout = settings.admission_timeout
         return channel
@@ -1150,6 +1134,113 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
             self._start_task_channels[task] = channel
             task.add_done_callback(self._forget_start_task)
 
+    async def _reserve_channel_auth(self, channel, workspace_config=None):
+        """Acquire claims before publishing or starting an isolated proxy."""
+        if not isinstance(channel, IsolatedChannelProxy):
+            return
+        row = channel._registration
+        if row.plugin_id != "wechat" or channel.channel != "wechat":
+            return
+        from ... import constant
+        from ...utils.io_utils import run_sync_io
+        from .wechat_auth_custody import reserve_wechat_auth_async
+
+        registry = channel._owner_registry
+        owner = channel._runtime_lease
+        if owner not in registry.runtime_owners.leases():
+            raise RuntimeError("CHANNEL_PREPARATION_STALE")
+        config = workspace_config or channel._auth_workspace_config
+        source = channel._auth_config_source
+        config_snapshot = channel._auth_config_snapshot
+        settings = channel._auth_settings_snapshot
+        configured_id = getattr(config, "id", None)
+        workspace = self._workspace
+        manager_config = self._workspace_config
+        manager_dir = self._workspace_dir
+        state_root = constant.WORKING_DIR
+        workspace_dir = channel._workspace_dir
+        runtime_config = dict(channel._launch_spec.config)
+        identity = channel._identity()
+
+        def authorize():
+            current = self._find_channel(channel.channel)
+            if (
+                self._stopping
+                or self._defer_channel_start
+                or self._workspace is not workspace
+                or self._workspace_config is not manager_config
+                or self._workspace_dir != manager_dir
+                or constant.WORKING_DIR != state_root
+                or channel._auth_config_source != source
+                or channel._auth_workspace_config is not config
+                or getattr(config, "id", None) != configured_id
+                or channel_cfg_for_key(config, channel.channel)
+                != config_snapshot
+                or registry.get_channel_catalog_entry(channel.channel)
+                is not row
+                or row.runtime_settings != settings
+                or row.runtime_settings is not channel._auth_settings
+                or row.description_record is not channel._auth_description
+                or channel.channel not in get_available_channels()
+                or not row.runtime_settings.allows(channel.channel)
+                or not row.global_enabled
+                or not channel_enabled(config_snapshot)
+                or dict(channel._launch_spec.config) != runtime_config
+                or channel._workspace_dir != workspace_dir
+                or current not in (None, channel)
+                or channel._identity() != identity
+                or owner not in registry.runtime_owners.leases()
+                or not registry.projector.start_allowed(
+                    "channel",
+                    channel.channel,
+                    row.plugin_id,
+                    self._workspace,
+                )
+            ):
+                raise RuntimeError("CHANNEL_PREPARATION_STALE")
+
+        authorize()
+        if channel._wechat_auth_claims:
+            if any(
+                claim not in registry.runtime_owners.leases()
+                or getattr(
+                    registry.runtime_owners.resource(claim),
+                    "owner",
+                    None,
+                )
+                != owner
+                for claim in channel._wechat_auth_claims
+            ):
+                raise RuntimeError("CHANNEL_PREPARATION_STALE")
+            return
+
+        def resolve_workspace_id():
+            if configured_id:
+                return configured_id
+            from ...config.utils import load_config
+
+            profiles = load_config().agents.profiles
+            directory = Path(workspace_dir).expanduser().resolve()
+            matches = [
+                key
+                for key, profile in profiles.items()
+                if Path(profile.workspace_dir).expanduser().resolve()
+                == directory
+            ]
+            return matches[0] if len(matches) == 1 else str(directory)
+
+        workspace_id = await run_sync_io(resolve_workspace_id)
+        authorize()
+        channel._wechat_auth_claims = await reserve_wechat_auth_async(
+            registry,
+            owner=owner,
+            workspace_id=workspace_id,
+            workspace_dir=workspace_dir,
+            config=runtime_config,
+            working_dir=state_root,
+            authorize=authorize,
+        )
+
     async def _start_existing(self, channel):
         lock = self._channel_lifecycle_locks.setdefault(
             channel.channel,
@@ -1165,6 +1256,7 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
                 return
             try:
                 self._bind_enqueue(channel)
+                await self._reserve_channel_auth(channel)
                 await channel.start()
                 self._started_channels.add(id(channel))
             except BaseException as exc:
@@ -1181,6 +1273,7 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
                     )
 
     async def _start_owned(self, channel):
+        await self._reserve_channel_auth(channel)
         task = asyncio.create_task(channel.start())
         self._start_tasks.add(task)
         self._start_task_channels[task] = channel
@@ -1528,6 +1621,7 @@ class ChannelManager:  # pylint: disable=too-many-public-methods
         )
         registered = False
         try:
+            await self._reserve_channel_auth(channel, effective_config)
             self._attach_runtime(channel)
             if self._workspace is not None:
                 channel.set_workspace(self._workspace, self._command_registry)

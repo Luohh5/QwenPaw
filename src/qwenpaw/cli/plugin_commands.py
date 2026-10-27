@@ -273,10 +273,14 @@ def _offline_channel_transaction(
     from ..plugins.loader import PluginLoader
 
     async def run():
-        loader = PluginLoader(
+        from ..utils.io_utils import run_sync_io
+
+        loader = await PluginLoader.create(
             [config_utils.get_plugins_dir()],
             channel_runtime=(
-                resolve_default_channel_runtime() if source_path else None
+                await run_sync_io(resolve_default_channel_runtime)
+                if source_path
+                else None
             ),
         )
         try:
