@@ -3,6 +3,7 @@
 // with one host fixture so vendor account behavior stays outside core UI.
 import React from "react";
 import { Button, Input, Tooltip } from "antd";
+import * as antdIcons from "@ant-design/icons";
 import {
   act,
   fireEvent,
@@ -42,6 +43,7 @@ beforeAll(async () => {
     value: {
       host: {
         React,
+        antdIcons,
         antd: {
           Button,
           Input,

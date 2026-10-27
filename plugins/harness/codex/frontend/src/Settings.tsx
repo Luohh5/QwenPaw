@@ -1,9 +1,22 @@
 import { getHost, type HarnessSettingsProps } from "@qwenpaw/plugin-sdk";
+import settingsCss from "./Settings.css?inline";
 import { localMessages } from "./locale";
 
 const host = getHost().host;
 const React = host.React;
 const { Button, Input, Tooltip, App } = host.antd;
+const {
+  CheckOutlined,
+  QuestionCircleOutlined,
+  ReloadOutlined,
+  CopyOutlined,
+  ExclamationCircleOutlined,
+  ExportOutlined,
+  LogoutOutlined,
+  ThunderboltOutlined,
+  ApartmentOutlined,
+  SafetyOutlined,
+} = host.antdIcons;
 const BACKEND = "codex";
 interface Status {
   installed: boolean;
@@ -141,13 +154,24 @@ export function Settings({ value, onChange, open }: HarnessSettingsProps) {
     ? text.chatGptAuthenticated
     : text.cliAuthenticated.replace("{{type}}", "Codex");
   return (
-    <div style={{ display: "grid", gap: 12, marginTop: 16 }}>
-      <p>{text.hint}</p>
-      <label>
+    <div className="harness-codex-settings">
+      <style>{settingsCss}</style>
+      <p className="providerHint">{text.hint}</p>
+      <div className="binaryField">
+        <label className="binaryLabel" htmlFor="codex-binary">
+          {text.binary}
+        </label>
         <Tooltip title={text.binaryHelp}>
-          <span>{text.binary}</span>
+          <button
+            type="button"
+            className="helpIcon"
+            aria-label={text.binaryHelp}
+          >
+            <QuestionCircleOutlined aria-hidden="true" />
+          </button>
         </Tooltip>
         <Input
+          id="codex-binary"
           value={String(value.binary ?? "")}
           placeholder={text.binaryPlaceholder}
           allowClear
@@ -161,21 +185,34 @@ export function Settings({ value, onChange, open }: HarnessSettingsProps) {
             })
           }
           suffix={
-            <Button type="text" loading={checking} onClick={() => void check()}>
-              {text.detect}
+            <Button
+              type="text"
+              size="small"
+              aria-label={text.detect}
+              icon={<ReloadOutlined aria-hidden="true" />}
+              loading={checking}
+              onClick={() => void check()}
+            >
+              <span className="detectLabel">{text.detect}</span>
             </Button>
           }
         />
-      </label>
+      </div>
       {status?.runtime_path && (
-        <div>
-          <strong>{text.detected}</strong>{" "}
+        <div className="binaryStatus detected">
+          <strong className="binaryStatusLabel">
+            <CheckOutlined aria-hidden="true" />
+            {text.detected}
+          </strong>{" "}
           <Tooltip title={status.runtime_path}>
-            <code style={{ overflowWrap: "anywhere" }}>
-              {status.runtime_path}
-            </code>
+            <code className="binaryPath">{status.runtime_path}</code>
           </Tooltip>{" "}
           <Button
+            className="copyPathButton"
+            type="text"
+            aria-label={text.copy}
+            title={text.copy}
+            icon={<CopyOutlined aria-hidden="true" />}
             size="small"
             onClick={() =>
               void navigator.clipboard
@@ -183,56 +220,103 @@ export function Settings({ value, onChange, open }: HarnessSettingsProps) {
                 .then(() => message.success(text.copied))
                 .catch(() => message.error(text.copyFailed))
             }
-          >
-            {text.copy}
-          </Button>
+          />
         </div>
       )}
       {!checking && status && !status.installed && (
-        <p role="status">{text.notFound}</p>
+        <p className="binaryStatus notDetected" role="status">
+          <ExclamationCircleOutlined aria-hidden="true" />
+          {text.notFound}
+        </p>
       )}
-      <div>
-        <strong>{text.account}</strong> ·{" "}
-        {status?.authenticated
-          ? `${account}${identity ? ` · ${identity}` : ""}`
-          : text.notConnected}
-        {!status?.authenticated && (
-          <Button
-            disabled={!status?.installed}
-            loading={connecting}
-            onClick={() => void connect()}
+      <div className="accountRow">
+        <div className="accountState">
+          <strong className="accountLabel">{text.account}</strong>
+          <span
+            className={
+              status?.authenticated ? "connectedState" : "disconnectedState"
+            }
           >
-            {text.connect}
-          </Button>
-        )}
-        {true && status?.authenticated && kind === "chatgpt" && (
-          <Button onClick={() => void disconnect()}>{text.disconnect}</Button>
-        )}
+            {status?.authenticated ? (
+              <CheckOutlined aria-hidden="true" />
+            ) : (
+              <ExclamationCircleOutlined aria-hidden="true" />
+            )}
+            {status?.authenticated
+              ? `${account}${identity ? ` · ${identity}` : ""}`
+              : text.notConnected}
+          </span>
+        </div>
+        <div className="accountAction">
+          {!status?.authenticated && (
+            <Button
+              icon={<ExportOutlined aria-hidden="true" />}
+              disabled={!status?.installed}
+              loading={connecting}
+              onClick={() => void connect()}
+            >
+              {text.connect}
+            </Button>
+          )}
+          {true && status?.authenticated && kind === "chatgpt" && (
+            <Button
+              icon={<LogoutOutlined aria-hidden="true" />}
+              onClick={() => void disconnect()}
+            >
+              {text.disconnect}
+            </Button>
+          )}
+        </div>
       </div>
-      {!status?.authenticated && status?.installed && <p>{text.authHint}</p>}
-      {status?.authenticated && <p>{text.chatSettingsHint}</p>}
-      {error && <p role="alert">{error}</p>}
+      {!status?.authenticated && status?.installed && (
+        <p className="authHint">{text.authHint}</p>
+      )}
+      {status?.authenticated && (
+        <p className="chatSettingsHint">{text.chatSettingsHint}</p>
+      )}
+      {error && (
+        <p className="authHint" role="alert">
+          {error}
+        </p>
+      )}
       {status && (
-        <div>
-          <strong>{text.capabilityTitle}</strong>
-          <p>
-            {text.inheritedSkills}:{" "}
-            {status.capabilities?.qwenpaw_skills_projection
-              ? text.runtimeInherited
-              : text.notSupported}
-          </p>
-          <p>
-            {text.inheritedMcp}:{" "}
-            {status.capabilities?.qwenpaw_mcp_projection
-              ? text.runtimeInherited
-              : text.notSupported}
-          </p>
-          <p>
-            {text.policyCompatibility}:{" "}
-            {status.capabilities?.mcp_tool_allowlist
-              ? text.toolAllowlistSupported
-              : text.policyLimited}
-          </p>
+        <div className="capabilityPanel">
+          <strong className="capabilityTitle">{text.capabilityTitle}</strong>
+          <div className="capabilityGrid">
+            <div className="capabilityItem">
+              <ThunderboltOutlined aria-hidden="true" />
+              <span>
+                <strong>{text.inheritedSkills}</strong>
+                <small>
+                  {status.capabilities?.qwenpaw_skills_projection
+                    ? text.runtimeInherited
+                    : text.notSupported}
+                </small>
+              </span>
+            </div>
+            <div className="capabilityItem">
+              <ApartmentOutlined aria-hidden="true" />
+              <span>
+                <strong>{text.inheritedMcp}</strong>
+                <small>
+                  {status.capabilities?.qwenpaw_mcp_projection
+                    ? text.runtimeInherited
+                    : text.notSupported}
+                </small>
+              </span>
+            </div>
+            <div className="capabilityItem">
+              <SafetyOutlined aria-hidden="true" />
+              <span>
+                <strong>{text.policyCompatibility}</strong>
+                <small>
+                  {status.capabilities?.mcp_tool_allowlist
+                    ? text.toolAllowlistSupported
+                    : text.policyLimited}
+                </small>
+              </span>
+            </div>
+          </div>
         </div>
       )}
     </div>

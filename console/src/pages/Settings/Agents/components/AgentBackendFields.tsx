@@ -1,6 +1,6 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { Form, Input } from "antd";
-import { Blocks, PawPrint, SquareTerminal } from "lucide-react";
+import { Blocks, Check, PawPrint, SquareTerminal } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import {
@@ -60,6 +60,7 @@ export function AgentBackendFields({ form, open }: AgentBackendFieldsProps) {
           className={`${styles.typeCard} ${
             backend === "qwenpaw" ? styles.selected : ""
           }`}
+          aria-pressed={backend === "qwenpaw"}
           onClick={() => select("qwenpaw")}
         >
           <span className={styles.typeIcon}>
@@ -69,12 +70,14 @@ export function AgentBackendFields({ form, open }: AgentBackendFieldsProps) {
             <strong>{t("agent.backend.nativeTitle")}</strong>
             <small>{t("agent.backend.nativeDescription")}</small>
           </span>
+          <span className={styles.radioMark} aria-hidden="true" />
         </button>
         <button
           type="button"
           className={`${styles.typeCard} ${
             backend !== "qwenpaw" ? styles.selected : ""
           }`}
+          aria-pressed={backend !== "qwenpaw"}
           onClick={() => setShowPlugins(true)}
         >
           <span className={styles.typeIcon}>
@@ -84,10 +87,15 @@ export function AgentBackendFields({ form, open }: AgentBackendFieldsProps) {
             <strong>{t("agent.backend.thirdPartyTitle")}</strong>
             <small>{t("agent.backend.thirdPartyDescription")}</small>
           </span>
+          <span className={styles.radioMark} aria-hidden="true" />
         </button>
       </div>
       {(showPlugins || backend !== "qwenpaw") && (
         <div className={styles.thirdPartyPanel}>
+          <div className={styles.panelHeading}>
+            <h4>{t("agent.backend.providerTitle")}</h4>
+            <p>{t("agent.backend.providerDescription")}</p>
+          </div>
           <div className={styles.providerGrid}>
             {rows
               .filter((row) => row.id !== "qwenpaw")
@@ -96,17 +104,31 @@ export function AgentBackendFields({ form, open }: AgentBackendFieldsProps) {
                   type="button"
                   key={row.id}
                   disabled={row.status !== "available"}
+                  aria-pressed={backend === row.id}
                   className={
-                    backend === row.id
+                    row.status !== "available"
+                      ? styles.providerCardDisabled
+                      : backend === row.id
                       ? styles.providerCardSelected
                       : styles.providerCard
                   }
                   onClick={() => select(row.id)}
                 >
-                  <SquareTerminal size={18} />
-                  <span>{row.label}</span>
-                  {row.status !== "available" && (
-                    <small>{t(`agent.backend.states.${row.status}`)}</small>
+                  <span className={styles.providerIcon}>
+                    <SquareTerminal size={18} />
+                  </span>
+                  <span className={styles.providerCopy}>
+                    <strong>{row.label}</strong>
+                    {row.status !== "available" && (
+                      <small>{t(`agent.backend.states.${row.status}`)}</small>
+                    )}
+                  </span>
+                  {backend === row.id && (
+                    <Check
+                      size={15}
+                      className={styles.providerCheck}
+                      aria-hidden="true"
+                    />
                   )}
                 </button>
               ))}
