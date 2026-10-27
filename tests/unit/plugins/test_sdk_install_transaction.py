@@ -271,6 +271,7 @@ def test_sdk_transitive_dependency_cannot_replace_an_installed_distribution(
     """A real isolated resolver sees parent -> loaded child, without installation."""
     import base64
     import hashlib
+    import importlib.metadata
     import os
     import subprocess
     import zipfile
@@ -307,10 +308,16 @@ def test_sdk_transitive_dependency_cannot_replace_an_installed_distribution(
 
     child = wheel("sdk_loaded_child", "1.0")
     wheel("sdk_loaded_child", "2.0")
-    installer = (
-        "pip" if change in {"same-version-source", "pip-version"} else "uv"
-    )
-    python, library = dependency_python(tmp_path / "venv", installer=installer)
+    # The wheel transaction resolves every root, including the TLS CA bundle.
+    certifi = importlib.metadata.distribution("certifi")
+    with zipfile.ZipFile(
+        wheels / f"certifi-{certifi.version}-py3-none-any.whl",
+        "w",
+    ) as archive:
+        for entry in certifi.files:
+            if entry.suffix != ".pyc":
+                archive.write(certifi.locate_file(entry), entry.as_posix())
+    python, library = dependency_python(tmp_path / "venv")
     with zipfile.ZipFile(child) as archive:
         archive.extractall(library)
     if change == "same-version-source":
@@ -463,6 +470,7 @@ asyncio.run(main())
     env.update(
         QWENPAW_WORKING_DIR=str(tmp_path / "bootstrap"),
         QWENPAW_SECRET_DIR=str(tmp_path / "bootstrap-secrets"),
+        QWENPAW_DEPENDENCY_STATE_DIR=str(tmp_path / "dependency-state"),
         PIP_NO_INDEX="1",
         UV_NO_INDEX="1",
         PIP_FIND_LINKS=str(wheels),

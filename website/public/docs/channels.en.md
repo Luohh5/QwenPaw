@@ -10,7 +10,6 @@ Two ways to configure channels:
 
 Below is how to get credentials and fill config for each channel.
 
-
 ---
 
 ## DingTalk (recommended)

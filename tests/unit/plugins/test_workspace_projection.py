@@ -399,6 +399,7 @@ class _BootChannel(BaseChannel):
     uses_manager_queue = False
 
     def __init__(self, ignore_cancel):
+        super().__init__(_noop_process)
         self.entered, self.release = asyncio.Event(), asyncio.Event()
         self.ignore_cancel = ignore_cancel
         self.alive = False
@@ -640,6 +641,7 @@ async def channel_plugin(tmp_path, monkeypatch, fresh_registry):
         uses_manager_queue = False
 
         def __init__(self):
+            super().__init__(_noop_process)
             self.alive = False
             self.starts = 0
             self.stops = 0
