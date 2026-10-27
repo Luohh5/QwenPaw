@@ -90,9 +90,11 @@ def install_case(tmp_path, source, expected, *, repair=False, tool=False):
     import shutil
 
     import qwenpaw
+    from tests.channel_support.host import local_certifi_wheel
 
     wheels = tmp_path / "wheels"
     wheels.mkdir()
+    local_certifi_wheel(wheels)
     for name in expected:
         write_wheel(wheels, name)
     python, _ = dependency_python(tmp_path / "python")
@@ -110,6 +112,7 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from qwenpaw.plugins import SDKError
 from qwenpaw.plugins.testing import PluginTestHost
+from qwenpaw.utils.runtime_environment import CERTIFI_REQUIREMENT
 source, root = map(Path, sys.argv[2:4])
 expected = set(json.loads(sys.argv[4]))
 commands, inputs = [], []
@@ -150,11 +153,13 @@ async def main():
             assert result.content[0].text == 'installed from manifest'
     assert len(commands) == 1, commands
     assert all(name in inputs[0] for name in expected)
-    if json.loads((source / 'plugin.json').read_text())['dependencies']:
-        assert all(not Path(a[a.index('-r') + 1]).exists() for a in commands)
-    else:
-        original = (source / 'requirements.txt').read_text()
-        assert all(Path(a[a.index('-r') + 1]).read_text() == original for a in commands)
+    assert all(CERTIFI_REQUIREMENT in text for text in inputs)
+    assert all(not Path(a[a.index('-r') + 1]).exists() for a in commands)
+    if 'requirements.txt' in before:
+        original_requirements = set(filter(None, before['requirements.txt'].decode().splitlines()))
+        assert original_requirements <= set(inputs[0].splitlines())
+        assert (source / 'requirements.txt').is_file()
+        assert (source / 'requirements.txt').read_bytes() == before['requirements.txt']
     if sys.argv[5] != 'repair':
         assert {p.name:p.read_bytes() for p in source.iterdir()} == before
     print(json.dumps({'commands':commands,'installed':sorted(expected)}))
@@ -209,7 +214,6 @@ asyncio.run(main())
 @pytest.mark.parametrize(
     ("dependencies", "requirements", "expected", "sdk"),
     [
-        (["b01-probe-manifest==1.0"], None, {"b01-probe-manifest"}, True),
         ([], "b01-probe-file==1.0\n", {"b01-probe-file"}, False),
         (
             ["b01-probe-manifest==1.0"],

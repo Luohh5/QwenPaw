@@ -929,6 +929,8 @@ def test_offline_force_dependency_failure_preserves_old(
         requirements_file,
         *,
         source_path,
+        wheel_tags=None,
+        dependency_context=None,
     ):
         calls.append((requirements_file, plugin_id, target))
         assert requirements_file == source / "requirements.txt"
@@ -1110,3 +1112,70 @@ def test_offline_force_install_respects_durable_commit(
         assert saved["status"] == "committed"
         backup = Path(saved["backup_path"])
         assert (backup / "user.txt").read_text() == "old data"
+
+
+@pytest.mark.parametrize("action", ["status", "cancel", "apply"])
+def test_offline_dependency_operation_uses_one_async_loader(
+    monkeypatch,
+    offline_environment,
+    action,
+):
+    import asyncio
+    import threading
+    from qwenpaw.plugins import channel_bootstrap, dependency_upgrade
+    from qwenpaw.plugins.loader import PluginLoader
+
+    runtime, loader = object(), object()
+    loop_thread = threading.get_ident()
+    events, loops = [], []
+
+    def resolve():
+        assert threading.get_ident() != loop_thread
+        events.append("resolve")
+        return runtime
+
+    async def create(directories, *, channel_runtime):
+        assert channel_runtime is runtime
+        assert directories == [offline_environment]
+        loops.append(asyncio.get_running_loop())
+        events.append("create")
+        return loader
+
+    class Manager:
+        def __init__(self, selected):
+            assert selected is loader
+            assert asyncio.get_running_loop() is loops[0]
+            events.append("manager")
+
+        def status(self, operation_id):
+            assert threading.get_ident() != loop_thread
+            assert operation_id == "operation"
+            events.append(action)
+            return {"id": operation_id, "status": "cancelled"}
+
+        cancel = status
+
+        async def apply(self, operation_id):
+            assert asyncio.get_running_loop() is loops[0]
+            assert operation_id == "operation"
+            events.append("apply")
+            return {"id": operation_id, "status": "applied"}
+
+    monkeypatch.setattr(
+        channel_bootstrap,
+        "resolve_default_channel_runtime",
+        resolve,
+    )
+    monkeypatch.setattr(PluginLoader, "create", create)
+    monkeypatch.setattr(
+        dependency_upgrade,
+        "DependencyUpgradeManager",
+        Manager,
+    )
+    result = CliRunner().invoke(
+        pc.plugin,
+        ["dependency-upgrade", action, "operation"],
+    )
+    assert result.exit_code == 0, result.output
+    assert events == ["resolve", "create", "manager", action]
+    assert len(loops) == 1 and loops[0].is_closed()

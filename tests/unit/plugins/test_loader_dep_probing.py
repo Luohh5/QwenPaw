@@ -472,9 +472,11 @@ async def test_mutable_missing_pip_is_rechecked_and_reaudited_after_bootstrap(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["ready", "changed", "cancel"])
 async def test_async_loader_leases_before_loop_registry_publication(
     tmp_path,
     monkeypatch,
+    action,
 ):
     import asyncio
     import threading
@@ -522,16 +524,136 @@ async def test_async_loader_leases_before_loop_registry_publication(
         assert await asyncio.to_thread(started.wait, 2)
         assert events == ["lease"]
         assert not creation.done()
+        if action == "changed":
+            runtime.runtime_identity["protocol"] = 2
+        elif action == "cancel":
+            creation.cancel()
+            await asyncio.sleep(0)
+            assert not creation.done()
     finally:
         release.set()
+    if action != "ready":
+        expected = (
+            pytest.raises(asyncio.CancelledError)
+            if action == "cancel"
+            else pytest.raises(RuntimeError, match="IDENTITY_CHANGED")
+        )
+        with expected:
+            await asyncio.wait_for(creation, 5)
+        assert events == ["lease"]
+        return
     result = await asyncio.wait_for(creation, 5)
     assert isinstance(result.registry, Registry)
     assert events == ["lease", "registry", "publish"]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["identity", "origin"])
+@pytest.mark.parametrize(
+    "change,expected",
+    [
+        ("stable", "imported"),
+        ("missing", "empty"),
+        ("no_file", "imported"),
+        ("empty_no_file", "empty"),
+        ("unrelated_addition", "imported"),
+        ("unrelated_removal", "imported"),
+        ("unrelated_identity", "imported"),
+        ("unrelated_origin", "imported"),
+        ("order", "imported"),
+        ("identity", "stale"),
+        ("origin", "stale"),
+        ("origin_into", "stale"),
+        ("removal", "stale"),
+        ("addition", "stale"),
+    ],
+)
 async def test_dependency_import_resolution_rejects_changed_module(
+    tmp_path,
+    monkeypatch,
+    change,
+    expected,
+):
+    import asyncio
+    import sys
+    import threading
+    from types import ModuleType
+    from qwenpaw.plugins import dependency_transaction as transaction
+    from qwenpaw.utils import io_utils
+
+    name, unrelated = "_qwenpaw_stale_dependency_test", "_qwenpaw_other_import"
+    source, other = tmp_path / "sdk.py", tmp_path / "other.py"
+    if change != "missing":
+        source.touch()
+    other.touch()
+    module, outside = ModuleType(name), ModuleType(unrelated)
+    module.__file__ = str(other if change == "origin_into" else source)
+    outside.__file__ = str(other)
+    if change != "addition":
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setitem(sys.modules, unrelated, outside)
+    started, release = threading.Event(), threading.Event()
+    offload, canonical = io_utils.run_sync_io, transaction.canonical
+    loop_thread = threading.get_ident()
+
+    def resolve(path):
+        assert threading.get_ident() != loop_thread
+        return canonical(path)
+
+    async def paused(operation, *args, **kwargs):
+        def worker():
+            result = operation(*args, **kwargs)
+            started.set()
+            assert release.wait(3)
+            return result
+
+        return await offload(worker)
+
+    monkeypatch.setattr(transaction, "canonical", resolve)
+    monkeypatch.setattr(io_utils, "run_sync_io", paused)
+    probe = asyncio.create_task(
+        transaction.imported_changes_async(
+            {"old": {} if change == "empty_no_file" else {str(source): {}}},
+        ),
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        if change == "order":
+            sys.modules[name] = sys.modules.pop(name)
+        elif change in {"no_file", "empty_no_file", "unrelated_addition"}:
+            added = ModuleType("_qwenpaw_added_import")
+            if change == "unrelated_addition":
+                added.__file__ = str(other)
+            monkeypatch.setitem(sys.modules, added.__name__, added)
+        elif change in {"removal", "unrelated_removal"}:
+            del sys.modules[name if change == "removal" else unrelated]
+        elif change in {"identity", "addition", "unrelated_identity"}:
+            replacement = ModuleType(
+                unrelated if change == "unrelated_identity" else name,
+            )
+            replacement.__file__ = str(
+                other if change == "unrelated_identity" else source,
+            )
+            monkeypatch.setitem(sys.modules, replacement.__name__, replacement)
+        elif change == "origin":
+            module.__file__ = str(other)
+        elif change == "origin_into":
+            module.__file__ = str(source)
+        elif change == "unrelated_origin":
+            outside.__file__ = str(tmp_path / "missing.py")
+    finally:
+        release.set()
+    if expected == "stale":
+        with pytest.raises(RuntimeError, match="DEPENDENCY_PLAN_STALE"):
+            await asyncio.wait_for(probe, 5)
+    else:
+        assert await asyncio.wait_for(probe, 5) == (
+            [name] if expected == "imported" else []
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["unrelated", "relevant", "continuous"])
+async def test_dependency_import_resolution_checks_supplemental_changes(
     tmp_path,
     monkeypatch,
     change,
@@ -541,51 +663,94 @@ async def test_dependency_import_resolution_rejects_changed_module(
     import threading
     from types import ModuleType
     from qwenpaw.plugins import dependency_transaction as transaction
+    from qwenpaw.utils import io_utils
 
-    name = "_qwenpaw_stale_dependency_test"
-    source = str(tmp_path / "sdk.py")
-    module = ModuleType(name)
-    module.__file__ = source
-    monkeypatch.setitem(sys.modules, name, module)
-    original = transaction._imported_changes
-    started, release = threading.Event(), threading.Event()
-    loop_thread = threading.get_ident()
+    source = tmp_path / "sdk.py"
+    source.touch()
+    others = [tmp_path / f"other_{index}.py" for index in range(8)]
+    for other in others:
+        other.touch()
+    loop = asyncio.get_running_loop()
+    offload = io_utils.run_sync_io
+    passes = 0
 
-    def resolve(payload, modules):
-        assert threading.get_ident() != loop_thread
-        started.set()
-        assert release.wait(3)
-        return original(payload, modules)
-
-    monkeypatch.setattr(transaction, "_imported_changes", resolve)
-    probe = asyncio.create_task(
-        transaction.imported_changes_async({"old": {source: {}}}),
-    )
-    try:
-        assert await asyncio.to_thread(started.wait, 2)
-        if change == "origin":
-            module.__file__ = str(tmp_path / "replacement.py")
-        else:
-            replacement = ModuleType(name)
-            replacement.__file__ = source
-            sys.modules[name] = replacement
-    finally:
+    def change_module(release):
+        if passes <= 2 or change == "continuous":
+            module = ModuleType("_qwenpaw_supplemental_import")
+            module.__file__ = str(
+                source
+                if change == "relevant" and passes == 2
+                else others[passes - 1],
+            )
+            monkeypatch.setitem(sys.modules, module.__name__, module)
         release.set()
-    with pytest.raises(RuntimeError, match="DEPENDENCY_PLAN_STALE"):
-        await asyncio.wait_for(probe, 5)
+
+    async def paused(operation, *args, **kwargs):
+        def worker():
+            nonlocal passes
+            result = operation(*args, **kwargs)
+            passes += 1
+            assert passes <= 8, "import validation retried without a bound"
+            release = threading.Event()
+            loop.call_soon_threadsafe(change_module, release)
+            assert release.wait(3)
+            return result
+
+        return await offload(worker)
+
+    monkeypatch.setattr(io_utils, "run_sync_io", paused)
+    probe = transaction.imported_changes_async({"old": {str(source): {}}})
+    if change == "unrelated":
+        assert await asyncio.wait_for(probe, 5) == []
+    else:
+        with pytest.raises(RuntimeError, match="DEPENDENCY_PLAN_STALE"):
+            await asyncio.wait_for(probe, 5)
+    assert passes >= 2
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["python", "channel"])
 async def test_async_dependency_targets_reject_changed_host_paths(
     tmp_path,
     monkeypatch,
+    kind,
 ):
     import sys
     from qwenpaw.plugins.python_backend import PythonBackend
 
-    backend = PythonBackend(SimpleNamespace())
-    admission = await backend.dependency_targets_async(None)
-    monkeypatch.setattr(sys, "path", [*sys.path, str(tmp_path / "new-site")])
+    from qwenpaw.plugins.channel_adapter import (
+        ChannelBackend,
+        ChannelRuntimeSettings,
+    )
+
+    runtime = ChannelRuntimeSettings(
+        python_executable=sys.executable,
+        support_root=tmp_path,
+        qwenpaw_version="test",
+        selected_channels=None,
+        dependency_paths=(tmp_path / "site",),
+    )
+    selection = SimpleNamespace(runtime=runtime)
+    backend = (
+        PythonBackend(SimpleNamespace())
+        if kind == "python"
+        else ChannelBackend(
+            SimpleNamespace(runtime_settings=lambda: selection.runtime),
+        )
+    )
+    admission = await backend.prepare_dependency_targets(
+        SimpleNamespace(id="test"),
+    )
+    admission.validate()
+    if kind == "python":
+        monkeypatch.setattr(
+            sys,
+            "path",
+            [*sys.path, str(tmp_path / "new-site")],
+        )
+    else:
+        assert admission.targets == (tmp_path / "site",)
+        selection.runtime = None
     with pytest.raises(RuntimeError, match="IDENTITY_CHANGED"):
         admission.validate()
 
@@ -612,6 +777,7 @@ async def test_frozen_dependency_path_preparation_and_loop_publication(
     monkeypatch.setenv("QWENPAW_PLUGIN_SITE", "before")
     monkeypatch.setattr(loader_mod, "_is_frozen", lambda: True)
     monkeypatch.setattr(loader_mod, "_plugin_runtime_dir", lambda: root)
+    loader = loader_mod.PluginLoader([tmp_path])
     loop_thread = threading.get_ident()
     started, release = threading.Event(), threading.Event()
     prepare = loader_mod._prepare_plugin_site_path
@@ -636,7 +802,7 @@ async def test_frozen_dependency_path_preparation_and_loop_publication(
     monkeypatch.setattr(loader_mod, "_prepare_plugin_site_path", resolve)
     monkeypatch.setattr(loader_mod, "_publish_plugin_site_path", commit)
     pending = asyncio.create_task(
-        loader_mod._ensure_plugin_site_on_path_async(target),
+        loader._publish_dependency_site(target),
     )
     try:
         assert await asyncio.to_thread(started.wait, 2)

@@ -209,7 +209,7 @@ async def test_group_requires_native_mention_and_uses_shared_group_identity(
     mentioned,
     admitted,
 ):
-    _, peer, _, _, _ = azure
+    _, peer, identity, _, external = azure
     assert await post(azure, activity(group, mentioned)) == 200
     assert bool(peer.batches) is admitted
     if admitted:
@@ -222,27 +222,21 @@ async def test_group_requires_native_mention_and_uses_shared_group_identity(
         assert event["metadata"]["bot_mentioned"] is True
         assert event["content_parts"] == [{"type": "text", "text": "hello"}]
 
-
-async def test_reply_uses_authenticated_connector_token_and_exact_conversation(
-    azure,
-):
-    _, peer, identity, _, external = azure
-    assert await post(azure, activity(True, True)) == 200
-    handle = peer.batches[0]["events"][0]["response_handle"]
-    assert (await send(peer, identity, handle))["state"] == "acknowledged"
-    method, url, kwargs = external.requests[-1]
-    assert (
-        method == "POST"
-        and url
-        == SERVICE + "/v3/conversations/conversation-ABCDEFGHIJ/activities"
-    )
-    assert kwargs["headers"] == {"Authorization": "Bearer connector-token"}
-    assert kwargs["json"] == {
-        "type": "message",
-        "from": {"id": "native-bot"},
-        "text": "native answer",
-    }
-    assert kwargs["allow_redirects"] is False
+        handle = peer.batches[0]["events"][0]["response_handle"]
+        assert (await send(peer, identity, handle))["state"] == "acknowledged"
+        method, url, kwargs = external.requests[-1]
+        assert (
+            method == "POST"
+            and url
+            == SERVICE + "/v3/conversations/conversation-ABCDEFGHIJ/activities"
+        )
+        assert kwargs["headers"] == {"Authorization": "Bearer connector-token"}
+        assert kwargs["json"] == {
+            "type": "message",
+            "from": {"id": "native-bot"},
+            "text": "native answer",
+        }
+        assert kwargs["allow_redirects"] is False
 
 
 async def test_invalid_audience_or_service_binding_never_admits(azure):

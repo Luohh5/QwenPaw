@@ -584,14 +584,27 @@ def _module_snapshot():
     )
 
 
+def _imported_origins(owned, origins):
+    return {
+        value: Path(value).is_file() and str(canonical(value)) in owned
+        for value in origins
+    }
+
+
+def _imported_observation(old, modules):
+    owned = {str(canonical(path)) for path in old}
+    origins = {
+        value for _name, _module, value in modules if isinstance(value, str)
+    }
+    return owned, _imported_origins(owned, origins)
+
+
 def _imported_changes(payload, modules):
-    owned = {str(canonical(path)) for path in payload["old"]}
+    _owned, origins = _imported_observation(tuple(payload["old"]), modules)
     return [
         name
         for name, _module, value in modules
-        if isinstance(value, str)
-        and Path(value).is_file()
-        and str(canonical(value)) in owned
+        if isinstance(value, str) and origins[value]
     ]
 
 
@@ -601,21 +614,51 @@ def imported_changes(payload):
 
 
 async def imported_changes_async(payload):
-    """Resolve detached origins, rejecting imports changed across the await."""
+    """Reject changed imports only when their origins affect owned files."""
     from ..utils.io_utils import run_sync_io
 
     modules = _module_snapshot()
-    result = await run_sync_io(_imported_changes, payload, modules)
-    current = _module_snapshot()
-    if len(current) != len(modules) or any(
-        name != now_name or module is not now_module or origin != now_origin
-        for (name, module, origin), (now_name, now_module, now_origin) in zip(
-            modules,
-            current,
+    owned, origins = await run_sync_io(
+        _imported_observation,
+        tuple(payload["old"]),
+        modules,
+    )
+    result = [
+        name
+        for name, _module, value in modules
+        if isinstance(value, str) and origins[value]
+    ]
+    previous = {name: (module, value) for name, module, value in modules}
+    changed_origins = set()
+    # Resolve new origins at most twice, then validate the final snapshot.
+    for attempt in range(3):
+        current = {
+            name: (module, value) for name, module, value in _module_snapshot()
+        }
+        for name in previous.keys() | current.keys():
+            before, after = previous.get(name), current.get(name)
+            if (
+                before is not None
+                and after is not None
+                and before[0] is after[0]
+                and before[1] == after[1]
+            ):
+                continue
+            for entry in (before, after):
+                if entry is not None and isinstance(entry[1], str):
+                    changed_origins.add(entry[1])
+        if any(origins.get(value, False) for value in changed_origins):
+            break
+        unresolved = changed_origins - origins.keys()
+        if not unresolved:
+            return result
+        if attempt == 2:
+            break
+        origins.update(
+            await run_sync_io(_imported_origins, owned, unresolved),
         )
-    ):
-        raise RuntimeError("DEPENDENCY_PLAN_STALE: host imports changed")
-    return result
+        previous = current
+    raise RuntimeError("DEPENDENCY_PLAN_STALE: host imports changed")
 
 
 @contextmanager

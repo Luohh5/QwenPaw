@@ -13,6 +13,8 @@ import json
 from pathlib import Path
 import zipfile
 
+import pytest
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT_FILE = (
     REPOSITORY_ROOT / "scripts" / "pack" / "generate_plugin_metadata.py"
@@ -37,8 +39,9 @@ def _write_plugin(
     plugins_root: Path,
     manifest: dict,
     files: list[str],
+    category: str = "apps",
 ) -> Path:
-    plugin_dir = plugins_root / "apps" / manifest["id"]
+    plugin_dir = plugins_root / category / manifest["id"]
     plugin_dir.mkdir(parents=True)
     (plugin_dir / "plugin.json").write_text(
         json.dumps(manifest),
@@ -83,13 +86,31 @@ def test_complete_plugin_packs_and_reports_no_failures(tmp_path) -> None:
     assert (tmp_path / "dist" / "apps" / "demo" / "demo-1.0.0.zip").is_file()
 
 
-def test_missing_entry_file_fails_the_pack(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "category,manifest,files",
+    [
+        ("apps", _manifest(), ["backend/main.py"]),
+        (
+            "channel",
+            _manifest(
+                id="demo-channel",
+                version="0.1.0",
+                type="channel",
+                entry={"backend": "plugin.py"},
+            ),
+            [],
+        ),
+    ],
+    ids=["app-frontend", "channel-backend"],
+)
+def test_missing_entry_file_fails_the_pack(
+    tmp_path,
+    category,
+    manifest,
+    files,
+) -> None:
     plugins_root = tmp_path / "plugins"
-    _write_plugin(
-        plugins_root,
-        _manifest(),
-        ["backend/main.py"],  # ui/dist/index.js is never built
-    )
+    _write_plugin(plugins_root, manifest, files, category=category)
 
     index, failed = packer.discover_and_pack(
         plugins_root,
@@ -97,9 +118,9 @@ def test_missing_entry_file_fails_the_pack(tmp_path) -> None:
         "/files/plugins",
     )
 
-    assert failed == ["demo"]
+    assert failed == [manifest["id"]]
     assert index["files"] == {}
-    assert not (tmp_path / "dist" / "apps" / "demo").exists()
+    assert not (tmp_path / "dist" / category / manifest["id"]).exists()
 
 
 def test_missing_pack_requires_artifact_fails_the_pack(
@@ -150,8 +171,6 @@ def test_required_relpaths_merges_entries_and_drops_unsafe() -> None:
 
 def _write_channel(plugins_root: Path, plugin_id="demo-channel", **settings):
     """Create a channel source without depending on a real platform SDK."""
-    plugin_dir = plugins_root / "channel" / plugin_id
-    plugin_dir.mkdir(parents=True)
     manifest = {
         "id": plugin_id,
         "version": "0.1.0",
@@ -159,10 +178,7 @@ def _write_channel(plugins_root: Path, plugin_id="demo-channel", **settings):
         "entry": {"backend": "plugin.py"},
         **settings,
     }
-    (plugin_dir / "plugin.json").write_text(
-        json.dumps(manifest),
-        encoding="utf-8",
-    )
+    plugin_dir = _write_plugin(plugins_root, manifest, [], category="channel")
     (plugin_dir / "plugin.py").write_text(
         "plugin = object()\n",
         encoding="utf-8",
@@ -199,18 +215,3 @@ def test_channel_discovery_builds_archive_and_channel_metadata(tmp_path):
         }
         assert zipped.read("demo-channel/plugin.py") == b"plugin = object()\n"
     assert not (tmp_path / "dist/channel/private-channel").exists()
-
-
-def test_channel_discovery_rejects_missing_entry(tmp_path):
-    plugins_root = tmp_path / "plugins"
-    (_write_channel(plugins_root) / "plugin.py").unlink()
-
-    index, failed = packer.discover_and_pack(
-        plugins_root,
-        tmp_path / "dist",
-        "/files/plugins",
-    )
-
-    assert failed == ["demo-channel"]
-    assert index["files"] == {}
-    assert not (tmp_path / "dist/channel/demo-channel").exists()

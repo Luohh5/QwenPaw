@@ -13,7 +13,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Callable
 
-from .execution_backend import DefinitionResult, PluginDescription
+from .execution_backend import (
+    DefinitionResult,
+    PluginDescription,
+    PreparedDependencyTargets,
+)
 from .lifecycle import PluginState, ReloadReport
 from .module_isolation import (
     build_plugin_builtins,
@@ -29,16 +33,6 @@ from .module_isolation import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class _DependencyTargets:
-    targets: tuple
-    path_snapshot: tuple
-
-    def validate(self):
-        if tuple(sys.path) != self.path_snapshot:
-            raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
 
 
 class _EntryPointNotFoundError(FileNotFoundError):
@@ -250,17 +244,7 @@ class PythonBackend:
         )
 
     @staticmethod
-    def dependency_targets(_description):
-        """Host roots are admission hints for this host-importing backend."""
-        from .execution.dependencies import dependency_sites
-
-        return tuple(
-            Path(path)
-            for path in dependency_sites(path for path in sys.path if path)
-        )
-
-    @staticmethod
-    async def dependency_targets_async(_description):
+    async def prepare_dependency_targets(_description):
         from .execution.dependencies import dependency_sites
         from ..utils.io_utils import run_sync_io
 
@@ -269,7 +253,15 @@ class PythonBackend:
             dependency_sites,
             tuple(p for p in paths if p),
         )
-        prepared = _DependencyTargets(tuple(Path(p) for p in targets), paths)
+
+        def validate():
+            if tuple(sys.path) != paths:
+                raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+
+        prepared = PreparedDependencyTargets(
+            tuple(Path(p) for p in targets),
+            validate,
+        )
         prepared.validate()
         return prepared
 
@@ -340,15 +332,22 @@ class PythonBackend:
                 raise RuntimeError("; ".join(failed.errors))
         return await self.audit_dependencies(description)
 
-    async def audit_dependencies(self, description):
+    async def audit_dependencies(
+        self,
+        description,
+        *,
+        context=None,
+        validate=None,
+    ):
         """Read this host's metadata without importing candidate modules."""
         from ..utils.io_utils import run_sync_io
         from .execution.dependencies import observe_dependencies
 
-        context = None
         factory = getattr(self.services, "dependency_environment", None)
-        if factory is not None:
+        if context is None and factory is not None:
             context = await run_sync_io(factory)
+        if validate is not None:
+            validate()
         for _ in range(2):
             cwd = os.getcwd()
             paths = _host_paths(cwd)
@@ -360,6 +359,8 @@ class PythonBackend:
                     "dependency_paths": (),
                 },
             )
+            if validate is not None:
+                validate()
             if context is not None and context.runtime_identity is not None:
                 from .channel_bootstrap import validate_runtime_identity
 

@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 import hashlib
 import json
-from typing import TYPE_CHECKING, Mapping, Protocol
+from typing import TYPE_CHECKING, Callable, Mapping, Protocol
 
 from .architecture import PluginManifest, PluginRecord, PluginType
 
@@ -78,11 +78,20 @@ class DefinitionResult:
     dependency_snapshot: object | None = None
 
 
+@dataclass(frozen=True)
+class PreparedDependencyTargets:
+    """Coordination hints and a synchronous, I/O-free freshness check."""
+
+    targets: tuple[Path, ...]
+    validate: Callable[[], None]
+
+
 class ExecutionBackend(Protocol):
     """Execution behavior without directory commits or lifecycle ownership.
 
-    Executable admission additionally uses optional dependency_targets and
-    audit_dependencies capabilities. Static discovery needs neither hook.
+    Executable admission uses optional async prepare_dependency_targets,
+    returning PreparedDependencyTargets. Missing hints never replace the
+    required audit_dependencies evidence. Static discovery needs neither hook.
     Optional dependency_environment(description, snapshot) selects host-owned
     installer policy independently of actual consumer audit evidence.
     Optional validate_config_update(description, config) checks eligibility

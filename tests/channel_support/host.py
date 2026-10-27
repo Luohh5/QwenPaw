@@ -59,7 +59,9 @@ async def saved_texts(ws, room, user="alice"):
 
 
 class Host:
-    def __init__(self, directory, monkeypatch):
+    @classmethod
+    async def create(cls, directory, monkeypatch):
+        self = cls()
         from qwenpaw.__version__ import __version__
         from qwenpaw.plugins.channel_adapter import ChannelRuntimeSettings
         from qwenpaw.plugins.loader import PluginLoader
@@ -92,7 +94,7 @@ class Host:
         PluginRegistry._instance = None
         self.registry = PluginRegistry()
         self.workspaces, self.models = [], {}
-        self.loader = PluginLoader(
+        self.loader = await PluginLoader.create(
             [self.installed.parent],
             channel_runtime=ChannelRuntimeSettings(
                 python_executable=sys.executable,
@@ -110,6 +112,7 @@ class Host:
         self.registry.projector = WorkspaceProjector(
             live_workspaces=lambda: self.workspaces,
         )
+        return self
 
     def artifact(self, version="1.0.0", *, sdk=False, fail_start=False):
         source = self.root / ("incoming-" + version) / KEY

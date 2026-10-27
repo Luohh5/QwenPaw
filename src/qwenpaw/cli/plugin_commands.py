@@ -823,17 +823,25 @@ def _dependency_operation(action, operation_id):
         from ..plugins.loader import PluginLoader
         from ..plugins.dependency_upgrade import DependencyUpgradeManager
 
-        loader = PluginLoader(
-            [config_utils.get_plugins_dir()],
-            channel_runtime=resolve_default_channel_runtime(),
-        )
-        manager = DependencyUpgradeManager(loader)
-        try:
-            operation = (
-                asyncio.run(manager.apply(operation_id))
-                if action == "apply"
-                else getattr(manager, action)(operation_id)
+        async def run():
+            from ..utils.io_utils import run_sync_io
+
+            loader = await PluginLoader.create(
+                [config_utils.get_plugins_dir()],
+                channel_runtime=await run_sync_io(
+                    resolve_default_channel_runtime,
+                ),
             )
+            manager = DependencyUpgradeManager(loader)
+            operation = (
+                await manager.apply(operation_id)
+                if action == "apply"
+                else await run_sync_io(getattr(manager, action), operation_id)
+            )
+            return manager, operation
+
+        try:
+            manager, operation = asyncio.run(run())
             if action == "apply" and operation["status"] == "waiting_restart":
                 import subprocess
 

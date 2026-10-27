@@ -87,7 +87,7 @@ async def receive(value, text="hello", **fields):
 
 
 async def test_only_new_sqlite_rows_enter_host_with_native_identity(imessage):
-    _, peer, identity, _, _ = imessage
+    _, peer, identity, _, root = imessage
     event = await receive(imessage)
     assert len(peer.batches) == 1
     assert event["content_parts"] == [{"type": "text", "text": "hello"}]
@@ -100,20 +100,6 @@ async def test_only_new_sqlite_rows_enter_host_with_native_identity(imessage):
     assert event["acl_sender_id"] == "+15550001111"
     assert event["metadata"]["session_id"] == "imessage:+15550001111"
     assert event["instance_id"] == identity.instance_id
-
-
-@pytest.mark.parametrize("text,own", [("outgoing", 1), ("", 0)])
-async def test_outgoing_and_empty_rows_advance_cursor_without_admission(
-    imessage,
-    text,
-    own,
-):
-    assert await receive(imessage, text, own=own) is None
-
-
-async def test_reply_executes_imsg_with_exact_recipient_and_text(imessage):
-    _, peer, identity, _, root = imessage
-    event = await receive(imessage)
     result = await send(peer, identity, event["response_handle"])
     assert result["state"] == "acknowledged"
     commands = [
@@ -123,6 +109,15 @@ async def test_reply_executes_imsg_with_exact_recipient_and_text(imessage):
     assert commands == [
         ["send", "--to", "+15550001111", "--text", "native answer"],
     ]
+
+
+@pytest.mark.parametrize("text,own", [("outgoing", 1), ("", 0)])
+async def test_outgoing_and_empty_rows_advance_cursor_without_admission(
+    imessage,
+    text,
+    own,
+):
+    assert await receive(imessage, text, own=own) is None
 
 
 async def test_proactive_session_resolves_native_destination(imessage):

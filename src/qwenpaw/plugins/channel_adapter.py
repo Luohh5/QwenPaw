@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from contextlib import asynccontextmanager, nullcontext
 
-from .execution_backend import DefinitionResult, PluginDescription
+from .execution_backend import (
+    DefinitionResult,
+    PluginDescription,
+    PreparedDependencyTargets,
+)
 
 from ..channel_protocol.artifacts import code_root_digest
 from ..channel_protocol.outbound_budget import (
@@ -408,18 +412,26 @@ class ChannelBackend:
             else None
         )
 
-    def dependency_targets(self, description):
+    async def prepare_dependency_targets(self, description):
         """Configured roots serialize inspection; the child verifies them."""
+        from .dependency_context import _capture_runtime_selection
+
+        validate = _capture_runtime_selection(
+            lambda: self.runtime_for(description),
+        )
         settings = self.runtime_for(description)
         if settings is None:
-            return ()
-        return (
-            *settings.dependency_paths,
-            *(
-                (settings.dependency_install_target,)
-                if settings.dependency_install_target
-                else ()
+            return PreparedDependencyTargets((), validate)
+        return PreparedDependencyTargets(
+            (
+                *settings.dependency_paths,
+                *(
+                    (settings.dependency_install_target,)
+                    if settings.dependency_install_target
+                    else ()
+                ),
             ),
+            validate,
         )
 
     def dependency_install_target(self, description, _snapshot):

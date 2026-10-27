@@ -247,7 +247,10 @@ async def test_stop_cancels_poll_and_closes_clients(runtime):
     assert rt.driver._platform is None and not rt.driver._connected
 
 
-@pytest.mark.parametrize("entry", ["config", "dynamic", "cancel"])
+@pytest.mark.parametrize(
+    "entry",
+    ["config", "env", "dynamic", "cancel", "stale"],
+)
 async def test_auth_admission_scans_off_loop_and_releases_claims(
     tmp_path,
     monkeypatch,
@@ -255,6 +258,7 @@ async def test_auth_admission_scans_off_loop_and_releases_claims(
 ):
     import threading
     import sys
+    from types import SimpleNamespace
 
     from qwenpaw.app.channels import wechat_auth_custody as custody
     from qwenpaw.app.channels.isolated_proxy import IsolatedChannelProxy
@@ -273,7 +277,7 @@ async def test_auth_admission_scans_off_loop_and_releases_claims(
     )
     from tests.channel_support.host import Host
 
-    case = Host(tmp_path, monkeypatch)
+    case = await Host.create(tmp_path, monkeypatch)
     root = load_config()
     for name in ("other-one", "other-two"):
         directory = tmp_path / name
@@ -287,7 +291,7 @@ async def test_auth_admission_scans_off_loop_and_releases_claims(
     save_config(root)
     managers = []
     entered, release = threading.Event(), threading.Event()
-    dynamic = entry in {"dynamic", "cancel"}
+    dynamic = entry in {"dynamic", "cancel", "stale"}
     loop_thread = threading.get_ident()
     scan = custody._read_wechat_auth_evidence
     scans = []
@@ -336,11 +340,23 @@ async def test_auth_admission_scans_off_loop_and_releases_claims(
             "bot_token_file": str(directory / "token"),
         }
         config = Config.model_validate({"channels": {"wechat": values}})
-        manager = ChannelManager.from_config(
-            process,
-            config,
-            workspace_dir=directory,
-            defer_process_channels=dynamic,
+        if entry == "env":
+            monkeypatch.setenv("WECHAT_CHANNEL_ENABLED", "1")
+            monkeypatch.setenv("WECHAT_BOT_TOKEN", values["bot_token"])
+            monkeypatch.setenv(
+                "WECHAT_BOT_TOKEN_FILE",
+                values["bot_token_file"],
+            )
+            manager = ChannelManager.from_env(process, workspace_dir=directory)
+        else:
+            manager = ChannelManager.from_config(
+                process,
+                config,
+                workspace_dir=directory,
+                defer_process_channels=dynamic,
+            )
+        manager.set_workspace(
+            SimpleNamespace(workspace_dir=directory, agent_id=name),
         )
         managers.append(manager)
         return manager, config
@@ -362,14 +378,25 @@ async def test_auth_admission_scans_off_loop_and_releases_claims(
             await pending
         assert entered.is_set()
         assert not pending.done()
-        if entry == "cancel":
-            pending.cancel()
-            await asyncio.sleep(0)
-            assert not pending.done()
+        if entry in {"cancel", "stale"}:
+            if entry == "cancel":
+                pending.cancel()
+                await asyncio.sleep(0)
+                assert not pending.done()
+            else:
+                config.channels.wechat.bot_token = "changed-account"
             release.set()
-            with pytest.raises(asyncio.CancelledError):
+            expected = (
+                pytest.raises(asyncio.CancelledError)
+                if entry == "cancel"
+                else pytest.raises(
+                    RuntimeError,
+                    match="CHANNEL_PREPARATION_STALE",
+                )
+            )
+            with expected:
                 await pending
-            assert not started
+            assert not started and first._find_channel("wechat") is None
             assert len(case.registry.runtime_owners.leases()) == baseline
             return
         if dynamic:
@@ -398,8 +425,20 @@ async def test_auth_admission_scans_off_loop_and_releases_claims(
         assert claims
         assert len(started) == 1
         assert all(
-            claim in case.registry.runtime_owners.leases() for claim in claims
+            claim in case.registry.runtime_owners.leases()
+            and case.registry.runtime_owners.resource(claim).owner
+            == started[0]._runtime_lease
+            for claim in claims
         )
+        if dynamic:
+            owner = next(m for m in managers if started[0] in m.channels)
+            with pytest.raises(RuntimeError, match="CHANNEL_ALREADY_OWNED"):
+                await owner.replace_channel(started[0])
+            assert owner._find_channel("wechat") is started[0]
+            assert all(
+                claim in case.registry.runtime_owners.leases()
+                for claim in claims
+            )
         for manager in managers:
             await manager.stop_all()
         assert not any(

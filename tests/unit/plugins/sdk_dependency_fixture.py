@@ -51,7 +51,11 @@ def dependency_python(root, *, installer="pip"):
                 continue
             destination = library / entry.name
             if not destination.exists():
-                expose(entry, destination)
+                # Audits resolve metadata origins within the observed site.
+                if entry.suffix == ".dist-info" and entry.is_dir():
+                    shutil.copytree(entry, destination)
+                else:
+                    expose(entry, destination)
     source = library / "qwenpaw"
     if not source.exists():
         expose(Path(qwenpaw.__file__).resolve().parent, source)

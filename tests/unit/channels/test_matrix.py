@@ -60,7 +60,6 @@ class LocalMatrixAPI:
         self.user = BOT
         self.device = "SERVER-DEVICE"
         self.closed = asyncio.Event()
-        self.uploads = []
         self.download = b"native-media-bytes"
 
     async def handle(self, request):
@@ -120,13 +119,8 @@ class LocalMatrixAPI:
                     SENDER: {"display_name": "User"},
                 },
             }, 200
-        elif "/join/" in path:
-            value, status = {"room_id": "!invite:example.com"}, 200
         elif "/send/" in path:
             value, status = ({"event_id": "$sent-" + str(len(self.sent))}, 200)
-        elif path.endswith("/upload"):
-            self.uploads.append(row)
-            value, status = {"content_uri": "mxc://example.org/media"}, 200
         elif "/download/" in path:
             return web.Response(
                 body=self.download,

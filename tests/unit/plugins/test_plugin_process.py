@@ -12,6 +12,37 @@ import threading
 import pytest
 import pytest_asyncio
 
+import csv
+from contextlib import contextmanager
+import py_compile
+import shutil
+import stat
+import subprocess
+from types import SimpleNamespace
+import zipfile
+
+from packaging.markers import default_environment
+from qwenpaw.plugins import dependency_maintenance as maintenance
+from qwenpaw.plugins.dependency_context import DependencyEnvironmentContext
+from qwenpaw.plugins.dependency_gate import SharedDependencyError
+from qwenpaw.plugins.dependency_transaction import (
+    _owned,
+    publish,
+    rollback,
+    verify_payload,
+)
+from qwenpaw.plugins.dependency_upgrade import DependencyUpgradeManager
+from qwenpaw.plugins.execution.dependencies import (
+    DependencySnapshot,
+    _installed_metadata,
+)
+from tests.channel_support.host import (
+    Host,
+    _local_dependency_wheel,
+    local_certifi_wheel,
+    local_wheel,
+)
+
 from qwenpaw.plugins.execution import CallUnknown, PluginProcess
 from tests.channel_support.process import (
     ROOT,
@@ -378,6 +409,11 @@ async def test_runtime_roots_interpreter_and_dependency_visible_in_worker(
         ("conda-symlink", False),
         ("conda-native-alias", False),
         ("immutable-alias", False),
+        ("explicit-target", True),
+        ("sibling-target", False),
+        ("bundle", False),
+        ("bundle-alias", False),
+        ("sibling-target-alias", False),
     ],
 )
 def test_dependency_site_permission_follows_real_target(
@@ -385,7 +421,6 @@ def test_dependency_site_permission_follows_real_target(
     layout,
     allowed,
 ):
-    from qwenpaw.plugins.dependency_context import DependencyEnvironmentContext
     from qwenpaw.plugins.dependency_transaction import (
         dependency_site_is_mutable,
     )
@@ -401,396 +436,446 @@ def test_dependency_site_permission_follows_real_target(
     site = (
         overlay if layout in {"conda-overlay", "immutable-alias"} else native
     )
+    if layout.startswith(("explicit-target", "sibling-target", "bundle")):
+        site = tmp_path / "host-selected/site"
+        site.mkdir(parents=True)
     if layout == "conda-overlap":
         managed = prefix
     elif layout == "conda-symlink":
         site = managed / "linked"
         site.symlink_to(native, target_is_directory=True)
-    context = None
+    target = site.parent / "other" if layout.startswith("sibling") else site
+    immutable = (site,) if layout.startswith(("immutable", "bundle")) else ()
     if layout.endswith("-alias"):
-        alias = (
-            prefix.with_name("PYTHON")
-            if layout.startswith("conda")
-            else managed.with_name("PLUGIN_RUNTIME")
-        )
-        if not alias.exists() or not alias.samefile(
-            prefix if layout.startswith("conda") else managed,
-        ):
+        root = prefix if layout.startswith("conda") else site.parent
+        alias = root.with_name(root.name.upper())
+        if not alias.exists() or not alias.samefile(root):
             pytest.skip("filesystem has no case aliases")
-        immutable = () if layout.startswith("conda") else (alias,)
-        prefix = alias if layout.startswith("conda") else prefix
-        context = DependencyEnvironmentContext(
-            str(prefix / "bin/python"),
-            ROOT / "src",
-            (site,),
-            site,
-            immutable,
-        ).to_mapping()
+        if layout.startswith("conda"):
+            prefix = alias
+        else:
+            target = alias / target.name
+            immutable = (alias,) if immutable else ()
+    context = DependencyEnvironmentContext(
+        str(prefix / "bin/python"),
+        ROOT / "src",
+        (site,),
+        target,
+        immutable,
+    ).to_mapping()
     assert (
         dependency_site_is_mutable(site, prefix, managed, context) is allowed
     )
 
 
-@pytest.mark.parametrize(
-    "layout",
-    [
-        "conda-overlay",
-        "explicit-target",
-        "sibling-target",
-        "conda-native",
-        "system",
-        "bundle",
-        "immutable-provider",
-        "overlay-bin",
-        "overlay-Scripts",
-        "venv-launcher",
-        "venv-Scripts-launcher",
-        "venv-package-cache-before",
-        "venv-package-cache-late",
-        "policy-change",
-        "conda-native-alias",
-        "bundle-alias",
-        "sibling-target-alias",
-        "venv-launcher-alias",
-    ],
-)
-def test_dependency_transaction_enforces_site_and_file_permission(
-    tmp_path,
-    layout,
-):
-    from functools import partial
-    import csv
-    import py_compile
-    import shutil
-    import stat
-    import subprocess
-    import zipfile
+@pytest.fixture
+def dependency_files(tmp_path):
+    """Small installed tree shared by preparation and transaction checks."""
 
-    from packaging.markers import default_environment
-
-    from qwenpaw.plugins.dependency_context import DependencyEnvironmentContext
-    from qwenpaw.plugins.dependency_gate import SharedDependencyError
-    from qwenpaw.plugins.dependency_transaction import (
-        _owned,
-        publish,
-        rollback,
-        verify_payload,
-    )
-    from qwenpaw.plugins.dependency_upgrade import DependencyUpgradeManager
-    from qwenpaw.plugins.execution.dependencies import (
-        DependencySnapshot,
-        _installed_metadata,
-    )
-    from tests.channel_support.host import (
-        _local_dependency_wheel,
-        local_certifi_wheel,
-    )
-
-    aliased = layout.endswith("-alias")
-    layout = layout.removesuffix("-alias")
-    package = layout.startswith("venv-package-cache-")
-    module_path = (
-        "sample_shared_sdk/__init__.py" if package else "sample_shared_sdk.py"
-    )
-    native_launcher = layout in {"venv-launcher", "venv-Scripts-launcher"}
-    directory = tmp_path / "operations" / "reviewed"
-    directory.mkdir(parents=True)
-    prefix = tmp_path / "python"
+    prefix, site = tmp_path / "python", tmp_path / "plugin_runtime/site"
     prefix.mkdir()
-    native = prefix / "lib/python3/site-packages"
-    site = tmp_path / "plugin_runtime/site"
-    if layout in {"conda-native", "system", "policy-change"} or (
-        native_launcher or package
-    ):
-        site = native
-    elif layout in {"explicit-target", "sibling-target", "bundle"}:
-        site = tmp_path / "host-selected/site"
+    (prefix / "pyvenv.cfg").write_text("home = /synthetic\n")
     site.mkdir(parents=True)
-    if aliased:
-        alias = prefix.with_name("PYTHON")
-        if not alias.exists() or not alias.samefile(prefix):
-            pytest.skip("filesystem has no case aliases")
-        if layout in {"conda-native", "venv-launcher"}:
-            prefix = alias
-    if layout.startswith("conda"):
-        (prefix / "conda-meta").mkdir()
-    elif layout != "system":
-        (prefix / "pyvenv.cfg").write_text("home = /synthetic\n")
-    old = _local_dependency_wheel(
-        tmp_path / "old",
-        "sample-shared-sdk",
-        "0.5",
-        {module_path: b"VALUE = '0.5'\n"},
-    )
-    if package:
-        installed = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-m",
-                "pip",
-                "install",
-                "--no-index",
-                "--no-deps",
-                "--disable-pip-version-check",
-                "--target",
-                str(site),
-                str(old),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert installed.returncode == 0, installed.stderr
-        record = site / "sample_shared_sdk-0.5.dist-info/RECORD"
-        pip_record = record.read_bytes()
-        cache_rows = [
-            row
-            for row in csv.reader(pip_record.decode().splitlines())
-            if row[0].endswith(".pyc")
-        ]
-        assert len(cache_rows) == 1
-        package_cache = site / cache_rows[0][0]
-        assert package_cache.is_file()
-        if layout.endswith("-late"):
-            package_cache.unlink()
-        else:
-            package_cache.chmod(0o600)
-    else:
-        with zipfile.ZipFile(old) as archive:
-            archive.extractall(site)
-    immutable = ()
-    if layout in {"bundle", "immutable-provider"}:
-        bundled = site if layout == "bundle" else tmp_path / "bundle/site"
-        bundled.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(old) as archive:
-            archive.extractall(bundled)
-        immutable = (bundled,)
-        if aliased:
-            immutable = (
-                bundled.parent.with_name(bundled.parent.name.upper())
-                / bundled.name,
-            )
-    certifi = local_certifi_wheel(tmp_path / "certifi")
-    with zipfile.ZipFile(certifi) as archive:
-        archive.extractall(site)
-    module = site / module_path
+    module = site / "sample_shared_sdk.py"
+    module.write_bytes(b"VALUE = '0.5'\n")
     module.chmod(0o640)
-    (site / "neighbor.txt").write_bytes(b"unowned\x00")
-    if package:
-        (site / "neighbor.txt").chmod(0o604)
-        neighbor_mode = stat.S_IMODE((site / "neighbor.txt").stat().st_mode)
-    launcher = None
-    if layout in {"overlay-bin", "overlay-Scripts"} or native_launcher:
-        scripts = "Scripts" if "Scripts" in layout else "bin"
-        launcher = prefix / scripts / ("sdk.py" if native_launcher else "sdk")
-        launcher.parent.mkdir()
-        launcher.write_bytes(b"#!/synthetic/python\nprint('old launcher')\n")
-        launcher.chmod(0o751)
-        launcher_mode = stat.S_IMODE(launcher.stat().st_mode)
-        record = site / "sample_shared_sdk-0.5.dist-info/RECORD"
-        with record.open("a") as stream:
-            stream.write(
-                Path(os.path.relpath(launcher, site)).as_posix() + ",,\n",
-            )
-        if native_launcher:
-            precache = launcher.parent / "__pycache__/sdk.cpython-313.pyc"
-            py_compile.compile(
-                str(launcher),
-                cfile=str(precache),
-                doraise=True,
-            )
-            precache.chmod(0o600)
-    rows, invalid, _ = _installed_metadata((site,))
-    assert not invalid
-    snapshot = DependencySnapshot(
-        str(prefix / "bin/python"),
-        str(prefix),
-        (str(site),),
-        default_environment(),
-        ("py3-none-any",),
-        rows,
-        (str(site),),
-    )
-    target = site.parent / "other" if layout == "sibling-target" else site
-    if aliased and layout == "sibling-target":
-        target = (
-            target.parent.with_name(target.parent.name.upper()) / target.name
+    for name, version in (
+        ("sample_shared_sdk", "0.5"),
+        ("certifi", "2026.10.19"),
+    ):
+        metadata = site / f"{name}-{version}.dist-info"
+        metadata.mkdir()
+        (metadata / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
         )
-    context = DependencyEnvironmentContext(
-        snapshot.executable,
-        ROOT / "src",
-        (site,),
-        target,
-        immutable,
-    )
-    if aliased and layout == "conda-native":
-        context = DependencyEnvironmentContext.from_snapshot(snapshot)
-    requirements = ["sample-shared-sdk==1.0"]
-    requirements_path = tmp_path / "requirements.txt"
-    requirements_path.write_text("sample-shared-sdk==1.0\n")
+        paths = [f"{metadata.name}/METADATA", f"{metadata.name}/RECORD"]
+        if name == "sample_shared_sdk":
+            paths.append(module.name)
+        (metadata / "RECORD").write_text(
+            "".join(f"{path},,\n" for path in paths),
+        )
+    (site / "neighbor.txt").write_bytes(b"unowned\x00")
+    (site / "neighbor.txt").chmod(0o604)
+    directory = tmp_path / "operations/reviewed"
+    directory.mkdir(parents=True)
     wheel = _local_dependency_wheel(
         tmp_path / "new",
         "sample-shared-sdk",
         "1.0",
-        {module_path: b"VALUE = '1.0'\n"},
+        {"sample_shared_sdk.py": b"VALUE = '1.0'\n"},
     )
-    args = directory, snapshot, requirements, []
-    resolve = partial(
-        DependencyUpgradeManager._prepare_resolution,
-        *args,
-        requirements_path,
-        context,
-    )
-    prepare = partial(
-        DependencyUpgradeManager._prepare_payload,
-        *args,
-        site,
-        context,
+    return SimpleNamespace(
+        prefix=prefix,
+        site=site,
+        module=module,
+        directory=directory,
+        wheel=wheel,
     )
 
-    def inventory(root=tmp_path):
-        return {
-            path.relative_to(root).as_posix(): (
-                path.read_bytes() if path.is_file() else None,
-                stat.S_IMODE(path.stat().st_mode),
-            )
-            for path in root.rglob("*")
-        }
 
-    before = inventory()
-    protected = layout in {
-        "sibling-target",
-        "conda-native",
-        "system",
-        "bundle",
-        "immutable-provider",
-    }
-    if protected:
-        with pytest.raises(
-            SharedDependencyError,
-            match="bundled|environment-managed",
-        ) as error:
-            resolve()
-        assert error.value.reason_code == "DEPENDENCY_ENVIRONMENT_PROTECTED"
-        assert inventory() == before
-        (directory / "wheels").mkdir()
-    else:
-        resolve()
-    shutil.copy2(wheel, directory / "wheels" / wheel.name)
-    if protected or layout.startswith("overlay-"):
-        before = inventory()
-        reason = (
-            "DEPENDENCY_ENVIRONMENT_PROTECTED|bundled"
-            if protected
-            else "DEPENDENCY_PLAN_UNVERIFIED"
+def _dependency_snapshot(files):
+    rows, invalid, _ = _installed_metadata((files.site,))
+    assert not invalid
+    return DependencySnapshot(
+        str(files.prefix / "bin/python"),
+        str(files.prefix),
+        (str(files.site),),
+        default_environment(),
+        ("py3-none-any",),
+        rows,
+        (str(files.site),),
+    )
+
+
+def _inventory(root):
+    return {
+        path.relative_to(root).as_posix(): (
+            path.read_bytes() if path.is_file() else None,
+            stat.S_IMODE(path.stat().st_mode),
         )
-        with pytest.raises(RuntimeError, match=reason):
-            prepare()
-        assert inventory() == before
-        return
-    _, changes, proposed, payload = prepare()
-    operation = {
-        "id": directory.name,
+        for path in root.rglob("*")
+    }
+
+
+def _prepare_dependency_operation(files, context=None):
+    """Prepare the same reviewed payload for the separate publish checks."""
+
+    snapshot = _dependency_snapshot(files)
+    context = context or DependencyEnvironmentContext(
+        snapshot.executable,
+        ROOT / "src",
+        (files.site,),
+        files.site,
+        (),
+    )
+    requirements = files.directory.parent / "requirements.txt"
+    requirements.write_text("sample-shared-sdk==1.0\n")
+    args = files.directory, snapshot, ["sample-shared-sdk==1.0"], []
+    DependencyUpgradeManager._prepare_resolution(*args, requirements, context)
+    shutil.copy2(files.wheel, files.directory / "wheels" / files.wheel.name)
+    _, changes, proposed, payload = DependencyUpgradeManager._prepare_payload(
+        *args,
+        files.site,
+        context,
+    )
+    return {
+        "id": files.directory.name,
         "environment": snapshot.to_mapping(),
         "dependency_context": context.to_mapping(),
         "changes": changes,
         "proposed": proposed,
         "payload": payload,
     }
-    if layout == "policy-change":
-        from qwenpaw.plugins.dependency_maintenance import repair_marker
-
-        (prefix / "conda-meta").mkdir()
-        before = inventory()
-        assert not repair_marker(site).exists()
-        for write in (verify_payload, publish):
-            with pytest.raises(
-                RuntimeError,
-                match="DEPENDENCY_ENVIRONMENT_PROTECTED",
-            ):
-                write(directory, operation)
-            assert inventory() == before
-            assert not repair_marker(site).exists()
-        return
-    cache = None
-    if native_launcher:
-        cache = launcher.parent / "__pycache__/sdk.cpython-313.opt-1.pyc"
-        py_compile.compile(
-            str(launcher),
-            cfile=str(cache),
-            doraise=True,
-            optimize=1,
-        )
-        cache.chmod(0o640)
-        runtime_before = inventory(prefix), inventory(site)
-    if package:
-        if layout.endswith("-late"):
-            py_compile.compile(str(module), doraise=True)
-            package_cache.chmod(0o600)
-        assert package_cache.is_file()
-        assert record.read_bytes() == pip_record
-        runtime_before = inventory(prefix), inventory(site)
-    publish(directory, operation)
-    assert module.read_text() == "VALUE = '1.0'\n"
-    assert not (site / "sample_shared_sdk-0.5.dist-info").exists()
-    assert (site / "sample_shared_sdk-1.0.dist-info/RECORD").is_file()
-    assert (site / "neighbor.txt").read_bytes() == b"unowned\x00"
-    if launcher is not None:
-        assert (
-            launcher.read_bytes()
-            == b"#!/synthetic/python\nprint('old launcher')\n"
-        )
-        assert stat.S_IMODE(launcher.stat().st_mode) == launcher_mode
-        record = site / "sample_shared_sdk-1.0.dist-info/RECORD"
-        assert (
-            sum(
-                (site / row[0]).samefile(launcher)
-                for row in csv.reader(record.read_text().splitlines())
-            )
-            == 1
-        )
-        assert not cache.exists() and not precache.exists()
-        rollback(directory)
-        assert (inventory(prefix), inventory(site)) == runtime_before
-    if package:
-        assert not package_cache.exists()
-        assert (
-            stat.S_IMODE((site / "neighbor.txt").stat().st_mode)
-            == neighbor_mode
-        )
-        rollback(directory)
-        assert (inventory(prefix), inventory(site)) == runtime_before
-        record.write_bytes(
-            pip_record + (",".join(cache_rows[0]) + "\n").encode(),
-        )
-        with pytest.raises(
-            RuntimeError,
-            match="duplicate installed ownership",
-        ):
-            _owned(rows["sample-shared-sdk"], prefix)
-        record.write_bytes(pip_record)
-        assert (inventory(prefix), inventory(site)) == runtime_before
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("broken_source", [False, True])
-async def test_shared_upgrade_replaces_provider_or_restores_exact_old_tree(
+@pytest.mark.parametrize(
+    "layout",
+    [
+        "sibling-target",
+        "conda-native",
+        "system",
+        "bundle",
+        "immutable-provider",
+    ],
+)
+def test_dependency_preparation_rejects_protected_environment(
     tmp_path,
-    monkeypatch,
-    broken_source,
+    dependency_files,
+    layout,
 ):
-    import shutil
-    import subprocess
-    import zipfile
+    files = dependency_files
+    if layout == "sibling-target":
+        files.site.rename(tmp_path / "host-selected")
+        files.site = tmp_path / "host-selected"
+    if layout in {"conda-native", "system"}:
+        files.site.rename(files.prefix / "site-packages")
+        files.site = files.prefix / "site-packages"
+        (files.prefix / "pyvenv.cfg").unlink()
+        if layout == "conda-native":
+            (files.prefix / "conda-meta").mkdir()
+    immutable = ()
+    if layout == "bundle":
+        immutable = (files.site,)
+    elif layout == "immutable-provider":
+        bundled = tmp_path / "bundle/site"
+        shutil.copytree(files.site, bundled)
+        immutable = (bundled,)
+    snapshot = _dependency_snapshot(files)
+    context = DependencyEnvironmentContext(
+        snapshot.executable,
+        ROOT / "src",
+        (files.site,),
+        (
+            files.site.parent / "other"
+            if layout == "sibling-target"
+            else files.site
+        ),
+        immutable,
+    )
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("sample-shared-sdk==1.0\n")
+    args = files.directory, snapshot, ["sample-shared-sdk==1.0"], []
+    before = _inventory(tmp_path)
+    with pytest.raises(
+        SharedDependencyError,
+        match="bundled|environment-managed",
+    ) as error:
+        DependencyUpgradeManager._prepare_resolution(
+            *args,
+            requirements,
+            context,
+        )
+    assert error.value.reason_code == "DEPENDENCY_ENVIRONMENT_PROTECTED"
+    assert _inventory(tmp_path) == before
+    wheels = files.directory / "wheels"
+    wheels.mkdir()
+    shutil.copy2(files.wheel, wheels / files.wheel.name)
+    before = _inventory(tmp_path)
+    with pytest.raises(
+        RuntimeError,
+        match="DEPENDENCY_ENVIRONMENT_PROTECTED|bundled",
+    ):
+        DependencyUpgradeManager._prepare_payload(*args, files.site, context)
+    assert _inventory(tmp_path) == before
 
-    from qwenpaw.plugins.dependency_upgrade import DependencyUpgradeManager
-    from tests.channel_support.host import (
-        Host,
-        local_certifi_wheel,
-        local_wheel,
+
+@pytest.mark.parametrize("scripts", ["bin", "Scripts"])
+def test_overlay_rejects_record_outside_target(
+    tmp_path,
+    dependency_files,
+    scripts,
+):
+    files = dependency_files
+    launcher = files.prefix / scripts / "sdk"
+    launcher.parent.mkdir()
+    launcher.write_bytes(b"old launcher\x00")
+    record = files.site / "sample_shared_sdk-0.5.dist-info/RECORD"
+    with record.open("a") as stream:
+        stream.write(
+            Path(os.path.relpath(launcher, files.site)).as_posix() + ",,\n",
+        )
+    snapshot = _dependency_snapshot(files)
+    context = DependencyEnvironmentContext(
+        snapshot.executable,
+        ROOT / "src",
+        (files.site,),
+        files.site,
+        (),
+    )
+    wheels = files.directory / "wheels"
+    wheels.mkdir()
+    shutil.copy2(files.wheel, wheels / files.wheel.name)
+    before = _inventory(tmp_path)
+    with pytest.raises(RuntimeError, match="DEPENDENCY_PLAN_UNVERIFIED"):
+        DependencyUpgradeManager._prepare_payload(
+            files.directory,
+            snapshot,
+            ["sample-shared-sdk==1.0"],
+            [],
+            files.site,
+            context,
+        )
+    assert _inventory(tmp_path) == before
+
+
+def test_conda_overlay_replaces_provider(dependency_files):
+    files = dependency_files
+    (files.prefix / "conda-meta").mkdir()
+    operation = _prepare_dependency_operation(files)
+    publish(files.directory, operation)
+    assert files.module.read_text() == "VALUE = '1.0'\n"
+    assert not (files.site / "sample_shared_sdk-0.5.dist-info").exists()
+    assert (files.site / "sample_shared_sdk-1.0.dist-info/RECORD").is_file()
+    assert (files.site / "neighbor.txt").read_bytes() == b"unowned\x00"
+
+
+def test_explicit_target_prepares_payload(tmp_path, dependency_files):
+    files = dependency_files
+    files.site.rename(tmp_path / "host-selected")
+    files.site = tmp_path / "host-selected"
+    operation = _prepare_dependency_operation(files)
+    assert (
+        operation["payload"]
+        and operation["changes"][0]["name"] == "sample-shared-sdk"
     )
 
-    host = Host(tmp_path, monkeypatch)
+
+def test_policy_change_blocks_verify_and_publish(tmp_path, dependency_files):
+    files = dependency_files
+    files.site.rename(files.prefix / "site-packages")
+    files.site = files.prefix / "site-packages"
+    operation = _prepare_dependency_operation(files)
+    (files.prefix / "conda-meta").mkdir()
+    before = _inventory(tmp_path)
+    assert not maintenance.repair_marker(files.site).exists()
+    for write in (verify_payload, publish):
+        with pytest.raises(
+            RuntimeError,
+            match="DEPENDENCY_ENVIRONMENT_PROTECTED",
+        ):
+            write(files.directory, operation)
+        assert _inventory(tmp_path) == before
+        assert not maintenance.repair_marker(files.site).exists()
+
+
+@pytest.mark.parametrize("scripts", ["bin", "Scripts"])
+def test_native_launcher_publish_and_exact_rollback(
+    tmp_path,
+    dependency_files,
+    scripts,
+):
+    files = dependency_files
+    files.site.rename(files.prefix / "site-packages")
+    files.site = files.prefix / "site-packages"
+    files.module = files.site / files.module.name
+    launcher = files.prefix / scripts / "sdk.py"
+    launcher.parent.mkdir()
+    launcher.write_bytes(b"#!/synthetic/python\nprint('old launcher')\n")
+    launcher.chmod(0o751)
+    launcher_mode = stat.S_IMODE(launcher.stat().st_mode)
+    record = files.site / "sample_shared_sdk-0.5.dist-info/RECORD"
+    with record.open("a") as stream:
+        stream.write(
+            Path(os.path.relpath(launcher, files.site)).as_posix() + ",,\n",
+        )
+    precache = launcher.parent / "__pycache__/sdk.cpython-313.pyc"
+    py_compile.compile(str(launcher), cfile=str(precache), doraise=True)
+    precache.chmod(0o600)
+    # Case alias ownership must pass a real aliased prefix into the resolver.
+    alias = files.prefix.with_name("PYTHON")
+    if scripts == "bin" and alias.exists() and alias.samefile(files.prefix):
+        owned = _owned(
+            _dependency_snapshot(files).distributions["sample-shared-sdk"],
+            alias,
+        )
+        assert str(launcher.resolve()) in owned
+        files.prefix = alias
+    operation = _prepare_dependency_operation(files)
+    cache = launcher.parent / "__pycache__/sdk.cpython-313.opt-1.pyc"
+    py_compile.compile(
+        str(launcher),
+        cfile=str(cache),
+        doraise=True,
+        optimize=1,
+    )
+    cache.chmod(0o640)
+    before = _inventory(files.prefix)
+    publish(files.directory, operation)
+    assert files.module.read_text() == "VALUE = '1.0'\n"
+    assert not (files.site / "sample_shared_sdk-0.5.dist-info").exists()
+    assert (
+        launcher.read_bytes()
+        == b"#!/synthetic/python\nprint('old launcher')\n"
+    )
+    assert stat.S_IMODE(launcher.stat().st_mode) == launcher_mode
+    record = files.site / "sample_shared_sdk-1.0.dist-info/RECORD"
+    assert (
+        sum(
+            (files.site / row[0]).samefile(launcher)
+            for row in csv.reader(record.read_text().splitlines())
+        )
+        == 1
+    )
+    assert not cache.exists() and not precache.exists()
+    assert (files.site / "neighbor.txt").read_bytes() == b"unowned\x00"
+    rollback(files.directory)
+    assert _inventory(files.prefix) == before
+
+
+@pytest.mark.parametrize("late_cache", [False, True])
+def test_pip_record_cache_publish_and_exact_rollback(
+    tmp_path,
+    dependency_files,
+    late_cache,
+):
+    files = dependency_files
+    files.site.rename(files.prefix / "site-packages")
+    files.site = files.prefix / "site-packages"
+    (files.site / "sample_shared_sdk.py").unlink()
+    shutil.rmtree(files.site / "sample_shared_sdk-0.5.dist-info")
+    module_path = "sample_shared_sdk/__init__.py"
+    old = _local_dependency_wheel(
+        tmp_path / "old",
+        "sample-shared-sdk",
+        "0.5",
+        {module_path: b"VALUE = '0.5'\n"},
+    )
+    installed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            "--no-deps",
+            "--disable-pip-version-check",
+            "--target",
+            str(files.site),
+            str(old),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert installed.returncode == 0, installed.stderr
+    record = files.site / "sample_shared_sdk-0.5.dist-info/RECORD"
+    pip_record = record.read_bytes()
+    cache_rows = [
+        row
+        for row in csv.reader(pip_record.decode().splitlines())
+        if row[0].endswith(".pyc")
+    ]
+    assert len(cache_rows) == 1
+    cache = files.site / cache_rows[0][0]
+    assert cache.is_file()
+    if late_cache:
+        cache.unlink()
+    else:
+        cache.chmod(0o600)
+    files.module = files.site / module_path
+    files.module.chmod(0o640)
+    files.wheel = _local_dependency_wheel(
+        tmp_path / "package-new",
+        "sample-shared-sdk",
+        "1.0",
+        {module_path: b"VALUE = '1.0'\n"},
+    )
+    neighbor_mode = stat.S_IMODE((files.site / "neighbor.txt").stat().st_mode)
+    operation = _prepare_dependency_operation(files)
+    if late_cache:
+        py_compile.compile(str(files.module), doraise=True)
+        cache.chmod(0o600)
+    assert cache.is_file() and record.read_bytes() == pip_record
+    before = _inventory(files.prefix)
+    publish(files.directory, operation)
+    assert files.module.read_text() == "VALUE = '1.0'\n"
+    assert not (files.site / "sample_shared_sdk-0.5.dist-info").exists()
+    assert (files.site / "sample_shared_sdk-1.0.dist-info/RECORD").is_file()
+    assert not cache.exists()
+    assert (files.site / "neighbor.txt").read_bytes() == b"unowned\x00"
+    assert (
+        stat.S_IMODE((files.site / "neighbor.txt").stat().st_mode)
+        == neighbor_mode
+    )
+    rollback(files.directory)
+    assert _inventory(files.prefix) == before
+
+
+def test_record_rejects_duplicate_installed_ownership(dependency_files):
+    files = dependency_files
+    row = _dependency_snapshot(files).distributions["sample-shared-sdk"]
+    with (files.site / "sample_shared_sdk-0.5.dist-info/RECORD").open(
+        "a",
+    ) as stream:
+        stream.write("sample_shared_sdk.py,,\n")
+    with pytest.raises(RuntimeError, match="duplicate installed ownership"):
+        _owned(row, files.prefix)
+
+
+@pytest_asyncio.fixture
+async def staged_upgrade(tmp_path, monkeypatch, request):
+    broken_source = getattr(request, "param", False)
+    host = await Host.create(tmp_path, monkeypatch)
     site = tmp_path / "plugin_runtime/site"
     site.mkdir(parents=True)
     alias = site.with_name("SITE")
@@ -839,39 +924,123 @@ async def test_shared_upgrade_replaces_provider_or_restores_exact_old_tree(
     try:
         manager = DependencyUpgradeManager(host.loader)
         operation = await manager.stage(source)
-        assert operation["status"] == "needs_confirmation"
-        assert operation["changes"] == [
-            {
-                "name": "sample-shared-sdk",
-                "current_version": "0.5",
-                "target_version": "1.0",
-            },
-        ]
-        assert digest(site) == before and not operation["requires_restart"]
-        assert not published.exists()
-        result = await manager.apply(operation["id"])
-        if broken_source:
-            assert result["status"] == "failed", result
-            assert (
-                result["error"]["code"] == "DEPENDENCY_UPGRADE_FAILED"
-            ), result
-            assert published.read_text() == "1.0\nVALUE = '1.0'\n"
-            assert digest(site) == before and module.stat().st_mode == mode
-            assert not host.installed.exists()
-        else:
-            assert result["status"] == "succeeded", result
-            assert module.read_text() == "VALUE = '1.0'\n"
-            assert not (site / "sample_shared_sdk-0.5.dist-info").exists()
-            assert (site / "sample_shared_sdk-1.0.dist-info/RECORD").is_file()
-            assert (host.installed / "sample.py").read_bytes() == (
-                source / "sample.py"
-            ).read_bytes()
-            assert (await manager.apply(operation["id"])) == result
-        assert (site / "neighbor.txt").read_bytes() == (
-            b"preserve unrelated bytes\x00"
+        yield SimpleNamespace(
+            host=host,
+            manager=manager,
+            operation=operation,
+            site=site,
+            module=module,
+            before=before,
+            mode=mode,
+            source=source,
+            published=published,
+            broken_source=broken_source,
         )
     finally:
         await host.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("staged_upgrade", [False, True], indirect=True)
+async def test_shared_upgrade_replaces_provider_or_restores_exact_old_tree(
+    staged_upgrade,
+):
+    prepared = staged_upgrade
+    host, manager, operation = (
+        prepared.host,
+        prepared.manager,
+        prepared.operation,
+    )
+    site, module, before = prepared.site, prepared.module, prepared.before
+    mode, source, published = (
+        prepared.mode,
+        prepared.source,
+        prepared.published,
+    )
+    broken_source = prepared.broken_source
+    assert operation["status"] == "needs_confirmation"
+    assert operation["changes"] == [
+        {
+            "name": "sample-shared-sdk",
+            "current_version": "0.5",
+            "target_version": "1.0",
+        },
+    ]
+    assert digest(site) == before and not operation["requires_restart"]
+    assert not published.exists()
+    result = await manager.apply(operation["id"])
+    if broken_source:
+        assert result["status"] == "failed", result
+        assert result["error"]["code"] == "DEPENDENCY_UPGRADE_FAILED", result
+        assert published.read_text() == "1.0\nVALUE = '1.0'\n"
+        assert digest(site) == before and module.stat().st_mode == mode
+        assert not host.installed.exists()
+    else:
+        assert result["status"] == "succeeded", result
+        assert module.read_text() == "VALUE = '1.0'\n"
+        assert not (site / "sample_shared_sdk-0.5.dist-info").exists()
+        assert (site / "sample_shared_sdk-1.0.dist-info/RECORD").is_file()
+        assert (host.installed / "sample.py").read_bytes() == (
+            source / "sample.py"
+        ).read_bytes()
+        assert (await manager.apply(operation["id"])) == result
+    assert (site / "neighbor.txt").read_bytes() == (
+        b"preserve unrelated bytes\x00"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_late_maintenance_entry_clears_own_marker(
+    staged_upgrade,
+    monkeypatch,
+):
+    prepared = staged_upgrade
+    manager, site, operation = (
+        prepared.manager,
+        prepared.site,
+        prepared.operation,
+    )
+    original = maintenance.maintenance
+    started, release = threading.Event(), threading.Event()
+
+    @contextmanager
+    def slow_entry(*args, **kwargs):
+        with original(*args, **kwargs) as value:
+            started.set()
+            assert release.wait(3)
+            yield value
+
+    monkeypatch.setattr(maintenance, "maintenance", slow_entry)
+    task_capabilities = []
+
+    async def apply():
+        try:
+            await manager.apply(operation["id"])
+        finally:
+            task_capabilities.append(maintenance.capability_context.get())
+
+    pending = asyncio.create_task(apply())
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        assert maintenance.marker(site).exists()
+        pending.cancel()
+        await asyncio.sleep(0)
+        assert not pending.done()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(pending, 5)
+    assert task_capabilities == [""]
+    assert not maintenance.marker(site).exists()
+    assert manager.status(operation["id"])["retryable"] is True
+    assert digest(site) == prepared.before
+    assert prepared.module.stat().st_mode == prepared.mode
+    assert not prepared.host.installed.exists()
+    with original([site], "next-operation", "next-capability"):
+        maintenance.clear_maintenance([site], operation["id"])
+        assert maintenance.marker(site).exists()
+    maintenance.clear_maintenance([site], "next-operation")
+    assert not maintenance.marker(site).exists()
 
 
 @pytest.mark.asyncio
@@ -893,7 +1062,7 @@ async def test_frozen_ordinary_loader_gate_installs_missing_sdk_in_overlay(
     )
 
     monkeypatch.setattr(sys, "path", sys.path.copy())
-    host = Host(tmp_path, monkeypatch)
+    host = await Host.create(tmp_path, monkeypatch)
     support, packaged = runtime_layout(tmp_path, monkeypatch)
     (packaged / "sample_shared_sdk.py").unlink()
     shutil.rmtree(packaged / "sample_shared_sdk-1.0.dist-info")

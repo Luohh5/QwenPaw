@@ -551,125 +551,69 @@ describe("ChannelDrawer builtin channel rendering", () => {
 // ---- QR-code auth callbacks ------------------------------------------------
 
 describe("ChannelDrawer qrcode auth callbacks", () => {
-  function renderQrcodeDrawer(channel: string) {
-    const onSubmit = vi.fn();
-    const onSubmitSnapshot = vi.fn().mockResolvedValue(true);
-    return {
-      ...renderDrawer({
+  it.each([
+    {
+      channel: "dingtalk",
+      credentials: { client_id: "cid", client_secret: "cs" },
+      expired: "warning",
+    },
+    {
+      channel: "feishu",
+      credentials: { app_id: "aid", app_secret: "as" },
+      expired: "warning",
+    },
+    {
+      channel: "wechat",
+      credentials: {
+        bot_token: "bt",
+        base_url: "https://wechat-auth.example.test",
+      },
+      expired: "warning",
+    },
+    {
+      channel: "qq",
+      credentials: { app_id: "aid", client_secret: "cs" },
+      expired: "warning",
+    },
+    {
+      channel: "wecom",
+      credentials: { bot_id: "bid", secret: "sec" },
+      expired: "error",
+    },
+  ] as const)(
+    "$channel fills and saves authorized credentials",
+    async ({ channel, credentials, expired }) => {
+      const onSubmit = vi.fn();
+      const onSubmitSnapshot = vi.fn().mockResolvedValue(true);
+      const { form } = renderDrawer({
         activeKey: channel,
         isBuiltin: false,
         onSubmit,
         onSubmitSnapshot,
-      }),
-      onSubmit,
-      onSubmitSnapshot,
-    };
-  }
-
-  async function expectQrcodeSave(
-    drawer: ReturnType<typeof renderQrcodeDrawer>,
-    channel: string,
-    credentials: Record<string, string>,
-  ) {
-    fireEvent.click(screen.getByRole("button", { name: "common.close" }));
-    await waitFor(() => expect(drawer.onSubmitSnapshot).toHaveBeenCalledOnce());
-    expect(drawer.onSubmitSnapshot).toHaveBeenCalledWith(
-      expect.objectContaining({
-        agentId: "agent-a",
-        channel,
-        authSession: `auth-${channel}`,
-        body: expect.objectContaining(credentials),
-      }),
-    );
-    expect(drawer.onSubmit).not.toHaveBeenCalled();
-  }
-
-  it("dingtalk success fills credentials and reports error states", async () => {
-    const drawer = renderQrcodeDrawer("dingtalk");
-    const { form } = drawer;
-    fireEvent.click(screen.getByTestId("qr-success-dingtalk"));
-    expect(form.getFieldValue("client_id")).toBe("cid");
-    expect(form.getFieldValue("client_secret")).toBe("cs");
-    expect(mockMessage.success).toHaveBeenCalled();
-    await expectQrcodeSave(drawer, "dingtalk", {
-      client_id: "cid",
-      client_secret: "cs",
-    });
-
-    fireEvent.click(screen.getByTestId("qr-expired-dingtalk"));
-    expect(mockMessage.warning).toHaveBeenCalled();
-    fireEvent.click(screen.getByTestId("qr-failed-dingtalk"));
-    expect(mockMessage.error).toHaveBeenCalled();
-  });
-
-  it("feishu success fills app credentials", async () => {
-    const drawer = renderQrcodeDrawer("feishu");
-    const { form } = drawer;
-    fireEvent.click(screen.getByTestId("qr-success-feishu"));
-    expect(form.getFieldValue("app_id")).toBe("aid");
-    expect(form.getFieldValue("app_secret")).toBe("as");
-    expect(mockMessage.success).toHaveBeenCalled();
-    await expectQrcodeSave(drawer, "feishu", {
-      app_id: "aid",
-      app_secret: "as",
-    });
-    fireEvent.click(screen.getByTestId("qr-expired-feishu"));
-    expect(mockMessage.warning).toHaveBeenCalled();
-    fireEvent.click(screen.getByTestId("qr-failed-feishu"));
-    expect(mockMessage.error).toHaveBeenCalled();
-  });
-
-  it("wechat success fills bot token and reports failures", async () => {
-    const drawer = renderQrcodeDrawer("wechat");
-    const { form } = drawer;
-    fireEvent.click(screen.getByTestId("qr-success-wechat"));
-    expect(form.getFieldValue("bot_token")).toBe("bt");
-    expect(form.getFieldValue("base_url")).toBe(
-      "https://wechat-auth.example.test",
-    );
-    expect(mockMessage.success).toHaveBeenCalled();
-    await expectQrcodeSave(drawer, "wechat", {
-      bot_token: "bt",
-      base_url: "https://wechat-auth.example.test",
-    });
-    fireEvent.click(screen.getByTestId("qr-expired-wechat"));
-    expect(mockMessage.warning).toHaveBeenCalled();
-    fireEvent.click(screen.getByTestId("qr-failed-wechat"));
-    expect(mockMessage.error).toHaveBeenCalled();
-  });
-
-  it("qq success fills credentials and reports failures", async () => {
-    const drawer = renderQrcodeDrawer("qq");
-    const { form } = drawer;
-    fireEvent.click(screen.getByTestId("qr-success-qq"));
-    expect(form.getFieldValue("app_id")).toBe("aid");
-    expect(form.getFieldValue("client_secret")).toBe("cs");
-    expect(mockMessage.success).toHaveBeenCalled();
-    await expectQrcodeSave(drawer, "qq", {
-      app_id: "aid",
-      client_secret: "cs",
-    });
-    fireEvent.click(screen.getByTestId("qr-expired-qq"));
-    expect(mockMessage.warning).toHaveBeenCalled();
-    fireEvent.click(screen.getByTestId("qr-failed-qq"));
-    expect(mockMessage.error).toHaveBeenCalled();
-  });
-
-  it("wecom success fills bot credentials and any error reports failure", async () => {
-    const drawer = renderQrcodeDrawer("wecom");
-    const { form } = drawer;
-    fireEvent.click(screen.getByTestId("qr-success-wecom"));
-    expect(form.getFieldValue("bot_id")).toBe("bid");
-    expect(form.getFieldValue("secret")).toBe("sec");
-    expect(mockMessage.success).toHaveBeenCalled();
-    await expectQrcodeSave(drawer, "wecom", { bot_id: "bid", secret: "sec" });
-    // wecom uses a single onError handler for every failure type
-    fireEvent.click(screen.getByTestId("qr-expired-wecom"));
-    expect(mockMessage.error).toHaveBeenCalled();
-    mockMessage.error.mockClear();
-    fireEvent.click(screen.getByTestId("qr-failed-wecom"));
-    expect(mockMessage.error).toHaveBeenCalled();
-  });
+      });
+      fireEvent.click(screen.getByTestId(`qr-success-${channel}`));
+      for (const [field, value] of Object.entries(credentials)) {
+        expect(form.getFieldValue(field)).toBe(value);
+      }
+      expect(mockMessage.success).toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "common.close" }));
+      await waitFor(() => expect(onSubmitSnapshot).toHaveBeenCalledOnce());
+      expect(onSubmitSnapshot).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agentId: "agent-a",
+          channel,
+          authSession: `auth-${channel}`,
+          body: expect.objectContaining(credentials),
+        }),
+      );
+      expect(onSubmit).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByTestId(`qr-expired-${channel}`));
+      expect(mockMessage[expired]).toHaveBeenCalled();
+      mockMessage.error.mockClear();
+      fireEvent.click(screen.getByTestId(`qr-failed-${channel}`));
+      expect(mockMessage.error).toHaveBeenCalled();
+    },
+  );
 });
 
 // ---- Plugin schema fields + resolveLocalized --------------------------------

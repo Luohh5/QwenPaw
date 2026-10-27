@@ -90,6 +90,14 @@ async def _settle(task):
     return task.result(), cancelled
 
 
+def _source_matches(current, snapshot):
+    """Match description/settings/binding identity and source path value."""
+    return not (
+        any(current[index] is not snapshot[index] for index in range(3))
+        or current[3] != snapshot[3]
+    )
+
+
 class ChannelManagementService:
     """Use existing exact custody, without starting message runtimes."""
 
@@ -319,12 +327,9 @@ class ChannelManagementService:
         current = self._source_snapshot(row, record, channel_key)
         if snapshot is None:
             snapshot = current
-        elif (
-            any(current[index] is not snapshot[index] for index in range(3))
-            or current[3] != snapshot[3]
-        ):
+        elif not _source_matches(current, snapshot):
             raise ManagementError("SOURCE_REVISION_MISMATCH")
-        description, settings, binding, source_path = snapshot
+        description, settings, _, source_path = snapshot
         code_root = description.code_root
         expected_revision = description.source_revision
 
@@ -338,12 +343,7 @@ class ChannelManagementService:
         except (OSError, ValueError, RuntimeError):
             raise ManagementError("SOURCE_REVISION_MISMATCH") from None
         current = self._source_snapshot(row, record, channel_key)
-        if (
-            current[0] is not description
-            or current[1] is not settings
-            or current[2] is not binding
-            or current[3] != source_path
-        ):
+        if not _source_matches(current, snapshot):
             raise ManagementError("SOURCE_REVISION_MISMATCH")
         if revision != expected_revision:
             raise ManagementError("SOURCE_REVISION_MISMATCH")

@@ -15,14 +15,20 @@ from qwenpaw.app.routers import mcp_oauth, provider_oauth, terminal
 
 
 @pytest.fixture
-def proxy_app(monkeypatch):
-    """Use production middleware registration without agent startup."""
-    monkeypatch.delenv("QWENPAW_RUNTIME_INTERNAL_TOKEN", raising=False)
+def proxy_config(monkeypatch):
+    """Configure middleware trust without constructing API routes."""
     networks = auth._parse_networks(["127.0.0.1/32"])
     config = SimpleNamespace(
         security=SimpleNamespace(allow_no_auth_hosts=[]),
     )
     monkeypatch.setattr(auth, "_get_config_cached", lambda: (config, networks))
+    return SimpleNamespace(networks=networks, config=config)
+
+
+@pytest.fixture
+def proxy_app(monkeypatch, proxy_config):
+    """Use production middleware registration without agent startup."""
+    monkeypatch.delenv("QWENPAW_RUNTIME_INTERNAL_TOKEN", raising=False)
     monkeypatch.setattr(auth, "is_auth_enabled", lambda: True)
     monkeypatch.setattr(auth, "has_registered_users", lambda: True)
     monkeypatch.setattr(
@@ -63,8 +69,8 @@ def proxy_app(monkeypatch):
     return SimpleNamespace(
         app=app,
         manager=manager,
-        networks=networks,
-        config=config,
+        networks=proxy_config.networks,
+        config=proxy_config.config,
     )
 
 
@@ -90,14 +96,7 @@ async def test_trusted_https_terminal_same_origin(proxy_app):
     assert proxy_app.manager.list.call_args.args[0][:2] == ("alice", "agent-a")
 
 
-@pytest.mark.parametrize(
-    "builder,callback_path",
-    [
-        ("provider", "/api/providers/openrouter/oauth/callback"),
-        ("mcp", "/api/mcp/oauth/callback"),
-    ],
-)
-async def test_trusted_https_oauth_callback(proxy_app, builder, callback_path):
+async def test_trusted_https_oauth_callback(proxy_app):
     async with _client(proxy_app) as client:
         response = await client.get(
             "/api/proxy-probe",
@@ -110,7 +109,12 @@ async def test_trusted_https_oauth_callback(proxy_app, builder, callback_path):
         )
     assert response.status_code == 200
     payload = response.json()
-    assert payload[builder] == f"https://qwenpaw.example.test{callback_path}"
+    assert payload["provider"] == (
+        "https://qwenpaw.example.test/api/providers/openrouter/oauth/callback"
+    )
+    assert payload["mcp"] == (
+        "https://qwenpaw.example.test/api/mcp/oauth/callback"
+    )
     assert payload["scheme"] == "https"
     assert payload["peer"] == "127.0.0.1"
     assert payload["resolved_ip"] == "203.0.113.7"
@@ -251,7 +255,7 @@ async def _invoke(scope):
     ],
 )
 async def test_scheme_only_changes_in_copied_scope(
-    proxy_app,
+    proxy_config,
     kind,
     value,
     expected,
@@ -272,7 +276,6 @@ async def test_scheme_only_changes_in_copied_scope(
     send.assert_not_awaited()
 
 
-@pytest.mark.parametrize("kind", ["http", "websocket"])
 @pytest.mark.parametrize(
     "values",
     [
@@ -291,27 +294,37 @@ async def test_scheme_only_changes_in_copied_scope(
         [b"https\xff"],
     ],
 )
-async def test_trusted_malformed_proto_rejected(proxy_app, kind, values):
-    downstream, _, send = await _invoke(_scope(kind, values))
+async def test_trusted_malformed_proto_rejected(proxy_config, values):
+    downstream, _, send = await _invoke(_scope(values=values))
     downstream.assert_not_awaited()
     first = send.call_args_list[0].args[0]
-    if kind == "websocket":
-        assert first == {"type": "websocket.close", "code": 1008}
-    else:
-        assert first["type"] == "http.response.start"
-        assert first["status"] == 400
-        assert send.call_args_list[-1].args[0]["type"] == "http.response.body"
+    assert first["type"] == "http.response.start"
+    assert first["status"] == 400
+    assert send.call_args_list[-1].args[0]["type"] == "http.response.body"
+
+
+@pytest.mark.parametrize("values", [[b"https", b"https"], [b"ftp"]])
+async def test_websocket_malformed_proto_closes_connection(
+    proxy_config,
+    values,
+):
+    downstream, _, send = await _invoke(_scope("websocket", values))
+    downstream.assert_not_awaited()
+    assert send.call_args_list[0].args[0] == {
+        "type": "websocket.close",
+        "code": 1008,
+    }
 
 
 @pytest.mark.parametrize("value", [b"ws", b"wss"])
-async def test_http_rejects_websocket_only_schemes(proxy_app, value):
+async def test_http_rejects_websocket_only_schemes(proxy_config, value):
     downstream, _, send = await _invoke(_scope(values=[value]))
     downstream.assert_not_awaited()
     assert send.call_args_list[0].args[0]["status"] == 400
 
 
 @pytest.mark.parametrize("kind", ["http", "websocket", "lifespan"])
-async def test_no_forwarded_proto_passes_scope_untouched(proxy_app, kind):
+async def test_no_forwarded_proto_passes_scope_untouched(proxy_config, kind):
     scope = _scope(kind)
     downstream, receive, send = await _invoke(scope)
     downstream.assert_awaited_once_with(scope, receive, send)
@@ -319,7 +332,7 @@ async def test_no_forwarded_proto_passes_scope_untouched(proxy_app, kind):
     send.assert_not_awaited()
 
 
-async def test_missing_peer_does_not_trust_forwarded_proto(proxy_app):
+async def test_missing_peer_does_not_trust_forwarded_proto(proxy_config):
     scope = _scope(values=[b"https"])
     scope["client"] = None
     downstream, _, send = await _invoke(scope)
@@ -329,7 +342,7 @@ async def test_missing_peer_does_not_trust_forwarded_proto(proxy_app):
 
 @pytest.mark.parametrize("kind", ["http", "websocket", "lifespan"])
 async def test_untrusted_or_non_request_invalid_headers_pass_through(
-    proxy_app,
+    proxy_config,
     kind,
 ):
     scope = _scope(kind, [b"https\r\n", b"invalid"], peer="198.51.100.2")

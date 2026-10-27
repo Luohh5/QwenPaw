@@ -17,6 +17,7 @@ from tests.channel_support.host import (
     Host,
     KEY,
     local_wheel,
+    local_certifi_wheel,
     rows,
     texts,
     session_path,
@@ -27,19 +28,14 @@ from tests.channel_support.process import alive, eventually
 
 @pytest_asyncio.fixture
 async def host(tmp_path, monkeypatch):
-    case = Host(tmp_path, monkeypatch)
+    case = await Host.create(tmp_path, monkeypatch)
     yield case
     await case.close()
 
 
-@pytest.mark.asyncio
-async def test_official_discovery_and_disabled_config_are_static(
-    host,
-    monkeypatch,
-):
-    from qwenpaw.app.channels.catalog import get_configurable_channel_catalog
-    from qwenpaw.plugins.settings import persist_plugin_settings
-
+@pytest.fixture
+def static_channel_guard(host, monkeypatch):
+    """Guard each discovery/admission run against SDK and worker startup."""
     attempts = []
 
     class Guard(importlib.abc.MetaPathFinder):
@@ -56,6 +52,18 @@ async def test_official_discovery_and_disabled_config_are_static(
     monkeypatch.setattr(sys, "meta_path", [Guard(), *sys.meta_path])
     monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden)
     monkeypatch.setattr(subprocess, "Popen", forbidden)
+    yield attempts
+    assert not attempts and not host.ledger.exists()
+
+
+def test_official_discovery_and_descriptor_snapshot_are_static(
+    host,
+    monkeypatch,
+    static_channel_guard,
+):
+    from dataclasses import replace
+    from qwenpaw.app.channels.catalog import get_configurable_channel_catalog
+
     official = get_configurable_channel_catalog()
     assert {
         "console",
@@ -99,37 +107,16 @@ async def test_official_discovery_and_disabled_config_are_static(
     for key in ("feishu", "dingtalk"):
         with pytest.raises(ProtocolValidationError, match="contract required"):
             validate_channel_contract(key, ())
-    source = host.artifact()
-    shutil.copytree(source, host.installed)
-    persist_plugin_settings(
-        KEY,
-        enabled=False,
-        config={"app_id": "saved", "untouched": 7},
-    )
-    await host.loader.load_all_plugins(types=["channel"], activate=False)
-    row = host.registry.get_channel_catalog_entry(KEY)
-    assert row is not None and not row.global_enabled
-    assert (
-        row.description_record.descriptor.config_schema["properties"][
-            "app_secret"
-        ]["type"]
-        == "string"
-    )
-    assert not host.loader.get_loaded_plugin(KEY).enabled
-    from qwenpaw.config.utils import load_config
-
-    assert load_config().plugins[KEY] == {
-        "enabled": False,
-        "app_id": "saved",
-        "untouched": 7,
-    }
-    assert not attempts and not host.ledger.exists()
-
-    from dataclasses import replace
     from qwenpaw.app.channels.isolated_proxy import IsolatedChannelProxy
     from qwenpaw.channel_protocol.shared import SharedChannelDescriptor
 
-    description = row.description_record
+    source = host.artifact(sdk=True)
+    description = describe_channel(
+        source,
+        PluginManifest.from_dict(
+            json.loads((source / "plugin.json").read_text(encoding="utf-8")),
+        ),
+    )
     prepared = description.prepare_proxy_config({"enabled": False})
 
     def forbid_descriptor_load(*args, **kwargs):
@@ -169,6 +156,87 @@ async def test_official_discovery_and_disabled_config_are_static(
                 ),
                 descriptor=description.descriptor,
             )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "enabled,runtime",
+    [(False, "selected"), (True, None), (True, "unselected")],
+)
+async def test_channel_catalog_admission_preserves_config_without_runtime(
+    host,
+    monkeypatch,
+    static_channel_guard,
+    enabled,
+    runtime,
+):
+    from dataclasses import replace
+    from qwenpaw.plugins.settings import persist_plugin_settings
+    from qwenpaw.plugins.channel_adapter import (
+        ChannelRuntimeNotIntegratedError,
+    )
+
+    if runtime is None:
+        host.registry.channel_runtime = None
+    elif runtime == "unselected":
+        host.registry.channel_runtime = replace(
+            host.registry.channel_runtime,
+            selected_channels=frozenset(),
+        )
+
+    source = host.artifact(sdk=True)
+    shutil.copytree(source, host.installed)
+    persist_plugin_settings(
+        KEY,
+        enabled=enabled,
+        config={"app_id": "saved", "untouched": 7},
+    )
+    await host.loader.load_all_plugins(types=["channel"], activate=False)
+    row = host.registry.get_channel_catalog_entry(KEY)
+    assert row is not None and row.global_enabled is enabled
+    assert (
+        row.description_record.descriptor.config_schema["properties"][
+            "app_secret"
+        ]["type"]
+        == "string"
+    )
+    record = host.loader.get_loaded_plugin(KEY)
+    assert not record.enabled
+    assert record.status == ("catalogued" if enabled else "inactive")
+    if enabled:
+        assert "channel_runtime_not_integrated" in record.diagnostics
+        usage = host.registry.dependency_usage
+        assert usage.has_declaration(row.dependency_token, plugin_id=KEY)
+        (declaration,) = usage.snapshot(
+            admission_token=row.dependency_token,
+        ).uses
+        assert (
+            declaration.source_revision
+            == row.description_record.source_revision
+        )
+        assert declaration.requirements == ("sample-shared-sdk==1.0",)
+        assert not declaration.pending and declaration.snapshot is None
+        with pytest.raises(
+            ChannelRuntimeNotIntegratedError,
+            match="^channel_runtime_not_integrated$",
+        ):
+            await host.loader.lifecycle.activate(KEY)
+        with pytest.raises(
+            ChannelRuntimeNotIntegratedError,
+            match="^channel_runtime_not_integrated$",
+        ):
+            await host.loader.lifecycle.prepare_backend(
+                record.backend_binding,
+                allow_install=False,
+                probe=True,
+            )
+    from qwenpaw.config.utils import load_config
+
+    assert load_config().plugins[KEY] == {
+        "enabled": enabled,
+        "app_id": "saved",
+        "untouched": 7,
+    }
 
 
 def test_runner_hello_requires_shared_identity():
@@ -474,6 +542,7 @@ async def test_local_install_enable_uses_installed_code_and_offline_dependency(
     ws = await host.workspace("first", use_sdk=True)
     source = host.artifact(sdk=True)
     wheels = local_wheel(host.root / "wheels")
+    local_certifi_wheel(wheels)
     calls = []
 
     def offline(command, *, timeout, plugin_id):
@@ -897,7 +966,7 @@ async def test_real_approval_card_and_inbound_operator_decision(
     assert ws.requests[-1].user_id == "alice" and not ws.model_calls
 
 
-@pytest.fixture(params=["azure_bot", "matrix"])
+@pytest.fixture
 def legacy_start(request, host, tmp_path, monkeypatch):
     from dataclasses import replace
     from types import SimpleNamespace
@@ -998,6 +1067,11 @@ def legacy_start(request, host, tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "legacy_start",
+    ["azure_bot", "matrix"],
+    indirect=True,
+)
 async def test_legacy_start_preparation_yields_and_keeps_authorization(
     legacy_start,
     monkeypatch,
@@ -1060,7 +1134,20 @@ async def test_legacy_start_preparation_yields_and_keeps_authorization(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ["cancel", "disable", "unregister"])
+@pytest.mark.parametrize(
+    "legacy_start,action",
+    [
+        ("azure_bot", "cancel"),
+        ("azure_bot", "disable"),
+        ("azure_bot", "unregister"),
+        ("azure_bot", "mutate"),
+        ("azure_bot", "replace"),
+        ("azure_bot", "publish"),
+        ("matrix", "cancel"),
+        ("matrix", "mutate"),
+    ],
+    indirect=["legacy_start"],
+)
 async def test_legacy_preparation_does_not_publish_stale_start(
     legacy_start,
     monkeypatch,
@@ -1079,10 +1166,15 @@ async def test_legacy_preparation_does_not_publish_stale_start(
 
     monkeypatch.setattr(case.reader, case.reader_name, slow)
     reserves = []
+    reserved = asyncio.Event()
+    baseline = tuple(case.registry.runtime_owners.leases())
+    if action == "publish":
+        await case.manager._lock.acquire()
     original_reserve = case.registry.runtime_owners.reserve
 
     def reserve(*args, **kwargs):
         reserves.append(1)
+        reserved.set()
         return original_reserve(*args, **kwargs)
 
     monkeypatch.setattr(case.registry.runtime_owners, "reserve", reserve)
@@ -1099,8 +1191,22 @@ async def test_legacy_preparation_does_not_publish_stale_start(
             task.cancel()
         elif action == "disable":
             case.row.global_enabled = False
-        else:
+        elif action == "unregister":
             case.registry._channels.pop(case.key)
+        elif action == "mutate":
+            case.manager._workspace_config.channels[case.key][
+                "enabled"
+            ] = False
+        elif action == "replace":
+            values = case.manager._workspace_config.channels[case.key]
+            case.manager._workspace_config.channels[case.key] = dict(values)
+        else:
+            release.set()
+            await asyncio.wait_for(reserved.wait(), 3)
+            await asyncio.sleep(0)
+            assert not task.done() and not case.manager.channels
+            case.row.global_enabled = False
+            case.manager._lock.release()
         release.set()
         expected = (
             pytest.raises(asyncio.CancelledError)
@@ -1109,7 +1215,116 @@ async def test_legacy_preparation_does_not_publish_stale_start(
         )
         with expected:
             await task
-        assert not case.manager.channels and not reserves
+        assert not case.manager.channels
+        assert bool(reserves) == (action == "publish")
+        assert tuple(case.registry.runtime_owners.leases()) == baseline
     finally:
+        if action == "publish" and case.manager._lock.locked():
+            case.manager._lock.release()
         release.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["scan", "replace", "cancel"])
+async def test_qr_session_rechecks_source_after_scope_read(
+    host,
+    monkeypatch,
+    action,
+):
+    import threading
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from qwenpaw.app.channels import qrcode_sessions as qr
+    from qwenpaw.app.channels.management import (
+        ChannelManagementService,
+        ManagementError,
+    )
+
+    record = await host.loader.load_plugin_from_path(host.artifact())
+    row = host.registry.get_channel_catalog_entry(KEY)
+    description = row.description_record
+    scope = qr.ChannelManagementScope("scan", host.root / "scan", KEY, {})
+    management = ChannelManagementService(host.loader)
+    sessions = qr.ChannelQRCodeSessions(host.loader, management)
+    entered, release = threading.Event(), threading.Event()
+    operations = []
+    baseline = tuple(host.registry.runtime_owners.leases())
+
+    def read_scope(*args):
+        entered.set()
+        assert release.wait(3)
+        return scope
+
+    async def execute(
+        workspace_id,
+        channel_key,
+        operation,
+        parameters,
+        **kwargs,
+    ):
+        operations.append(operation)
+        payload = (
+            {"scan_url": "https://scan.test", "continuation": "private-scan"}
+            if operation == "qrcode.fetch"
+            else {"status": "confirmed", "credentials": {"app_id": "fresh"}}
+        )
+        return SimpleNamespace(
+            plugin_id=row.plugin_id,
+            workspace_id=workspace_id,
+            channel_key=channel_key,
+            source_revision=description.source_revision,
+            outcome="ok",
+            result=payload,
+        )
+
+    monkeypatch.setattr(qr, "_read_scope", read_scope)
+    monkeypatch.setattr(management, "execute", execute)
+    pending = asyncio.create_task(sessions.fetch(scope, {}))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        session = next(iter(sessions._sessions.values()))
+        assert host.registry.runtime_owners.resource(session.lease) is session
+        assert not operations and not pending.done()
+        if action == "replace":
+            original = row.runtime_settings
+            row.runtime_settings = replace(original)
+            assert row.runtime_settings == original
+            assert row.runtime_settings is not original
+        elif action == "cancel":
+            pending.cancel()
+            await asyncio.sleep(0)
+            assert not pending.done()
+            assert session.lease in host.registry.runtime_owners.leases()
+        else:
+            record.source_path = Path(str(record.source_path))
+        release.set()
+        if action != "scan":
+            expected = (
+                pytest.raises(asyncio.CancelledError)
+                if action == "cancel"
+                else pytest.raises(
+                    ManagementError,
+                    match="SOURCE_REVISION_MISMATCH",
+                )
+            )
+            with expected:
+                await pending
+            assert not operations and session.status == "failed"
+        else:
+            fetched = await pending
+            assert fetched.scan_url == "https://scan.test"
+            result = await sessions.poll(scope, fetched.poll_token)
+            assert result.status == "confirmed" and result.credentials == {
+                "app_id": "fresh",
+            }
+            assert operations == ["qrcode.fetch", "qrcode.poll"]
+            await sessions.cancel(scope, fetched.poll_token)
+            assert session.status == "cancelled"
+        assert not session.continuation and not session.credentials
+        assert not session.config and session.timer is None
+        assert tuple(host.registry.runtime_owners.leases()) == baseline
+    finally:
+        release.set()
+        await asyncio.gather(pending, return_exceptions=True)
+        await sessions.aclose()

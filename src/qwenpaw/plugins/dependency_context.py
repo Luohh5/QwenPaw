@@ -7,9 +7,41 @@ from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 import subprocess
+import sys
 from types import SimpleNamespace
 
 from .dependency_maintenance import canonical, contains_environment_path
+
+
+def _runtime_environment_snapshot(runtime):
+    if runtime is None:
+        return None
+    return (
+        runtime.python_executable,
+        runtime.support_root,
+        tuple(runtime.dependency_paths),
+        runtime.dependency_install_target,
+        json.dumps(runtime.runtime_identity, sort_keys=True),
+    )
+
+
+def _capture_runtime_selection(get_runtime, is_frozen=None):
+    """Capture once; subsequent checks compare only in-memory policy."""
+    if is_frozen is None:
+        is_frozen = lambda: bool(getattr(sys, "frozen", False))
+    runtime = get_runtime()
+    identity = _runtime_environment_snapshot(runtime)
+    frozen = is_frozen()
+
+    def validate():
+        if (
+            get_runtime() is not runtime
+            or _runtime_environment_snapshot(runtime) != identity
+            or is_frozen() != frozen
+        ):
+            raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+
+    return validate
 
 
 def host_bundle_identity():

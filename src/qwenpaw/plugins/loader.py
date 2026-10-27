@@ -30,6 +30,7 @@ from .execution_backend import (
     probes_before_activation,
     registration_scope,
 )
+from .dependency_context import _capture_runtime_selection
 from .python_backend import (
     PythonBackend,
     PythonServices,
@@ -223,18 +224,6 @@ class _DependencyAdmission:
     released: bool = False
 
 
-def _runtime_environment_snapshot(runtime):
-    if runtime is None:
-        return None
-    return (
-        runtime.python_executable,
-        runtime.support_root,
-        tuple(runtime.dependency_paths),
-        runtime.dependency_install_target,
-        json.dumps(runtime.runtime_identity, sort_keys=True),
-    )
-
-
 def _prepare_plugin_site_path(site_dir, path_snapshot):
     """Resolve the complete frozen path edit without touching global state."""
     try:
@@ -275,13 +264,6 @@ def _publish_plugin_site_path(prepared):
     importlib.invalidate_caches()
 
 
-def _ensure_plugin_site_on_path(site_dir=None):
-    if _is_frozen():
-        _publish_plugin_site_path(
-            _prepare_plugin_site_path(site_dir, tuple(sys.path)),
-        )
-
-
 async def _ensure_plugin_site_on_path_async(site_dir=None, *, validate=None):
     from ..utils.io_utils import run_sync_io
 
@@ -304,20 +286,14 @@ async def _ensure_plugin_site_on_path_async(site_dir=None, *, validate=None):
 class PluginLoader:  # pylint: disable=too-many-public-methods
     """Plugin loader for discovering and loading plugins."""
 
-    def __init__(self, plugin_dirs: List[Path], *, channel_runtime=None):
+    def __init__(self, plugin_dirs: List[Path]):
         """Initialize plugin loader.
 
         Args:
             plugin_dirs: List of directories to search for plugins
         """
         self.plugin_dirs = [Path(d) for d in plugin_dirs]
-        if channel_runtime is not None:
-            from .dependency_maintenance import lease_environment
-
-            lease_environment(channel_runtime.dependency_paths)
         self.registry = PluginRegistry()
-        if channel_runtime is not None:
-            self.registry.configure_channel_runtime(channel_runtime)
         self.lifecycle = PluginLifecycle(self)
         self._loaded_plugins: Dict[str, PluginRecord] = {}
         self._recovery_blocked: dict[str, str] = {}
@@ -387,27 +363,28 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         from ..utils.io_utils import run_sync_io
         from .dependency_maintenance import lease_environment
 
+        validate = _capture_runtime_selection(
+            lambda: channel_runtime,
+            _is_frozen,
+        )
         if channel_runtime is not None:
-            identity = _runtime_environment_snapshot(channel_runtime)
-            await run_sync_io(lease_environment, identity[2])
-            if _runtime_environment_snapshot(channel_runtime) != identity:
-                raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+            await run_sync_io(
+                lease_environment,
+                tuple(channel_runtime.dependency_paths),
+            )
+        validate()
         loader = cls(plugin_dirs)
         if channel_runtime is not None:
             loader.registry.configure_channel_runtime(channel_runtime)
         return loader
 
-    async def _publish_dependency_site(self, target):
-        runtime = self.registry.channel_runtime
-        identity = _runtime_environment_snapshot(runtime)
-
-        def validate():
-            if (
-                self.registry.channel_runtime is not runtime
-                or _runtime_environment_snapshot(runtime) != identity
-            ):
-                raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
-
+    async def _publish_dependency_site(self, target, *, validate=None):
+        if validate is None:
+            validate = _capture_runtime_selection(
+                lambda: self.registry.channel_runtime,
+                _is_frozen,
+            )
+        validate()
         await _ensure_plugin_site_on_path_async(target, validate=validate)
 
     def _channel_runtime_for(self, manifest):
@@ -975,23 +952,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 "Shared runtime requires explicit administrator repair",
             )
         frozen = _is_frozen()
-        runtime = self.registry.channel_runtime
-        runtime_identity = _runtime_environment_snapshot(runtime)
-
-        def validate_runtime_selection():
-            if (
-                self.registry.channel_runtime is not runtime
-                or _runtime_environment_snapshot(runtime) != runtime_identity
-                or _is_frozen() != frozen
-            ):
-                raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
-
-        async def publish_site(target):
-            validate_runtime_selection()
-            await _ensure_plugin_site_on_path_async(
-                target,
-                validate=validate_runtime_selection,
-            )
+        validate_runtime_selection = _capture_runtime_selection(
+            lambda: self.registry.channel_runtime,
+            _is_frozen,
+        )
 
         context = await run_sync_io(self._dependency_environment)
         validate_runtime_selection()
@@ -1045,7 +1009,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 )
 
             paths = await run_sync_io(resolve_paths)
-            await publish_site(target)
+            await self._publish_dependency_site(
+                target,
+                validate=validate_runtime_selection,
+            )
         await self._stop_preparation(plugin_id)
         cleanup = ExitStack()
         try:
@@ -1144,6 +1111,8 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 async def host_audit(_spec):
                     observed = await self._python_backend.audit_dependencies(
                         SimpleNamespace(source_path=root),
+                        context=context,
+                        validate=validate_runtime_selection,
                     )
                     return SimpleNamespace(snapshot=observed)
 
@@ -1168,6 +1137,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     snapshot,
                 )
                 target = context.install_target
+            validate_runtime_selection()
             try:
                 await prepare_shared_dependencies(
                     audit_process,
@@ -1201,7 +1171,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     dependency_context=context if frozen else None,
                 )
             if frozen:
-                await publish_site(target)
+                await self._publish_dependency_site(
+                    target,
+                    validate=validate_runtime_selection,
+                )
             return GateDecision(False, True, reason="already satisfied")
         except Exception:
             if identity_error is not None:
@@ -1597,21 +1570,15 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         if admission.token is None:
             prepare = getattr(
                 binding.backend,
-                "dependency_targets_async",
+                "prepare_dependency_targets",
                 None,
             )
             prepared = (
                 await prepare(description) if prepare is not None else None
             )
-            hints = getattr(binding.backend, "dependency_targets", None)
-            targets = (
-                prepared.targets
-                if prepared is not None
-                else hints(description)
-                if hints is not None
-                else ()
-            )
-            async with environment_coordinator(targets):
+            async with environment_coordinator(
+                prepared.targets if prepared else (),
+            ):
                 if prepared is not None:
                     prepared.validate()
                 admission.token = usage.declare(

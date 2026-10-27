@@ -27,7 +27,11 @@ from ...config.channel_config_compat import absolute_execution_paths
 from ...config.utils import load_config
 from ...constant import WORKING_DIR
 from ...plugins.ownership import RuntimeKey, RuntimeLease, RuntimeStopReceipt
-from .management import ChannelManagementService, ManagementError
+from .management import (
+    ChannelManagementService,
+    ManagementError,
+    _source_matches,
+)
 from .qrcode_auth_handler import PollResult, QRCodeResult
 from ...utils.io_utils import run_async_to_completion, run_sync_io
 from .wechat_auth_custody import (
@@ -265,10 +269,7 @@ class ChannelQRCodeSessions:
             record,
             session.scope.channel_key,
         )
-        if (
-            any(current[index] is not snapshot[index] for index in range(3))
-            or current[3] != snapshot[3]
-        ):
+        if not _source_matches(current, snapshot):
             raise ManagementError("SOURCE_REVISION_MISMATCH")
 
     async def _prepare_fetch(self, session, source):
