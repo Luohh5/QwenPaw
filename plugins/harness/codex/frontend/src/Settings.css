@@ -204,7 +204,7 @@
 .harness-codex-settings .binaryLabel {
   color: var(--abf-text);
   font-size: 14px;
-  margin: 0 5px 7px 0;
+  margin: 0 5px 4px 0;
 }
 .harness-codex-settings .helpIcon {
   border: 0;
@@ -215,20 +215,16 @@
 .harness-codex-settings .binaryField > .ant-input-affix-wrapper {
   width: 100%;
 }
-.harness-codex-settings .binaryStatusLabel .anticon,
-.harness-codex-settings .connectedState .anticon,
-.harness-codex-settings .disconnectedState .anticon,
-.harness-codex-settings .capabilityItem > .anticon {
+.harness-codex-settings .binaryStatusLabel svg,
+.harness-codex-settings .connectedState svg,
+.harness-codex-settings .disconnectedState svg,
+.harness-codex-settings .capabilityItem > svg {
   flex: 0 0 auto;
 }
 .harness-codex-settings .connectedState,
 .harness-codex-settings .disconnectedState {
   overflow-wrap: anywhere;
   min-width: 0;
-}
-.harness-codex-settings .capabilityItem > .anticon {
-  margin-top: 2px;
-  font-size: 16px;
 }
 .harness-codex-settings .capabilityItem strong {
   white-space: normal;

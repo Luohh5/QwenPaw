@@ -1,22 +1,11 @@
 import { getHost, type HarnessSettingsProps } from "@qwenpaw/plugin-sdk";
+import { Icon } from "./Icons";
 import settingsCss from "./Settings.css?inline";
 import { localMessages } from "./locale";
 
 const host = getHost().host;
 const React = host.React;
 const { Button, Input, Tooltip, App } = host.antd;
-const {
-  CheckOutlined,
-  QuestionCircleOutlined,
-  ReloadOutlined,
-  CopyOutlined,
-  ExclamationCircleOutlined,
-  ExportOutlined,
-  LogoutOutlined,
-  ThunderboltOutlined,
-  ApartmentOutlined,
-  SafetyOutlined,
-} = host.antdIcons;
 const BACKEND = "qoder";
 interface Status {
   installed: boolean;
@@ -167,7 +156,7 @@ export function Settings({ value, onChange, open }: HarnessSettingsProps) {
             className="helpIcon"
             aria-label={text.binaryHelp}
           >
-            <QuestionCircleOutlined aria-hidden="true" />
+            <Icon name="CircleHelp" size={14} />
           </button>
         </Tooltip>
         <Input
@@ -189,7 +178,7 @@ export function Settings({ value, onChange, open }: HarnessSettingsProps) {
               type="text"
               size="small"
               aria-label={text.detect}
-              icon={<ReloadOutlined aria-hidden="true" />}
+              icon={<Icon name="RefreshCw" size={14} />}
               loading={checking}
               onClick={() => void check()}
             >
@@ -201,31 +190,32 @@ export function Settings({ value, onChange, open }: HarnessSettingsProps) {
       {status?.runtime_path && (
         <div className="binaryStatus detected">
           <strong className="binaryStatusLabel">
-            <CheckOutlined aria-hidden="true" />
+            <Icon name="Check" size={14} />
             {text.detected}
           </strong>{" "}
           <Tooltip title={status.runtime_path}>
             <code className="binaryPath">{status.runtime_path}</code>
           </Tooltip>{" "}
-          <Button
-            className="copyPathButton"
-            type="text"
-            aria-label={text.copy}
-            title={text.copy}
-            icon={<CopyOutlined aria-hidden="true" />}
-            size="small"
-            onClick={() =>
-              void navigator.clipboard
-                .writeText(status.runtime_path!)
-                .then(() => message.success(text.copied))
-                .catch(() => message.error(text.copyFailed))
-            }
-          />
+          <Tooltip title={text.copy}>
+            <button
+              className="copyPathButton"
+              type="button"
+              aria-label={text.copy}
+              onClick={() =>
+                void navigator.clipboard
+                  .writeText(status.runtime_path!)
+                  .then(() => message.success(text.copied))
+                  .catch(() => message.error(text.copyFailed))
+              }
+            >
+              <Icon name="Copy" size={13} />
+            </button>
+          </Tooltip>
         </div>
       )}
       {!checking && status && !status.installed && (
         <p className="binaryStatus notDetected" role="status">
-          <ExclamationCircleOutlined aria-hidden="true" />
+          <Icon name="CircleAlert" size={14} />
           {text.notFound}
         </p>
       )}
@@ -238,9 +228,9 @@ export function Settings({ value, onChange, open }: HarnessSettingsProps) {
             }
           >
             {status?.authenticated ? (
-              <CheckOutlined aria-hidden="true" />
+              <Icon name="Check" size={14} />
             ) : (
-              <ExclamationCircleOutlined aria-hidden="true" />
+              <Icon name="CircleAlert" size={14} />
             )}
             {status?.authenticated
               ? `${account}${identity ? ` · ${identity}` : ""}`
@@ -250,7 +240,7 @@ export function Settings({ value, onChange, open }: HarnessSettingsProps) {
         <div className="accountAction">
           {!status?.authenticated && (
             <Button
-              icon={<ExportOutlined aria-hidden="true" />}
+              icon={<Icon name="ExternalLink" size={14} />}
               disabled={!status?.installed}
               loading={connecting}
               onClick={() => void connect()}
@@ -260,7 +250,7 @@ export function Settings({ value, onChange, open }: HarnessSettingsProps) {
           )}
           {false && status?.authenticated && kind === "chatgpt" && (
             <Button
-              icon={<LogoutOutlined aria-hidden="true" />}
+              icon={<Icon name="LogOut" size={14} />}
               onClick={() => void disconnect()}
             >
               {text.disconnect}
@@ -284,7 +274,7 @@ export function Settings({ value, onChange, open }: HarnessSettingsProps) {
           <strong className="capabilityTitle">{text.capabilityTitle}</strong>
           <div className="capabilityGrid">
             <div className="capabilityItem">
-              <ThunderboltOutlined aria-hidden="true" />
+              <Icon name="Sparkles" size={16} />
               <span>
                 <strong>{text.inheritedSkills}</strong>
                 <small>
@@ -295,7 +285,7 @@ export function Settings({ value, onChange, open }: HarnessSettingsProps) {
               </span>
             </div>
             <div className="capabilityItem">
-              <ApartmentOutlined aria-hidden="true" />
+              <Icon name="Network" size={16} />
               <span>
                 <strong>{text.inheritedMcp}</strong>
                 <small>
@@ -306,7 +296,7 @@ export function Settings({ value, onChange, open }: HarnessSettingsProps) {
               </span>
             </div>
             <div className="capabilityItem">
-              <SafetyOutlined aria-hidden="true" />
+              <Icon name="ShieldCheck" size={16} />
               <span>
                 <strong>{text.policyCompatibility}</strong>
                 <small>

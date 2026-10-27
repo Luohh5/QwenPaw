@@ -18,7 +18,7 @@
 - Use concise colocated code and existing public frontend SDK capabilities. No new runtime dependencies.
 - Preserve keyboard access, narrow-screen layout, dark theme, long paths and long account identifiers.
 - Production author does not edit test files. Independent QA may update only assertions made stale by changed accessible markup, and must retain existing behavioral coverage.
-- ZIP artifacts may be updated only in `/Users/luohh/Documents/Qwenpaw/harness插件化`; do not update the user's installed plugin copies or restart/modify the backend on 9099.
+- ZIP artifacts may be updated only in `/Users/luohh/Documents/Qwenpaw/harness插件化`. Apply requested live updates only through the official plugin lifecycle API without task interruption; never edit installed plugin files directly or restart the backend on 9099.
 - Keep the existing `refactor/plugin_harness` checkout. No push, publish or unrelated code changes.
 
 ## Review Focus
@@ -49,11 +49,22 @@
 
 ## Verification
 
-- Separate production and test authors; only the supported icon namespace was added to the existing vendor test fixture. No new tests or weakened assertions.
+- Separate production and test authors; existing vendor behavioral assertions remain unchanged. Temporary Ant Design icon fixture support was removed after restoring the original SVGs.
 - Baseline settings tests: 11 passed. Existing related ownership, loading, SDK and locale coverage: 86 passed across eight suites. After decorative-icon and responsive-grid polish, both directly affected suites passed again: 11 tests, including exact translated button names.
 - Both plugin TypeScript/Vite builds and the full Console production build passed after final changes. Prettier checks and `git diff --check` passed.
 - Browser preview used actual host components and built plugin JavaScript with synthetic account/status data, without connecting to 9099. Checked Codex/Qoder switching, create/edit presentation, desktop width 1280, mobile width 390, light/dark palettes, three capability cards, long paths/account names, and absence of horizontal overflow.
 - Scoped review: spec PASS; code quality APPROVE; decorative icon finding addressed.
-- Both existing `1.0.0` ZIPs in the user-designated directory were rebuilt using the repository packer. Each has 11 entries, all matching current source; only `frontend/dist/index.js` changed relative to the previous ZIP. Existing installed plugins were not changed.
-- Codex ZIP SHA-256: `af69bc30bb33866a0acc410131d5a72ffabbf079424ca27e3b8cdf8334cf84ee`.
-- Qoder ZIP SHA-256: `f7f81dd08a12123c52e674be8fece937f0149ee3d57656d07198bf0e0bab4a80`.
+- Both existing `1.0.0` ZIPs in the user-designated directory were rebuilt using the repository packer. Each has 11 entries, all matching current source; only `frontend/dist/index.js` changed relative to the previous ZIP.
+- Codex ZIP SHA-256: `29756b0f635911d9562fd66a9c7aa0f31a9a88da3f363620dacb1c62ad139d80`.
+- Qoder ZIP SHA-256: `7b07c8f0e6a820e5960a03e4a34d84598221ea0519de5b766919f8fe96de8b3b`.
+
+## Follow-up: original assets and actual installed delivery
+
+The user's actual 9099 UI still showed plain text after the first restoration. Both served plugin scripts were older builds without the card root classes or embedded CSS. A real repeat ZIP upload returned HTTP 409 because Console omitted the documented replacement flag, so the normal upload path could not apply the updated package.
+
+- Restored remaining original lower-panel details: native copy button and tooltip, original spacing/sizes, and all ten original Lucide vector geometries. Tiny plugin-owned SVG helpers retain upstream license notices; no new dependency or SDK interface.
+- Local ZIP uploads now use `force=true` to replace the same installed plugin. Existing busy-task confirmation still gates `interrupt_tasks=true`; uploading alone does not authorize interrupting tasks.
+- Independent regression: two expected failures before the API fix, then 37 passing tests across the API and settings suites. After final SVG changes, the two existing settings suites passed again: 11 tests, with unchanged behavioral assertions. No redundant visual tests.
+- Both final plugin builds passed; the Console production build passed after the upload fix. Scoped review approved spec compliance and code quality, including original icon geometry and attribution.
+- Applied both canonical ZIPs through the official 9099 upload endpoint with `force=true`, without `interrupt_tasks`; both returned HTTP 200. Served JS matched the final source builds byte for byte.
+- Actual browser verification covered both Codex and Qoder create/edit panels with existing account status, green detected-runtime strips, separate account cards, three capability cards, and the original SVGs. No agent was created, saved, deleted, or logged out. Actual screenshots and asset fingerprints are retained under ignored `tmp/harness-style-preview`.

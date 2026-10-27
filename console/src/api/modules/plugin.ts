@@ -229,7 +229,9 @@ export async function uploadPlugin(file: File): Promise<InstallPluginResult> {
     (interruptTasks) =>
       fetch(
         getApiUrl(
-          `/plugins/upload${interruptTasks ? "?interrupt_tasks=true" : ""}`,
+          `/plugins/upload?force=true${
+            interruptTasks ? "&interrupt_tasks=true" : ""
+          }`,
         ),
         {
           method: "POST",
