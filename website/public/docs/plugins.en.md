@@ -293,6 +293,7 @@ class Plugin:
             id="echo-backend", label="Echo", create=create,
             capabilities=HarnessCapabilities(),
             config_fields=({"name": "prefix", "label": "Prefix", "type": "text"},),
+            instance_settings_keys=("prefix",),
         ))
 
 plugin = Plugin()
@@ -300,8 +301,16 @@ plugin = Plugin()
 
 Registration stores the factory without executing it. Catalog reads do not create
 clients, query accounts, discover CLI binaries or write projections. Instances are
-owned by plugin generation, context and workspace; effective settings changes
-close the previous instance before construction. Factories run on the event loop:
+owned by plugin generation, context and workspace. `instance_settings_keys`
+declares which settings determine an instance; it defaults to `()`. The factory
+receives an independent deep copy of only those keys that are present. Changing
+declared values closes the previous idle instance before construction; an active
+instance stays intact and the conflicting request fails with `plugin_busy`
+(HTTP 409 for management calls, a failed response for Console streams).
+`HarnessCallContext.settings` contains a fresh deep copy of all effective call
+settings. Keep model, reasoning and approval parameters there, outside instance
+identity, so concurrent calls and status checks can share a backend. Codex and
+Qoder declare only `("binary",)`. Factories run on the event loop:
 keep synchronous construction pure, and use an async factory for preparation.
 Offload only bounded filesystem/discovery operations, preserving locks until their
 real worker completes. Do not construct asyncio clients or locks in worker threads.

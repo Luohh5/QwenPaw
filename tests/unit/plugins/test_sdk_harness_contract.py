@@ -40,6 +40,7 @@ DTO_FIELDS = {
         "description",
         "icon",
         "doc_url",
+        "instance_settings_keys",
     },
     "HarnessContext": {
         "plugin_id",

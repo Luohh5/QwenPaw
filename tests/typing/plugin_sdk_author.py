@@ -177,15 +177,16 @@ async def harness_contract(
         assert_type(settings, dict[str, Any])
         return backend
 
+    spec = HarnessSpec(
+        "author-example",
+        "Example",
+        create,
+        HarnessCapabilities(),
+        instance_settings_keys=("binary",),
+    )
+    assert_type(spec.instance_settings_keys, tuple[str, ...])
     handle = assert_type(
-        plugin.register_harness(
-            HarnessSpec(
-                "author-example",
-                "Example",
-                create,
-                HarnessCapabilities(),
-            ),
-        ),
+        plugin.register_harness(spec),
         Registration,
     )
     assert_type(await backend.status(call), HarnessStatus)

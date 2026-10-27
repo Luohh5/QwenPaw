@@ -11,8 +11,72 @@ import pytest
 from qwenpaw.app.routers.frontend_plugin import router as frontend_router
 from qwenpaw.plugins.testing import PluginTestHost
 
-from tests.unit.plugins.harness_bridge_fixture import SOURCE
+from tests.unit.plugins.harness_bridge_fixture import SOURCE, collect, until
 from tests.unit.plugins.test_sdk_entry_contract import write_plugin
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("binary, status", [("one", 200), ("two", 409)])
+async def test_status_during_turn_omits_turn_settings_without_rebuild(
+    tmp_path,
+    binary,
+    status,
+):
+    source = tmp_path / "status-owner"
+    write_plugin(
+        source,
+        SOURCE,
+        sdk={"version": "1.1.0", "capabilities": ["harnesses"]},
+        meta={"harnesses": [{"id": "fake-backend", "label": "Fake"}]},
+    )
+    async with PluginTestHost(tmp_path / "host") as host:
+        assert (await host.install(source)).ok
+        workspace = await host._workspace("test")
+        plugin = host._loader.get_loaded_plugin("status-owner").instance
+        active = asyncio.create_task(
+            collect(
+                workspace.backend_runtime,
+                "hold",
+                settings={
+                    "binary": "one",
+                    "model": "chosen",
+                    "permissions": "read-only",
+                },
+            ),
+        )
+        try:
+            await until(
+                lambda: plugin.created and plugin.created[0].entered.is_set(),
+            )
+            backend = plugin.created[0]
+            response = await host.request(
+                "POST",
+                "/api/harnesses/fake-backend/status",
+                headers={"X-Agent-Id": "test"},
+                json={"settings": {"binary": binary}},
+            )
+            assert response.status == status
+            if status == 200:
+                assert response.json()["installed"] is True
+                assert backend.calls[-1].settings == {"binary": "one"}
+            else:
+                assert response.json()["detail"]["code"] == "plugin_busy"
+            assert len(plugin.created) == 1
+            assert not active.done() and not backend.closed
+            assert not backend.close_entered.is_set()
+        finally:
+            for backend in plugin.created:
+                backend.release.set()
+            await active
+        if status == 409:
+            replaced = await host.request(
+                "POST",
+                "/api/harnesses/fake-backend/status",
+                headers={"X-Agent-Id": "test"},
+                json={"settings": {"binary": "two"}},
+            )
+            assert replaced.status == 200
+            assert len(plugin.created) == 2 and plugin.created[0].closed
 
 
 @pytest.mark.integration

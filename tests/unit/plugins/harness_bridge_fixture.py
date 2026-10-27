@@ -178,6 +178,7 @@ class Plugin:
                     external_history=True,
                     commands=(HarnessCommand("compact"),),
                 ),
+                instance_settings_keys=("binary", "connection"),
             )
         )
 

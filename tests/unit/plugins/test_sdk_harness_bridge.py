@@ -13,7 +13,14 @@ from .test_sdk_entry_contract import plugin_loader
 
 # Imported fixture discovery is intentional; helpers are called below.
 # pylint: disable-next=unused-import
-from .harness_bridge_fixture import collect, harness_fixture, request, until
+from .harness_bridge_fixture import (
+    SOURCE,
+    collect,
+    harness_fixture,
+    load_backend,
+    request,
+    until,
+)
 
 
 @pytest.mark.parametrize("reset_command", ["/clear", "/new"])
@@ -413,6 +420,165 @@ async def test_concurrent_same_session_approval_and_credentials_stay_scoped(
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_concurrent_turn_settings_reuse_backend(harness):
+    runtime = harness.runtime()
+    first_settings = {"model": "one", "permissions": "read-only"}
+    second_settings = {"model": "two", "permissions": "full-access"}
+    first = asyncio.create_task(
+        collect(
+            runtime,
+            "hold",
+            session="first",
+            user="alice",
+            channel="console",
+            settings=first_settings,
+        ),
+    )
+    second = None
+    try:
+        await until(
+            lambda: harness.plugin.created
+            and harness.plugin.created[0].entered.is_set(),
+        )
+        backend = harness.plugin.created[0]
+        second = asyncio.create_task(
+            collect(
+                runtime,
+                "hold",
+                session="second",
+                user="bob",
+                channel="mail",
+                settings=second_settings,
+            ),
+        )
+        await until(lambda: len(backend.calls) == 2 or second.done())
+        if second.done():
+            await second
+        assert len(harness.plugin.created) == 1
+        assert [call.settings for call in backend.calls] == [
+            first_settings,
+            second_settings,
+        ]
+        assert [
+            (call.session_id, call.user_id, call.channel)
+            for call in backend.calls
+        ] == [("first", "alice", "console"), ("second", "bob", "mail")]
+        assert not first.done() and not second.done() and not backend.closed
+        backend.release.set()
+        completed = await asyncio.gather(first, second)
+        assert all(result[-1].status == "completed" for result in completed)
+    finally:
+        for backend in harness.plugin.created:
+            backend.release.set()
+        await asyncio.gather(
+            first,
+            *([second] if second is not None else []),
+            return_exceptions=True,
+        )
+
+
+async def test_settings_copies_isolate_calls_factory_and_reuse(harness):
+    from copy import deepcopy
+
+    runtime = harness.runtime()
+    original = {
+        "binary": "one",
+        "connection": {"env": {"TOKEN": "original"}},
+        "turn": {"args": ["original"]},
+        "model": "chosen",
+    }
+    incoming = deepcopy(original)
+    await runtime.call("fake-backend", "status", incoming)
+    backend = harness.plugin.created[0]
+    first = backend.calls[0]
+    assert backend.settings == {
+        "binary": "one",
+        "connection": {"env": {"TOKEN": "original"}},
+    }
+    assert first.settings == original
+    incoming["connection"]["env"]["TOKEN"] = "caller"
+    incoming["turn"]["args"].append("caller")
+    assert first.settings == original
+    first.settings["connection"]["env"]["TOKEN"] = "first-call"
+    first.settings["turn"]["args"].append("first-call")
+    assert backend.settings["connection"]["env"]["TOKEN"] == "original"
+    backend.settings["connection"]["env"]["TOKEN"] = "factory"
+    await runtime.call("fake-backend", "status", original)
+    assert len(harness.plugin.created) == 1
+    second = backend.calls[-1]
+    assert second.settings == original
+    second.settings["turn"]["args"].append("second-call")
+    assert first.settings["turn"]["args"] == ["original", "first-call"]
+    assert original["turn"]["args"] == ["original"]
+    assert first.settings["connection"]["env"]["TOKEN"] == "first-call"
+
+
+async def test_undeclared_settings_are_only_per_call(tmp_path, harness):
+    source = SOURCE.replace(
+        '                instance_settings_keys=("binary", "connection"),\n',
+        "",
+    )
+    plugin = await load_backend(
+        tmp_path,
+        harness.loader,
+        owner="default-owner",
+        backend="default-backend",
+        source=source,
+    )
+    runtime = harness.runtime()
+    try:
+        await runtime.call("default-backend", "status", {"binary": "one"})
+        await runtime.call("default-backend", "status", {"binary": "two"})
+        assert len(plugin.created) == 1
+        backend = plugin.created[0]
+        assert backend.settings == {}
+        assert [call.settings for call in backend.calls] == [
+            {"binary": "one"},
+            {"binary": "two"},
+        ]
+    finally:
+        await harness.loader.unload_plugin("default-owner")
+
+
+async def test_console_busy_failure_emits_failed_response(harness):
+    import json
+
+    from qwenpaw.app.channels.console.channel import ConsoleChannel
+
+    runtime = harness.runtime()
+    active = asyncio.create_task(
+        collect(runtime, "hold", settings={"binary": "one"}),
+    )
+    try:
+        await until(
+            lambda: harness.plugin.created
+            and harness.plugin.created[0].entered.is_set(),
+        )
+        backend = harness.plugin.created[0]
+
+        def process(incoming):
+            return runtime.stream("fake-backend", incoming, {"binary": "two"})
+
+        channel = ConsoleChannel(process=process, enabled=True, bot_prefix="")
+        events = [
+            json.loads(event.removeprefix("data: "))
+            async for event in channel.stream_one(
+                {"sender_id": "other", "content_parts": [], "meta": {}},
+            )
+        ]
+        assert events, "Busy backend failure must produce an SSE response"
+        assert events[-1]["object"] == "response"
+        assert events[-1]["status"] == "failed"
+        assert events[-1]["error"]["code"] == "plugin_busy"
+        assert len(harness.plugin.created) == 1
+        assert not active.done() and not backend.closed
+        assert not backend.close_entered.is_set()
+    finally:
+        for backend in harness.plugin.created:
+            backend.release.set()
+        await active
 
 
 async def test_materialized_history_does_not_resolve_missing_backend(tmp_path):

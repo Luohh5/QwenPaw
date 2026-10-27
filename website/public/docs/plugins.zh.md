@@ -270,13 +270,19 @@ class Plugin:
             id="echo-backend", label="Echo", create=create,
             capabilities=HarnessCapabilities(),
             config_fields=({"name": "prefix", "label": "Prefix", "type": "text"},),
+            instance_settings_keys=("prefix",),
         ))
 
 plugin = Plugin()
 ```
 
 注册只保存工厂。目录枚举不创建客户端、不查账号、不探测 CLI、不生成投影文件。
-实例归属于插件代次、上下文及工作区；有效配置变化先等待旧实例真正关闭，再重建。
+实例归属于插件代次、上下文及工作区。`instance_settings_keys` 声明决定实例身份的
+配置字段，默认 `()`；工厂只收到这些字段中实际存在的值的独立深拷贝。声明的值变化时，
+先关闭空闲的旧实例再重建；旧实例有任务时保持原样，冲突请求明确返回 `plugin_busy`
+（管理接口 HTTP 409，Console 流返回失败响应）。`HarnessCallContext.settings` 每次
+保留全部有效调用参数的独立深拷贝。模型、推理和审批参数应从这里读取，不参与实例身份，
+从而允许不同会话和状态查询共享后端。Codex、Qoder 仅声明 `("binary",)`。
 工厂始终在事件循环执行：同步构造函数只做纯声明，准备工作使用异步工厂。
 只在线程中执行有界文件/发现操作，并在真实 worker 完成前保留锁；不要在线程中
 创建 asyncio 客户端、锁或执行完整模块/生命周期。

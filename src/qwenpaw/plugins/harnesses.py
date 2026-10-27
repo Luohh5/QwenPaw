@@ -348,6 +348,8 @@ class HarnessApprovalSummary:
 
 @dataclass(frozen=True)
 class HarnessCallContext:
+    """Invocation values with a fresh deep copy of all effective settings."""
+
     request_id: str
     session_id: str
     user_id: str
@@ -476,6 +478,15 @@ class HarnessArchiveBackend(Protocol):
 
 @dataclass(frozen=True)
 class HarnessSpec:
+    """Declare a lazy workspace backend and its constructor settings.
+
+    ``instance_settings_keys`` selects the settings that determine instance
+    reuse. The factory receives a fresh deep copy of declared, present keys;
+    the default selects none. Every call still receives all effective
+    settings in ``HarnessCallContext.settings``. Changing an instance setting
+    replaces an idle backend and rejects replacement while it is busy.
+    """
+
     id: str
     label: str
     create: Callable[
@@ -487,6 +498,7 @@ class HarnessSpec:
     description: str = ""
     icon: str = ""
     doc_url: str = ""
+    instance_settings_keys: tuple[str, ...] = ()
 
     def __post_init__(self):
         if not isinstance(self.id, str) or not re.fullmatch(
@@ -500,6 +512,14 @@ class HarnessSpec:
             raise SDKError("Harness capabilities must be HarnessCapabilities")
         if not callable(self.create):
             raise SDKError("Harness create must be callable")
+        if not isinstance(self.instance_settings_keys, tuple) or any(
+            not isinstance(key, str) or not key
+            for key in self.instance_settings_keys
+        ):
+            raise SDKError(
+                "Harness instance_settings_keys must be a tuple "
+                "of nonempty strings",
+            )
 
 
 __all__ = [

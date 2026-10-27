@@ -109,9 +109,10 @@ class HarnessSpec:
     description: str = ""
     icon: str = ""
     doc_url: str = ""
+    instance_settings_keys: tuple[str, ...] = ()
 ```
 
-`create` 只在实际调用该后端时运行。声明阶段禁止运行工厂、解析 binary、查询账户或生成投影文件。首版实例按 `(plugin_id, generation, context_identity, workspace_id, backend_id, settings_revision)` 归属；配置发生有效变化时关闭旧实例并重建，保留当前运行行为，不新增跨工作区共享或空闲回收。
+`create` 只在实际调用该后端时运行。声明阶段禁止运行工厂、解析 binary、查询账户或生成投影文件。实例按 `(plugin_id, generation, context_identity, workspace_id, backend_id, instance_settings_revision)` 归属；工厂只接收 `instance_settings_keys` 声明且实际存在的配置值的独立深拷贝。Codex、Qoder 只声明 `("binary",)`。模型、推理和审批等每轮参数从独立的 `HarnessCallContext.settings` 读取，不触发整个后端重建。真正的实例配置变化在空闲时先关闭再重建，运行中拒绝并明确返回 `plugin_busy`；不新增跨工作区共享或空闲回收。
 
 后端 ID 使用 `[a-z][a-z0-9_-]*`，`qwenpaw` 为保留 ID。不同插件同 ID 注册失败并显示占用者；旧注册句柄不能注销新代同名后端。
 

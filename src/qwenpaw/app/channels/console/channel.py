@@ -34,6 +34,7 @@ from ...console_push_store import append as push_store_append
 from ....constant import DEFAULT_MEDIA_DIR
 from ....token_usage.model_wrapper import TokenRecordingModelWrapper
 from ....exceptions import ModelQuotaExceededException
+from ....plugins.activity import PluginBusyError
 from ....plugins.errors import SDKError
 from ..renderer import ChannelDisplayConfig
 from ..base import (
@@ -559,16 +560,20 @@ class ConsoleChannel(BaseChannel):
             logger.exception("console process/reply failed")
             err_msg = str(e).strip() or "An error occurred while processing."
             self._print_error(err_msg)
-            if isinstance(e, SDKError):
+            if isinstance(e, (SDKError, PluginBusyError)):
                 response = AgentResponse(
                     object="response",
                     session_id=session_id,
                     status=RunStatus.Failed,
                     error={
                         "code": (
-                            "backend_unavailable"
-                            if err_msg.startswith("backend_unavailable:")
-                            else "sdk_error"
+                            "plugin_busy"
+                            if isinstance(e, PluginBusyError)
+                            else (
+                                "backend_unavailable"
+                                if err_msg.startswith("backend_unavailable:")
+                                else "sdk_error"
+                            )
                         ),
                         "message": err_msg,
                     },

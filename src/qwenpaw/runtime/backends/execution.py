@@ -94,13 +94,23 @@ class BackendExecution:
     async def _instance(self, entry, settings):
         async with self._lock:
             entry.assert_active()
+            instance_settings = deepcopy(
+                {
+                    key: settings[key]
+                    for key in entry.spec.instance_settings_keys
+                    if key in settings
+                },
+            )
             existing = self._instances.get(entry.spec.id)
             if existing is not None:
                 if existing.failed:
                     raise StaleContextError(
                         "Backend cleanup must complete before reuse",
                     )
-                if existing.entry is entry and existing.settings == settings:
+                if (
+                    existing.entry is entry
+                    and existing.settings == instance_settings
+                ):
                     return existing
                 await self._close_instance(existing)
             plugin = entry._context
@@ -136,11 +146,14 @@ class BackendExecution:
                     scope,
                     plugin.logger,
                 )
-                instance = _Instance(entry, deepcopy(settings), None, context)
+                instance = _Instance(entry, instance_settings, None, context)
                 self._instances[entry.spec.id] = instance
                 entry._runtimes.add(self)
                 # Constructors and returned awaitables belong to this loop.
-                backend = entry.spec.create(context, deepcopy(settings))
+                backend = entry.spec.create(
+                    context,
+                    deepcopy(instance_settings),
+                )
                 if inspect.isawaitable(backend):
                     backend = await backend
                 if not callable(getattr(backend, "close", None)):

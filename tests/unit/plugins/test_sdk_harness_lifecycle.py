@@ -103,11 +103,11 @@ async def test_config_rebuild_waits_for_close_and_revokes_old_context(harness):
     from qwenpaw.plugins import ResourceError, StaleContextError
 
     runtime = harness.runtime()
-    await runtime.call("fake-backend", "status", {"model": "one"})
+    await runtime.call("fake-backend", "status", {"binary": "one"})
     old = harness.plugin.created[0]
     old.close_release.clear()
     changing = asyncio.create_task(
-        runtime.call("fake-backend", "status", {"model": "two"}),
+        runtime.call("fake-backend", "status", {"binary": "two"}),
     )
     try:
         await asyncio.wait_for(old.close_entered.wait(), 5)
@@ -116,6 +116,25 @@ async def test_config_rebuild_waits_for_close_and_revokes_old_context(harness):
         old.close_release.set()
         await changing
     assert old.closed and len(harness.plugin.created) == 2
+    with pytest.raises((ResourceError, StaleContextError)):
+        old.context.resources.defer(lambda: None)
+
+
+async def test_same_settings_after_reload_use_new_generation(harness):
+    from qwenpaw.plugins import ResourceError, StaleContextError
+
+    runtime = harness.runtime()
+    await runtime.call("fake-backend", "status", {"binary": "one"})
+    old = harness.plugin.created[0]
+    report = await harness.loader.lifecycle.reload("bridge-owner")
+    assert report.ok and old.closed
+    current = harness.loader.get_loaded_plugin("bridge-owner").instance
+    await runtime.call("fake-backend", "status", {"binary": "one"})
+    assert len(current.created) == 1
+    new = current.created[0]
+    assert new.context.generation > old.context.generation
+    assert new.context.workspace_id == old.context.workspace_id
+    assert new.settings == {"binary": "one"}
     with pytest.raises((ResourceError, StaleContextError)):
         old.context.resources.defer(lambda: None)
 

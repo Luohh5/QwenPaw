@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from .activity import PluginBusyError
 from .errors import SDKError
 from .harnesses import HarnessLogin, HarnessOperationNotSupportedError
 
@@ -141,6 +142,8 @@ class _Gateway:
                         "message": str(exc),
                     },
                 ) from exc
+            except PluginBusyError as exc:
+                raise HTTPException(409, exc.detail) from exc
             except SDKError as exc:
                 raise HTTPException(
                     409,

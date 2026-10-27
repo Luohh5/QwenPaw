@@ -24,6 +24,7 @@ class Plugin:
                 id="qoder",
                 label="Qoder",
                 create=create_backend,
+                instance_settings_keys=("binary",),
                 capabilities=HarnessCapabilities(
                     authentication=True,
                     model_selection=True,
