@@ -260,9 +260,18 @@ def dependency_sites(sites, *, explicit=(), distributions=()):
     )
 
 
-def _record_entries(distribution):
+def _read_record(distribution, metadata_path, records):
+    """Reuse raw RECORD evidence only within the caller's synchronous read."""
+    if records is None or metadata_path is None:
+        return distribution.read_text("RECORD")
+    if metadata_path not in records:
+        records[metadata_path] = distribution.read_text("RECORD")
+    return records[metadata_path]
+
+
+def _record_entries(distribution, *, metadata_path=None, record_reads=None):
     """Validate RECORD once without allocating a Path for each file."""
-    record = distribution.read_text("RECORD")
+    record = _read_record(distribution, metadata_path, record_reads)
     if not record:
         return None
     entries = []
@@ -293,13 +302,29 @@ def _record_names(entries, *, allow_external=False):
     return names
 
 
-def _provides_loaded_modules(row, modules):
+def _provides_loaded_modules(
+    row,
+    modules,
+    *,
+    record_reads=None,
+    record_names=None,
+):
     """Use RECORD overlap even when optional top-level hints are absent."""
     modules = tuple(modules)
     if not modules:
         return False
-    entries = _record_entries(metadata.Distribution.at(row["metadata_path"]))
-    names = _record_names(entries, allow_external=True)
+    origin = row["metadata_path"]
+    if record_names is None or origin not in record_names:
+        entries = _record_entries(
+            metadata.Distribution.at(origin),
+            metadata_path=origin,
+            record_reads=record_reads,
+        )
+        names = _record_names(entries, allow_external=True)
+        if record_names is not None:
+            record_names[origin] = names
+    else:
+        names = record_names[origin]
     if names is None:
         return True
     module_paths = {
@@ -363,7 +388,13 @@ def _owns_embedded_files(required, root, inventory):
     return True
 
 
-def _installed_metadata(sites, *, embedded_sites=None, embedded_owners=None):
+def _installed_metadata(
+    sites,
+    *,
+    embedded_sites=None,
+    embedded_owners=None,
+    record_reads=None,
+):
     """Read metadata headers and invalid names without importing code."""
     # pylint: disable=protected-access
     from ..dependency_maintenance import authorized, check_admission
@@ -439,7 +470,11 @@ def _installed_metadata(sites, *, embedded_sites=None, embedded_owners=None):
 
     def entries(origin, distribution):
         if origin not in record_entries:
-            record_entries[origin] = _record_entries(distribution)
+            record_entries[origin] = _record_entries(
+                distribution,
+                metadata_path=origin,
+                record_reads=record_reads,
+            )
         return record_entries[origin]
 
     embedded = set()
@@ -578,6 +613,7 @@ def observe_dependencies(
     packet: Mapping[str, Any],
     *,
     _embedded_owners=None,
+    _record_reads=None,
 ) -> DependencySnapshot:
     """Inspect this interpreter's paths before candidate imports execute."""
     excluded = {Path(packet["code_root"]).resolve()}
@@ -597,6 +633,7 @@ def observe_dependencies(
         sites,
         embedded_sites=embedded_sites,
         embedded_owners=_embedded_owners,
+        record_reads=_record_reads,
     )
     from .runtime import _requirements
 

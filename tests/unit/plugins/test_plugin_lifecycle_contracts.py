@@ -3308,19 +3308,19 @@ async def test_commit_persist_then_error_does_not_rollback(
 )
 async def test_http_stop_unquiescent_is_409(
     tmp_path: Path,
-    fresh_registry,
     monkeypatch,
     route,
     method,
     mode,
 ):
-    monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", tmp_path / "work")
-    loader, _workspace, _installed = await _load(
-        tmp_path,
-        fresh_registry,
-        "stay-loaded",
-        "api.register_slash_command('ping', lambda c, a: None)",
-    )
+    from contextlib import asynccontextmanager
+
+    loaded = object()
+
+    @asynccontextmanager
+    async def plugin_lifecycle(plugin_id):
+        assert plugin_id == "stay-loaded"
+        yield
 
     async def _busy(*_args, **_kwargs):
         return UnloadReport(
@@ -3332,7 +3332,11 @@ async def test_http_stop_unquiescent_is_409(
             errors=["channel stop failed"],
         )
 
-    monkeypatch.setattr(loader, "_unload_plugin_unlocked", _busy)
+    loader = SimpleNamespace(
+        lifecycle=SimpleNamespace(unload=_busy),
+        plugin_lifecycle=plugin_lifecycle,
+        get_loaded_plugin=lambda plugin_id: loaded,
+    )
     from qwenpaw.app.routers.plugins import router as plugins_router
     from qwenpaw.app.routers.pawapps import router as pawapps_router
 
@@ -3360,7 +3364,7 @@ async def test_http_stop_unquiescent_is_409(
         async def _memory(*_args, **_kwargs):
             raise MemoryBackendInUseError("memory backend is in use")
 
-        monkeypatch.setattr(loader, "_unload_plugin_unlocked", _memory)
+        monkeypatch.setattr(loader.lifecycle, "unload", _memory)
         memory_resp = client.delete(url)
         assert memory_resp.status_code == 409
         memory_detail = memory_resp.json()["detail"]

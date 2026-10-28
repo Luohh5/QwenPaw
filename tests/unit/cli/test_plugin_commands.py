@@ -481,12 +481,11 @@ class TestInstallCommandOffline:
         )
         assert "Path not found" in res.output
 
-    def test_missing_manifest(self, monkeypatch, tmp_path):
-        self._offline(monkeypatch)
-        d = tmp_path / "src"
-        d.mkdir()
-        res = CliRunner().invoke(pc.plugin, ["install", str(d)])
-        assert "plugin.json not found" in res.output
+    def test_missing_manifest(self, tmp_path):
+        from qwenpaw.plugins.loader import PluginLoader
+
+        with pytest.raises(FileNotFoundError, match="plugin.json not found"):
+            PluginLoader.__new__(PluginLoader).read_source_manifest(tmp_path)
 
     def test_invalid_manifest_json(self, monkeypatch, tmp_path):
         self._offline(monkeypatch)
@@ -497,23 +496,20 @@ class TestInstallCommandOffline:
         assert res.exit_code != 0
         assert "Failed to install plugin" in res.output
 
-    def test_manifest_read_failure_generic(self, monkeypatch, tmp_path):
-        self._offline(monkeypatch)
-        d = tmp_path / "src"
-        d.mkdir()
-        (d / "plugin.json").write_bytes(b"\xff\xfe\x00invalid")
-        res = CliRunner().invoke(pc.plugin, ["install", str(d)])
-        assert res.exit_code != 0
-        assert "Failed to install plugin" in res.output
+    def test_manifest_read_failure_generic(self, tmp_path):
+        from qwenpaw.plugins.loader import PluginLoader
 
-    def test_manifest_missing_fields(self, monkeypatch, tmp_path):
-        self._offline(monkeypatch)
-        d = tmp_path / "src"
-        d.mkdir()
-        (d / "plugin.json").write_text(json.dumps({"id": "x"}))
-        res = CliRunner().invoke(pc.plugin, ["install", str(d)])
-        assert res.exit_code != 0
-        assert "Field required" in res.output
+        (tmp_path / "plugin.json").write_bytes(b"\xff\xfe\x00invalid")
+        with pytest.raises(UnicodeDecodeError):
+            PluginLoader.__new__(PluginLoader).read_source_manifest(tmp_path)
+
+    def test_manifest_missing_fields(self, tmp_path):
+        from pydantic import ValidationError
+        from qwenpaw.plugins.loader import PluginLoader
+
+        (tmp_path / "plugin.json").write_text(json.dumps({"id": "x"}))
+        with pytest.raises(ValidationError, match="Field required"):
+            PluginLoader.__new__(PluginLoader).read_source_manifest(tmp_path)
 
     def test_already_exists_without_force(self, monkeypatch, tmp_path):
         self._offline(monkeypatch)
@@ -544,12 +540,12 @@ class TestInstallCommandOffline:
         src = tmp_path / "src"
         src.mkdir()
         _write_plugin(src)
-        monkeypatch.setattr(pc, "_validate_plugin_module", lambda *a: None)
 
-        def boom(s, t, **kw):
+        # This checks CLI error translation at the transaction boundary.
+        def boom(*args, **kwargs):
             raise OSError("disk full")
 
-        monkeypatch.setattr(pc.shutil, "copytree", boom)
+        monkeypatch.setattr(pc, "_offline_channel_transaction", boom)
         res = CliRunner().invoke(pc.plugin, ["install", str(src)])
         assert res.exit_code != 0
         assert "disk full" in res.output
@@ -571,11 +567,38 @@ class TestInstallCommandOffline:
             "_download_plugin_from_url",
             lambda url: (src, temp),
         )
-        monkeypatch.setattr(pc, "_validate_plugin_module", lambda *a: None)
+        from types import SimpleNamespace
+        from qwenpaw.plugins.loader import PluginLoader
+
+        async def install(source_path, **kwargs):
+            assert source_path == src
+            return SimpleNamespace(
+                manifest=SimpleNamespace(name="Demo"),
+                source_path=src,
+                diagnostics=[],
+            )
+
+        async def unload_all(mode):
+            return []
+
+        async def create(*args, **kwargs):
+            return SimpleNamespace(
+                install_plugin_files=install,
+                lifecycle=SimpleNamespace(unload_all=unload_all),
+                retains_preparation_source=lambda path: False,
+            )
+
+        monkeypatch.setattr(PluginLoader, "create", create)
+        monkeypatch.setattr(
+            "qwenpaw.plugins.channel_bootstrap.resolve_default_channel_runtime",
+            lambda: None,
+        )
+        cleanup_attempts = []
         real_rmtree = pc.shutil.rmtree
 
         def selective_rmtree(path, *a, **kw):
             if Path(path) == temp:
+                cleanup_attempts.append(Path(path))
                 raise OSError("locked")
             return real_rmtree(path, *a, **kw)
 
@@ -586,6 +609,7 @@ class TestInstallCommandOffline:
         )
         assert res.exit_code == 0
         assert "installed successfully" in res.output
+        assert cleanup_attempts == [temp]
 
     def test_force_reinstall_replaces_existing(self, monkeypatch, tmp_path):
         self._offline(monkeypatch)

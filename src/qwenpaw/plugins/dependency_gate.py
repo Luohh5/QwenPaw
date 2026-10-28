@@ -376,10 +376,12 @@ async def admit_shared_dependencies(
 
     keys = await run_sync_io(
         _canonical_dependency_roots,
-        snapshot.dependency_sites
-        if isinstance(snapshot, DependencySnapshot)
-        and snapshot.dependency_sites is not None
-        else targets,
+        (
+            snapshot.dependency_sites
+            if isinstance(snapshot, DependencySnapshot)
+            and snapshot.dependency_sites is not None
+            else targets
+        ),
     )
     # Release before reacquiring one changed root set; never re-enter prepare.
     for _attempt in range(2):
@@ -476,6 +478,7 @@ def evaluate_shared_dependencies(
     )
     sites = {str(canonical(path)) for path in snapshot.dependency_sites or ()}
     host_inventories = {}
+    record_reads, record_names, provider_matches = {}, {}, {}
     host_dirty = False
     extra_requirements = tuple(extra_requirements)
     additions = set()
@@ -605,7 +608,10 @@ def evaluate_shared_dependencies(
             )
             try:
                 if roots not in host_inventories:
-                    rows, invalid, _observed = _installed_metadata(roots)
+                    rows, invalid, _observed = _installed_metadata(
+                        roots,
+                        record_reads=record_reads,
+                    )
                     del _observed
                     host_inventories[roots] = (rows, invalid)
                 rows, invalid = host_inventories[roots]
@@ -645,7 +651,21 @@ def evaluate_shared_dependencies(
                     }.items():
                         if provider_name in evidence.distributions:
                             continue
-                        if _provides_loaded_modules(provider, embedded_tops):
+                        # Rows remain referenced by the inventories/snapshot;
+                        # identity distinguishes all provider evidence sources.
+                        key = (
+                            provider_name,
+                            id(provider),
+                            frozenset(embedded_tops),
+                        )
+                        if key not in provider_matches:
+                            provider_matches[key] = _provides_loaded_modules(
+                                provider,
+                                embedded_tops,
+                                record_reads=record_reads,
+                                record_names=record_names,
+                            )
+                        if provider_matches[key]:
                             conflicts.append(
                                 f"host {use.plugin_id}: {provider_name} "
                                 "shadows a loaded embedded module",

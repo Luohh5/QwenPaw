@@ -186,13 +186,42 @@ async def test_three_idle_reloads_leave_one_callable_generation(tmp_path):
         host.assert_quiescent("author-contract")
 
 
-async def test_tool_argument_validation_and_invocation_identity(tmp_path):
+async def test_tool_argument_validation_and_invocation_identity(sdk_component):
     from qwenpaw.plugins import ToolInputError
-    from qwenpaw.plugins.testing import PluginTestHost
+    from qwenpaw.plugins.messages import ContentBlock
+    from qwenpaw.plugins.tools import ToolResult, ToolSpec
 
-    root = make_plugin(tmp_path)
-    async with PluginTestHost(tmp_path / "host") as host:
-        ctx = await host.load(root)
+    def declare(ctx):
+        async def echo(call, arguments):
+            return ToolResult(
+                content=(ContentBlock(text=arguments["text"]),),
+                metadata={
+                    "plugin_id": call.plugin_id,
+                    "generation": call.generation,
+                    "workspace_id": call.workspace_id,
+                    "session_id": call.session_id,
+                },
+            )
+
+        ctx.register_tool(
+            ToolSpec(
+                "sdk_contract_echo",
+                "Echo the supplied text",
+                {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+                echo,
+                enabled=True,
+            ),
+        )
+
+    async with sdk_component(
+        declare,
+        plugin_id="author-contract",
+        capabilities=("tools",),
+    ) as (host, ctx):
         for invalid in ({}, {"text": 42}):
             with pytest.raises(ToolInputError):
                 await host.call_tool("sdk_contract_echo", invalid)
@@ -383,25 +412,17 @@ async def test_approval_gates_handler_execution(tmp_path, approved):
 
 
 async def test_unsupported_tool_content_raises_instead_of_disappearing(
-    tmp_path,
+    sdk_component,
 ):
     from qwenpaw.plugins import SDKError
-    from qwenpaw.plugins.testing import PluginTestHost
 
-    source = """
-from qwenpaw.plugins.messages import ContentBlock
-from qwenpaw.plugins.tools import ToolResult, ToolSpec
+    from qwenpaw.plugins.messages import ContentBlock
+    from qwenpaw.plugins.tools import ToolResult, ToolSpec
 
-
-class Plugin:
-    def register(self, ctx):
+    def declare(ctx):
         async def unsupported(call, args):
             return ToolResult(
-                (
-                    ContentBlock(
-                        type="thinking", text="must-not-disappear"
-                    ),
-                )
+                (ContentBlock(type="thinking", text="must-not-disappear"),),
             )
 
         ctx.register_tool(
@@ -411,14 +432,14 @@ class Plugin:
                 input_schema={"type": "object"},
                 handler=unsupported,
                 enabled=True,
-            )
+            ),
         )
 
-
-plugin = Plugin()
-"""
-    async with PluginTestHost(tmp_path / "host") as host:
-        await host.load(make_plugin(tmp_path, source))
+    async with sdk_component(
+        declare,
+        plugin_id="author-contract",
+        capabilities=("tools",),
+    ) as (host, ctx):
         with pytest.raises(SDKError):
             await host.call_tool("sdk_unsupported_content", {})
         assert host.resource_snapshot("author-contract")["active_calls"] == 0
@@ -474,21 +495,16 @@ plugin = Plugin()
 
 
 async def test_tool_result_metadata_keys_are_not_reserved_by_host_bridge(
-    tmp_path,
+    sdk_component,
 ):
-    from qwenpaw.plugins.testing import PluginTestHost
-
     expected = {
         "_sdk_event": "author-event",
         "is_error": "author-value",
         "_sdk_attachment_previews": {"nested": ["author-value"]},
     }
-    source = """
-from qwenpaw.plugins.tools import ToolSpec, ToolResult
+    from qwenpaw.plugins.tools import ToolSpec, ToolResult
 
-
-class Plugin:
-    def register(self, ctx):
+    def declare(ctx):
         async def result(call, args):
             return ToolResult(metadata=args)
 
@@ -499,14 +515,14 @@ class Plugin:
                 {"type": "object"},
                 result,
                 enabled=True,
-            )
+            ),
         )
 
-
-plugin = Plugin()
-"""
-    async with PluginTestHost(tmp_path / "host") as host:
-        await host.load(make_plugin(tmp_path, source))
+    async with sdk_component(
+        declare,
+        plugin_id="author-contract",
+        capabilities=("tools",),
+    ) as (host, ctx):
         result = await host.call_tool("metadata_echo", expected)
         assert result.metadata == expected
         assert result.is_error is False
@@ -514,37 +530,27 @@ plugin = Plugin()
 
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_adjacent_text_with_different_metadata_is_explicitly_rejected(
-    tmp_path,
+    sdk_component,
     streaming,
 ):
     from qwenpaw.plugins import SDKError
-    from qwenpaw.plugins.testing import PluginTestHost
 
-    source = """
-from qwenpaw.plugins.messages import ContentBlock
-from qwenpaw.plugins.tools import ToolSpec, ToolResult, ToolEvent
+    from qwenpaw.plugins.messages import ContentBlock
+    from qwenpaw.plugins.tools import ToolSpec, ToolResult, ToolEvent
 
-
-class Plugin:
-    def register(self, ctx):
+    def declare(ctx):
         async def result(call, args):
             return ToolResult(
                 (
-                    ContentBlock(
-                        text="first", metadata={"author": "first"}
-                    ),
+                    ContentBlock(text="first", metadata={"author": "first"}),
                     ContentBlock(text="second"),
-                )
+                ),
             )
 
         async def stream(call, args):
             yield ToolEvent(
                 "delta",
-                (
-                    ContentBlock(
-                        text="first", metadata={"author": "first"}
-                    ),
-                ),
+                (ContentBlock(text="first", metadata={"author": "first"}),),
             )
             yield ToolEvent("delta", (ContentBlock(text="second"),))
 
@@ -553,19 +559,16 @@ class Plugin:
                 "metadata_conflict",
                 "metadata",
                 {"type": "object"},
-                HANDLER,
+                stream if streaming else result,
                 enabled=True,
-            )
+            ),
         )
 
-
-plugin = Plugin()
-""".replace(
-        "HANDLER",
-        "stream" if streaming else "result",
-    )
-    async with PluginTestHost(tmp_path / "host") as host:
-        await host.load(make_plugin(tmp_path, source))
+    async with sdk_component(
+        declare,
+        plugin_id="author-contract",
+        capabilities=("tools",),
+    ) as (host, ctx):
         with pytest.raises(SDKError):
             await host.call_tool("metadata_conflict", {})
         host.assert_quiescent("author-contract")

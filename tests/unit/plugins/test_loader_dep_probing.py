@@ -687,6 +687,31 @@ def test_host_dependency_record_retains_loaded_ownership(tmp_path):
     assert _files_for_loaded_origins(distribution, origins) == [
         PurePosixPath(path) for path in expected
     ]
+    from qwenpaw.plugins.python_backend import _observe_host_dependencies
+
+    (info / "METADATA").write_text("Name: sample\nVersion: 1.0\n")
+    loaded = (("shared_ns.loaded", str(source)),)
+    original = record.read_text()
+    _, imported = _observe_host_dependencies(
+        tmp_path / "plugin",
+        (tmp_path,),
+        loaded,
+    )
+    assert "sample" in imported
+    record.write_text("unrelated.py,,12\n")
+    _, imported = _observe_host_dependencies(
+        tmp_path / "plugin",
+        (tmp_path,),
+        loaded,
+    )
+    assert "sample" not in imported
+    record.write_text(original)
+    _, imported = _observe_host_dependencies(
+        tmp_path / "plugin",
+        (tmp_path,),
+        loaded,
+    )
+    assert "sample" in imported
     with record.open("a") as stream:
         stream.write("unrelated.py,,not-a-size\n")
     with pytest.raises(ValueError):
@@ -886,6 +911,31 @@ def test_dependency_directory_classification_retains_provider_ownership(
         paths,
         ((loaded_module, str(embedded)),),
     )
+    other_use = None
+    if layout == "namespace_overlap":
+        other_embedded = nested / "shared_namespace/two.py"
+        other_embedded.write_text("VALUE = 'other embedded'\n")
+        with (owner_info / "RECORD").open("a") as stream:
+            stream.write(f"{other_embedded.relative_to(site).as_posix()},,\n")
+        other_before, other_imported = _observe_host_dependencies(
+            tmp_path / "plugin",
+            paths,
+            (("shared_namespace.two", str(other_embedded)),),
+        )
+        assert imported["owner"]["loaded_modules"] == ("shared_namespace.one",)
+        assert other_imported["owner"]["loaded_modules"] == (
+            "shared_namespace.two",
+        )
+        other_use = SimpleNamespace(
+            **{
+                **vars(use),
+                "plugin_id": "loaded-other",
+                "snapshot": replace(
+                    other_before,
+                    distributions=other_imported,
+                ),
+            },
+        )
     public.write_text("VALUE = 'public'\n")
     install(site, "sample_sdk", "2.0", [module])
     use.snapshot = replace(before, distributions=imported)
@@ -900,6 +950,32 @@ def test_dependency_directory_classification_retains_provider_ownership(
         "sample-sdk shadows a loaded embedded module" in conflict
         for conflict in decision.host_conflicts
     )
+    if other_use is not None:
+        for consumers in ((other_use, use), (use, other_use)):
+            decision = evaluate_shared_dependencies(
+                None,
+                observed,
+                plugin_id="incoming",
+                uses=consumers,
+            )
+            assert decision.require_restart
+            assert decision.host_conflicts == [
+                "host loaded-owner: sample-sdk shadows a loaded "
+                "embedded module",
+            ]
+        # The next gate must reread the same provider's changed RECORD.
+        (public_info / "RECORD").write_text("shared_namespace/two.py,,\n")
+        decision = evaluate_shared_dependencies(
+            None,
+            observed,
+            plugin_id="incoming",
+            uses=(use, other_use),
+        )
+        assert decision.require_restart
+        assert decision.host_conflicts == [
+            "host loaded-other: sample-sdk shadows a loaded "
+            "embedded module",
+        ]
 
 
 @pytest.mark.asyncio

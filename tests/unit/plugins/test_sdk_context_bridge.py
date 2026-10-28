@@ -595,78 +595,41 @@ async def test_bound_provider_identity_uses_profile_id_not_directory_name(
         )
 
 
-async def test_real_log_formatters_preserve_bound_identity_and_author_fields(
-    tmp_path,
-    caplog,
-):
+def test_real_log_formatters_preserve_bound_identity_and_author_fields():
     import logging
-    from qwenpaw.plugins.testing import PluginTestHost
     from qwenpaw.utils.logging import ColorFormatter, PlainFormatter
 
-    source = """
-from qwenpaw.plugins.tools import ToolSpec, ToolResult
-
-
-class Plugin:
-    def register(self, ctx):
-        async def invoke(call, args):
-            call.logger.warning(
-                "visible-context-record",
-                fields={
-                    "plugin_id": "author-collision",
-                    "business": "visible-value",
-                },
-            )
-            return ToolResult.text("logged")
-
-        ctx.register_tool(
-            ToolSpec(
-                "visible_log_probe",
-                "log",
-                {"type": "object"},
-                invoke,
-                enabled=True,
-            )
-        )
-
-
-plugin = Plugin()
-"""
-    caplog.set_level(logging.INFO)
-    caplog.set_level(logging.INFO, logger="qwenpaw")
-    async with PluginTestHost(tmp_path / "host") as host:
-        await host.load(
-            package(
-                tmp_path / "caller",
-                "visible-log-owner",
-                source,
-                ["tools", "logging"],
-            ),
-        )
-        await host.call_tool(
-            "visible_log_probe",
-            {},
-            workspace_id="visible-workspace",
-            session_id="visible-session",
-        )
-        record = next(
-            r
-            for r in caplog.records
-            if r.getMessage() == "visible-context-record"
-        )
-        assert record.sdk_context["plugin_id"] == "visible-log-owner"
-        assert record.sdk_fields["plugin_id"] == "author-collision"
-        for formatter in (ColorFormatter(), PlainFormatter()):
-            text = formatter.format(record)
-            for value in (
-                "visible-context-record",
-                "visible-log-owner",
-                "visible-workspace",
-                "visible-session",
-                "author-collision",
-                "visible-value",
-            ):
-                assert value in text
+    # Bound identity and spoof isolation are exercised by context_services'
+    # test_logger_binds_identity_without_accepting_author_field_spoofing.
+    record = logging.LogRecord(
+        "qwenpaw",
+        logging.WARNING,
+        __file__,
+        1,
+        "visible-context-record",
+        (),
+        None,
+    )
+    record.sdk_context = {
+        "plugin_id": "visible-log-owner",
+        "workspace_id": "visible-workspace",
+        "session_id": "visible-session",
+    }
+    record.sdk_fields = {
+        "plugin_id": "author-collision",
+        "business": "visible-value",
+    }
+    for formatter in (ColorFormatter(), PlainFormatter()):
+        text = formatter.format(record)
+        for value in (
+            "visible-context-record",
+            "visible-log-owner",
+            "visible-workspace",
+            "visible-session",
+            "author-collision",
+            "visible-value",
+        ):
+            assert value in text
 
 
 async def test_skipped_fallback_formatter_closes_its_created_client(

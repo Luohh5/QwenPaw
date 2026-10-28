@@ -126,18 +126,12 @@ plugin = Plugin()
 
 
 async def test_hook_priority_and_failed_observer_do_not_abort_remaining_hooks(
-    tmp_path,
+    sdk_component,
     caplog,
 ):
-    from qwenpaw.plugins.hooks import HookPhase
-    from qwenpaw.plugins.testing import PluginTestHost
+    from qwenpaw.plugins.hooks import HookPhase, HookResult, HookSpec
 
-    source = """
-from qwenpaw.plugins.hooks import HookPhase, HookResult, HookSpec
-
-
-class Plugin:
-    def register(self, ctx):
+    def declare(ctx):
         async def later(call):
             trace = ctx.storage.read_json("trace.json", [])
             ctx.storage.write_json("trace.json", trace + ["later"])
@@ -153,7 +147,7 @@ class Plugin:
                 phase=HookPhase.PRE_EXECUTE,
                 handler=later,
                 priority=200,
-            )
+            ),
         )
         ctx.register_hook(
             HookSpec(
@@ -161,16 +155,14 @@ class Plugin:
                 phase=HookPhase.PRE_EXECUTE,
                 handler=earlier,
                 priority=10,
-            )
+            ),
         )
 
-
-plugin = Plugin()
-"""
-    async with PluginTestHost(tmp_path / "host") as host:
-        ctx = await host.load(
-            make_plugin(tmp_path, source, ["hooks", "storage"]),
-        )
+    async with sdk_component(
+        declare,
+        plugin_id="extension-contract",
+        capabilities=("hooks", "config", "storage"),
+    ) as (host, ctx):
         result = await host.run_hooks(HookPhase.PRE_EXECUTE, messages=())
         assert result.action == "continue"
         assert ctx.storage.read_json("trace.json") == ["earlier", "later"]
@@ -304,25 +296,16 @@ plugin = Plugin()
         assert (await host.reload("extension-contract")).ok
 
 
-async def test_late_hook_phase_cannot_replace_input(tmp_path, caplog):
-    from qwenpaw.plugins.hooks import HookPhase
+async def test_late_hook_phase_cannot_replace_input(sdk_component, caplog):
+    from qwenpaw.plugins.hooks import HookPhase, HookResult, HookSpec
     from qwenpaw.plugins.messages import ContentBlock, Message
-    from qwenpaw.plugins.testing import PluginTestHost
 
-    source = """
-from qwenpaw.plugins.hooks import HookPhase, HookResult, HookSpec
-from qwenpaw.plugins.messages import ContentBlock, Message
-
-
-class Plugin:
-    def register(self, ctx):
+    def declare(ctx):
         async def rewrite(call):
             return HookResult(
                 replace_input=(
-                    Message(
-                        "user", (ContentBlock(text="illegal"),)
-                    ),
-                )
+                    Message("user", (ContentBlock(text="illegal"),)),
+                ),
             )
 
         ctx.register_hook(
@@ -330,14 +313,14 @@ class Plugin:
                 name="late-rewrite",
                 phase=HookPhase.POST_RESPONSE,
                 handler=rewrite,
-            )
+            ),
         )
 
-
-plugin = Plugin()
-"""
-    async with PluginTestHost(tmp_path / "host") as host:
-        await host.load(make_plugin(tmp_path, source, ["hooks"]))
+    async with sdk_component(
+        declare,
+        plugin_id="extension-contract",
+        capabilities=("hooks", "config", "storage"),
+    ) as (host, ctx):
         result = await host.run_hooks(
             HookPhase.POST_RESPONSE,
             messages=(Message("user", (ContentBlock(text="original"),)),),
@@ -351,31 +334,23 @@ plugin = Plugin()
     ["invalid_action", "invalid_reply", "invalid_injection"],
 )
 async def test_invalid_hook_result_does_not_partially_mutate_runtime(
-    tmp_path,
+    sdk_component,
     caplog,
     case,
 ):
+    from qwenpaw.plugins.hooks import (
+        HookPhase,
+        HookResult,
+        HookSpec,
+        ContextInjection,
+    )
     from qwenpaw.plugins.messages import ContentBlock, Message
-    from qwenpaw.plugins.testing import PluginTestHost
 
-    source = """
-from qwenpaw.plugins.hooks import (
-    HookPhase,
-    HookResult,
-    HookSpec,
-    ContextInjection,
-)
-from qwenpaw.plugins.messages import ContentBlock, Message
-
-
-class Plugin:
-    def register(self, ctx):
+    def declare(ctx):
         async def invalid(call):
             case = ctx.config.get("case")
             return HookResult(
-                action=(
-                    "bad" if case == "invalid_action" else "reply"
-                ),
+                action=("bad" if case == "invalid_action" else "reply"),
                 message=Message(
                     "assistant",
                     (
@@ -399,26 +374,20 @@ class Plugin:
                     ContextInjection(
                         "must not apply",
                         priority=(
-                            "bad"
-                            if case == "invalid_injection"
-                            else 100
+                            "bad" if case == "invalid_injection" else 100
                         ),
                     ),
                 ),
             )
 
-        ctx.register_hook(
-            HookSpec("invalid", HookPhase.PRE_DISPATCH, invalid)
-        )
+        ctx.register_hook(HookSpec("invalid", HookPhase.PRE_DISPATCH, invalid))
 
-
-plugin = Plugin()
-"""
-    async with PluginTestHost(tmp_path / "host") as host:
-        await host.load(
-            make_plugin(tmp_path, source, ["hooks", "config"]),
-            config={"case": case},
-        )
+    async with sdk_component(
+        declare,
+        plugin_id="extension-contract",
+        capabilities=("hooks", "config", "storage"),
+        config={"case": case},
+    ) as (host, ctx):
         result = await host.run_hooks(
             "pre_dispatch",
             messages=(Message("user", (ContentBlock(text="original"),)),),
@@ -438,26 +407,19 @@ plugin = Plugin()
     ],
 )
 async def test_hook_control_flow_actions_rejected_where_runtime_ignores_them(
-    tmp_path,
+    sdk_component,
     caplog,
     phase,
     action,
 ):
-    from qwenpaw.plugins.testing import PluginTestHost
+    from qwenpaw.plugins.hooks import HookPhase, HookResult, HookSpec
+    from qwenpaw.plugins.messages import ContentBlock, Message
 
-    source = """
-from qwenpaw.plugins.hooks import HookPhase, HookResult, HookSpec
-from qwenpaw.plugins.messages import ContentBlock, Message
-
-
-class Plugin:
-    def register(self, ctx):
+    def declare(ctx):
         async def control(call):
             return HookResult(
                 action=ctx.config.get("action"),
-                message=Message(
-                    "assistant", (ContentBlock(text="reply"),)
-                ),
+                message=Message("assistant", (ContentBlock(text="reply"),)),
             )
 
         ctx.register_hook(
@@ -465,17 +427,15 @@ class Plugin:
                 "control",
                 HookPhase(ctx.config.get("phase")),
                 control,
-            )
+            ),
         )
 
-
-plugin = Plugin()
-"""
-    async with PluginTestHost(tmp_path / "host") as host:
-        await host.load(
-            make_plugin(tmp_path, source, ["hooks", "config"]),
-            config={"phase": phase, "action": action},
-        )
+    async with sdk_component(
+        declare,
+        plugin_id="extension-contract",
+        capabilities=("hooks", "config", "storage"),
+        config={"phase": phase, "action": action},
+    ) as (host, ctx):
         result = await host.run_hooks(phase)
         assert result.action == "continue" and result.message is None
         assert "Control-flow actions are not permitted" in caplog.text

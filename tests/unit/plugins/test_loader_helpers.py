@@ -295,16 +295,20 @@ class TestHubPluginLifecycle:
                 await loader.unload_plugin(plugin_id)
 
     @pytest.mark.asyncio
-    async def test_catalog_waits_for_default_hubs(self, tmp_path, monkeypatch):
+    async def test_catalog_waits_for_default_hubs(self, monkeypatch):
         import asyncio
         from fastapi import FastAPI, Request
         from qwenpaw.app.routers.market import get_market_providers
-        from qwenpaw.market import builtin
-        from qwenpaw.plugins.registry import PluginRegistry
+        from qwenpaw.market.schema import ProviderInfo
 
-        monkeypatch.setattr(PluginRegistry, "_instance", None)
-        builtin.seed_builtin_hub_plugins(tmp_path)
-        loader = pl.PluginLoader([tmp_path])
+        providers = [
+            ProviderInfo(key, key, True, None)
+            for key in ("qwenpaw", "clawhub", "modelscope", "aliyun")
+        ]
+        monkeypatch.setattr(
+            "qwenpaw.app.routers.market.list_providers",
+            lambda: providers,
+        )
         app = FastAPI()
         app.state.market_ready = asyncio.Event()
         catalog_request = asyncio.create_task(
@@ -313,7 +317,6 @@ class TestHubPluginLifecycle:
         try:
             await asyncio.sleep(0)
             assert not catalog_request.done()
-            await loader.load_all_plugins(types=["hub"])
             app.state.market_ready.set()
             catalog = await asyncio.wait_for(
                 catalog_request,
@@ -327,8 +330,7 @@ class TestHubPluginLifecycle:
             ]
         finally:
             catalog_request.cancel()
-            for plugin_id in list(loader.get_all_loaded_plugins()):
-                await loader.unload_plugin(plugin_id)
+            await asyncio.gather(catalog_request, return_exceptions=True)
 
     def test_seeding_preserves_existing_files_and_rejects_bad_marker(
         self,

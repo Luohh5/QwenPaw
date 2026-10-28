@@ -1247,9 +1247,31 @@ async def test_qr_session_rechecks_source_after_scope_read(
         ManagementError,
     )
 
-    record = await host.loader.load_plugin_from_path(host.artifact())
-    row = host.registry.get_channel_catalog_entry(KEY)
-    description = row.description_record
+    from qwenpaw.plugins.architecture import PluginRecord
+    from qwenpaw.plugins.execution_backend import BackendBinding
+
+    source = host.artifact()
+    _, manifest = host.loader.read_source_manifest(source)
+    binding_description = host.loader._channel_backend.describe(
+        source,
+        manifest,
+    )
+    description = binding_description.payload
+    record = PluginRecord(
+        manifest=manifest,
+        source_path=source,
+        enabled=True,
+        backend_binding=BackendBinding(
+            host.loader._channel_backend,
+            binding_description,
+        ),
+    )
+    host.loader._loaded_plugins[manifest.id] = record
+    row = host.registry.register_channel_descriptor(
+        manifest.id,
+        description,
+        runtime_settings=host.registry.channel_runtime,
+    )
     scope = qr.ChannelManagementScope("scan", host.root / "scan", KEY, {})
     management = ChannelManagementService(host.loader)
     sessions = qr.ChannelQRCodeSessions(host.loader, management)

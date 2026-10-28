@@ -72,26 +72,34 @@ async def test_retained_old_handle_cannot_remove_replacement_tool(
         assert result.content[0].text == "new generation"
 
 
-async def test_error_result_retains_error_terminal_state_in_runtime(tmp_path):
+async def test_error_result_retains_error_terminal_state_in_runtime(
+    sdk_component,
+):
     from agentscope.message import ToolResultState
     from qwenpaw.agents import tools
-    from qwenpaw.plugins.testing import PluginTestHost
     from qwenpaw.runtime.tool_guard import GuardedFunctionTool
 
-    source = """
-from qwenpaw.plugins.tools import ToolResult, ToolSpec
-class Plugin:
-    def register(self, ctx):
+    from qwenpaw.plugins.tools import ToolResult, ToolSpec
+
+    def declare(ctx):
         async def fail(call, arguments):
             return ToolResult.text("remote operation failed", is_error=True)
-        ctx.register_tool(ToolSpec(
-            name="sdk_terminal_failure", description="A failed operation",
-            input_schema={"type": "object"}, handler=fail, enabled=True,
-        ))
-plugin = Plugin()
-"""
-    async with PluginTestHost(tmp_path / "host") as host:
-        await host.load(make_plugin(tmp_path, source))
+
+        ctx.register_tool(
+            ToolSpec(
+                name="sdk_terminal_failure",
+                description="A failed operation",
+                input_schema={"type": "object"},
+                handler=fail,
+                enabled=True,
+            ),
+        )
+
+    async with sdk_component(
+        declare,
+        plugin_id="author-contract",
+        capabilities=("tools",),
+    ) as (host, ctx):
         tool = GuardedFunctionTool(getattr(tools, "sdk_terminal_failure"))
         stream = await tool.call()
         chunks = [chunk async for chunk in stream]
@@ -185,11 +193,10 @@ plugin = Plugin()
 
 
 async def test_sdk_schema_keeps_nested_constraints_in_runtime_wrapper(
-    tmp_path,
+    sdk_component,
 ):
     from qwenpaw.agents import tools
     from qwenpaw.plugins import ToolInputError
-    from qwenpaw.plugins.testing import PluginTestHost
     from qwenpaw.runtime.tool_guard import GuardedFunctionTool
 
     schema = {
@@ -206,32 +213,26 @@ async def test_sdk_schema_keeps_nested_constraints_in_runtime_wrapper(
             },
         },
     }
-    source = """
-from qwenpaw.plugins.tools import ToolSpec, ToolResult
+    from qwenpaw.plugins.tools import ToolSpec, ToolResult
 
-
-class Plugin:
-    def register(self, ctx):
+    def declare(ctx):
         ctx.register_tool(
             ToolSpec(
                 name="sdk_schema_contract",
                 description="Nested schema contract",
-                input_schema=SCHEMA,
+                input_schema=schema,
                 handler=lambda call, args: ToolResult.text(
-                    args["request"]["quality"]
+                    args["request"]["quality"],
                 ),
                 enabled=True,
-            )
+            ),
         )
 
-
-plugin = Plugin()
-""".replace(
-        "SCHEMA",
-        repr(schema),
-    )
-    async with PluginTestHost(tmp_path / "host") as host:
-        await host.load(make_plugin(tmp_path, source))
+    async with sdk_component(
+        declare,
+        plugin_id="author-contract",
+        capabilities=("tools",),
+    ) as (host, ctx):
         wrapper = GuardedFunctionTool(getattr(tools, "sdk_schema_contract"))
         assert wrapper.input_schema == schema
         with pytest.raises(ToolInputError):
@@ -423,17 +424,16 @@ plugin = Plugin()
 
 
 async def test_sdk_model_adapter_emits_deltas_and_complete_host_terminal(  # pylint: disable=protected-access  # noqa: E501
-    tmp_path,
+    sdk_component,
 ):
     from agentscope.message import Msg, TextBlock
-    from qwenpaw.plugins.testing import PluginTestHost
-    from .sdk_author_fixture import make_plugin as author_plugin
-    from .test_sdk_provider_contract import SOURCE
+    from .test_sdk_provider_contract import declare_provider
 
-    async with PluginTestHost(tmp_path / "host") as host:
-        await host.load(
-            author_plugin(tmp_path, SOURCE, ["providers", "storage"]),
-        )
+    async with sdk_component(
+        declare_provider,
+        plugin_id="extension-contract",
+        capabilities=("providers", "storage"),
+    ) as (host, ctx):
         public_model = await host.create_model("sdk-provider", "sdk-model")
         stream = await public_model._model(
             [

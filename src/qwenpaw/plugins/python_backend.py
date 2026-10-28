@@ -54,9 +54,17 @@ def _relative_module_origins(origins, root):
     return relative
 
 
-def _files_for_loaded_origins(distribution, origins):
+def _files_for_loaded_origins(
+    distribution,
+    origins,
+    *,
+    metadata_path=None,
+    record_reads=None,
+):
     """Validate fresh RECORD rows, then stat only loaded-origin candidates."""
-    record = distribution.read_text("RECORD")
+    from .execution.dependencies import _read_record
+
+    record = _read_record(distribution, metadata_path, record_reads)
     if not record:
         return distribution.files
     candidates = []
@@ -119,6 +127,7 @@ def _observe_host_dependencies(code_root, paths, loaded_origins):
     )
 
     embedded_owners = {}
+    record_reads = {}
     snapshot = observe_dependencies(
         {
             "code_root": code_root,
@@ -126,6 +135,7 @@ def _observe_host_dependencies(code_root, paths, loaded_origins):
             "dependency_paths": (),
         },
         _embedded_owners=embedded_owners,
+        _record_reads=record_reads,
     )
     loaded = {name: Path(origin) for name, origin in loaded_origins}
     resolved = {path: path.resolve() for path in set(loaded.values())}
@@ -137,7 +147,12 @@ def _observe_host_dependencies(code_root, paths, loaded_origins):
         distribution = PathDistribution(Path(row["metadata_path"]))
         if root not in relative_origins:
             relative_origins[root] = _relative_module_origins(origins, root)
-        files = _files_for_loaded_origins(distribution, relative_origins[root])
+        files = _files_for_loaded_origins(
+            distribution,
+            relative_origins[root],
+            metadata_path=row["metadata_path"],
+            record_reads=record_reads,
+        )
         if files is not None:
             owned = {
                 os.path.normcase(os.path.normpath(item)) for item in files
@@ -200,6 +215,7 @@ def _observe_host_dependencies(code_root, paths, loaded_origins):
             if name not in imported and _provides_loaded_modules(
                 row,
                 embedded_modules,
+                record_reads=record_reads,
             ):
                 imported[name] = row
     return snapshot, imported

@@ -33,3 +33,71 @@ def fresh_registry():
         yield PluginRegistry()
     finally:
         PluginRegistry._instance = old
+
+
+@pytest.fixture()
+def sdk_component(tmp_path):
+    """Real SDK activation/disposal, retaining Host's process isolation only."""
+    from contextlib import asynccontextmanager
+
+    from qwenpaw.plugins.api import PluginApi
+    from qwenpaw.plugins.lifecycle import UnloadMode
+    from qwenpaw.plugins.sdk import PluginContext
+    from qwenpaw.plugins.testing import PluginTestHost
+
+    @asynccontextmanager
+    async def component(
+        declare=lambda ctx: None,
+        *,
+        plugin_id="resource-contract",
+        capabilities=("resources",),
+        config=None,
+    ):
+        async with PluginTestHost(tmp_path / "component") as host:
+            loader = host._loader
+            instance = loader.lifecycle.ensure_instance(
+                plugin_id,
+                generation=1,
+            )
+            api = PluginApi(
+                plugin_id,
+                config or {},
+                {
+                    "id": plugin_id,
+                    "version": "1.0.0",
+                    "sdk": {
+                        "version": "1.0",
+                        "capabilities": list(capabilities),
+                    },
+                },
+            )
+            api.set_registry(loader.registry)
+            api._instance, api._loader = instance, loader
+            ctx = PluginContext(api)
+            instance.sdk_context = ctx
+            try:
+                declare(ctx)
+                await loader.lifecycle.activate(plugin_id)
+                yield host, ctx
+            finally:
+                async with instance.activity.mutation():
+                    report = await instance.dispose(UnloadMode.UNLOAD)
+                assert report.clean and report.quiescent
+                assert ctx.resources.snapshot()["resources"] == ()
+                assert not instance.activity.tasks
+                assert not instance.activity.cleanup_tasks
+                assert not loader.registry.leftover_registrations(plugin_id)
+                assert not any(
+                    intent.plugin_id == plugin_id
+                    for intent in loader.registry.projector._intents
+                )
+                from qwenpaw.plugins.workspace_projector import scan_owner_rows
+
+                assert not scan_owner_rows(
+                    plugin_id,
+                    list(host._workspaces.values()),
+                ).stamped_leaks
+                loader.registry.unregister_plugin(plugin_id)
+                loader.lifecycle.drop_instance(plugin_id)
+
+    return component

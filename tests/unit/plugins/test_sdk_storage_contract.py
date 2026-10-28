@@ -51,7 +51,11 @@ async def test_reload_preserves_data_and_rejects_old_generation_writes(
     from qwenpaw.plugins.testing import PluginTestHost
 
     async with PluginTestHost(tmp_path / "host") as host:
-        old = await host.load(make_plugin(tmp_path))
+        old = await host.load(
+            make_plugin(tmp_path),
+            config={"token": "context-secret"},
+        )
+        assert old.config.secret("token") == "context-secret"
         old.storage.write_json("nested/state.json", {"value": "retained"})
         assert (await host.reload("storage-contract")).ok
         current = host.context("storage-contract")
@@ -67,43 +71,39 @@ async def test_reload_preserves_data_and_rejects_old_generation_writes(
         }
 
 
-async def test_storage_rejects_path_escape_without_touching_other_files(
-    tmp_path,
-):
+def test_storage_rejects_path_escape_without_touching_other_files(tmp_path):
     from qwenpaw.plugins import SDKError
-    from qwenpaw.plugins.testing import PluginTestHost
+    from qwenpaw.plugins.storage import PluginStorage
 
     outside = tmp_path / "outside.json"
     outside.write_text("untouched", encoding="utf-8")
-    async with PluginTestHost(tmp_path / "host") as host:
-        ctx = await host.load(make_plugin(tmp_path))
-        for name in (
-            str(outside),
-            "../outside.json",
-            "nested/../../outside.json",
-        ):
-            with pytest.raises(SDKError):
-                ctx.storage.write_json(name, {"overwrite": True})
-        assert outside.read_text() == "untouched"
+    storage = PluginStorage(tmp_path / "data", guard=lambda: None)
+    for name in (
+        str(outside),
+        "../outside.json",
+        "nested/../../outside.json",
+    ):
+        with pytest.raises(SDKError):
+            storage.write_json(name, {"overwrite": True})
+    assert outside.read_text() == "untouched"
 
 
-async def test_config_snapshot_and_explicit_secret_access(tmp_path):
+def test_config_snapshot_and_explicit_secret_access():
     from qwenpaw.plugins import SDKError
-    from qwenpaw.plugins.testing import PluginTestHost
+    from qwenpaw.plugins.storage import PluginConfig
 
     initial = {"token": "test-only-value", "options": {"quality": "high"}}
-    async with PluginTestHost(tmp_path / "host") as host:
-        ctx = await host.load(make_plugin(tmp_path), config=initial)
-        initial["options"]["quality"] = "changed"
-        returned = ctx.config.get("options")
-        assert returned == {"quality": "high"}
-        returned["quality"] = "changed-again"
-        assert ctx.config.get("options") == {"quality": "high"}
-        with pytest.raises(SDKError):
-            ctx.config.get("token")
-        assert ctx.config.secret("token") == "test-only-value"
-        with pytest.raises(SDKError):
-            ctx.config.secret("undeclared")
+    config = PluginConfig(initial, {"secrets": ["token"]})
+    initial["options"]["quality"] = "changed"
+    returned = config.get("options")
+    assert returned == {"quality": "high"}
+    returned["quality"] = "changed-again"
+    assert config.get("options") == {"quality": "high"}
+    with pytest.raises(SDKError):
+        config.get("token")
+    assert config.secret("token") == "test-only-value"
+    with pytest.raises(SDKError):
+        config.secret("undeclared")
 
 
 async def test_media_reference_remains_readable_after_reload(tmp_path):
