@@ -7,6 +7,7 @@ import csv
 from dataclasses import dataclass
 from importlib import metadata
 from importlib.machinery import EXTENSION_SUFFIXES
+from importlib.util import source_from_cache
 import inspect
 import os
 from pathlib import Path
@@ -331,6 +332,37 @@ def _provides_loaded_modules(row, modules):
     return False
 
 
+def _owns_embedded_files(required, root, inventory):
+    for item in required:
+        relative = os.path.normcase(os.path.normpath(item.relative_to(root)))
+        if relative in inventory:
+            continue
+        # Vendored RECORDs can retain build-machine caches omitted from the
+        # enclosing wheel. Only an absent cache with jointly owned source is
+        # dispensable; existing files and dangling symlinks remain evidence.
+        if item.suffix != ".pyc":
+            return False
+        try:
+            item.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            return False
+        try:
+            source = Path(source_from_cache(str(item)))
+        except ValueError:
+            return False
+        if (
+            source not in required
+            or os.path.normcase(
+                os.path.normpath(source.relative_to(root)),
+            )
+            not in inventory
+        ):
+            return False
+    return True
+
+
 def _installed_metadata(sites, *, embedded_sites=None, embedded_owners=None):
     """Read metadata headers and invalid names without importing code."""
     # pylint: disable=protected-access
@@ -459,13 +491,7 @@ def _installed_metadata(sites, *, embedded_sites=None, embedded_owners=None):
                 item.is_relative_to(path.parent) for item in required
             ):
                 for parent_origin, root, inventory in possible:
-                    if all(
-                        os.path.normcase(
-                            os.path.normpath(str(item.relative_to(root))),
-                        )
-                        in inventory
-                        for item in required
-                    ):
+                    if _owns_embedded_files(required, root, inventory):
                         owners.append(parent_origin)
         if len(owners) == 1:
             embedded.add(origin)

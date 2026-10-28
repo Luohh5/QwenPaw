@@ -705,6 +705,10 @@ def test_host_dependency_record_retains_loaded_ownership(tmp_path):
         "namespace_parent",
         "namespace_module",
         "mixed",
+        "missing_cache",
+        "unowned_cache",
+        "cache_without_source",
+        "non_cache_file",
     ],
 )
 def test_dependency_directory_classification_retains_provider_ownership(
@@ -768,6 +772,26 @@ def test_dependency_directory_classification_retains_provider_ownership(
         ]
     )
     owner_info = install(site, "owner", "1.0", owned)
+    if layout in {
+        "missing_cache",
+        "unowned_cache",
+        "cache_without_source",
+        "non_cache_file",
+    }:
+        cache = nested / "__pycache__/sample_sdk.cpython-312.pyc"
+        extra = (
+            cache.with_suffix(".txt") if layout == "non_cache_file" else cache
+        )
+        with (nested_info / "RECORD").open("a") as stream:
+            stream.write(f"{extra.relative_to(nested).as_posix()},,\n")
+        if layout == "unowned_cache":
+            cache.parent.mkdir()
+            cache.write_bytes(b"unowned")
+        elif layout == "cache_without_source":
+            record = nested_info / "RECORD"
+            record.write_text(
+                record.read_text().replace("sample_sdk.py,,\n", ""),
+            )
     if layout == "mixed":
         neighbor = nested / "independent.py"
         neighbor.write_text("VALUE = 'independent'\n")
@@ -793,7 +817,13 @@ def test_dependency_directory_classification_retains_provider_ownership(
     assert classified[:2] == (str(site.resolve()), str(nested.resolve()))
     packet = {"code_root": tmp_path / "plugin", "_audit_sites": paths}
     snapshot = observe_dependencies(packet)
-    if layout not in {"unowned", "independent"}:
+    if layout not in {
+        "unowned",
+        "independent",
+        "unowned_cache",
+        "cache_without_source",
+        "non_cache_file",
+    }:
         expected_sites = (
             (str(site.resolve()), str(nested.resolve()))
             if layout == "mixed"
