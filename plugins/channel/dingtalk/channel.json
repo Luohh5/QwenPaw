@@ -9,7 +9,7 @@
   "dependency_mode": "shared",
   "entrypoint": {
     "scope": "runner",
-    "module": "dingtalk.driver",
+    "module": "qwenpaw_channel_dingtalk.driver",
     "qualname": "DingTalkDriver"
   },
   "requirements_file": "requirements.txt",

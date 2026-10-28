@@ -769,6 +769,9 @@ class PluginProcess:
                 except Exception:
                     # Forwarding is optional; always keep draining the pipe.
                     logs = None
+            # StreamReader.read() may complete synchronously while buffered.
+            # Bound uninterrupted parsing/draining work to one 16 KiB chunk.
+            await asyncio.sleep(0)
 
     async def call(
         self,

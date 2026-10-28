@@ -16,7 +16,9 @@ _LINES_PER_SECOND = 32
 _BYTES_PER_SECOND = 64 * 1024
 _QUEUE_SIZE = 256
 _TRUNCATED = " [truncated]"
-_ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+_ANSI = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))",
+)
 _CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")
 _HEADERS = re.compile(
     r"(\b(?:(?:proxy-)?authorization|(?:set-)?cookie)"
@@ -25,13 +27,32 @@ _HEADERS = re.compile(
 )
 _BEARER = re.compile(r"\b(Bearer|Basic)\s+[^\s,;\"'<>]+", re.I)
 _TELEGRAM = re.compile(r"(/bot)\d+:[A-Za-z0-9_-]+", re.I)
+_KEY = re.compile(r"[\w.-]+")
 _CREDENTIAL = re.compile(
-    r"(\b(?:[\w.-]*(?:token|secret|password|passwd|api[_-]?key)"
-    r"[\w.-]*|authorization|cookie)\b[\"']?\s*[:=]\s*)"
-    r"(?:\"[^\"]*(?:\"|$)|'[^']*(?:'|$)|[^\s&,;}]+)",
+    r"token|secret|password|passwd|api[_-]?key|^authorization$|^cookie$",
     re.I,
 )
+_VALUE = re.compile(
+    r"[\"']?\s*[:=]\s*(\"[^\"]*(?:\"|$)|'[^']*(?:'|$)|[^\s&,;}]+)",
+)
 _URL_AUTH = re.compile(r"(https?://)[^/\s@]+@", re.I)
+
+
+def _credentials(text: str) -> str:
+    # Consume each whole key once: restarting a greedy key pattern at every
+    # word boundary makes long dotted/hyphenated tokens quadratic.
+    parts = []
+    position = copied = 0
+    while key := _KEY.search(text, position):
+        position = key.end()
+        if not _CREDENTIAL.search(key.group()):
+            continue
+        value = _VALUE.match(text, position)
+        if value is not None:
+            parts.extend((text[copied : value.start(1)], "[REDACTED]"))
+            position = copied = value.end()
+    parts.append(text[copied:])
+    return "".join(parts)
 
 
 def _clean(text: str) -> str:
@@ -40,12 +61,13 @@ def _clean(text: str) -> str:
     text = _HEADERS.sub(r"\1[REDACTED]", text)
     text = _TELEGRAM.sub(r"\1[REDACTED]", text)
     text = _BEARER.sub(r"\1 [REDACTED]", text)
-    text = _CREDENTIAL.sub(r"\1[REDACTED]", text)
+    text = _credentials(text)
     return _URL_AUTH.sub(r"\1[REDACTED]@", text)
 
 
 def _prefix_value(value: object) -> str:
-    return _clean(str(value)).encode("utf-8")[:128].decode("utf-8", "ignore")
+    text = _clean(str(value)[:128])
+    return text.encode("utf-8")[:128].decode("utf-8", "ignore")
 
 
 class _LogSink:
@@ -123,10 +145,11 @@ class WorkerLogs:
         if workspace is not None:
             fields.append(f"workspace_id={_prefix_value(workspace)}")
         self.prefix = "[worker stderr " + " ".join(fields) + "] "
+        self.prefix_bytes = len(self.prefix.encode("utf-8"))
         self.buffer = bytearray()
         self.line_bytes = 0
         self.window = monotonic()
-        self.lines = self.bytes = 0
+        self.attempts = self.bytes = 0
         self.omitted_lines = self.omitted_bytes = 0
         self.last_delivery: threading.Event | None = None
 
@@ -142,48 +165,67 @@ class WorkerLogs:
     def _refresh(self) -> None:
         now = monotonic()
         if now - self.window >= 1.0:
-            self.window, self.lines, self.bytes = now, 0, 0
+            self.window, self.attempts, self.bytes = now, 0, 0
+
+    def _admit(self, *, summary: bool = False) -> bool:
+        # Reserve one record and 256 bytes for a merged omission summary.
+        line_limit = _LINES_PER_SECOND - (0 if summary else 1)
+        byte_limit = _BYTES_PER_SECOND - (0 if summary else 256)
+        if (
+            self.attempts >= line_limit
+            or self.bytes + self.prefix_bytes > byte_limit
+        ):
+            return False
+        # Charge before decoding/cleaning, even if the queue is full or the
+        # resulting record cannot fit. Only successfully queued bytes count.
+        self.attempts += 1
+        return True
 
     def _offer(self, text: str, *, summary: bool = False) -> bool:
         message = self.prefix + text
         size = len(message.encode("utf-8"))
-        # Reserve one record and 256 bytes for a merged omission summary.
-        line_limit = _LINES_PER_SECOND - (0 if summary else 1)
         byte_limit = _BYTES_PER_SECOND - (0 if summary else 256)
-        if self.lines >= line_limit or self.bytes + size > byte_limit:
+        if self.bytes + size > byte_limit:
             return False
         delivered = _submit(message)
         if delivered is None:
             return False
         self.last_delivery = delivered
-        self.lines += 1
         self.bytes += size
         return True
 
     def _summary(self) -> None:
-        if self.omitted_lines and self._offer(
-            f"omitted {self.omitted_lines} lines "
-            f"({self.omitted_bytes} bytes)",
-            summary=True,
+        if (
+            self.omitted_lines
+            and self._admit(summary=True)
+            and self._offer(
+                f"omitted {self.omitted_lines} lines "
+                f"({self.omitted_bytes} bytes)",
+                summary=True,
+            )
         ):
             self.omitted_lines = self.omitted_bytes = 0
 
     def _line(self) -> None:
         self._refresh()
-        # Keep only a bounded raw prefix; redact before final output truncation.
-        text = _clean(self.buffer.decode("utf-8", "replace"))
-        data = text.encode("utf-8")
-        limit = _LINE_BYTES - len(self.prefix.encode("utf-8"))
-        if self.line_bytes > len(self.buffer) or len(data) > limit:
-            text = data[: limit - len(_TRUNCATED)].decode("utf-8", "ignore")
-            text += _TRUNCATED
-        if (
-            self.lines < _LINES_PER_SECOND - 1
-            and self.bytes + len((self.prefix + text).encode("utf-8"))
-            <= _BYTES_PER_SECOND - 256
-        ):
+        # Retry a pending summary once on window rollover (or at EOF), rather
+        # than spending every remaining attempt on a full sink.
+        if self.attempts == 0:
             self._summary()
-        if not self._offer(text):
+        accepted = False
+        if self._admit():
+            # Redact the bounded raw prefix before final output truncation.
+            text = _clean(self.buffer.decode("utf-8", "replace"))
+            data = text.encode("utf-8")
+            limit = _LINE_BYTES - self.prefix_bytes
+            if self.line_bytes > len(self.buffer) or len(data) > limit:
+                text = data[: limit - len(_TRUNCATED)].decode(
+                    "utf-8",
+                    "ignore",
+                )
+                text += _TRUNCATED
+            accepted = self._offer(text)
+        if not accepted:
             self.omitted_lines += 1
             self.omitted_bytes += self.line_bytes
         self.buffer.clear()

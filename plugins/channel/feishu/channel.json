@@ -9,7 +9,7 @@
   "dependency_mode": "shared",
   "entrypoint": {
     "scope": "runner",
-    "module": "feishu.driver",
+    "module": "qwenpaw_channel_feishu.driver",
     "qualname": "FeishuDriver"
   },
   "requirements_file": "requirements.txt",

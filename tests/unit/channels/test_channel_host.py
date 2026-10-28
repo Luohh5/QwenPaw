@@ -41,7 +41,13 @@ def static_channel_guard(host, monkeypatch):
     class Guard(importlib.abc.MetaPathFinder):
         def find_spec(self, fullname, path=None, target=None):
             if fullname.startswith(
-                ("lark_oapi", "dingtalk_stream", "feishu.driver", "sample"),
+                (
+                    "lark_oapi",
+                    "dingtalk_stream",
+                    "qwenpaw_channel_feishu",
+                    "qwenpaw_channel_dingtalk",
+                    "sample",
+                ),
             ):
                 attempts.append(fullname)
                 raise AssertionError("Static discovery attempted SDK import")

@@ -146,6 +146,15 @@ async def test_log_flood_is_bounded_redacted_and_keeps_ipc_responsive(
     await eventually(lambda: "sample SDK diagnostic" in worker_logs.text)
     worker_logs.clear()
     baseline = process.health_snapshot()["log_bytes"]
+    cleaned = []
+    clean = log_bridge._clean
+
+    def observe_clean(text):
+        cleaned.append(text)
+        return clean(text)
+
+    monkeypatch.setattr(log_bridge, "_clean", observe_clean)
+    complex_line = "a-b." * 1024
     diagnostic = (
         "credential-check \x1b[31mAuthorization: Bearer bearer-secret\x1b[0m\r\n"
         "https://api.telegram.org/bot123456:telegram-secret/sendMessage\n"
@@ -153,13 +162,44 @@ async def test_log_flood_is_bounded_redacted_and_keeps_ipc_responsive(
         "Authorization: token ghp_secretvalue\n"
         "Cookie: session=first_secret; auth=second_secret\n"
     )
+    diagnostic += complex_line + "\n"
+    diagnostic += "a-b." * 900 + ' api_token="complex-secret"\n'
     text = diagnostic + "long-line " + "x" * (128 * 1024) + "\n"
     text += ("flood-line " + "y" * 120 + "\n") * 2048
-    size = await asyncio.wait_for(
-        process.call("sample.logs", {"text": text}),
+    progress = []
+
+    async def heartbeat():
+        while True:
+            progress.append(process.health_snapshot()["log_bytes"])
+            await asyncio.sleep(0)
+
+    beating = asyncio.create_task(heartbeat())
+    try:
+        size = await asyncio.wait_for(
+            process.call("sample.logs", {"text": text}),
+            3,
+        )
+        await eventually(
+            lambda: process.health_snapshot()["log_bytes"] == baseline + size,
+        )
+    finally:
+        beating.cancel()
+        await asyncio.gather(beating, return_exceptions=True)
+    assert size == len(text.encode())
+    assert any(baseline < count < baseline + size for count in progress)
+    assert complex_line in cleaned
+    # Exhausted windows must reject before decoding/redacting more records.
+    cleaned_before = len(cleaned)
+    rejected = (complex_line + "\n") * 8
+    size += await asyncio.wait_for(
+        process.call("sample.logs", {"text": rejected}),
         3,
     )
-    assert size == len(text.encode())
+    await eventually(
+        lambda: process.health_snapshot()["log_bytes"] == baseline + size,
+    )
+    assert len(cleaned) == cleaned_before
+    assert cleaned_before <= 31
     assert await asyncio.wait_for(
         process.call("sample.echo", {"ok": 1}),
         1,
@@ -177,6 +217,7 @@ async def test_log_flood_is_bounded_redacted_and_keeps_ipc_responsive(
     output = "\n".join(messages)
     assert "credential-check" in output and "long-line" in output
     assert "api.telegram.org" in output and "example.test" in output
+    assert "a-b." * 32 in output and "api_token=" in output
     assert "truncated" in output.lower()
     assert len(messages) <= 32
     assert sum(len(message.encode()) for message in messages) <= 64 * 1024
@@ -188,6 +229,7 @@ async def test_log_flood_is_bounded_redacted_and_keeps_ipc_responsive(
         "ghp_secretvalue",
         "first_secret",
         "second_secret",
+        "complex-secret",
     ):
         assert secret not in output
     assert "\x1b" not in output and "\r" not in output

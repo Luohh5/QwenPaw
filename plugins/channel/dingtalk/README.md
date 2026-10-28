@@ -2,7 +2,7 @@
 
 正式入口为 `plugin.json` 的 `entry.descriptor: "channel.json"`，运行模式为
 `runner_process + shared`。插件根目录包含静态清单和唯一依赖声明
-`requirements.txt`，Python 实现在 `dingtalk/`，子进程入口为 `dingtalk.driver`。
+`requirements.txt`，Python 实现在 `qwenpaw_channel_dingtalk/`，子进程入口为 `qwenpaw_channel_dingtalk.driver`。
 `publish: false` 和预览版本保持不变，本轮不发布制品。
 
 ## 宿主接入
