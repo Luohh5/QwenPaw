@@ -59,14 +59,14 @@ vi.mock("react-i18next", async (original) => ({
 }));
 vi.mock("@/components/PageHeader", () => ({
   PageHeader: ({
-    title,
+    current,
     extra,
   }: {
-    title: React.ReactNode;
+    current: React.ReactNode;
     extra: React.ReactNode;
   }) => (
     <header>
-      <h1>{title}</h1>
+      <h1>{current}</h1>
       {extra}
     </header>
   ),
@@ -74,6 +74,9 @@ vi.mock("@/components/PageHeader", () => ({
 vi.mock("@/components/InlineHelp", () => ({ default: () => null }));
 vi.mock("./useMCP", () => ({
   useMCP: () => ({
+    agentId: mocks.agent.selectedAgent,
+    ready: true,
+    error: null,
     clients: [
       {
         key: "saved",

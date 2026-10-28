@@ -17,6 +17,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 
 from ...plugins.browser_access import browser_prefixes
+from ...plugins.registry import MemoryBackendInUseError
 
 logger = logging.getLogger(__name__)
 
@@ -224,22 +225,16 @@ async def uninstall_pawapp(
         ) from exc
     except PluginBusyError as exc:
         raise HTTPException(status_code=409, detail=exc.detail) from exc
-    except RuntimeError as exc:
-        if "memory backend is in use" in str(exc):
-            still_loaded = loader.get_loaded_plugin(app_id) is not None
-            raise HTTPException(
-                status_code=409,
-                detail=memory_in_use_detail(
-                    app_id,
-                    exc,
-                    loaded=still_loaded,
-                    kind="PawApp",
-                ),
-            ) from exc
-        logger.error("PawApp uninstall failed for '%s': %s", app_id, exc)
+    except MemoryBackendInUseError as exc:
+        still_loaded = loader.get_loaded_plugin(app_id) is not None
         raise HTTPException(
-            status_code=500,
-            detail=f"Uninstall failed: {exc}",
+            status_code=409,
+            detail=memory_in_use_detail(
+                app_id,
+                exc,
+                loaded=still_loaded,
+                kind="PawApp",
+            ),
         ) from exc
     except Exception as exc:  # noqa: BLE001
         logger.error("PawApp uninstall failed for '%s': %s", app_id, exc)

@@ -1,4 +1,7 @@
-"""Resolve SDK workspace identity from host ownership, never directory names."""
+# -*- coding: utf-8 -*-
+"""
+Resolve SDK workspace identity from host ownership, never directory names.
+"""
 
 from contextvars import ContextVar
 from pathlib import Path

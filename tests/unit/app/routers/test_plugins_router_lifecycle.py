@@ -262,7 +262,12 @@ class TestAsyncDownload:
 # ---------------------------------------------------------------------------
 
 
-def _client(loader: Any = None, provider_manager: Any = None):
+def _client(
+    loader: Any = None,
+    provider_manager: Any = None,
+    *,
+    raise_server_exceptions: bool = True,
+):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -274,7 +279,7 @@ def _client(loader: Any = None, provider_manager: Any = None):
     app.state.provider_manager = provider_manager
     app.include_router(plugins_router, prefix="/api")
     app.include_router(pawapps_router, prefix="/api")
-    return TestClient(app)
+    return TestClient(app, raise_server_exceptions=raise_server_exceptions)
 
 
 class TestListPluginsRoute:
@@ -1057,18 +1062,55 @@ class TestUninstallPluginRoute:
             ),
         }
 
-    def test_memory_backend_in_use_returns_409_and_keeps_plugin_loaded(self):
-        loader = _loader_stub([], record=_record())
-        loader.lifecycle.unload.side_effect = RuntimeError(
-            "memory backend is in use",
+    @pytest.mark.p1
+    @pytest.mark.parametrize(
+        "method,endpoint,kind",
+        [
+            ("delete", "plugins/plug", "Plugin"),
+            ("post", "plugins/plug/unload", "Plugin"),
+            ("delete", "pawapps/plug", "PawApp"),
+        ],
+    )
+    @pytest.mark.parametrize("loaded", [False, True])
+    @pytest.mark.parametrize("memory_in_use", [False, True])
+    def test_memory_conflict_is_classified_by_type(
+        self,
+        monkeypatch,
+        tmp_path,
+        method,
+        endpoint,
+        kind,
+        loaded,
+        memory_in_use,
+    ):
+        from qwenpaw.plugins.registry import MemoryBackendInUseError
+
+        monkeypatch.setattr(
+            "qwenpaw.app.routers.pawapps._get_apps_dir",
+            lambda: tmp_path,
         )
-        response = _client(loader).delete("/api/plugins/plug")
-        assert response.status_code == 409
-        detail = response.json()["detail"]
-        assert detail["loaded"] is True
-        assert detail["quiescent"] is False
-        assert detail["needs_restart"] is True
-        assert detail["errors"] == ["memory backend is in use"]
+        error = (
+            MemoryBackendInUseError("backend still has active users")
+            if memory_in_use
+            else RuntimeError("memory backend is in use")
+        )
+        loader = _loader_stub([], record=_record() if loaded else None)
+        loader.lifecycle.unload.side_effect = error
+        client = _client(loader, raise_server_exceptions=False)
+        response = client.request(method, f"/api/{endpoint}")
+        assert response.status_code == (409 if memory_in_use else 500)
+        if memory_in_use:
+            assert response.json()["detail"] == {
+                "id": "plug",
+                "loaded": loaded,
+                "clean": False,
+                "quiescent": False,
+                "needs_restart": True,
+                "errors": [str(error)],
+                "message": f"{kind} 'plug': {error}",
+            }
+        assert (loader.get_loaded_plugin("plug") is not None) is loaded
+        loader.lifecycle.unload.assert_awaited_once()
 
     def test_busy_market_provider_returns_409(self):
         from qwenpaw.market.registry import MarketProviderBusyError

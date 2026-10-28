@@ -1,4 +1,8 @@
+# -*- coding: utf-8 -*-
 """Unbuffered in-process ASGI client for the public integration host."""
+
+# Host adapters access private ownership state behind the public SDK.
+# pylint: disable=protected-access
 
 import asyncio
 import json
@@ -39,8 +43,14 @@ class TestConnection:
     ):
         self._host, self._method, self._path = host, method, path
         self._workspace_id, self._user_id = workspace_id, user_id
-        self._headers, self._body, self._websocket = headers or {}, body, websocket
-        self._incoming, self._outgoing = asyncio.Queue(), asyncio.Queue(maxsize=1)
+        self._headers, self._body, self._websocket = (
+            headers or {},
+            body,
+            websocket,
+        )
+        self._incoming, self._outgoing = asyncio.Queue(), asyncio.Queue(
+            maxsize=1,
+        )
         self._task = None
         self._response_complete = False
         self.status, self.headers = 0, {}
@@ -72,11 +82,19 @@ class TestConnection:
         initial = (
             {"type": "websocket.connect"}
             if self._websocket
-            else {"type": "http.request", "body": self._body, "more_body": False}
+            else {
+                "type": "http.request",
+                "body": self._body,
+                "more_body": False,
+            }
         )
         await self._incoming.put(initial)
         self._task = asyncio.create_task(
-            self._host._http_app(scope, self._incoming.get, self._outgoing.put)
+            self._host._http_app(
+                scope,
+                self._incoming.get,
+                self._outgoing.put,
+            ),
         )
         self._host._connections.add(self)
         try:
@@ -87,7 +105,8 @@ class TestConnection:
         if event["type"] == "http.response.start":
             self.status = event["status"]
             self.headers = {
-                key.decode(): value.decode() for key, value in event.get("headers", ())
+                key.decode(): value.decode()
+                for key, value in event.get("headers", ())
             }
         elif event["type"] != "websocket.accept":
             await self.close()
@@ -98,7 +117,8 @@ class TestConnection:
         receiver = asyncio.create_task(self._outgoing.get())
         try:
             done, _ = await asyncio.wait(
-                {receiver, self._task}, return_when=asyncio.FIRST_COMPLETED
+                {receiver, self._task},
+                return_when=asyncio.FIRST_COMPLETED,
             )
             if receiver in done:
                 return receiver.result()
@@ -124,7 +144,7 @@ class TestConnection:
             {
                 "type": "websocket.receive",
                 "text" if isinstance(message, str) else "bytes": message,
-            }
+            },
         )
 
     async def receive(self) -> str | bytes | None:
@@ -143,17 +163,21 @@ class TestConnection:
             if self._response_complete:
                 # The last body is not the end of the application's resource
                 # cleanup. A normal response must not cancel that cleanup.
-                _, pending = await asyncio.wait({task}, timeout=TASK_STOP_SECONDS)
+                _, pending = await asyncio.wait(
+                    {task},
+                    timeout=TASK_STOP_SECONDS,
+                )
                 if pending:
                     raise SDKError(
-                        "HTTP response completed but request cleanup is still running"
+                        "HTTP response completed but request cleanup is "
+                        "still running",
                     )
                 task.result()
             else:
                 await self._incoming.put(
                     {"type": "websocket.disconnect", "code": 1000}
                     if self._websocket
-                    else {"type": "http.disconnect"}
+                    else {"type": "http.disconnect"},
                 )
                 await stop_task(task, "test HTTP/WebSocket connection")
         finally:

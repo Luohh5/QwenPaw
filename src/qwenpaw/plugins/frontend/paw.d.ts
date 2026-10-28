@@ -55,7 +55,13 @@ export interface PawChatOptions {
 }
 
 /** JSON-only extension data; host runtime objects never cross this boundary. */
-export type PawJSONValue = null | boolean | number | string | PawJSONValue[] | { [key: string]: PawJSONValue };
+export type PawJSONValue =
+  | null
+  | boolean
+  | number
+  | string
+  | PawJSONValue[]
+  | { [key: string]: PawJSONValue };
 
 export interface PawChatContent {
   type: string;

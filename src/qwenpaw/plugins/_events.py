@@ -1,4 +1,8 @@
+# -*- coding: utf-8 -*-
 """Non-blocking event fan-out with SDK-owned, bounded consumer workers."""
+
+# Host adapters access private ownership state behind the public SDK.
+# pylint: disable=protected-access
 
 import asyncio
 import functools
@@ -22,7 +26,6 @@ from .events import (
     StreamMessage,
     SubscriptionGap,
 )
-from .resources import Registration
 
 _log = logging.getLogger(__name__)
 _listeners = []
@@ -38,13 +41,15 @@ def freeze(value):
     if hasattr(value, "model_dump"):
         value = value.model_dump(mode="json")
     if isinstance(value, Mapping):
-        return MappingProxyType({str(key): freeze(item) for key, item in value.items()})
+        return MappingProxyType(
+            {str(key): freeze(item) for key, item in value.items()},
+        )
     if isinstance(value, (tuple, list)):
         return tuple(freeze(item) for item in value)
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     raise SDKError(
-        f"Event payload must contain JSON values, got {type(value).__name__}"
+        f"Event payload must contain JSON values, got {type(value).__name__}",
     )
 
 
@@ -54,14 +59,25 @@ def _content(value):
         key: data.pop(key)
         for key in tuple(data)
         if key
-        in {"type", "text", "delta", "index", "status", "object", "msg_id", "data"}
+        in {
+            "type",
+            "text",
+            "delta",
+            "index",
+            "status",
+            "object",
+            "msg_id",
+            "data",
+        }
     }
     return StreamContent(**fields, attributes=freeze(data))
 
 
 def _message(value):
     data = dict(value)
-    fields = {key: data.pop(key, None) for key in ("id", "type", "role", "status")}
+    fields = {
+        key: data.pop(key, None) for key in ("id", "type", "role", "status")
+    }
     return StreamMessage(
         **fields,
         content=tuple(_content(block) for block in data.pop("content", ())),
@@ -77,7 +93,9 @@ def chat_event(value):
         object_type = (
             "response"
             if "output" in data
-            else "message" if "content" in data else "event"
+            else "message"
+            if "content" in data
+            else "event"
         )
     if object_type == "content":
         return ChatEvent(
@@ -144,7 +162,7 @@ def approval_changed(pending):
                 approval_snapshot(pending),
                 next(_sequence),
                 time.time(),
-            )
+            ),
         )
     except Exception:
         _log.exception("SDK approval snapshot failed")
@@ -157,14 +175,18 @@ def observe_stream(function):
             return function(workspace, request)
 
         async def observed():
-            run_id = str(getattr(request, "request_id", None) or uuid.uuid4().hex)
-            identity = dict(
-                run_id=run_id,
-                workspace_id=workspace.agent_id,
-                session_id=str(getattr(request, "session_id", "") or ""),
-                user_id=str(getattr(request, "user_id", "") or ""),
-                channel=str(getattr(request, "channel", "console") or "console"),
+            run_id = str(
+                getattr(request, "request_id", None) or uuid.uuid4().hex,
             )
+            identity = {
+                "run_id": run_id,
+                "workspace_id": workspace.agent_id,
+                "session_id": str(getattr(request, "session_id", "") or ""),
+                "user_id": str(getattr(request, "user_id", "") or ""),
+                "channel": str(
+                    getattr(request, "channel", "console") or "console",
+                ),
+            }
 
             def publish(kind, event=None, reason=""):
                 emit(
@@ -175,7 +197,7 @@ def observe_stream(function):
                         timestamp=time.time(),
                         event=event,
                         reason=reason,
-                    )
+                    ),
                 )
 
             publish("run.started")
@@ -237,7 +259,10 @@ def subscribe(plugin, spec):
                 and event.workspace_id != spec.workspace_id
             ):
                 return
-            if spec.session_id is not None and event.session_id != spec.session_id:
+            if (
+                spec.session_id is not None
+                and event.session_id != spec.session_id
+            ):
                 return
             if len(self.queue) >= spec.capacity:
                 disposable = next(
@@ -268,7 +293,8 @@ def subscribe(plugin, spec):
                 while self.queue or self.lost:
                     if self.lost:
                         event = SubscriptionGap(
-                            lost=self.lost, disconnected=self.disconnected
+                            lost=self.lost,
+                            disconnected=self.disconnected,
                         )
                         self.lost = 0
                     else:
@@ -279,11 +305,9 @@ def subscribe(plugin, spec):
                             session_id=getattr(event, "session_id", ""),
                         ) as context:
                             await plugin._call(spec.handler, context, event)
-                    except asyncio.CancelledError:
-                        raise
                     except Exception as exc:
                         plugin._instance.add_diagnostic(
-                            f"Event subscriber failed: {exc}"
+                            f"Event subscriber failed: {exc}",
                         )
                 if self.disconnected:
                     return

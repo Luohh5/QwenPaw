@@ -21,8 +21,8 @@ def write_plugin(root, source, **manifest_fields):
     return PluginManifest.from_dict(manifest)
 
 
-@pytest.fixture
-def loader(tmp_path, monkeypatch, fresh_registry):
+@pytest.fixture(name="loader")
+def plugin_loader(tmp_path, monkeypatch, fresh_registry):
     work = tmp_path / "work"
     monkeypatch.setenv("QWENPAW_WORKING_DIR", str(work))
     monkeypatch.setattr("qwenpaw.constant.WORKING_DIR", work)
@@ -122,19 +122,31 @@ async def test_incompatible_reload_does_not_probe_or_stop_old_plugin(
         sdk={"version": "999.0"},
     )
     try:
-        report = await loader.lifecycle.reload(manifest.id, new_source=incoming)
+        report = await loader.lifecycle.reload(
+            manifest.id,
+            new_source=incoming,
+        )
         assert not report.ok and report.unchanged
-        assert not marker.exists(), "An incompatible candidate must not be probed"
-        assert not stopped.exists(), "Compatibility rejection must precede teardown"
+        assert (
+            not marker.exists()
+        ), "An incompatible candidate must not be probed"
+        assert (
+            not stopped.exists()
+        ), "Compatibility rejection must precede teardown"
         assert loader.get_loaded_plugin(manifest.id) is old
         assert old.status == "active" and old.instance.value == "old"
     finally:
         await loader.unload_plugin(manifest.id)
 
 
-@pytest.mark.parametrize("plugin_id", ["../other", "/absolute", "a/../../other"])
+@pytest.mark.parametrize(
+    "plugin_id",
+    ["../other", "/absolute", "a/../../other"],
+)
 async def test_sdk_identity_cannot_escape_owned_storage_roots(
-    tmp_path, loader, plugin_id
+    tmp_path,
+    loader,
+    plugin_id,
 ):
     from qwenpaw.plugins import SDKError
 

@@ -13,18 +13,20 @@ import subprocess
 import sys
 import threading
 import tempfile
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from packaging.requirements import Requirement
 
+from ..utils.runtime_environment import require_pip, require_uv
 from .architecture import PluginManifest, PluginRecord
 from .api import PluginApi
 from .dependency_gate import (
     DependencyGate,
     GateDecision,
+    combined_requirements,
     is_requirement_satisfied,
 )
 from .lifecycle import (
@@ -502,44 +504,54 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         Boot paths pass ``allow_install=False`` (check only). User-facing
         install / update / repair pass ``True`` so the gate may install.
         """
+        from ..utils.io_utils import run_sync_io
+
         _ensure_plugin_site_on_path()
-        requirements_file = source_path / "requirements.txt"
         if not self.lifecycle.delegate.owns_dependency_env(plugin_id):
             return GateDecision(
                 allow_install=False,
                 already_satisfied=True,
                 reason="dependency env not owned by this process",
             )
-        decision = DependencyGate().evaluate(
+        cleanup = ExitStack()
+        try:
+            try:
+                requirements_file = await run_sync_io(
+                    cleanup.enter_context,
+                    combined_requirements(source_path),
+                )
+            except ValueError as exc:
+                return GateDecision(
+                    allow_install=False,
+                    already_satisfied=False,
+                    unsupported=[str(exc)],
+                    reason=str(exc),
+                )
+            return await self._ensure_requirements_installed(
+                requirements_file,
+                plugin_id,
+                allow_install=allow_install,
+            )
+        finally:
+            await run_sync_io(cleanup.close)
+
+    async def _ensure_requirements_installed(
+        self,
+        requirements_file: Path,
+        plugin_id: str,
+        *,
+        allow_install: bool,
+    ) -> GateDecision:
+        from ..utils.io_utils import run_sync_io
+
+        decision = await run_sync_io(
+            DependencyGate().evaluate,
             requirements_file,
             allow_install=allow_install,
             plugin_id=plugin_id,
         )
         if decision.unsupported:
             return decision
-        if decision.missing:
-            from ._sdk_dependencies import loaded_sdk_conflicts
-            from ..utils.io_utils import run_sync_io
-
-            conflicts = await run_sync_io(
-                loaded_sdk_conflicts,
-                source_path,
-                decision.missing,
-            )
-            if conflicts:
-                return GateDecision(
-                    allow_install=False,
-                    already_satisfied=False,
-                    missing=decision.missing,
-                    host_conflicts=conflicts,
-                    require_restart=True,
-                    reason=(
-                        f"Plugin '{plugin_id}' cannot safely replace "
-                        "distributions in this process "
-                        f"({', '.join(conflicts)}). "
-                        "Restart the backend to apply."
-                    ),
-                )
         if decision.already_satisfied or not decision.allow_install:
             return decision
         logger.info(
@@ -549,14 +561,13 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             len(decision.missing),
             ", ".join(decision.missing),
         )
-        from ..utils.io_utils import run_sync_io
-
         await run_sync_io(
             self._install_requirements_locked,
             requirements_file,
             plugin_id,
         )
-        recheck = DependencyGate().evaluate(
+        recheck = await run_sync_io(
+            DependencyGate().evaluate,
             requirements_file,
             allow_install=False,
             plugin_id=plugin_id,
@@ -593,17 +604,6 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             _ensure_plugin_site_on_path()
             importlib.invalidate_caches()
             missing = self._find_unsatisfied_dependencies(requirements_file)
-            from ._sdk_dependencies import loaded_sdk_conflicts
-
-            conflicts = loaded_sdk_conflicts(requirements_file.parent, missing)
-            if conflicts:
-                from .errors import SDKRestartRequiredError
-
-                raise SDKRestartRequiredError(
-                    f"Plugin '{plugin_id}' cannot safely replace "
-                    "distributions in this process "
-                    f"({', '.join(conflicts)}). Restart the backend to apply.",
-                )
             if not missing:
                 logger.info(
                     "Plugin '%s' dependencies already satisfied by a "
@@ -1053,6 +1053,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             logger.warning(f"Plugin '{plugin_id}' already loaded")
             return self._loaded_plugins[plugin_id]
 
+        previous_instance = self.lifecycle.get_instance(plugin_id)
         instance = self.lifecycle.ensure_instance(
             plugin_id,
             generation=generation,
@@ -1086,17 +1087,27 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             self._loaded_plugins[plugin_id] = record
             return record
 
-        decision = await self._ensure_dependencies_installed(
-            source_path,
-            plugin_id,
-            allow_install=allow_install,
-        )
-        if decision.require_restart:
-            if manifest.sdk is not None:
-                from .errors import SDKRestartRequiredError
+        try:
+            decision = await self._ensure_dependencies_installed(
+                source_path,
+                plugin_id,
+                allow_install=allow_install,
+            )
+            if decision.require_restart:
+                if manifest.sdk is not None:
+                    from .errors import SDKRestartRequiredError
 
-                raise SDKRestartRequiredError(decision.reason)
-            raise RuntimeError(decision.reason)
+                    raise SDKRestartRequiredError(decision.reason)
+                raise RuntimeError(decision.reason)
+        except BaseException:
+            # No record exists yet for normal unload/repair to reclaim.
+            if (
+                instance is not previous_instance
+                and not instance.activated
+                and not instance.has_runtime_ledger()
+            ):
+                self.lifecycle.drop_instance(plugin_id)
+            raise
         if decision.unsupported or (
             decision.missing and not decision.allow_install
         ):
@@ -1485,24 +1496,6 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 "ask the administrator to install the requirements, "
                 "or use Docker for independently managed dependencies.",
             )
-        from ._sdk_dependencies import is_sdk_source, install_sdk_requirements
-
-        if is_sdk_source(requirements_file.parent):
-            python = _desktop_python() if _is_frozen() else sys.executable
-            if python is None:
-                raise RuntimeError(
-                    "The bundled dependency runtime is unavailable",
-                )
-            install_sdk_requirements(
-                requirements_file,
-                plugin_id,
-                python=str(python),
-                target=str(_plugin_site_dir()) if _is_frozen() else None,
-                run=self._run_subprocess_with_streaming_log,
-                find_uv=self._find_uv,
-            )
-            importlib.invalidate_caches()
-            return
         logger.info(
             f"Installing dependencies for plugin '{plugin_id}'...",
         )
@@ -1516,6 +1509,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             return
 
         # ── Attempt 1: python -m pip ──────────────────────────────────
+        require_pip(sys.executable)
         try:
             result = self._run_subprocess_with_streaming_log(
                 [
@@ -1525,6 +1519,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     "install",
                     "--disable-pip-version-check",
                     "--no-input",
+                    "certifi>=2026.10.19",
                     "-r",
                     req,
                 ],
@@ -1567,6 +1562,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         logger.info(
             f"pip not available; retrying with uv for plugin '{plugin_id}'",
         )
+        require_uv(uv)
         try:
             uv_result = self._run_subprocess_with_streaming_log(
                 [
@@ -1575,6 +1571,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     "install",
                     "--python",
                     sys.executable,
+                    "certifi>=2026.10.19",
                     "-r",
                     req,
                 ],
@@ -1619,6 +1616,10 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 "Desktop, or install the plugin's dependencies manually.",
             )
         target = str(_plugin_site_dir())
+        if not require_pip(python):
+            raise RuntimeError(
+                "Bundled pip is missing; update QwenPaw Desktop",
+            )
         try:
             result = self._run_subprocess_with_streaming_log(
                 [
@@ -1630,6 +1631,8 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     "--no-input",
                     "--target",
                     target,
+                    "--upgrade",
+                    "certifi>=2026.10.19",
                     "-r",
                     req,
                 ],

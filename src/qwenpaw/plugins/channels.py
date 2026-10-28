@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Messaging transports backed by the host queue, access policy and runtime."""
 
 from dataclasses import dataclass, field
@@ -73,19 +74,36 @@ class ChannelContext(ToolContext):
 
 
 class ChannelBackend(Protocol):
-    async def start(self, context: ChannelContext) -> None: ...
-    async def stop(self, context: ChannelContext) -> bool: ...
-    async def send(self, context: ChannelContext, message: OutgoingMessage) -> None: ...
+    async def start(self, context: ChannelContext) -> None:
+        ...
+
+    async def stop(self, context: ChannelContext) -> bool:
+        ...
+
+    async def send(
+        self,
+        context: ChannelContext,
+        message: OutgoingMessage,
+    ) -> None:
+        ...
 
 
 class StreamingChannelBackend(ChannelBackend, Protocol):
     async def on_stream(
-        self, context: ChannelContext, event: ChannelStreamEvent
-    ) -> None: ...
+        self,
+        context: ChannelContext,
+        event: ChannelStreamEvent,
+    ) -> None:
+        ...
 
 
 class RunAwareChannelBackend(ChannelBackend, Protocol):
-    async def on_run(self, context: ChannelContext, event: ChannelRunEvent) -> None: ...
+    async def on_run(
+        self,
+        context: ChannelContext,
+        event: ChannelRunEvent,
+    ) -> None:
+        ...
 
 
 @dataclass(frozen=True)

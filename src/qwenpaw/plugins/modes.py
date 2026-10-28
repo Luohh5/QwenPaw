@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Mode bundles selected from an immutable request snapshot."""
 
 from dataclasses import dataclass
@@ -30,5 +31,8 @@ class ModeSpec:
     commands: tuple[CommandSpec, ...] = ()
     hooks: tuple[HookSpec, ...] = ()
     prompts: tuple[PromptSpec, ...] = ()
-    on_turn_start: Callable[[ModeContext], None | Awaitable[None]] | None = None
+    on_turn_start: Callable[
+        [ModeContext],
+        None | Awaitable[None],
+    ] | None = None
     on_reset: Callable[[ModeContext], None | Awaitable[None]] | None = None

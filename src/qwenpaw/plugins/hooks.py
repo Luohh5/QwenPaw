@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Runtime hooks expose message snapshots and explicit permitted changes."""
 
 from dataclasses import dataclass

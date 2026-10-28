@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Stable lifecycle outcomes containing only public value types."""
 
 from dataclasses import dataclass

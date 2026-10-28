@@ -1,13 +1,20 @@
+# -*- coding: utf-8 -*-
 """Internal controls for bound services against the builtin model factory."""
+
+# Inspect host ownership and cleanup state at the tested bridge boundary.
+# pylint: disable=protected-access
 
 import json
 import socket
 import threading
 
-import pytest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import pytest
+
 from .test_sdk_context_services import package
+
+from .timing import WAIT_TIMEOUT
 
 
 async def configure_loopback(host, base_url):
@@ -23,19 +30,24 @@ async def configure_loopback(host, base_url):
             models=[ModelInfo(id="gpt-4o-mini", name="Loopback")],
             chat_model="OpenAIChatModel",
             model_sync_mode="disabled",
-        )
+        ),
     )
     assert (
-        ProviderManager.get_instance().get_provider("context-loopback").base_url
+        ProviderManager.get_instance()
+        .get_provider("context-loopback")
+        .base_url
         == base_url
     )
     await host.configure_chat_model(
-        "context-loopback", "gpt-4o-mini", workspace_id="bound"
+        "context-loopback",
+        "gpt-4o-mini",
+        workspace_id="bound",
     )
 
 
 async def test_bound_models_match_builtin_openai_factory_over_loopback(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
 ):
     from qwenpaw.plugins.testing import PluginTestHost
     from qwenpaw.plugins.messages import ContentBlock, Message
@@ -51,12 +63,18 @@ async def test_bound_models_match_builtin_openai_factory_over_loopback(
         def do_POST(self):
             assert self.path == "/v1/chat/completions"
             requests.append(
-                json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                json.loads(
+                    self.rfile.read(int(self.headers["Content-Length"])),
+                ),
             )
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
-            for text, final in (("loopback:", False), ("answer", False), ("", True)):
+            for text, final in (
+                ("loopback:", False),
+                ("answer", False),
+                ("", True),
+            ):
                 chunk = {
                     "id": "builtin-loopback",
                     "object": "chat.completion.chunk",
@@ -67,7 +85,7 @@ async def test_bound_models_match_builtin_openai_factory_over_loopback(
                             "index": 0,
                             "delta": {"content": text} if text else {},
                             "finish_reason": "stop" if final else None,
-                        }
+                        },
                     ],
                 }
                 if final:
@@ -76,7 +94,9 @@ async def test_bound_models_match_builtin_openai_factory_over_loopback(
                         "completion_tokens": 4,
                         "total_tokens": 11,
                     }
-                self.wfile.write(("data: " + json.dumps(chunk) + "\n\n").encode())
+                self.wfile.write(
+                    ("data: " + json.dumps(chunk) + "\n\n").encode(),
+                )
                 self.wfile.flush()
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
@@ -88,7 +108,10 @@ async def test_bound_models_match_builtin_openai_factory_over_loopback(
 
     def loopback_only(sock, address):
         if isinstance(address, tuple):
-            assert address[0] in ("127.0.0.1", "::1"), "External network is forbidden"
+            assert address[0] in (
+                "127.0.0.1",
+                "::1",
+            ), "External network is forbidden"
         return original_connect(sock, address)
 
     monkeypatch.setattr(socket.socket, "connect", loopback_only)
@@ -97,33 +120,66 @@ from dataclasses import asdict
 from qwenpaw.plugins.tools import ToolSpec, ToolResult
 from qwenpaw.plugins.messages import Message, ContentBlock
 from qwenpaw.plugins.providers import ModelToolChoice
+
+
 class Plugin:
     def register(self, ctx):
         async def invoke(call, args):
             result = await call.models.complete(
-                (Message("user", (ContentBlock(text="question"),)),),
-                tool_choice=ModelToolChoice("none"), options={"temperature": .2})
-            return ToolResult(result.content, metadata={"usage": asdict(result.usage)})
-        ctx.register_tool(ToolSpec("builtin_bound_probe", "real factory", {"type": "object"}, invoke, enabled=True))
+                (
+                    Message(
+                        "user", (ContentBlock(text="question"),)
+                    ),
+                ),
+                tool_choice=ModelToolChoice("none"),
+                options={"temperature": 0.2},
+            )
+            return ToolResult(
+                result.content,
+                metadata={"usage": asdict(result.usage)},
+            )
+
+        ctx.register_tool(
+            ToolSpec(
+                "builtin_bound_probe",
+                "real factory",
+                {"type": "object"},
+                invoke,
+                enabled=True,
+            )
+        )
+
+
 plugin = Plugin()
 """
     try:
         async with PluginTestHost(tmp_path / "host") as host:
             await host.load(
-                package(tmp_path / "caller", "builtin-model-caller", source, ["tools"])
+                package(
+                    tmp_path / "caller",
+                    "builtin-model-caller",
+                    source,
+                    ["tools"],
+                ),
             )
             base_url = f"http://127.0.0.1:{server.server_port}/v1"
             await configure_loopback(host, base_url)
             # Verify routing before allowing the real builtin client to run.
             assert (
-                ProviderManager.get_instance().get_provider("context-loopback").base_url
+                ProviderManager.get_instance()
+                .get_provider("context-loopback")
+                .base_url
                 == base_url
             )
             await host.configure_chat_model(
-                "context-loopback", "gpt-4o-mini", workspace_id="bound"
+                "context-loopback",
+                "gpt-4o-mini",
+                workspace_id="bound",
             )
             direct = await host.create_model(
-                "context-loopback", "gpt-4o-mini", workspace_id="bound"
+                "context-loopback",
+                "gpt-4o-mini",
+                workspace_id="bound",
             )
             chunks = [
                 chunk
@@ -138,7 +194,9 @@ plugin = Plugin()
             )
             assert expected == "loopback:answer"
             result = await host.call_tool(
-                "builtin_bound_probe", {}, workspace_id="bound"
+                "builtin_bound_probe",
+                {},
+                workspace_id="bound",
             )
             assert "".join(block.text for block in result.content) == expected
             assert (
@@ -163,10 +221,10 @@ plugin = Plugin()
 
 
 async def test_cancelled_factory_worker_closes_real_late_model_client(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
 ):
     import asyncio
-    import pytest
     from qwenpaw.plugins import PluginBusyError
     from qwenpaw.plugins.testing import PluginTestHost
     from qwenpaw.providers.openai_provider import OpenAIProvider
@@ -183,38 +241,68 @@ async def test_cancelled_factory_worker_closes_real_late_model_client(
         if provider.id == "context-loopback":
             created.append(model)
             entered.set()
-            assert release.wait(10), "Factory test gate was not released"
+            assert release.wait(
+                WAIT_TIMEOUT * 2,
+            ), "Factory test gate was not released"
         return model
 
     def forbidden_network(*_):
-        raise AssertionError("A cancelled factory must not start an HTTP request")
+        raise AssertionError(
+            "A cancelled factory must not start an HTTP request",
+        )
 
     source = """
 from qwenpaw.plugins.tools import ToolSpec, ToolResult
 from qwenpaw.plugins.messages import Message, ContentBlock
+
+
 class Plugin:
     def register(self, ctx):
         async def invoke(call, args):
-            result = await call.models.complete((Message("user", (ContentBlock(text="question"),)),))
+            result = await call.models.complete(
+                (Message("user", (ContentBlock(text="question"),)),)
+            )
             return ToolResult(result.content)
-        ctx.register_tool(ToolSpec("late_factory_probe", "late factory", {"type": "object"}, invoke, enabled=True))
+
+        ctx.register_tool(
+            ToolSpec(
+                "late_factory_probe",
+                "late factory",
+                {"type": "object"},
+                invoke,
+                enabled=True,
+            )
+        )
+
+
 plugin = Plugin()
 """
     async with PluginTestHost(tmp_path / "host") as host:
         await host.load(
-            package(tmp_path / "caller", "late-factory-caller", source, ["tools"])
+            package(
+                tmp_path / "caller",
+                "late-factory-caller",
+                source,
+                ["tools"],
+            ),
         )
         await configure_loopback(host, "http://127.0.0.1:9/v1")
         await host.configure_chat_model(
-            "context-loopback", "gpt-4o-mini", workspace_id="bound"
+            "context-loopback",
+            "gpt-4o-mini",
+            workspace_id="bound",
         )
-        monkeypatch.setattr(OpenAIProvider, "get_chat_model_instance", blocked_factory)
+        monkeypatch.setattr(
+            OpenAIProvider,
+            "get_chat_model_instance",
+            blocked_factory,
+        )
         monkeypatch.setattr(socket.socket, "connect", forbidden_network)
         task = asyncio.create_task(
-            host.call_tool("late_factory_probe", {}, workspace_id="bound")
+            host.call_tool("late_factory_probe", {}, workspace_id="bound"),
         )
         try:
-            assert await asyncio.to_thread(entered.wait, 5)
+            assert await asyncio.to_thread(entered.wait, WAIT_TIMEOUT)
             task.cancel()
             await asyncio.sleep(0.02)
             assert not task.done(), "Factory thread is still live"
@@ -223,17 +311,20 @@ plugin = Plugin()
         finally:
             release.set()
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(task, 5)
+                await asyncio.wait_for(task, WAIT_TIMEOUT)
         assert len(created) == 1
         assert created[
             0
         ].client.is_closed(), "Late factory result leaked its real AsyncClient"
-        assert host.resource_snapshot("late-factory-caller")["active_calls"] == 0
+        assert (
+            host.resource_snapshot("late-factory-caller")["active_calls"] == 0
+        )
         assert (await host.reload("late-factory-caller")).ok
 
 
 async def test_closing_bound_builtin_stream_closes_real_http_transport(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
 ):
     import asyncio
     from qwenpaw.plugins.testing import PluginTestHost
@@ -260,11 +351,17 @@ async def test_closing_bound_builtin_stream_closes_real_http_transport(
                 "created": 1,
                 "model": "gpt-4o-mini",
                 "choices": [
-                    {"index": 0, "delta": {"content": "first"}, "finish_reason": None}
+                    {
+                        "index": 0,
+                        "delta": {"content": "first"},
+                        "finish_reason": None,
+                    },
                 ],
             }
             writer.write(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/event-stream\r\n"
+                b"Connection: close\r\n\r\n",
             )
             writer.write(("data: " + json.dumps(chunk) + "\n\n").encode())
             await writer.drain()
@@ -281,44 +378,75 @@ async def test_closing_bound_builtin_stream_closes_real_http_transport(
 
     def loopback_only(sock, address):
         if isinstance(address, tuple):
-            assert address[0] in ("127.0.0.1", "::1"), "External network is forbidden"
+            assert address[0] in (
+                "127.0.0.1",
+                "::1",
+            ), "External network is forbidden"
         return original_connect(sock, address)
 
     monkeypatch.setattr(socket.socket, "connect", loopback_only)
     source = """
 from qwenpaw.plugins.tools import ToolSpec, ToolEvent
 from qwenpaw.plugins.messages import Message, ContentBlock
+
+
 class Plugin:
     def register(self, ctx):
         async def invoke(call, args):
-            stream = call.models.stream((Message("user", (ContentBlock(text="held"),)),))
+            stream = call.models.stream(
+                (Message("user", (ContentBlock(text="held"),)),)
+            )
             try:
                 async for chunk in stream:
                     if chunk.content:
                         yield ToolEvent("delta", chunk.content)
             finally:
                 await stream.aclose()
-        ctx.register_tool(ToolSpec("transport_bound_probe", "transport", {"type": "object"}, invoke, enabled=True))
+
+        ctx.register_tool(
+            ToolSpec(
+                "transport_bound_probe",
+                "transport",
+                {"type": "object"},
+                invoke,
+                enabled=True,
+            )
+        )
+
+
 plugin = Plugin()
 """
     try:
         async with PluginTestHost(tmp_path / "host") as host:
             await host.load(
-                package(tmp_path / "caller", "transport-caller", source, ["tools"])
+                package(
+                    tmp_path / "caller",
+                    "transport-caller",
+                    source,
+                    ["tools"],
+                ),
             )
             port = server.sockets[0].getsockname()[1]
             await configure_loopback(host, f"http://127.0.0.1:{port}/v1")
             await host.configure_chat_model(
-                "context-loopback", "gpt-4o-mini", workspace_id="bound"
+                "context-loopback",
+                "gpt-4o-mini",
+                workspace_id="bound",
             )
-            stream = host.stream_tool("transport_bound_probe", {}, workspace_id="bound")
+            stream = host.stream_tool(
+                "transport_bound_probe",
+                {},
+                workspace_id="bound",
+            )
             try:
-                first = await asyncio.wait_for(anext(stream), 5)
+                first = await asyncio.wait_for(anext(stream), WAIT_TIMEOUT)
                 assert connected.is_set() and first.content[0].text == "first"
             finally:
-                await asyncio.wait_for(stream.aclose(), 5)
-            await asyncio.wait_for(disconnected.wait(), 2)
-            assert host.resource_snapshot("transport-caller")["active_calls"] == 0
+                await asyncio.wait_for(stream.aclose(), WAIT_TIMEOUT)
+            await asyncio.wait_for(disconnected.wait(), WAIT_TIMEOUT)
+            assert (
+                host.resource_snapshot("transport-caller")["active_calls"] == 0
+            )
             assert (await host.reload("transport-caller")).ok
     finally:
         server.close()
@@ -327,15 +455,16 @@ plugin = Plugin()
             writer.close()
         if serving:
             await asyncio.wait_for(
-                asyncio.gather(*tuple(serving), return_exceptions=True), 3
+                asyncio.gather(*tuple(serving), return_exceptions=True),
+                WAIT_TIMEOUT,
             )
 
 
 async def test_factory_formatter_failure_closes_already_created_client(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
 ):
     from functools import wraps
-    import pytest
     from qwenpaw.agents import model_factory
     from qwenpaw.plugins.testing import PluginTestHost
     from qwenpaw.providers.openai_provider import OpenAIProvider
@@ -350,39 +479,70 @@ async def test_factory_formatter_failure_closes_already_created_client(
         return model
 
     def broken_formatter(*args, **kwargs):
-        raise RuntimeError("controlled formatter failure after client construction")
+        raise RuntimeError(
+            "controlled formatter failure after client construction",
+        )
 
     source = """
 from qwenpaw.plugins.tools import ToolSpec, ToolResult
 from qwenpaw.plugins.messages import Message, ContentBlock
+
+
 class Plugin:
     def register(self, ctx):
         async def invoke(call, args):
-            result = await call.models.complete((Message("user", (ContentBlock(text="question"),)),))
+            result = await call.models.complete(
+                (Message("user", (ContentBlock(text="question"),)),)
+            )
             return ToolResult(result.content)
-        ctx.register_tool(ToolSpec("formatter_failure_probe", "factory cleanup", {"type": "object"}, invoke, enabled=True))
+
+        ctx.register_tool(
+            ToolSpec(
+                "formatter_failure_probe",
+                "factory cleanup",
+                {"type": "object"},
+                invoke,
+                enabled=True,
+            )
+        )
+
+
 plugin = Plugin()
 """
     try:
         async with PluginTestHost(tmp_path / "host") as host:
             await host.load(
                 package(
-                    tmp_path / "caller", "formatter-failure-caller", source, ["tools"]
-                )
+                    tmp_path / "caller",
+                    "formatter-failure-caller",
+                    source,
+                    ["tools"],
+                ),
             )
             await configure_loopback(host, "http://127.0.0.1:9/v1")
-            monkeypatch.setattr(OpenAIProvider, "get_chat_model_instance", record)
             monkeypatch.setattr(
-                model_factory, "_install_model_formatter", broken_formatter
+                OpenAIProvider,
+                "get_chat_model_instance",
+                record,
+            )
+            monkeypatch.setattr(
+                model_factory,
+                "_install_model_formatter",
+                broken_formatter,
             )
             monkeypatch.setattr(
                 socket.socket,
                 "connect",
                 lambda *_: pytest.fail("No network is permitted"),
             )
-            with pytest.raises(Exception, match="controlled formatter failure"):
+            with pytest.raises(
+                Exception,
+                match="controlled formatter failure",
+            ):
                 await host.call_tool(
-                    "formatter_failure_probe", {}, workspace_id="bound"
+                    "formatter_failure_probe",
+                    {},
+                    workspace_id="bound",
                 )
             assert len(created) == 1
             assert created[
@@ -391,7 +551,10 @@ plugin = Plugin()
                 "Factory abandoned an owned client before returning its model"
             )
             assert (
-                host.resource_snapshot("formatter-failure-caller")["active_calls"] == 0
+                host.resource_snapshot("formatter-failure-caller")[
+                    "active_calls"
+                ]
+                == 0
             )
             host.assert_quiescent("formatter-failure-caller")
     finally:
@@ -401,7 +564,9 @@ plugin = Plugin()
                 await model.client.close()
 
 
-async def test_bound_provider_identity_uses_profile_id_not_directory_name(tmp_path):
+async def test_bound_provider_identity_uses_profile_id_not_directory_name(
+    tmp_path,
+):
     import shutil
     from qwenpaw.config.utils import load_config, save_config
     from qwenpaw.plugins.testing import PluginTestHost
@@ -416,17 +581,23 @@ async def test_bound_provider_identity_uses_profile_id_not_directory_name(tmp_pa
         config.agents.profiles["one"].workspace_dir = str(custom)
         save_config(config)
         result = await host.call_tool(
-            "context_model_tool", {}, workspace_id="one", session_id="identity"
+            "context_model_tool",
+            {},
+            workspace_id="one",
+            session_id="identity",
         )
         assert_complete(result.metadata["result"])
         request = provider.storage.read_json("one-identity.json")
         assert request["workspace"] == "one"
         assert request["session"] == "identity"
-        assert not provider.storage.read_json("custom-directory-name-identity.json")
+        assert not provider.storage.read_json(
+            "custom-directory-name-identity.json",
+        )
 
 
 async def test_real_log_formatters_preserve_bound_identity_and_author_fields(
-    tmp_path, caplog
+    tmp_path,
+    caplog,
 ):
     import logging
     from qwenpaw.plugins.testing import PluginTestHost
@@ -434,12 +605,31 @@ async def test_real_log_formatters_preserve_bound_identity_and_author_fields(
 
     source = """
 from qwenpaw.plugins.tools import ToolSpec, ToolResult
+
+
 class Plugin:
     def register(self, ctx):
         async def invoke(call, args):
-            call.logger.warning("visible-context-record", fields={"plugin_id": "author-collision", "business": "visible-value"})
+            call.logger.warning(
+                "visible-context-record",
+                fields={
+                    "plugin_id": "author-collision",
+                    "business": "visible-value",
+                },
+            )
             return ToolResult.text("logged")
-        ctx.register_tool(ToolSpec("visible_log_probe", "log", {"type": "object"}, invoke, enabled=True))
+
+        ctx.register_tool(
+            ToolSpec(
+                "visible_log_probe",
+                "log",
+                {"type": "object"},
+                invoke,
+                enabled=True,
+            )
+        )
+
+
 plugin = Plugin()
 """
     caplog.set_level(logging.INFO)
@@ -447,8 +637,11 @@ plugin = Plugin()
     async with PluginTestHost(tmp_path / "host") as host:
         await host.load(
             package(
-                tmp_path / "caller", "visible-log-owner", source, ["tools", "logging"]
-            )
+                tmp_path / "caller",
+                "visible-log-owner",
+                source,
+                ["tools", "logging"],
+            ),
         )
         await host.call_tool(
             "visible_log_probe",
@@ -457,7 +650,9 @@ plugin = Plugin()
             session_id="visible-session",
         )
         record = next(
-            r for r in caplog.records if r.getMessage() == "visible-context-record"
+            r
+            for r in caplog.records
+            if r.getMessage() == "visible-context-record"
         )
         assert record.sdk_context["plugin_id"] == "visible-log-owner"
         assert record.sdk_fields["plugin_id"] == "author-collision"
@@ -475,7 +670,8 @@ plugin = Plugin()
 
 
 async def test_skipped_fallback_formatter_closes_its_created_client(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
 ):
     from functools import wraps
     from qwenpaw.agents import model_factory
@@ -509,21 +705,36 @@ async def test_skipped_fallback_formatter_closes_its_created_client(
             await configure_loopback(host, "http://127.0.0.1:9/v1")
             config = load_agent_config("one")
             config.fallback_models = [
-                ModelSlotConfig(provider_id="context-loopback", model="gpt-4o-mini")
+                ModelSlotConfig(
+                    provider_id="context-loopback",
+                    model="gpt-4o-mini",
+                ),
             ]
             config.fallback_policy.enabled = True
             config.fallback_policy.target_scope = "any"
             save_agent_config("one", config)
-            monkeypatch.setattr(OpenAIProvider, "get_chat_model_instance", record)
             monkeypatch.setattr(
-                model_factory, "_install_model_formatter", fail_fallback
+                OpenAIProvider,
+                "get_chat_model_instance",
+                record,
             )
-            result = await host.call_tool("context_model_tool", {}, workspace_id="one")
+            monkeypatch.setattr(
+                model_factory,
+                "_install_model_formatter",
+                fail_fallback,
+            )
+            result = await host.call_tool(
+                "context_model_tool",
+                {},
+                workspace_id="one",
+            )
             assert_complete(result.metadata["result"])
             assert len(created) == 1
             assert created[
                 0
-            ].client.is_closed(), "Skipped fallback lost its request-owned client"
+            ].client.is_closed(), (
+                "Skipped fallback lost its request-owned client"
+            )
     finally:
         for model in created:
             if not model.client.is_closed():
@@ -531,9 +742,9 @@ async def test_skipped_fallback_formatter_closes_its_created_client(
 
 
 async def test_unknown_factory_is_rejected_before_constructing_resources(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
 ):
-    import pytest
     from qwenpaw.plugins import SDKError
     from qwenpaw.plugins.testing import PluginTestHost
     from qwenpaw.providers.openai_provider import OpenAIProvider
@@ -541,29 +752,44 @@ async def test_unknown_factory_is_rejected_before_constructing_resources(
 
     calls = []
 
-    def unknown_factory(*args, **kwargs):
+    def unknown_factory(*_args, **_kwargs):
         calls.append(True)
         raise AssertionError("Unknown factory must not be entered")
 
     async with PluginTestHost(tmp_path / "host") as host:
         await load_services(host, tmp_path)
         await configure_loopback(host, "http://127.0.0.1:9/v1")
-        monkeypatch.setattr(OpenAIProvider, "get_chat_model_instance", unknown_factory)
+        monkeypatch.setattr(
+            OpenAIProvider,
+            "get_chat_model_instance",
+            unknown_factory,
+        )
         with pytest.raises(SDKError):
-            await host.call_tool("context_model_tool", {}, workspace_id="bound")
-        assert calls == []
+            await host.call_tool(
+                "context_model_tool",
+                {},
+                workspace_id="bound",
+            )
+        assert not calls
         assert (await host.reload("context-caller-plugin")).ok
 
 
 @pytest.mark.parametrize("use_model", [False, True])
 async def test_published_tool_uses_real_profile_with_shared_directory_basename(
-    tmp_path, use_model, caplog
+    tmp_path,
+    use_model,
+    caplog,
 ):
+    # Keep this ownership/cleanup scenario and its assertions together.
+    # pylint: disable=too-many-statements
     import shutil
     from agentscope.permission import PermissionBehavior
     from agentscope.tool import ToolResponse
     from qwenpaw.agents import tools
-    from qwenpaw.config.context import current_workspace_dir, current_session_id
+    from qwenpaw.config.context import (
+        current_workspace_dir,
+        current_session_id,
+    )
     from qwenpaw.config.utils import load_config, save_config
     from qwenpaw.governance.tool_adapter import PolicyGuardedTool
     from qwenpaw.governance.resource_governor import ResourceGovernor
@@ -575,28 +801,68 @@ async def test_published_tool_uses_real_profile_with_shared_directory_basename(
 import json
 from qwenpaw.plugins.tools import ToolSpec, ToolResult
 from qwenpaw.plugins.messages import ContentBlock, Message
+
+
 class Plugin:
     def register(self, ctx):
         async def probe(call, args):
-            before = call.storage.read_json('counter.json', 0)
-            call.storage.write_json('counter.json', before + 1)
-            call.logger.warning('workspace-identity', fields={'actual': call.workspace_id})
-            if args.get('model'):
-                await call.models.complete((Message('user',(ContentBlock(text='identity'),)),))
-            return ToolResult.text(json.dumps({'workspace': call.workspace_id,
-                'before': before, 'setting': call.config.get('marker')}))
-        ctx.register_tool(ToolSpec('profile_identity_probe', 'identity', {'type':'object','properties':{'model':{'type':'boolean'}}},
-            probe, enabled=True, config_fields=({'name':'marker','type':'text'},)))
+            before = call.storage.read_json("counter.json", 0)
+            call.storage.write_json("counter.json", before + 1)
+            call.logger.warning(
+                "workspace-identity",
+                fields={"actual": call.workspace_id},
+            )
+            if args.get("model"):
+                await call.models.complete(
+                    (
+                        Message(
+                            "user", (ContentBlock(text="identity"),)
+                        ),
+                    )
+                )
+            return ToolResult.text(
+                json.dumps(
+                    {
+                        "workspace": call.workspace_id,
+                        "before": before,
+                        "setting": call.config.get("marker"),
+                    }
+                )
+            )
+
+        ctx.register_tool(
+            ToolSpec(
+                "profile_identity_probe",
+                "identity",
+                {
+                    "type": "object",
+                    "properties": {"model": {"type": "boolean"}},
+                },
+                probe,
+                enabled=True,
+                config_fields=({"name": "marker", "type": "text"},),
+            )
+        )
+
+
 plugin = Plugin()
 """
     async with PluginTestHost(tmp_path / "host") as host:
         provider = await host.load(
-            package(tmp_path / "provider", "identity-provider", PROVIDER, ["providers"])
+            package(
+                tmp_path / "provider",
+                "identity-provider",
+                PROVIDER,
+                ["providers"],
+            ),
         )
         await host.load(
             package(
-                tmp_path / "caller", "identity-caller", source, ["tools", "storage"]
-            )
+                tmp_path / "caller",
+                "identity-caller",
+                source,
+                ["tools", "storage"],
+            ),
         )
         for identity in ("sales", "support"):
             await host.configure_chat_model(
@@ -605,13 +871,18 @@ plugin = Plugin()
                 workspace_id=identity,
             )
             await host.configure_tool(
-                "profile_identity_probe", {"marker": identity}, workspace_id=identity
+                "profile_identity_probe",
+                {"marker": identity},
+                workspace_id=identity,
             )
         config = load_config()
         directories = {}
         for identity in ("sales", "support"):
             directory = tmp_path / identity / "shared"
-            shutil.copytree(config.agents.profiles[identity].workspace_dir, directory)
+            shutil.copytree(
+                config.agents.profiles[identity].workspace_dir,
+                directory,
+            )
             config.agents.profiles[identity].workspace_dir = str(directory)
             directories[identity] = directory
         save_config(config)
@@ -619,16 +890,21 @@ plugin = Plugin()
         for identity in ("sales", "support", "sales", "support"):
             directory = directories[identity]
             governor = ResourceGovernor(
-                str(directory), governance_dir=str(host.root / "governance")
+                str(directory),
+                governance_dir=str(host.root / "governance"),
             )
             governor.start()
             governor.policy.user_rules.insert(
-                0, GovernanceRule("*(**)", GovernanceAction.ALLOW)
+                0,
+                GovernanceRule("*(**)", GovernanceAction.ALLOW),
             )
             tool = PolicyGuardedTool(
                 tools.profile_identity_probe,
                 governor=governor,
-                request_context={"agent_id": identity, "session_id": "same-session"},
+                request_context={
+                    "agent_id": identity,
+                    "session_id": "same-session",
+                },
             )
             assert (
                 await tool.check_permissions({"model": use_model})
@@ -637,7 +913,10 @@ plugin = Plugin()
             workspace_token = current_workspace_dir.set(directory)
             session_token = current_session_id.set("same-session")
             try:
-                stream = await tool(model=use_model)
+                # PolicyGuardedTool forwards calls to the registered handler.
+                stream = await tool(  # pylint: disable=not-callable
+                    model=use_model,
+                )
                 try:
                     async for chunk in stream:
                         response.append_chunk(chunk)
@@ -647,7 +926,7 @@ plugin = Plugin()
                 current_session_id.reset(session_token)
                 current_workspace_dir.reset(workspace_token)
             observed.append(
-                json.loads("".join(block.text for block in response.content))
+                json.loads("".join(block.text for block in response.content)),
             )
         assert observed == [
             {"workspace": identity, "before": before, "setting": identity}
@@ -664,37 +943,64 @@ plugin = Plugin()
                 ("sales", "default-model"),
                 ("support", "explicit-model"),
             ):
-                request = provider.storage.read_json(identity + "-same-session.json")
+                request = provider.storage.read_json(
+                    identity + "-same-session.json",
+                )
                 assert request["workspace"] == identity
                 assert request["model"] == model
-            assert provider.storage.read_json("shared-same-session.json") is None
+            assert (
+                provider.storage.read_json("shared-same-session.json") is None
+            )
 
 
 MODEL_CLEANUP_REFUSAL = """
 from qwenpaw.plugins.messages import ContentBlock
-from qwenpaw.plugins.providers import ProviderSpec, ModelInfo, ModelChunk
+from qwenpaw.plugins.providers import (
+    ProviderSpec,
+    ModelInfo,
+    ModelChunk,
+)
+
+
 class Plugin:
     def register(self, ctx):
         async def generate(call, request):
             async def cleanup():
-                ctx.storage.write_json('attempts.json',ctx.storage.read_json('attempts.json',0)+1)
-                if not ctx.storage.read_json('release.json',False):
-                    raise RuntimeError('controlled cleanup refusal')
-                ctx.storage.write_json('closed.json',True)
-            call.resources.defer(cleanup,'retained model cleanup')
-            yield ModelChunk((ContentBlock(text='result'),),is_last=True)
-        ctx.register_provider(ProviderSpec('bound-provider','Bound',generate,
-            models=(ModelInfo('bound-model','Bound'),),require_api_key=False))
-plugin=Plugin()
+                ctx.storage.write_json(
+                    "attempts.json",
+                    ctx.storage.read_json("attempts.json", 0) + 1,
+                )
+                if not ctx.storage.read_json("release.json", False):
+                    raise RuntimeError("controlled cleanup refusal")
+                ctx.storage.write_json("closed.json", True)
+
+            call.resources.defer(cleanup, "retained model cleanup")
+            yield ModelChunk(
+                (ContentBlock(text="result"),), is_last=True
+            )
+
+        ctx.register_provider(
+            ProviderSpec(
+                "bound-provider",
+                "Bound",
+                generate,
+                models=(ModelInfo("bound-model", "Bound"),),
+                require_api_key=False,
+            )
+        )
+
+
+plugin = Plugin()
 """
 
 
 @pytest.mark.parametrize("interrupt_retry", [False, True])
-async def test_interrupt_reload_retries_failed_model_cleanup_after_outer_tool_exits(
-    tmp_path, interrupt_retry
+@pytest.mark.usefixtures("short_stream_stop_timeout")
+async def test_interrupt_reload_retries_cleanup_after_outer_tool_exits(
+    tmp_path,
+    interrupt_retry,
 ):
     import asyncio
-    import pytest
     from qwenpaw.plugins import PluginBusyError
     from qwenpaw.plugins.testing import PluginTestHost
     from .test_sdk_context_lifecycle import load_pair, until
@@ -702,54 +1008,75 @@ async def test_interrupt_reload_retries_failed_model_cleanup_after_outer_tool_ex
     async with PluginTestHost(tmp_path / "host") as host:
         provider, _ = await load_pair(host, tmp_path, MODEL_CLEANUP_REFUSAL)
         call = asyncio.create_task(
-            host.call_tool("bound_complete", {}, workspace_id="bound")
+            host.call_tool("bound_complete", {}, workspace_id="bound"),
         )
         try:
-            await until(lambda: provider.storage.read_json("attempts.json", 0) > 0)
+            await until(
+                lambda: provider.storage.read_json("attempts.json", 0) > 0,
+            )
             with pytest.raises(PluginBusyError):
                 await host.reload("bound-caller-owner", interrupt_tasks=True)
-            # Wait for the actual outer invocation, not a guessed cleanup delay.
+            # Wait for the actual outer invocation, not a guessed cleanup
+            # delay.
             done, _ = await asyncio.wait({call}, timeout=20)
             assert (
                 call in done
             ), "The controlled case requires the outer tool to have exited"
             assert not provider.storage.read_json("closed.json", False)
-            assert host.resource_snapshot("bound-caller-owner")["active_calls"] > 0
+            assert (
+                host.resource_snapshot("bound-caller-owner")["active_calls"]
+                > 0
+            )
             attempts = provider.storage.read_json("attempts.json")
             provider.storage.write_json("release.json", True)
             report = await host.reload(
-                "bound-caller-owner", interrupt_tasks=interrupt_retry
+                "bound-caller-owner",
+                interrupt_tasks=interrupt_retry,
             )
             assert report.ok
             assert provider.storage.read_json("attempts.json") > attempts
             assert provider.storage.read_json("closed.json") is True
-            assert host.resource_snapshot("bound-caller-owner")["active_calls"] == 0
+            assert (
+                host.resource_snapshot("bound-caller-owner")["active_calls"]
+                == 0
+            )
             assert (await host.reload("bound-provider-owner")).ok
         finally:
             # Failure-only test hygiene: these private cancellations are never
             # used to satisfy the public-retry assertions above.
             host.context("bound-provider-owner").storage.write_json(
-                "release.json", True
+                "release.json",
+                True,
             )
-            for _ in range(50):
-                pending = {
-                    task
-                    for owner in ("bound-caller-owner", "bound-provider-owner")
-                    if (instance := host._loader.lifecycle.get_instance(owner))
-                    for task in instance.activity.tasks
-                    if not task.done()
-                }
-                if not call.done():
-                    pending.add(call)
-                if not pending:
-                    break
-                for task in pending:
-                    task.cancel()
-                await asyncio.sleep(0.02)
+            async with asyncio.timeout(WAIT_TIMEOUT):
+                while True:
+                    pending = {
+                        task
+                        for owner in (
+                            "bound-caller-owner",
+                            "bound-provider-owner",
+                        )
+                        if (
+                            instance := host._loader.lifecycle.get_instance(
+                                owner,
+                            )
+                        )
+                        for task in instance.activity.tasks
+                        if not task.done()
+                    }
+                    if not call.done():
+                        pending.add(call)
+                    if not pending:
+                        break
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.sleep(0.02)
             await asyncio.gather(call, return_exceptions=True)
 
 
-async def test_open_model_stream_closes_after_profile_directory_changes(tmp_path):
+async def test_open_model_stream_closes_after_profile_directory_changes(
+    tmp_path,
+):
     from qwenpaw.config.utils import load_config, save_config
     from qwenpaw.plugins.testing import PluginTestHost
     from .test_sdk_context_lifecycle import load_pair
@@ -757,7 +1084,10 @@ async def test_open_model_stream_closes_after_profile_directory_changes(tmp_path
     async with PluginTestHost(tmp_path / "host") as host:
         provider, _ = await load_pair(host, tmp_path)
         stream = host.stream_tool(
-            "bound_stream", {}, workspace_id="bound", session_id="moving-profile"
+            "bound_stream",
+            {},
+            workspace_id="bound",
+            session_id="moving-profile",
         )
         first = await anext(stream)
         assert first.content[0].text == "first"
@@ -770,8 +1100,14 @@ async def test_open_model_stream_closes_after_profile_directory_changes(tmp_path
         try:
             await stream.aclose()
             assert provider.storage.read_json("provider-closed.json") is True
-            assert host.resource_snapshot("bound-provider-owner")["active_calls"] == 0
-            assert host.resource_snapshot("bound-caller-owner")["active_calls"] == 0
+            assert (
+                host.resource_snapshot("bound-provider-owner")["active_calls"]
+                == 0
+            )
+            assert (
+                host.resource_snapshot("bound-caller-owner")["active_calls"]
+                == 0
+            )
         finally:
             config = load_config()
             config.agents.profiles["bound"].workspace_dir = original
@@ -781,8 +1117,10 @@ async def test_open_model_stream_closes_after_profile_directory_changes(tmp_path
 
 
 @pytest.mark.parametrize("entry", ["app", "channel"])
+@pytest.mark.usefixtures("short_interrupt_timeout")
 async def test_runtime_owner_retries_failed_provider_scope_via_public_reload(
-    tmp_path, entry
+    tmp_path,
+    entry,
 ):
     import asyncio
     from qwenpaw.plugins import PluginBusyError
@@ -794,15 +1132,33 @@ async def test_runtime_owner_retries_failed_provider_scope_via_public_reload(
     source = """
 from qwenpaw.plugins.apps import PawApp
 from qwenpaw.plugins.channels import ChannelSpec
+
+
 class Plugin:
     def register(self, plugin):
         class Backend:
-            async def start(self,ctx): pass
-            async def stop(self,ctx): return True
-            async def send(self,ctx,message): pass
-        plugin.register_channel(ChannelSpec('cleanup-runtime','Cleanup runtime',Backend))
-        plugin.register_app(PawApp(app_id='cleanup-runtime').enable_standard_capabilities())
-plugin=Plugin()
+            async def start(self, ctx):
+                pass
+
+            async def stop(self, ctx):
+                return True
+
+            async def send(self, ctx, message):
+                pass
+
+        plugin.register_channel(
+            ChannelSpec(
+                "cleanup-runtime", "Cleanup runtime", Backend
+            )
+        )
+        plugin.register_app(
+            PawApp(
+                app_id="cleanup-runtime"
+            ).enable_standard_capabilities()
+        )
+
+
+plugin = Plugin()
 """
     async with PluginTestHost(tmp_path / "host") as host:
         provider = await host.load(
@@ -811,7 +1167,7 @@ plugin=Plugin()
                 "runtime-cleanup-provider",
                 MODEL_CLEANUP_REFUSAL,
                 ["providers", "storage"],
-            )
+            ),
         )
         await host.load(
             package(
@@ -819,10 +1175,12 @@ plugin=Plugin()
                 "runtime-cleanup-caller",
                 source,
                 ["apps", "channels"],
-            )
+            ),
         )
         await host.configure_chat_model(
-            "bound-provider", "bound-model", workspace_id="bound"
+            "bound-provider",
+            "bound-model",
+            workspace_id="bound",
         )
         if entry == "app":
             response = await host.request(
@@ -833,41 +1191,75 @@ plugin=Plugin()
             )
             assert response.status == 200
         else:
-            await host.start_channel("cleanup-runtime", {}, workspace_id="bound")
+            await host.start_channel(
+                "cleanup-runtime",
+                {},
+                workspace_id="bound",
+            )
             await host.receive_channel(
                 "cleanup-runtime",
-                ChannelMessage("author", (ContentBlock(text="runtime cleanup"),)),
+                ChannelMessage(
+                    "author",
+                    (ContentBlock(text="runtime cleanup"),),
+                ),
                 workspace_id="bound",
             )
         try:
-            await until(lambda: provider.storage.read_json("attempts.json", 0) > 0)
+            await until(
+                lambda: provider.storage.read_json("attempts.json", 0) > 0,
+            )
             with pytest.raises(PluginBusyError):
-                await host.reload("runtime-cleanup-caller", interrupt_tasks=True)
+                await host.reload(
+                    "runtime-cleanup-caller",
+                    interrupt_tasks=True,
+                )
             assert not provider.storage.read_json("closed.json", False)
-            assert host.resource_snapshot("runtime-cleanup-caller")["active_calls"] > 0
+            assert (
+                host.resource_snapshot("runtime-cleanup-caller")[
+                    "active_calls"
+                ]
+                > 0
+            )
             attempts = provider.storage.read_json("attempts.json")
             provider.storage.write_json("release.json", True)
             assert (
-                await host.reload("runtime-cleanup-caller", interrupt_tasks=True)
+                await host.reload(
+                    "runtime-cleanup-caller",
+                    interrupt_tasks=True,
+                )
             ).ok
             assert provider.storage.read_json("closed.json") is True
             assert provider.storage.read_json("attempts.json") > attempts
-            assert host.resource_snapshot("runtime-cleanup-caller")["active_calls"] == 0
+            assert (
+                host.resource_snapshot("runtime-cleanup-caller")[
+                    "active_calls"
+                ]
+                == 0
+            )
             assert (await host.reload("runtime-cleanup-provider")).ok
         finally:
             host.context("runtime-cleanup-provider").storage.write_json(
-                "release.json", True
+                "release.json",
+                True,
             )
-            for _ in range(50):
-                pending = {
-                    task
-                    for owner in ("runtime-cleanup-caller", "runtime-cleanup-provider")
-                    if (instance := host._loader.lifecycle.get_instance(owner))
-                    for task in instance.activity.tasks
-                    if not task.done()
-                }
-                if not pending:
-                    break
-                for task in pending:
-                    task.cancel()
-                await asyncio.sleep(0.02)
+            async with asyncio.timeout(WAIT_TIMEOUT):
+                while True:
+                    pending = {
+                        task
+                        for owner in (
+                            "runtime-cleanup-caller",
+                            "runtime-cleanup-provider",
+                        )
+                        if (
+                            instance := host._loader.lifecycle.get_instance(
+                                owner,
+                            )
+                        )
+                        for task in instance.activity.tasks
+                        if not task.done()
+                    }
+                    if not pending:
+                        break
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.sleep(0.02)

@@ -46,6 +46,10 @@ class _RunStreams:
 
     def retain(self, stream):
         async def close():
+            # Host-created anext tasks may still be finishing cancellation.
+            # The observer supplies native async generators only.
+            while stream.ag_running:
+                await asyncio.sleep(0.01)
             await stream.aclose()
             self.streams.pop(stream, None)
 

@@ -167,7 +167,7 @@ class AppContext(ToolContext):
         self,
         workspace_id: str,
     ) -> AbstractAsyncContextManager["AppContext"]:
-        """Open a fresh owned call with the app and authenticated identity.
+        """Open an owned call with the same app and authenticated identity.
 
         Only configured, enabled targets are accepted. A plugin-owned
         background task may retain this identity delegation; each entry
@@ -185,9 +185,8 @@ class AppContext(ToolContext):
     async def chat(self, request: ChatRequest | str) -> ChatReply:
         stream = self.chat_stream(request)
         try:
-            # tuple() cannot consume an async generator directly.
-            # pylint: disable-next=consider-using-generator
-            return ChatReply(tuple([event async for event in stream]))
+            events = [event async for event in stream]
+            return ChatReply(tuple(events))
         finally:
             await stream.aclose()
 
@@ -222,7 +221,10 @@ class AppContext(ToolContext):
         return await self._services.task(run_id)
 
     def task_stream(self, run_id: str) -> AsyncGenerator[TaskSnapshot, None]:
-        """Stream until terminal; disconnect leaves the run alive."""
+        """
+        Current status and changes until terminal; disconnect leaves the run
+        alive.
+        """
         return self._services.task_stream(run_id)
 
     async def cancel_task(self, run_id: str, *, timeout=5.0) -> CancelResult:
@@ -324,7 +326,9 @@ class PawApp:
 
 
 class WebSocket:
-    """Owned connection wrapper that retains host websocket objects."""
+    """
+    Owned connection wrapper; host websocket objects never leave the adapter.
+    """
 
     def __init__(self, connection):
         self._connection = connection

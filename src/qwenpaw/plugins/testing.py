@@ -1,23 +1,31 @@
 # -*- coding: utf-8 -*-
-# This production adapter intentionally accesses the services under test.
-# pylint: disable=protected-access
 """Author-facing integration host using the production loader and lifecycle.
 
 This host owns process-wide plugin registries. Use one host per process; run
 independent hosts in separate processes, just as independent QwenPaw instances.
 """
 
+# Host adapters access private ownership state behind the public SDK.
+# pylint: disable=protected-access
+
 from __future__ import annotations
 
 import os
 import sys
 import inspect
-from types import SimpleNamespace
-from typing import AsyncGenerator, Sequence, Mapping, Any
 from pathlib import Path
 from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import AsyncGenerator, Sequence, Mapping, Any
 from .sdk import PluginContext
-from .messages import Message
+
+# Preserve the message types re-exported for plugin authors.
+# pylint: disable-next=unused-import
+from .messages import (
+    Message,
+    Attachment as Attachment,
+    ContentBlock as ContentBlock,
+)
 from .apps import ChatRequest
 from .events import ChatEvent
 from .hooks import HookPhase, HookResult
@@ -32,6 +40,7 @@ from .results import (
     ReloadResult,
     ConfigUpdateResult,
 )
+
 from .errors import SDKError
 from .tools import ToolResult, ToolEvent
 from ._testing_http import TestHttpResponse, TestConnection
@@ -87,7 +96,9 @@ class TestApproval:
 
 
 class TestModel:
-    """A model using production formatting, usage and retry wrappers."""
+    """
+    A model built through the production formatter, usage and retry wrappers.
+    """
 
     def __init__(self, model, workspace, workspace_id):
         self._model, self._workspace = model, workspace
@@ -121,8 +132,9 @@ class TestModel:
             await stream.aclose()
 
 
-# The public harness exercises each SDK service through the real host.
-class PluginTestHost:  # pylint: disable=too-many-public-methods
+# One author-facing host intentionally covers all SDK contribution types.
+# pylint: disable-next=too-many-public-methods
+class PluginTestHost:
     def __init__(
         self,
         root: Path,
@@ -235,7 +247,9 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         await self.close()
 
     async def close(self) -> None:
-        """Retry failed cleanup, retaining ownership until it succeeds."""
+        """
+        Retry cleanup after a failed close; ownership stays until it succeeds.
+        """
         from .lifecycle import UnloadMode
 
         if _ACTIVE_HOST is not self:
@@ -257,8 +271,8 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
                 timeout=5,
             ):
                 raise SDKError(
-                    f"Workspace {workspace_id!r} task completion "
-                    "has not stopped; retry close()",
+                    f"Workspace {workspace_id!r} task completion has not "
+                    f"stopped; retry close()",
                 )
             if "memory_manager" in workspace._service_manager.services:
                 await self.stop_memory(workspace_id=workspace_id)
@@ -410,7 +424,9 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         *,
         interrupt_tasks: bool = False,
     ) -> UnloadResult:
-        """Delete only installed copies in this host's plugins directory."""
+        """
+        Delete only installed copies owned by this host's plugins directory.
+        """
         async with self._loader.plugin_lifecycle(plugin_id):
             record = self._loader.get_loaded_plugin(plugin_id)
             destination = self.root / "plugins"
@@ -610,11 +626,9 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
             from_host(message) for message in context.input_msgs
         )
         return HookResult(
-            (
-                "reply"
-                if result.action.value == "short_circuit"
-                else result.action.value
-            ),
+            "reply"
+            if result.action.value == "short_circuit"
+            else result.action.value,
             from_host(result.payload) if result.payload is not None else None,
             final_messages if final_messages != initial_messages else None,
             tuple(
@@ -644,7 +658,9 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         *,
         workspace_id: str = "test",
     ) -> None:
-        """Start the real queue; None reuses settings, {} replaces them."""
+        """
+        Start the real queue; None reuses saved settings, {} replaces them.
+        """
         from ..app.channels.manager import ChannelManager
         from ..config.config import load_agent_config, save_agent_config
         from ..utils.io_utils import run_sync_io
@@ -730,7 +746,9 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         *,
         workspace_id: str = "test",
     ) -> None:
-        """Change the workspace ACL using the platform sender identity."""
+        """
+        Change the real workspace ACL, using the platform sender identity.
+        """
         from ..app.channels.access_control import get_access_control_store
         from ..utils.io_utils import run_sync_io
 
@@ -788,7 +806,9 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         *,
         workspace_id="test",
     ):
-        """Persist tool settings through the normal agent.json writer."""
+        """
+        Persist declared tool settings through the normal agent.json writer.
+        """
         from ..config.config import (
             load_agent_config,
             save_agent_config,
@@ -898,7 +918,7 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         root = get_workspace_skills_dir(workspace.workspace_dir)
         return tuple(
             sorted(
-                str(path.relative_to(root))
+                path.relative_to(root).as_posix()
                 for path in root.rglob("*")
                 if path.is_file()
             ),
@@ -1304,7 +1324,9 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         session_id: str = "test",
         user_id: str = "test",
     ) -> AsyncGenerator[ChatEvent, None]:
-        """Run production Runtime with registered command and hook routes."""
+        """
+        Run the production Runtime, including registered command/hook routes.
+        """
         from ..schemas import AgentRequest
         from ._events import chat_event, _observing
 
@@ -1467,7 +1489,8 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         invoke = getattr(tools, name, None)
         if invoke is None or invoke is not context._tools[name][2]:
             raise SDKError(f"Tool {name!r} is not registered in the runtime")
-        tool = PolicyGuardedTool(
+        # __new__ returns a dynamically constructed FunctionTool subclass.
+        tool: Any = PolicyGuardedTool(
             invoke,
             governor=governor,
             request_context={
@@ -1478,8 +1501,9 @@ class PluginTestHost:  # pylint: disable=too-many-public-methods
         decision = await tool.check_permissions(arguments)
         if decision.behavior is not PermissionBehavior.ALLOW:
             raise SDKError(f"Tool invocation denied: {decision.message}")
-        # PolicyGuardedTool supplies its callable adapter dynamically.
-        normalized = await tool(**arguments)  # pylint: disable=not-callable
+        # Dynamic FunctionTool.__call__ is installed by __new__.
+        # pylint: disable-next=not-callable
+        normalized = await tool(**arguments)
         try:
             while True:
                 workspace_token = current_workspace_dir.set(workspace)

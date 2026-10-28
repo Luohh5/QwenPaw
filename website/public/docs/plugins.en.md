@@ -36,8 +36,8 @@ separately. The checker is neither a security sandbox nor a full permission audi
   "id": "hello-sdk",
   "name": "Hello SDK",
   "version": "1.0.0",
-  "entry": {"backend": "main.py"},
-  "sdk": {"version": "1.0.0", "capabilities": ["tools", "storage"]}
+  "entry": { "backend": "main.py" },
+  "sdk": { "version": "1.0.0", "capabilities": ["tools", "storage"] }
 }
 ```
 
@@ -329,18 +329,18 @@ the fault is resolved. Old contexts cannot write or register resources for a new
 
 ## Public capabilities
 
-| Capability | Public entry |
-| --- | --- |
-| Declaration and versions | `PluginContext`, `SDK_VERSION`, `SDK_CAPABILITIES` |
-| Tools and configuration fields | `qwenpaw.plugins.tools` |
-| Configuration, persistence, media | `qwenpaw.plugins.storage`; instances come from contexts |
-| Logging and configured models | `qwenpaw.plugins.logging`, `qwenpaw.plugins.models` |
-| Messages, attachments, run and approval observation | `qwenpaw.plugins.messages`, `qwenpaw.plugins.events` |
-| Commands, hooks, modes, prompts | `commands`, `hooks`, `modes`, `prompts` |
-| Channels and applications | `channels`, `apps` |
-| Model providers, memory, markets, skills | `providers`, `memory`, `markets`, `skills` |
-| Resources, results, testing | `resources`, `results`, `testing` |
-| Exceptions | Import public exceptions such as `SDKError` and `StaleContextError` from `qwenpaw.plugins` |
+| Capability                                          | Public entry                                                                               |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Declaration and versions                            | `PluginContext`, `SDK_VERSION`, `SDK_CAPABILITIES`                                         |
+| Tools and configuration fields                      | `qwenpaw.plugins.tools`                                                                    |
+| Configuration, persistence, media                   | `qwenpaw.plugins.storage`; instances come from contexts                                    |
+| Logging and configured models                       | `qwenpaw.plugins.logging`, `qwenpaw.plugins.models`                                        |
+| Messages, attachments, run and approval observation | `qwenpaw.plugins.messages`, `qwenpaw.plugins.events`                                       |
+| Commands, hooks, modes, prompts                     | `commands`, `hooks`, `modes`, `prompts`                                                    |
+| Channels and applications                           | `channels`, `apps`                                                                         |
+| Model providers, memory, markets, skills            | `providers`, `memory`, `markets`, `skills`                                                 |
+| Resources, results, testing                         | `resources`, `results`, `testing`                                                          |
+| Exceptions                                          | Import public exceptions such as `SDKError` and `StaleContextError` from `qwenpaw.plugins` |
 
 Short module names in this table are under `qwenpaw.plugins`; use the allowlist for exact symbols.
 
@@ -486,7 +486,7 @@ my-plugin/
 | `author`          | `string`           | no       | Author or organisation name.                                                                                                                                                                         |
 | `entry.backend`   | `string`           | no\*     | Path (relative to plugin dir) of the Python entry file that exports `plugin`.                                                                                                                        |
 | `entry.frontend`  | `string`           | no\*     | Path of the built frontend bundle (e.g. `dist/index.js`).                                                                                                                                            |
-| `dependencies`    | `string[]`         | no       | Python package requirements installed via pip/uv at install time.                                                                                                                                    |
+| `dependencies`    | `string[]`         | no       | Python package requirements combined with `requirements.txt`; explicit install, update, or repair installs missing packages, while startup only checks them.                                         |
 | `qwenpaw_version` | `object`           | no       | QwenPaw version constraint (recommended). Contains `min` (inclusive) and `max` (exclusive, optional) sub-fields. Semantics: `>=min, <max`. When `max` is omitted, defaults to `{major}.{minor+1}.0`. |
 | `min_version`     | `string`           | no       | **Legacy.** Minimum QwenPaw version required. Ignored when `qwenpaw_version` is present. Retained only for backward compatibility with third-party plugins.                                          |
 | `max_version`     | `string`           | no       | **Legacy.** First incompatible QwenPaw version (exclusive). Used with `min_version`; when omitted, derived from `min_version`.                                                                       |
@@ -2262,21 +2262,51 @@ def register(self, api: PluginApi):
 
 ### Dependency Management
 
-#### Using requirements.txt
+#### Declaring Python Package Dependencies
 
-If your plugin requires additional Python packages, create `requirements.txt`:
+Declare dependencies in `plugin.json` without also creating `requirements.txt`:
+
+```json
+{
+  "dependencies": ["httpx>=0.24.0", "pydantic>=2.0.0"]
+}
+```
+
+Alternatively, use `requirements.txt`:
 
 ```
 httpx>=0.24.0
 pydantic>=2.0.0
 ```
 
-Explicit installation, updates, and repairs check and install missing dependencies.
-Boot only checks dependencies; it does not install them. Missing dependencies fail
-that plugin's load. Call `POST /api/plugins/{plugin_id}/repair-dependencies` to repair
-them; disabled plugins stay disabled. Versions that conflict with protected host
-packages are refused; resolve the environment conflict first. Administrator-managed
-local runtimes require the administrator to install dependencies.
+Both declarations are combined into the same dependency check and installation
+flow; neither takes precedence. For example, `example-package>=1.0` in the manifest
+and `example-package<2.0` in the file must both hold. Conflicting constraints fail
+the check or dependency resolution. Prefer maintaining each dependency in one
+place to avoid duplicate declarations. These are Python package dependencies,
+not other plugin IDs or runtime service dependencies.
+
+SDK and legacy plugins share the framework's dependency checks, installation, and
+post-install verification; the `sdk` declaration does not select a separate installer.
+Satisfied requirements and inapplicable environment markers need no network access.
+Boot only checks dependencies; missing dependencies fail that plugin's load. Only
+explicit installation, updates, and repairs may install dependencies. Call
+`POST /api/plugins/{plugin_id}/repair-dependencies` to repair them; disabled plugins
+stay disabled. Administrator-managed local runtimes require the administrator to
+install dependencies.
+
+Directly declared requirements that conflict with protected host packages are refused;
+restart the backend and prepare the dependency environment first. SDK plugins report
+this as `SDKRestartRequiredError`. After acquiring the installation lock, the framework
+rechecks whether requirements are satisfied, then uses the shared pip / uv flow
+if dependencies are still missing. Desktop
+builds use the bundled Python interpreter and shared plugin dependency directory.
+The plugin loads only after its requirements pass post-install verification.
+
+The framework does not audit the entire environment for duplicate package versions,
+pin all installed versions, or preview the complete installation plan. It does not
+guarantee that replacements caused by transitive dependencies will be blocked, and
+does not provide atomic rollback of the shared dependency environment.
 
 #### Using Custom PyPI Index
 
@@ -2288,6 +2318,9 @@ my-package>=1.0.0
 Use `--index-url URL` or `--index-url=URL` on its own line. pip / uv receives the
 index setting; package version and host-package checks still apply. Other options,
 nested `-r` files, extras, and direct URL requirements are not supported yet.
+Index settings belong only in `requirements.txt`. Each manifest dependency must
+be a single package requirement with optional version constraints and environment
+markers; installer options and multiline strings are not allowed.
 
 ### Best Practices
 

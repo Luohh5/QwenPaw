@@ -220,15 +220,15 @@ class CheckReport:
         return not any(item.severity == "error" for item in self.findings)
 
 
+# Keep the static scan together; its per-file closures never escape the loop.
+# pylint: disable-next=too-many-branches,too-many-statements
 def check_plugin(directory: str | Path) -> CheckReport:
     """Inspect Python sources against exact public modules and symbols.
 
     Third-party imports are dependencies, not SDK violations. Dynamic code is
     reported as unverified; this is an author aid, never a security sandbox.
     """
-    # Keep the static rules together to share per-source alias state.
-    # pylint: disable=too-many-branches,too-many-statements
-    # pylint: disable=too-many-nested-blocks
+    # pylint: disable=cell-var-from-loop,too-many-nested-blocks
     directory = Path(directory).resolve()
     findings, dependencies, uncovered = [], set(), set()
     digest = hashlib.sha256()
@@ -273,8 +273,10 @@ def check_plugin(directory: str | Path) -> CheckReport:
         ):
             raise ValueError("Manifest requires id and version")
         from .sdk_version import validate_sdk
+        from .dependency_gate import manifest_requirements
 
         validate_sdk(manifest.get("sdk"), manifest["id"])
+        manifest_requirements(manifest)
         compatibility = (
             "compatible"
             if manifest.get("sdk") is not None
@@ -282,8 +284,8 @@ def check_plugin(directory: str | Path) -> CheckReport:
         )
         if compatibility == "legacy-not-sdk":
             uncovered.add(
-                "Manifest does not opt in to the SDK; "
-                "legacy behavior was not migrated or disabled",
+                "Manifest does not opt in to the SDK; legacy behavior was "
+                "not migrated or disabled",
             )
         entry = (manifest.get("entry") or {}).get("backend") or manifest.get(
             "entry_point",
@@ -389,9 +391,11 @@ def check_plugin(directory: str | Path) -> CheckReport:
                 for argument in arguments:
                     if argument.annotation and qualified(
                         argument.annotation,
-                    ).endswith("Context"):
+                    ).endswith(
+                        "Context",
+                    ):
                         contexts.add(argument.arg)
-        # Follow aliases without relying on author spelling.
+        # Resolve simple aliases without relying on author spelling.
         for _ in range(len(tuple(ast.walk(tree)))):
             before = (len(contexts), dict(aliases))
             for node in ast.walk(tree):

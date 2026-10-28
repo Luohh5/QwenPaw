@@ -42,8 +42,8 @@ def validate_sdk(declaration, plugin_id=None):
         plugin_id,
     ):
         raise SDKCompatibilityError(
-            "SDK plugin IDs must contain only letters, digits, "
-            "underscores and hyphens",
+            "SDK plugin IDs must contain only letters, digits, underscores "
+            "and hyphens",
         )
     if not isinstance(declaration, dict):
         raise SDKCompatibilityError(

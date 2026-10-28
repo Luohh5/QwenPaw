@@ -480,6 +480,8 @@ class Services:  # pylint: disable=protected-access
                 outcome, error = "failed", str(exc)
                 raise
             finally:
+                from ..utils.io_utils import run_async_to_completion
+
                 owned.closing = True
                 try:
                     await stream.aclose()
@@ -504,8 +506,11 @@ class Services:  # pylint: disable=protected-access
                 # work.
                 while owned.streams or owned.scopes:
                     for close_scope in owned.closers():
+                        # Repeated stops must not interrupt resource release.
+                        closing = asyncio.create_task(close_scope())
+                        self.plugin._instance.activity.retain_cleanup(closing)
                         try:
-                            await close_scope()
+                            await run_async_to_completion(closing)
                         except asyncio.CancelledError:
                             outcome = "cancelled"
                         except Exception as exc:
@@ -524,8 +529,6 @@ class Services:  # pylint: disable=protected-access
                     result=summary,
                     result_truncated=truncated,
                 )
-                from ..utils.io_utils import run_async_to_completion
-
                 # Finish persistence and memory bookkeeping even if stop or
                 # reload cancels this producer again while its disk I/O waits.
                 saving = asyncio.create_task(

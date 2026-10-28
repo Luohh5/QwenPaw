@@ -1,4 +1,10 @@
-"""One conversion path for configured-model consumers and the author test host."""
+# -*- coding: utf-8 -*-
+"""
+One conversion path for configured-model consumers and the author test host.
+"""
+
+# Host adapters access private ownership state behind the public SDK.
+# pylint: disable=protected-access
 
 from contextlib import contextmanager
 from copy import deepcopy
@@ -6,12 +12,13 @@ from collections.abc import Mapping
 import math
 from contextvars import ContextVar
 
-model_deadline = ContextVar("sdk_model_deadline", default=None)
 from ._workspace import workspace_id as model_workspace_id
 
 from .errors import SDKError
 from .providers import ModelChunk, ModelUsage
 from ._messages import to_host, _from_block, _take_previews
+
+model_deadline = ContextVar("sdk_model_deadline", default=None)
 
 
 def json_mapping(value):
@@ -22,9 +29,13 @@ def json_mapping(value):
             return item
         if isinstance(item, (tuple, list)):
             return [convert(part) for part in item]
-        if isinstance(item, Mapping) and all(isinstance(key, str) for key in item):
+        if isinstance(item, Mapping) and all(
+            isinstance(key, str) for key in item
+        ):
             return {key: convert(part) for key, part in item.items()}
-        raise SDKError("Fields and model options must contain finite JSON values")
+        raise SDKError(
+            "Fields and model options must contain finite JSON values",
+        )
 
     if not isinstance(value, Mapping):
         raise SDKError("Fields and model options must be mappings")
@@ -48,7 +59,10 @@ def model_context(workspace, session_id, workspace_id):
 
 def public_chunk(chunk, content):
     usage = chunk.usage
-    metadata, previews, block_metadata = _take_previews(chunk.metadata, chunk.content)
+    metadata, previews, block_metadata = _take_previews(
+        chunk.metadata,
+        chunk.content,
+    )
     return ModelChunk(
         tuple(
             _from_block(block, previews, block_metadata, str(index))
@@ -78,7 +92,9 @@ def model_response(chunk):
     from dataclasses import asdict
     from .messages import Message
 
-    message = to_host(Message("assistant", chunk.content, metadata=chunk.metadata))
+    message = to_host(
+        Message("assistant", chunk.content, metadata=chunk.metadata),
+    )
     return ChatResponse(
         content=message.content,
         metadata=message.metadata,
@@ -90,13 +106,20 @@ def model_response(chunk):
 
 
 class ModelAccumulator:
-    """Host delta merging, with the existing message codec for SDK block fields."""
+    """
+    Host delta merging, with the existing message codec for SDK block fields.
+    """
 
     def __init__(self):
         from agentscope.model import ChatResponse
 
         self.response = ChatResponse(content=[], is_last=True)
-        self.blocks, self.metadata, self.block_metadata, self.previews = {}, {}, {}, {}
+        self.blocks, self.metadata, self.block_metadata, self.previews = (
+            {},
+            {},
+            {},
+            {},
+        )
 
     def append(self, chunk, converted=None):
         from ._messages import _block_key, _merge_refs
@@ -104,10 +127,18 @@ class ModelAccumulator:
         converted = model_response(chunk) if converted is None else converted
         for public, host in zip(chunk.content, converted.content):
             key = _block_key(host)
-            _merge_refs(self.block_metadata, {key: public.metadata}, "metadata")
+            _merge_refs(
+                self.block_metadata,
+                {key: public.metadata},
+                "metadata",
+            )
             _merge_refs(
                 self.previews,
-                {key: public.attachment.preview_url if public.attachment else ""},
+                {
+                    key: public.attachment.preview_url
+                    if public.attachment
+                    else "",
+                },
                 "preview URLs",
             )
             self.blocks[key] = public
@@ -117,7 +148,12 @@ class ModelAccumulator:
         self.response.finished_reason = converted.finished_reason
 
     def finish(self):
-        from ._messages import _block_key, _with_previews, _preview_refs, _metadata_refs
+        from ._messages import (
+            _block_key,
+            _with_previews,
+            _preview_refs,
+            _metadata_refs,
+        )
 
         blocks = self.response.content
         public = [self.blocks[_block_key(block)] for block in blocks]
@@ -170,7 +206,9 @@ async def stream_model(
     if isinstance(stream, ChatResponse):
         if stream.content:
             yield replace(
-                public_chunk(stream, stream.content), is_last=False, usage=None
+                public_chunk(stream, stream.content),
+                is_last=False,
+                usage=None,
             )
         yield public_chunk(stream, ())
         return
@@ -188,10 +226,13 @@ async def stream_model(
             terminal = chunk.is_last
             if terminal:
                 # Host terminal content is the accumulated summary, not another
-                # delta. A terminal-only response still has to deliver its body.
+                # delta. A terminal-only response still has to deliver its
+                # body.
                 if not emitted and chunk.content:
                     yield replace(
-                        public_chunk(chunk, chunk.content), is_last=False, usage=None
+                        public_chunk(chunk, chunk.content),
+                        is_last=False,
+                        usage=None,
                     )
                 yield public_chunk(chunk, ())
             else:
@@ -205,7 +246,9 @@ async def stream_model(
 
 
 class ModelLease:
-    """Own only models constructed for this request, never a provider manager."""
+    """
+    Own only models constructed for this request, never a provider manager.
+    """
 
     def __init__(self):
         self.model = None
@@ -241,7 +284,8 @@ class ModelLease:
         )
         if not known and not sdk:
             raise SDKError(
-                "This configured provider factory has no supported SDK request ownership adapter"
+                "This configured provider factory has no supported SDK "
+                "request ownership adapter",
             )
 
     def capture(self, root=None):
@@ -276,10 +320,12 @@ class ModelLease:
                 "agentscope.model._dashscope",
             )
             if not any(
-                cls.__module__.startswith(supported) for cls in type(model).__mro__
+                cls.__module__.startswith(supported)
+                for cls in type(model).__mro__
             ):
                 raise SDKError(
-                    "This configured model type has no supported SDK request ownership adapter"
+                    "This configured model type has no supported SDK request "
+                    "ownership adapter",
                 )
             client = model.client
             if not any(client is item for item in self.clients):
@@ -319,7 +365,11 @@ class ModelLease:
             aio = getattr(client, "aio", None)
             if aio is not None and callable(getattr(aio, "aclose", None)):
                 await aio.aclose()
-            closer = getattr(client, "aclose", None) or getattr(client, "close", None)
+            closer = getattr(client, "aclose", None) or getattr(
+                client,
+                "close",
+                None,
+            )
             if closer is None:
                 raise SDKError("The configured model client cannot be closed")
             if inspect.iscoroutinefunction(closer):

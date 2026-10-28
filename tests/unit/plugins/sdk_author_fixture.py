@@ -1,4 +1,5 @@
-"""Portable author fixture: write a minimal SDK package, with no host imports."""
+# -*- coding: utf-8 -*-
+"""Portable author fixture: a minimal SDK package without host imports."""
 
 import json
 
@@ -13,7 +14,7 @@ def make_plugin(tmp_path, source, capabilities):
                 "version": "1.0.0",
                 "entry": {"backend": "main.py"},
                 "sdk": {"version": "1.0", "capabilities": capabilities},
-            }
+            },
         ),
         encoding="utf-8",
     )

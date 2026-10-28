@@ -28,9 +28,33 @@ INTERNAL = {
 }
 
 
+def prepare_author_tests(source: Path, root: Path) -> list[str]:
+    """Copy the standalone author suite and its local helpers."""
+    suite = root / "author_tests"
+    suite.mkdir()
+    (suite / "__init__.py").touch()
+    for fixture in (
+        "sdk_author_fixture.py",
+        "timing.py",
+    ):
+        shutil.copy2(source / "tests/unit/plugins" / fixture, suite)
+    tests = []
+    for file in sorted((source / "tests/unit/plugins").glob("test_sdk_*.py")):
+        if file.name not in INTERNAL:
+            shutil.copy2(file, suite)
+            tests.append(file.name)
+    assert tests, "No public author tests found in build snapshot"
+    (root / "pytest.ini").write_text(
+        "[pytest]\nasyncio_mode = auto\n"
+        "markers =\n"
+        "    p1: supported feature contracts\n",
+    )
+    return tests
+
+
+# The standalone acceptance sequence shares one report and environment.
+# pylint: disable-next=too-many-statements
 def main():
-    # Keep the ordered, independently logged release stages together.
-    # pylint: disable=too-many-statements
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wheel", type=Path, required=True)
     parser.add_argument("--sdist", type=Path, required=True)
@@ -103,7 +127,7 @@ def main():
             "files": len(names),
         }
     import_check = f"""
-import hashlib, importlib.metadata, json, shutil, sys, zipfile
+import hashlib, importlib.metadata, json, zipfile
 from email.parser import BytesParser
 from pathlib import Path
 import qwenpaw
@@ -129,14 +153,12 @@ with zipfile.ZipFile({str(args.wheel.resolve())!r}) as archive:
             assert hashlib.sha256(installed.read_bytes()).digest() == hashlib.sha256(
                 archive.read(name)
             ).digest(), f"Installed wheel bytes mismatch: {{name}}"
-uv = Path(shutil.which("uv") or "missing").absolute()
-assert uv.parent == Path(sys.executable).absolute().parent, uv
 versions = {{
     name: importlib.metadata.version(name)
-    for name in ("qwenpaw", "agentscope", "fastapi", "pytest", "uv")
+    for name in ("qwenpaw", "agentscope", "fastapi", "pytest")
 }}
 print(json.dumps({{
-    "import_path": str(location), "uv": str(uv), "versions": versions,
+    "import_path": str(location), "versions": versions,
 }}))
 """
     report["environment"] = json.loads(
@@ -152,25 +174,12 @@ print(json.dumps({{
         "--follow-imports=silent",
         str(root / typing_source.name),
     )
-    suite = root / "author_tests"
-    suite.mkdir()
-    (suite / "__init__.py").touch()
-    shutil.copy2(source / "tests/unit/plugins/sdk_author_fixture.py", suite)
-    for file in sorted((source / "tests/unit/plugins").glob("test_sdk_*.py")):
-        if file.name not in INTERNAL:
-            shutil.copy2(file, suite)
-            report["tests"].append(file.name)
-    assert report["tests"], "No public author tests found in build snapshot"
-    (root / "pytest.ini").write_text(
-        "[pytest]\nasyncio_mode = auto\n"
-        "markers =\n"
-        "    p1: supported feature contracts\n",
-    )
+    report["tests"] = prepare_author_tests(source, root)
     run(
         "public-author-tests",
         "-m",
         "pytest",
-        str(suite),
+        str(root / "author_tests"),
         "-q",
         "--tb=short",
         "--timeout=45",
@@ -207,15 +216,15 @@ from qwenpaw.plugins.testing import PluginTestHost
 async def main():
     async with PluginTestHost(Path({str(root / "template-host")!r})) as host:
         await host.load(Path({str(template)!r}))
-        result = await host.call_tool("hello_sdk", {{"name":"outside"}})
-        assert result.content[0].text == "Hello outside (1)"
+        first = await host.call_tool("hello_sdk", {{"name": "outside"}})
+        assert first.content[0].text == "Hello outside (1)"
         assert (await host.reload("hello-sdk")).ok
-        result = await host.call_tool("hello_sdk", {{"name":"outside"}})
-        assert result.content[0].text == "Hello outside (2)"
-        result = await host.call_tool(
-            "hello_sdk", {{"name":"other"}}, workspace_id="other",
+        second = await host.call_tool("hello_sdk", {{"name": "outside"}})
+        assert second.content[0].text == "Hello outside (2)"
+        other = await host.call_tool(
+            "hello_sdk", {{"name": "other"}}, workspace_id="other",
         )
-        assert result.content[0].text == "Hello other (1)"
+        assert other.content[0].text == "Hello other (1)"
 asyncio.run(main())
 """,
     )

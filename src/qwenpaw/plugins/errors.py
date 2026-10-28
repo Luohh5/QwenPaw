@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Stable errors raised by the opt-in plugin SDK."""
 
 

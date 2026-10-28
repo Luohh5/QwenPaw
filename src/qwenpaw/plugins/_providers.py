@@ -1,4 +1,8 @@
+# -*- coding: utf-8 -*-
 """SDK-only model adapter through the production provider/model factories."""
+
+# Host adapters access private ownership state behind the public SDK.
+# pylint: disable=protected-access
 
 import inspect
 import asyncio
@@ -17,6 +21,8 @@ from .providers import (
 from .storage import PluginConfig
 
 
+# Keep the ownership state machine in one scope.
+# pylint: disable-next=too-many-statements
 def register(context, spec):
     from agentscope.credential import CredentialBase
     from agentscope.formatter import OpenAIChatFormatter
@@ -51,21 +57,31 @@ def register(context, spec):
                 *(context._api.manifest.get("sdk") or {}).get("secrets", []),
             ]
             public = ProviderContext(
-                **{field.name: getattr(base, field.name) for field in fields(base)},
+                **{
+                    field.name: getattr(base, field.name)
+                    for field in fields(base)
+                },
                 provider_id=spec.id,
                 base_url=provider.base_url,
                 headers=deepcopy(provider.custom_headers),
             )
-            yield replace(public, config=PluginConfig(values, {"secrets": secrets}))
+            yield replace(
+                public,
+                config=PluginConfig(values, {"secrets": secrets}),
+            )
 
     def response(chunk):
         if not isinstance(chunk, ModelChunk):
             raise SDKError(
-                "Provider generate must return ModelChunk or stream ModelChunk values"
+                "Provider generate must return ModelChunk or stream "
+                "ModelChunk values",
             )
-        if any(block.type in {"hint", "tool_result"} for block in chunk.content):
+        if any(
+            block.type in {"hint", "tool_result"} for block in chunk.content
+        ):
             raise SDKError(
-                "Model output supports text, thinking, tool_call and attachments"
+                "Model output supports text, thinking, tool_call and "
+                "attachments",
             )
         return model_response(chunk)
 
@@ -86,18 +102,26 @@ def register(context, spec):
                     "audio/*",
                     "video/*",
                     "application/*",
-                ]
+                ],
             )
 
+        # Keep the ownership state machine in one scope.
+        # pylint: disable-next=too-many-branches
         async def _generate(self, request):
             async with invocation(self.provider) as public:
                 if inspect.isasyncgenfunction(spec.generate):
                     result = spec.generate(public, request)
                 else:
-                    result = await context._call(spec.generate, public, request)
+                    result = await context._call(
+                        spec.generate,
+                        public,
+                        request,
+                    )
                 if isinstance(result, ModelChunk):
                     if not result.is_last:
-                        raise SDKError("A non-streamed ModelChunk must be terminal")
+                        raise SDKError(
+                            "A non-streamed ModelChunk must be terminal",
+                        )
                     converted = response(result)
                     if converted.content:
                         yield replace(converted, is_last=False, usage=None)
@@ -105,7 +129,8 @@ def register(context, spec):
                     return
                 if not hasattr(result, "__aiter__"):
                     raise SDKError(
-                        "Provider generate must return ModelChunk or an async stream"
+                        "Provider generate must return ModelChunk or an "
+                        "async stream",
                     )
                 terminal = False
                 terminal_response = None
@@ -114,7 +139,8 @@ def register(context, spec):
                     async for chunk in result:
                         if terminal:
                             raise SDKError(
-                                "Model stream yielded after its terminal chunk"
+                                "Model stream yielded after its terminal "
+                                "chunk",
                             )
                         converted = response(chunk)
                         complete.append(chunk, converted)
@@ -124,9 +150,15 @@ def register(context, spec):
                         else:
                             yield converted
                     if not terminal:
-                        raise SDKError("Model stream ended without a terminal chunk")
+                        raise SDKError(
+                            "Model stream ended without a terminal chunk",
+                        )
                     if terminal_response.content:
-                        yield replace(terminal_response, is_last=False, usage=None)
+                        yield replace(
+                            terminal_response,
+                            is_last=False,
+                            usage=None,
+                        )
                     yield complete.finish()
                 finally:
                     close = getattr(result, "aclose", None)
@@ -134,13 +166,20 @@ def register(context, spec):
                         await close()
 
         async def _call_api(
-            self, model_name, messages, tools=None, tool_choice=None, **kwargs
+            self,
+            model_name,
+            messages,
+            tools=None,
+            tool_choice=None,
+            **kwargs,
         ):
             guard()
             choice = None
             if tool_choice is not None:
                 choice = ModelToolChoice(
-                    tool_choice if isinstance(tool_choice, str) else tool_choice.mode,
+                    tool_choice
+                    if isinstance(tool_choice, str)
+                    else tool_choice.mode,
                     (
                         tuple(tool_choice.tools)
                         if getattr(tool_choice, "tools", None) is not None
@@ -152,17 +191,32 @@ def register(context, spec):
                 tuple(from_host(message) for message in messages),
                 tuple(deepcopy(tools or [])),
                 choice,
-                {**deepcopy(self.provider.generate_kwargs), **deepcopy(kwargs)},
+                {
+                    **deepcopy(self.provider.generate_kwargs),
+                    **deepcopy(kwargs),
+                },
             )
             return context._managed_stream(
-                lambda: self._generate(request), f"provider:{spec.id}:{model_name}"
+                lambda: self._generate(request),
+                f"provider:{spec.id}:{model_name}",
             )
 
-        async def __call__(self, messages, tools=None, tool_choice=None, **kwargs):
-            # Preserve aclose through the SDK stream; host token/retry/rate-limit
+        async def __call__(
+            self,
+            messages,
+            tools=None,
+            tool_choice=None,
+            **kwargs,
+        ):
+            # Preserve aclose through the SDK stream; host
+            # token/retry/rate-limit
             # wrappers still surround this model in create_model_and_formatter.
             return await self._call_api(
-                self.model, messages, tools, tool_choice, **kwargs
+                self.model,
+                messages,
+                tools,
+                tool_choice,
+                **kwargs,
             )
 
     class Adapter(Provider):
@@ -173,21 +227,35 @@ def register(context, spec):
         async def check_connection(self, timeout=5):
             async with (
                 asyncio.timeout(timeout),
-                invocation(self, asyncio.get_running_loop().time() + timeout) as public,
+                invocation(
+                    self,
+                    asyncio.get_running_loop().time() + timeout,
+                ) as public,
             ):
                 if spec.check_connection is None:
-                    return False, "This provider does not declare a connection check"
-                result = await context._call(spec.check_connection, public, timeout)
+                    return (
+                        False,
+                        "This provider does not declare a connection check",
+                    )
+                result = await context._call(
+                    spec.check_connection,
+                    public,
+                    timeout,
+                )
                 if not isinstance(result, ConnectionResult):
                     raise SDKError(
-                        "Provider check_connection must return ConnectionResult"
+                        "Provider check_connection must return "
+                        "ConnectionResult",
                     )
                 return result.success, result.message
 
         async def fetch_models(self, timeout=5):
             async with (
                 asyncio.timeout(timeout),
-                invocation(self, asyncio.get_running_loop().time() + timeout) as public,
+                invocation(
+                    self,
+                    asyncio.get_running_loop().time() + timeout,
+                ) as public,
             ):
                 result = (
                     spec.models
@@ -199,10 +267,15 @@ def register(context, spec):
         async def check_model_connection(self, model_id, timeout=5):
             model = self.get_chat_model_instance(model_id)
             from agentscope.message import Msg, TextBlock
-            import asyncio
 
             stream = await model(
-                [Msg(name="user", role="user", content=[TextBlock(text="Reply OK")])]
+                [
+                    Msg(
+                        name="user",
+                        role="user",
+                        content=[TextBlock(text="Reply OK")],
+                    ),
+                ],
             )
             try:
                 async with asyncio.timeout(timeout):
@@ -234,5 +307,7 @@ def register(context, spec):
         await handle.close()
 
     return Registration(
-        release, owner=context.resources.owner, description=f"provider:{spec.id}"
+        release,
+        owner=context.resources.owner,
+        description=f"provider:{spec.id}",
     )

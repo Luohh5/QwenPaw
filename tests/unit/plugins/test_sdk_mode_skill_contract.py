@@ -15,33 +15,76 @@ from qwenpaw.plugins.modes import ModeSpec
 from qwenpaw.plugins.tools import ToolSpec, ToolResult
 from qwenpaw.plugins.hooks import HookSpec, HookPhase, HookResult
 from qwenpaw.plugins.prompts import PromptSpec
+
+
 class Plugin:
     def register(self, ctx):
         def active(call):
-            assert not hasattr(call, "workspace") and not hasattr(call, "agent")
-            return bool(call.messages and call.messages[0].content[0].text == "activate")
+            assert not hasattr(call, "workspace") and not hasattr(
+                call, "agent"
+            )
+            return bool(
+                call.messages
+                and call.messages[0].content[0].text == "activate"
+            )
+
         async def echo(call, args):
             return ToolResult.text("mode tool")
+
         async def hook(call):
             ctx.storage.write_json("hook.json", call.workspace_id)
             return HookResult()
+
         async def turn(call):
-            ctx.storage.write_json("turn.json", [call.mode_name, call.workspace_id, call.session_id])
+            ctx.storage.write_json(
+                "turn.json",
+                [
+                    call.mode_name,
+                    call.workspace_id,
+                    call.session_id,
+                ],
+            )
+
         async def reset(call):
             ctx.storage.write_json("reset.json", True)
-        ctx.register_mode(ModeSpec(name="sdk_focus", is_active=active,
-            tools=(ToolSpec("mode_echo", "mode echo", {"type":"object"}, echo, enabled=True),),
-            hooks=(HookSpec("mode_hook", HookPhase.PRE_EXECUTE, hook),),
-            prompts=(PromptSpec("mode_prompt", "MODE_PUBLIC_MARKER"),),
-            on_turn_start=turn, on_reset=reset))
+
+        ctx.register_mode(
+            ModeSpec(
+                name="sdk_focus",
+                is_active=active,
+                tools=(
+                    ToolSpec(
+                        "mode_echo",
+                        "mode echo",
+                        {"type": "object"},
+                        echo,
+                        enabled=True,
+                    ),
+                ),
+                hooks=(
+                    HookSpec(
+                        "mode_hook", HookPhase.PRE_EXECUTE, hook
+                    ),
+                ),
+                prompts=(
+                    PromptSpec("mode_prompt", "MODE_PUBLIC_MARKER"),
+                ),
+                on_turn_start=turn,
+                on_reset=reset,
+            )
+        )
+
+
 plugin = Plugin()
 """
     active = (Message("user", (ContentBlock(text="activate"),)),)
     async with PluginTestHost(tmp_path / "host") as host:
         ctx = await host.load(
             make_plugin(
-                tmp_path, source, ["modes", "tools", "hooks", "prompts", "storage"]
-            )
+                tmp_path,
+                source,
+                ["modes", "tools", "hooks", "prompts", "storage"],
+            ),
         )
         assert "sdk_focus" in await host.mode_names()
         assert "sdk_focus" not in await host.active_modes()
@@ -52,7 +95,11 @@ plugin = Plugin()
         assert "MODE_PUBLIC_MARKER" in await host.build_prompt(messages=active)
         await host.run_hooks("pre_execute")
         assert ctx.storage.read_json("hook.json", None) is None
-        await host.run_hooks("pre_execute", messages=active, workspace_id="one")
+        await host.run_hooks(
+            "pre_execute",
+            messages=active,
+            workspace_id="one",
+        )
         assert ctx.storage.read_json("hook.json") == "one"
         await host.run_mode(
             "sdk_focus",
@@ -61,7 +108,11 @@ plugin = Plugin()
             workspace_id="one",
             session_id="chat",
         )
-        assert ctx.storage.read_json("turn.json") == ["sdk_focus", "one", "chat"]
+        assert ctx.storage.read_json("turn.json") == [
+            "sdk_focus",
+            "one",
+            "chat",
+        ]
         await host.run_mode("sdk_focus", "reset")
         assert ctx.storage.read_json("reset.json") is True
         assert (await host.reload("extension-contract")).ok
@@ -69,7 +120,9 @@ plugin = Plugin()
         await host.unload("extension-contract")
         assert "sdk_focus" not in await host.mode_names()
         assert "mode_echo" not in await host.available_tools(messages=active)
-        assert "MODE_PUBLIC_MARKER" not in await host.build_prompt(messages=active)
+        assert "MODE_PUBLIC_MARKER" not in await host.build_prompt(
+            messages=active,
+        )
 
 
 async def test_skill_projects_into_existing_and_new_workspaces(tmp_path):
@@ -85,22 +138,31 @@ plugin = Plugin()
     root = make_plugin(tmp_path, source, ["skills"])
     skill = root / "skills" / "sdk-sample" / "SKILL.md"
     skill.parent.mkdir(parents=True)
-    contents = "---\nname: sdk-sample\ndescription: Public SDK test skill\n---\nUse the sample.\n"
+    contents = (
+        "---\nname: sdk-sample\ndescription: Public SDK test "
+        "skill\n---\nUse the sample.\n"
+    )
     skill.write_text(contents)
     async with PluginTestHost(tmp_path / "host") as host:
-        assert "sdk-sample/SKILL.md" not in await host.skill_files(workspace_id="one")
+        assert "sdk-sample/SKILL.md" not in await host.skill_files(
+            workspace_id="one",
+        )
         await host.load(root)
         for workspace in ("one", "two"):
             assert "sdk-sample/SKILL.md" in await host.skill_files(
-                workspace_id=workspace
+                workspace_id=workspace,
             )
             assert (
-                await host.read_skill("sdk-sample/SKILL.md", workspace_id=workspace)
+                await host.read_skill(
+                    "sdk-sample/SKILL.md",
+                    workspace_id=workspace,
+                )
                 == contents
             )
         assert (await host.reload("extension-contract")).ok
         assert (
-            await host.read_skill("sdk-sample/SKILL.md", workspace_id="one") == contents
+            await host.read_skill("sdk-sample/SKILL.md", workspace_id="one")
+            == contents
         )
 
 
@@ -121,7 +183,9 @@ plugin = Plugin()
             await host.load(make_plugin(tmp_path, source, ["skills"]))
 
 
-async def test_skill_handle_removes_owned_files_and_future_projection(tmp_path):
+async def test_skill_handle_removes_owned_files_and_future_projection(
+    tmp_path,
+):
     from qwenpaw.plugins.testing import PluginTestHost
 
     source = """
@@ -141,11 +205,20 @@ plugin = Plugin()
     skill = root / "skills" / "sdk-owned" / "SKILL.md"
     skill.parent.mkdir(parents=True)
     skill.write_text(
-        "---\nname: sdk-owned\ndescription: Test skill\n---\nOwned instructions.\n"
+        (
+            "---\nname: sdk-owned\ndescription: Test "
+            "skill\n---\nOwned instructions.\n"
+        ),
     )
     async with PluginTestHost(tmp_path / "host") as host:
         await host.load(root)
-        assert "sdk-owned/SKILL.md" in await host.skill_files(workspace_id="one")
+        assert "sdk-owned/SKILL.md" in await host.skill_files(
+            workspace_id="one",
+        )
         await host.call_command("/revokeskills", workspace_id="one")
-        assert "sdk-owned/SKILL.md" not in await host.skill_files(workspace_id="one")
-        assert "sdk-owned/SKILL.md" not in await host.skill_files(workspace_id="new")
+        assert "sdk-owned/SKILL.md" not in await host.skill_files(
+            workspace_id="one",
+        )
+        assert "sdk-owned/SKILL.md" not in await host.skill_files(
+            workspace_id="new",
+        )

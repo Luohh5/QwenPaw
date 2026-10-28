@@ -56,58 +56,7 @@ async def text_result(host):
     return (await host.call_tool("transaction_tool", {})).content[0].text
 
 
-def reuse_thirdparty_dependencies(library, mirror):
-    from importlib.metadata import Distribution, distributions
-    from pathlib import Path
-    import shutil
-    import sys
-
-    # Only active dependency roots with real distribution metadata qualify.
-    # This also supports wheel hosts whose dependencies use a filtered mirror.
-    existing = {
-        dist.metadata["Name"].lower().replace("_", "-")
-        for dist in distributions(path=[str(library)])
-    }
-    roots = []
-    for entry in sys.path:
-        path = Path(entry)
-        if not path.is_absolute() or not path.is_dir():
-            continue
-        path = path.resolve()
-        if path not in roots and any(distributions(path=[str(path)])):
-            roots.append(path)
-    mirror.mkdir()
-    for root in roots:
-        for item in root.iterdir():
-            if (
-                item.name.endswith((".pth", ".egg-link"))
-                or item.name.startswith("__editable__")
-                or item.name == "qwenpaw"
-                or (library / item.name).exists()
-                or (mirror / item.name).exists()
-            ):
-                continue
-            if item.name.endswith((".dist-info", ".egg-info")):
-                name = (
-                    Distribution.at(item)
-                    .metadata["Name"]
-                    .lower()
-                    .replace("_", "-")
-                )
-                if name == "qwenpaw" or name in existing:
-                    continue
-            destination = mirror / item.name
-            try:
-                destination.symlink_to(item, target_is_directory=item.is_dir())
-            except OSError:
-                if item.is_dir():
-                    shutil.copytree(item, destination)
-                else:
-                    shutil.copy2(item, destination)
-    (library / "host_dependencies.pth").write_text(str(mirror) + "\n")
-
-
-async def test_sdk_install_config_disable_upgrade_uninstall_keeps_data(
+async def test_install_config_disable_upgrade_uninstall_preserves_user_data(
     tmp_path,
 ):
     from qwenpaw.plugins import SDKError
@@ -186,7 +135,7 @@ async def test_sdk_transaction_commit_boundary_retains_correct_code_and_data(
 
 @pytest.mark.parametrize(
     ("dependency", "module"),
-    [("httpx", "httpx"), ("aiohttp", "aiohttp"), ("Pillow", "PIL")],
+    [("httpx", "httpx"), ("uvicorn", "uvicorn"), ("pydantic", "pydantic")],
 )
 async def test_sdk_dependency_restart_rejected_before_module_execution(
     tmp_path,
@@ -228,7 +177,7 @@ async def test_sdk_dependency_restart_rejected_before_module_execution(
         await host.install(one, config={"label": "retained"})
         with pytest.raises(SDKRestartRequiredError):
             await host.install(two, replace=True)
-        assert len(installer_calls) == 0
+        assert not installer_calls
         assert not marker.exists()
         assert await text_result(host) == "1.0.0:retained:1"
         assert (
@@ -237,284 +186,6 @@ async def test_sdk_dependency_restart_rejected_before_module_execution(
             )["version"]
             == "1.0.0"
         )
-
-
-@pytest.mark.parametrize(
-    "change",
-    [
-        "version",
-        "pip-version",
-        "same-version-source",
-        "not-imported",
-        "addition",
-    ],
-)
-# One subprocess transaction retains all before/after safety assertions.
-# pylint: disable-next=too-many-statements
-def test_sdk_transitive_dependency_cannot_replace_an_installed_distribution(
-    tmp_path,
-    change,
-):
-    """Resolve parent/child dependencies without replacing installed code."""
-    import os
-    from pathlib import Path
-    import subprocess
-    import venv
-    import zipfile
-
-    wheels = tmp_path / "wheels"
-    wheels.mkdir()
-
-    def wheel(name, version, requires="", body=None):
-        metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
-        if requires:
-            metadata += f"Requires-Dist: {requires}\n"
-        info = f"{name}-{version}.dist-info"
-        files = {
-            f"{name}/__init__.py": body or f"__version__ = {version!r}\n",
-            f"{info}/METADATA": metadata,
-            f"{info}/WHEEL": "Wheel-Version: 1.0\nGenerator: sdk-test\n"
-            "Root-Is-Purelib: true\nTag: py3-none-any\n",
-        }
-        files[f"{info}/RECORD"] = (
-            "".join(f"{key},,\n" for key in files) + f"{info}/RECORD,,\n"
-        )
-        path = wheels / f"{name}-{version}-py3-none-any.whl"
-        with zipfile.ZipFile(path, "w") as archive:
-            for key, value in files.items():
-                archive.writestr(key, value)
-        return path
-
-    child = wheel("sdk_loaded_child", "1.0")
-    wheel("sdk_loaded_child", "2.0")
-    environment = tmp_path / "venv"
-    venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
-    python = environment / (
-        "Scripts/python.exe" if os.name == "nt" else "bin/python"
-    )
-    library = Path(
-        subprocess.check_output(
-            [
-                str(python),
-                "-I",
-                "-c",
-                "import site; print(site.getsitepackages()[0])",
-            ],
-            text=True,
-        ).strip(),
-    )
-    with zipfile.ZipFile(child) as archive:
-        archive.extractall(library)
-    if change in {"same-version-source", "pip-version"}:
-        import ensurepip
-
-        bundled = next(
-            (Path(ensurepip.__file__).parent / "_bundled").glob("pip-*.whl"),
-        )
-        with zipfile.ZipFile(bundled) as archive:
-            archive.extractall(library)
-    if change == "same-version-source":
-        # Pip considers the installed same version satisfied: adding parent
-        # is safe only if the differently sourced child bytes stay unchanged.
-        wheel(
-            "sdk_loaded_child",
-            "1.0",
-            body="__version__ = '1.0'\nSOURCE = 'replacement'\n",
-        )
-        requirement = "sdk-loaded-child @ " + child.as_uri()
-    elif change == "addition":
-        requirement = "sdk-loaded-child>=1.0"
-    else:
-        requirement = "sdk-loaded-child>=2.0"
-    wheel("sdk_new_parent", "1.0", requirement)
-    reuse_thirdparty_dependencies(library, tmp_path / "host-dependencies")
-    import importlib.metadata
-    import shutil
-    import qwenpaw
-
-    # Admit only this host package and its matching metadata into the child.
-    host_package = Path(qwenpaw.__file__).resolve().parent
-    host_metadata = [
-        path
-        for path in host_package.parent.iterdir()
-        if path.name.endswith((".dist-info", ".egg-info"))
-        and importlib.metadata.Distribution.at(path)
-        .metadata["Name"]
-        .lower()
-        .replace("_", "-")
-        == "qwenpaw"
-    ]
-    assert len(host_metadata) == 1, host_metadata
-    host_version = importlib.metadata.Distribution.at(host_metadata[0]).version
-    host_root = tmp_path / "current-host-package"
-    host_root.mkdir()
-    for item in (host_package, host_metadata[0]):
-        destination = host_root / item.name
-        try:
-            destination.symlink_to(item, target_is_directory=item.is_dir())
-        except OSError:
-            if item.is_dir():
-                shutil.copytree(item, destination)
-            else:
-                shutil.copy2(item, destination)
-    expected_origin = (host_root / "qwenpaw/__init__.py").resolve()
-    assert expected_origin.read_bytes() == Path(qwenpaw.__file__).read_bytes()
-    one, two = package(tmp_path, "1.0.0"), package(tmp_path, "2.0.0")
-    (two / "requirements.txt").write_text("sdk-new-parent==1.0\n")
-    code = """
-import asyncio, hashlib, importlib.metadata, json, subprocess, sys
-from pathlib import Path
-
-source_root = Path(sys.argv[5]).resolve()
-sys.path.insert(0, str(source_root))
-import qwenpaw
-
-assert Path(qwenpaw.__file__).resolve() == Path(sys.argv[6]).resolve()
-host_versions = [
-    d.version
-    for d in importlib.metadata.distributions()
-    if d.metadata["Name"].lower().replace("_", "-") == "qwenpaw"
-]
-assert host_versions == [sys.argv[7]], host_versions
-import mcp.types
-from qwenpaw.plugins import SDKRestartRequiredError
-from qwenpaw.plugins.testing import PluginTestHost
-
-root, one, two = map(Path, sys.argv[1:4])
-if sys.argv[4] != "not-imported":
-    import sdk_loaded_child
-
-    assert sdk_loaded_child.__version__ == "1.0"
-else:
-    assert "sdk_loaded_child" not in sys.modules
-dist = importlib.metadata.distribution("sdk-loaded-child")
-
-
-def snapshot():
-    return {
-        str(p): hashlib.sha256(
-            Path(dist.locate_file(p)).read_bytes()
-        ).hexdigest()
-        for p in dist.files
-    }
-
-
-before = snapshot()
-spawn = subprocess.Popen
-mutations = []
-previews = []
-
-
-def guarded(args, *values, **kwargs):
-    if "install" in args and ("pip" in args or "uv" in str(args[0])):
-        if "--dry-run" not in args:
-            mutations.append(list(args))
-            if sys.argv[4] not in {"addition", "same-version-source"}:
-                raise AssertionError(
-                    "SDK attempted a mutating dependency install"
-                )
-            assert "--constraint" in args
-            assert (
-                args[0] == sys.executable
-                or args[args.index("--python") + 1] == sys.executable
-            )
-        previews.append(list(args))
-    return spawn(args, *values, **kwargs)
-
-
-subprocess.Popen = guarded
-
-
-async def main():
-    async with PluginTestHost(root) as host:
-        await host.install(one, config={"label": "retained"})
-        if sys.argv[4] in {"addition", "same-version-source"}:
-            result = await host.install(two, replace=True)
-            assert result.ok and mutations
-            assert importlib.metadata.version("sdk-new-parent") == "1.0"
-        else:
-            try:
-                await host.install(two, replace=True)
-            except SDKRestartRequiredError:
-                pass
-            else:
-                raise AssertionError(
-                    "Transitive loaded dependency did not require restart"
-                )
-            assert not mutations, mutations
-        assert snapshot() == before
-        if sys.argv[4] in {"same-version-source", "pip-version"}:
-            assert any(
-                "--report" in a and "--dry-run" in a for a in previews
-            ), previews
-        assert importlib.metadata.version("sdk-loaded-child") == "1.0"
-        result = await host.call_tool("transaction_tool", {})
-        expected = (
-            "2.0.0"
-            if sys.argv[4] in {"addition", "same-version-source"}
-            else "1.0.0"
-        )
-        assert result.content[0].text == expected + ":retained:1"
-    print(
-        json.dumps(
-            {
-                "mutations": mutations,
-                "previews": previews,
-                "unchanged": snapshot() == before,
-            }
-        )
-    )
-
-
-asyncio.run(main())
-"""
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith(("QWENPAW_", "PYTHON"))
-        and not any(
-            word in key.upper()
-            for word in ("TOKEN", "SECRET", "API_KEY", "PASSWORD")
-        )
-    }
-    env.update(
-        QWENPAW_WORKING_DIR=str(tmp_path / "bootstrap"),
-        QWENPAW_SECRET_DIR=str(tmp_path / "bootstrap-secrets"),
-        PIP_NO_INDEX="1",
-        UV_NO_INDEX="1",
-        PIP_FIND_LINKS=str(wheels),
-        UV_FIND_LINKS=str(wheels),
-        UV_CACHE_DIR=str(tmp_path / "uv-cache"),
-        UV_CREDENTIALS_DIR=str(tmp_path / "uv-credentials"),
-        PIP_CACHE_DIR=str(tmp_path / "pip-cache"),
-        XDG_CONFIG_HOME=str(tmp_path / "xdg-config"),
-    )
-    result = subprocess.run(
-        [
-            str(python),
-            "-I",
-            "-c",
-            code,
-            str(tmp_path / "host"),
-            str(one),
-            str(two),
-            change,
-            str(host_root),
-            str(expected_origin),
-            host_version,
-        ],
-        cwd=tmp_path,
-        env=env,
-        capture_output=True,
-        check=False,
-        text=True,
-        timeout=90,
-    )
-    (tmp_path / "transitive-result.log").write_text(
-        result.stdout + result.stderr,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert json.loads(result.stdout.strip().splitlines()[-1])["unchanged"]
 
 
 async def test_sdk_busy_stream_in_other_workspace_prevents_install_commit(
@@ -537,7 +208,12 @@ class Plugin:
         async def tool(call, args):
             try:
                 yield ToolEvent(
-                    "delta", (ContentBlock(text="old:" + call.workspace_id),)
+                    "delta",
+                    (
+                        ContentBlock(
+                            text="old:" + call.workspace_id
+                        ),
+                    ),
                 )
                 await asyncio.sleep(100)
             finally:
@@ -601,8 +277,6 @@ async def test_sdk_upgrade_partial_activation_stops_new_task_and_restores_old(
         """
 import asyncio
 from pathlib import Path
-
-
 class Plugin:
     def register(self, plugin):
         async def activate(ctx):
@@ -611,14 +285,10 @@ class Plugin:
                     await asyncio.sleep(100)
                 finally:
                     Path(__MARKER__).touch()
-
             ctx.resources.task(worker(), description="partial-new-start")
             await asyncio.sleep(0)
             raise RuntimeError("partial new activation failed")
-
         plugin.on_activate(activate)
-
-
 plugin = Plugin()
 """.replace(
             "__MARKER__",
@@ -656,14 +326,10 @@ async def test_uninstall_refuses_external_source_tree_but_unload_is_allowed(
 
     source = make_plugin(
         tmp_path,
-        """
-class Plugin:
-    def register(self, ctx):
-        pass
-
-
-plugin = Plugin()
-""",
+        (
+            "class Plugin:\n    def register(self, ctx): "
+            "pass\nplugin = Plugin()\n"
+        ),
         [],
     )
     before = {

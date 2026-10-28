@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import re
 import shlex
 import sys
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterator
 
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _dist_version
@@ -110,6 +114,61 @@ def parse_requirements_file(requirements_file: Path) -> ParsedRequirements:
             continue
         parsed.requirements.append(req)
     return parsed
+
+
+def manifest_requirements(manifest: dict) -> list[str]:
+    """Validate manifest entries using the same supported package syntax."""
+    if not isinstance(manifest, dict):
+        raise ValueError("plugin.json must contain an object")
+    dependencies = manifest.get("dependencies", [])
+    if not isinstance(dependencies, list):
+        raise ValueError("plugin.json dependencies must be a list of strings")
+    result = []
+    for declaration in dependencies:
+        try:
+            if not isinstance(declaration, str) or any(
+                char in declaration for char in "\r\n"
+            ):
+                raise ValueError("Expected a single-line requirement")
+            requirement = Requirement(declaration)
+            if requirement.url or requirement.extras:
+                raise ValueError("URLs and extras are unsupported")
+        except ValueError as exc:
+            raise ValueError(
+                "plugin.json dependencies contains unsupported requirement "
+                f"syntax: {declaration!r}",
+            ) from exc
+        result.append(str(requirement))
+    return result
+
+
+@contextmanager
+def combined_requirements(source: Path) -> Iterator[Path]:
+    """Merge declarations without modifying a potentially read-only source."""
+    requirements = source / "requirements.txt"
+    manifest = source / "plugin.json"
+    dependencies = (
+        manifest_requirements(json.loads(manifest.read_text(encoding="utf-8")))
+        if manifest.is_file()
+        else []
+    )
+    if not dependencies:
+        yield requirements
+        return
+    content = (
+        requirements.read_text(encoding="utf-8")
+        if requirements.is_file()
+        else ""
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="qwenpaw-plugin-requirements-",
+    ) as tmp:
+        merged = Path(tmp) / "requirements.txt"
+        merged.write_text(
+            content + "\n" + "\n".join(dependencies) + "\n",
+            encoding="utf-8",
+        )
+        yield merged
 
 
 def _dist_key(req: Requirement) -> str:
