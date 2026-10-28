@@ -3,6 +3,7 @@
 
 import asyncio
 import base64
+import logging
 from dataclasses import replace
 from pathlib import Path
 import os
@@ -63,10 +64,23 @@ async def process():
     assert result.exited and not result.residual
 
 
+@pytest.fixture
+def worker_logs(caplog, monkeypatch):
+    logger = logging.getLogger("qwenpaw.plugins.worker")
+    monkeypatch.setattr(logger, "propagate", False)
+    logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger=logger.name):
+            yield caplog
+    finally:
+        logger.removeHandler(caplog.handler)
+
+
 @pytest.mark.asyncio
 async def test_lifecycle_bidirectional_ipc_logs_and_repeated_stop(
     tmp_path,
     process,
+    worker_logs,
 ):
     spec, _ = launch(tmp_path)
     notices = []
@@ -101,12 +115,89 @@ async def test_lifecycle_bidirectional_ipc_logs_and_repeated_stop(
     assert stopped.exited and not stopped.forced and stopped.returncode == 0
     assert not alive(probe["pid"])
     assert (await process.stop()).exited
+    for marker in ("sample SDK connected", "sample SDK diagnostic"):
+        await eventually(lambda: marker in worker_logs.text)
+        record = next(r for r in worker_logs.records if marker in r.message)
+        assert record.name == "qwenpaw.plugins.worker"
+        assert record.levelno == logging.WARNING
+        for value in (
+            spec.plugin_id,
+            spec.instance_id,
+            "generation=1",
+            "mode=run",
+            "stderr",
+        ):
+            assert value in record.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_log_flood_is_bounded_redacted_and_keeps_ipc_responsive(
+    tmp_path,
+    process,
+    worker_logs,
+    monkeypatch,
+):
+    from qwenpaw.plugins.execution import worker_logs as log_bridge
+
+    # Keep one rate window even when a CI machine reads the pipe slowly.
+    monkeypatch.setattr(log_bridge, "monotonic", lambda: 1.0)
+    spec, _ = launch(tmp_path)
+    health = await process.start(spec)
+    await eventually(lambda: "sample SDK diagnostic" in worker_logs.text)
+    worker_logs.clear()
+    baseline = process.health_snapshot()["log_bytes"]
+    diagnostic = (
+        "credential-check \x1b[31mAuthorization: Bearer bearer-secret\x1b[0m\r\n"
+        "https://api.telegram.org/bot123456:telegram-secret/sendMessage\n"
+        "https://example.test/?token=query-secret&ok=yes\n"
+        "Authorization: token ghp_secretvalue\n"
+        "Cookie: session=first_secret; auth=second_secret\n"
+    )
+    text = diagnostic + "long-line " + "x" * (128 * 1024) + "\n"
+    text += ("flood-line " + "y" * 120 + "\n") * 2048
+    size = await asyncio.wait_for(
+        process.call("sample.logs", {"text": text}),
+        3,
+    )
+    assert size == len(text.encode())
+    assert await asyncio.wait_for(
+        process.call("sample.echo", {"ok": 1}),
+        1,
+    ) == {
+        "ok": 1,
+    }
+    await eventually(
+        lambda: process.health_snapshot()["log_bytes"] == baseline + size,
+    )
+    stopped = await asyncio.wait_for(process.stop(), 3)
+    assert stopped.exited and not stopped.forced and stopped.returncode == 0
+    assert not alive(health["pid"])
+    await eventually(lambda: "omitted" in worker_logs.text.lower())
+    messages = [r.getMessage() for r in worker_logs.records]
+    output = "\n".join(messages)
+    assert "credential-check" in output and "long-line" in output
+    assert "api.telegram.org" in output and "example.test" in output
+    assert "truncated" in output.lower()
+    assert len(messages) <= 32
+    assert sum(len(message.encode()) for message in messages) <= 64 * 1024
+    assert max(len(message.encode()) for message in messages) <= 4096
+    for secret in (
+        "bearer-secret",
+        "123456:telegram-secret",
+        "query-secret",
+        "ghp_secretvalue",
+        "first_secret",
+        "second_secret",
+    ):
+        assert secret not in output
+    assert "\x1b" not in output and "\r" not in output
 
 
 @pytest.mark.asyncio
 async def test_crash_restarts_generation_and_retains_host_handler(
     tmp_path,
     process,
+    worker_logs,
 ):
     spec, _ = launch(tmp_path, restart_limit=1, restart_backoff=0.02)
     seen = []
@@ -129,6 +220,15 @@ async def test_crash_restarts_generation_and_retains_host_handler(
     assert fresh["pid"] != first["pid"] and not alive(first["pid"])
     assert (await process.call("sample.reverse", {}))["generation"] == 2
     assert seen == [fresh["identity"]]
+    for generation in (1, 2):
+        await eventually(
+            lambda: any(
+                "sample SDK diagnostic" in r.getMessage()
+                and f"generation={generation}" in r.getMessage()
+                and spec.instance_id in r.getMessage()
+                for r in worker_logs.records
+            ),
+        )
 
 
 @pytest.mark.asyncio

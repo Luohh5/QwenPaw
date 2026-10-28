@@ -29,6 +29,7 @@ from .models import PluginIdentity
 from .process_tree import ProcessTree
 from .rpc import RpcCallNotSent, RpcPeer
 from .runtime import validate_hello, _requirements
+from .worker_logs import WorkerLogs
 
 
 @dataclass(frozen=True)
@@ -607,6 +608,7 @@ class PluginProcess:
         options: dict[str, Any] = (
             {"start_new_session": True} if os.name != "nt" else {}
         )
+        logs = WorkerLogs(spec, self._mode)
         spawn = asyncio.create_task(
             asyncio.create_subprocess_exec(
                 spec.python_executable,
@@ -624,7 +626,7 @@ class PluginProcess:
         )
         self._spawn_task = spawn
         self._spawn_error = None
-        spawn.add_done_callback(self._spawn_done)
+        spawn.add_done_callback(lambda task: self._spawn_done(task, logs))
         await asyncio.shield(spawn)
         if self._spawn_error is not None:
             raise self.error_type(self._spawn_error)
@@ -669,13 +671,13 @@ class PluginProcess:
             if self._ready.done() and not self._ready.cancelled():
                 self._ready.exception()
 
-    def _spawn_done(self, task: asyncio.Task[Any]) -> None:
+    def _spawn_done(self, task: asyncio.Task[Any], logs: WorkerLogs) -> None:
         """Take ownership even if cancellation beat subprocess creation."""
         try:
             self._process = task.result()
             assert self._process is not None
             self._log_task = asyncio.create_task(
-                self._drain_logs(self._process),
+                self._drain_logs(self._process, logs),
             )
             self._tree = ProcessTree(self._process.pid)
         except (asyncio.CancelledError, Exception):
@@ -745,13 +747,28 @@ class PluginProcess:
                 ),
             )
 
-    async def _drain_logs(self, process: asyncio.subprocess.Process) -> None:
+    async def _drain_logs(
+        self,
+        process: asyncio.subprocess.Process,
+        logs: WorkerLogs | None,
+    ) -> None:
         assert process.stderr is not None
         while True:
             chunk = await process.stderr.read(16384)
             if not chunk:
+                if logs is not None:
+                    try:
+                        await logs.finish()
+                    except Exception:
+                        pass
                 return
             self._log_bytes += len(chunk)
+            if logs is not None:
+                try:
+                    logs.feed(chunk)
+                except Exception:
+                    # Forwarding is optional; always keep draining the pipe.
+                    logs = None
 
     async def call(
         self,

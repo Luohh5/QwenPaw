@@ -14,7 +14,7 @@ class Worker:
     def bind(self, context):
         self.context = context
         self.started = asyncio.Event()
-        for name in ("probe", "echo", "reverse", "slow", "crash"):
+        for name in ("probe", "echo", "reverse", "slow", "crash", "logs"):
             context.peer.register_method("sample." + name, getattr(self, name))
 
     async def start(self, config):
@@ -70,6 +70,12 @@ class Worker:
 
     async def echo(self, params, _request):
         return params
+
+    async def logs(self, params, _request):
+        text = params["text"]
+        sys.stderr.write(text)
+        sys.stderr.flush()
+        return len(text.encode("utf-8"))
 
     async def reverse(self, params, _request):
         await self.context.peer.notify("sample.notice", params)
