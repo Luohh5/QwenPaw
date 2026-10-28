@@ -1277,13 +1277,20 @@ async def test_cancelled_late_maintenance_entry_clears_own_marker(
     )
     original = maintenance.maintenance
     started, release = threading.Event(), threading.Event()
+    requested = asyncio.Event()
 
     @contextmanager
-    def slow_entry(*args, **kwargs):
+    def blocked_entry(*args, **kwargs):
         with original(*args, **kwargs) as value:
             started.set()
             assert release.wait(3)
             yield value
+
+    def slow_entry(*args, **kwargs):
+        # Preparation audits precede this factory call. Measure the controlled
+        # maintenance entry only after the operation actually requests it.
+        requested.set()
+        return blocked_entry(*args, **kwargs)
 
     monkeypatch.setattr(maintenance, "maintenance", slow_entry)
     task_capabilities = []
@@ -1295,7 +1302,15 @@ async def test_cancelled_late_maintenance_entry_clears_own_marker(
             task_capabilities.append(maintenance.capability_context.get())
 
     pending = asyncio.create_task(apply())
+    entry_requested = asyncio.create_task(requested.wait())
     try:
+        done, _ = await asyncio.wait(
+            (pending, entry_requested),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if pending in done:
+            await pending  # Preserve an early admission failure's traceback.
+            pytest.fail("apply returned before entering maintenance")
         assert await asyncio.to_thread(started.wait, 2)
         assert maintenance.marker(site).exists()
         pending.cancel()
@@ -1303,6 +1318,8 @@ async def test_cancelled_late_maintenance_entry_clears_own_marker(
         assert not pending.done()
     finally:
         release.set()
+        entry_requested.cancel()
+        await asyncio.gather(entry_requested, return_exceptions=True)
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(pending, 5)
     assert task_capabilities == [""]

@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 from importlib import metadata
+from importlib.machinery import EXTENSION_SUFFIXES
 import inspect
 import os
 from pathlib import Path
@@ -72,6 +74,11 @@ class DependencySnapshot:
                     **row,
                     "requires_dist": list(row["requires_dist"]),
                     "top_level": list(row["top_level"]),
+                    **(
+                        {"loaded_modules": list(row["loaded_modules"])}
+                        if "loaded_modules" in row
+                        else {}
+                    ),
                 }
                 for key, row in self.distributions.items()
             },
@@ -144,12 +151,16 @@ class DependencySnapshot:
                 or canonicalize_name(name) != name
                 or not isinstance(row, Mapping)
                 or set(row)
-                != {
-                    "version",
-                    "metadata_path",
-                    "requires_dist",
-                    "top_level",
-                }
+                not in (
+                    {"version", "metadata_path", "requires_dist", "top_level"},
+                    {
+                        "version",
+                        "metadata_path",
+                        "requires_dist",
+                        "top_level",
+                        "loaded_modules",
+                    },
+                )
             ):
                 raise dependency_error()
             try:
@@ -162,7 +173,11 @@ class DependencySnapshot:
                 or str(origin.parent) not in data["sites"]
             ):
                 raise dependency_error()
-            for key in ("requires_dist", "top_level"):
+            for key in (
+                "requires_dist",
+                "top_level",
+                *(["loaded_modules"] if "loaded_modules" in row else []),
+            ):
                 if not isinstance(row[key], (list, tuple)) or any(
                     not isinstance(item, str) for item in row[key]
                 ):
@@ -171,6 +186,11 @@ class DependencySnapshot:
                 **row,
                 "requires_dist": tuple(row["requires_dist"]),
                 "top_level": tuple(row["top_level"]),
+                **(
+                    {"loaded_modules": tuple(row["loaded_modules"])}
+                    if "loaded_modules" in row
+                    else {}
+                ),
             }
         return cls(
             data["executable"],
@@ -239,7 +259,79 @@ def dependency_sites(sites, *, explicit=(), distributions=()):
     )
 
 
-def _installed_metadata(sites):
+def _record_entries(distribution):
+    """Validate RECORD once without allocating a Path for each file."""
+    record = distribution.read_text("RECORD")
+    if not record:
+        return None
+    entries = []
+    try:
+        for row in csv.reader(record.splitlines(), strict=True):
+            if not 1 <= len(row) <= 3 or not row[0]:
+                return None
+            if len(row) == 3 and row[2] and int(row[2]) < 0:
+                return None
+            entries.append(row[0])
+    except (ValueError, csv.Error):
+        return None
+    return tuple(entries)
+
+
+def _record_names(entries, *, allow_external=False):
+    """Index bounded relative RECORD names without resolving unrelated files."""
+    if entries is None:
+        return None
+    names = set()
+    for item in entries:
+        parts = item.replace("\\", "/").split("/")
+        if item.startswith(("/", "\\")) or ":" in item or ".." in parts:
+            if not allow_external:
+                return None
+            continue
+        names.add(os.path.normcase(os.path.normpath(item)))
+    return names
+
+
+def _provides_loaded_modules(row, modules):
+    """Use RECORD overlap even when optional top-level hints are absent."""
+    modules = tuple(modules)
+    if not modules:
+        return False
+    entries = _record_entries(metadata.Distribution.at(row["metadata_path"]))
+    names = _record_names(entries, allow_external=True)
+    if names is None:
+        return True
+    module_paths = {
+        os.path.normcase(module.replace(".", "/")).replace("\\", "/")
+        for module in modules
+    }
+    module_ancestors = {
+        "/".join(parts[:index])
+        for module in module_paths
+        for parts in (module.split("/"),)
+        for index in range(1, len(parts))
+    }
+    for item in names:
+        parts = item.replace("\\", "/").split("/")
+        direct = "/".join((*parts[:-1], parts[-1].split(".", 1)[0]))
+        if direct in module_paths:
+            return True
+        if parts[-1].endswith((".py", ".pyc", *EXTENSION_SUFFIXES)) and (
+            direct in module_ancestors
+            or (
+                parts[-1].split(".", 1)[0] == "__init__"
+                and "/".join(parts[:-1]) in module_ancestors
+            )
+        ):
+            # A regular ancestor package (or module) blocks namespace traversal.
+            return True
+        for index in range(1, len(parts)):
+            if "/".join(parts[:index]) in module_paths:
+                return True
+    return False
+
+
+def _installed_metadata(sites, *, embedded_sites=None, embedded_owners=None):
     """Read metadata headers and invalid names without importing code."""
     # pylint: disable=protected-access
     from ..dependency_maintenance import authorized, check_admission
@@ -251,6 +343,8 @@ def _installed_metadata(sites):
     ):
         raise dependency_error("DEPENDENCY_REPAIR_REQUIRED")
     rows, invalid, observed = {}, {}, {}
+    candidates = {}
+    unresolved_roots = set()
     canonical_sites = {str(canonical_environment_path(site)) for site in sites}
     # Resolve each metadata parent once per observation, never across installs.
     parents = {}
@@ -273,6 +367,7 @@ def _installed_metadata(sites):
             ("Name", "Version"),
             ("Requires-Python",),
         ):
+            unresolved_roots.add(origin.parent)
             for claimed in installed_metadata.get_all("Name", []) or (key,):
                 invalid[
                     str(canonicalize_name(claimed))
@@ -287,17 +382,15 @@ def _installed_metadata(sites):
                 raise ValueError("invalid metadata")
             Version(version)
         except ValueError:
+            unresolved_roots.add(origin.parent)
             invalid[key] = "DEPENDENCY_METADATA_INVALID"
             continue
-        if key in rows:
-            if rows[key]["metadata_path"] == str(origin):
-                continue
-            invalid[key] = "DEPENDENCY_ENVIRONMENT_AMBIGUOUS"
+        if str(origin) in candidates:
             continue
         tops = set((distribution.read_text("top_level.txt") or "").split())
         if not tops:
             tops.add(key.replace("-", "_"))
-        rows[key] = {
+        row = {
             "version": version,
             "metadata_path": str(origin),
             "requires_dist": tuple(
@@ -305,7 +398,96 @@ def _installed_metadata(sites):
             ),
             "top_level": tuple(sorted(tops)),
         }
+        candidates[str(origin)] = (key, row, distribution)
+
+    # A search root is not necessarily an independent installation. Retain
+    # every candidate until explicit ancestor RECORD ownership is established.
+    inventories = {}
+    record_entries = {}
+
+    def entries(origin, distribution):
+        if origin not in record_entries:
+            record_entries[origin] = _record_entries(distribution)
+        return record_entries[origin]
+
+    embedded = set()
+    by_root = {}
+    for origin, candidate in candidates.items():
+        by_root.setdefault(Path(origin).parent, []).append((origin, candidate))
+    ancestor_candidates = {
+        root: [
+            candidate
+            for parent_root, group in by_root.items()
+            if root != parent_root and root.is_relative_to(parent_root)
+            for candidate in group
+        ]
+        for root in by_root
+    }
+    for origin, (key, _row, distribution) in candidates.items():
+        path = Path(origin)
+        ancestors = ancestor_candidates[path.parent]
+        if not ancestors:
+            continue
+        owners = []
+        possible = []
+        for parent_origin, (_name, _row, parent) in ancestors:
+            if parent_origin not in inventories:
+                inventories[parent_origin] = _record_names(
+                    entries(parent_origin, parent),
+                    allow_external=True,
+                )
+            names = inventories[parent_origin]
+            root = Path(parent_origin).parent
+            marker = os.path.normcase(
+                os.path.normpath(
+                    str((path / "METADATA").relative_to(root)),
+                ),
+            )
+            if names is not None and marker in names:
+                possible.append((parent_origin, root, names))
+        if possible:
+            names = _record_names(entries(origin, distribution))
+            required = (
+                {
+                    canonical_environment_path(path.parent / item)
+                    for item in names
+                }
+                if names
+                else set()
+            )
+            if path / "METADATA" in required and all(
+                item.is_relative_to(path.parent) for item in required
+            ):
+                for parent_origin, root, inventory in possible:
+                    if all(
+                        os.path.normcase(
+                            os.path.normpath(str(item.relative_to(root))),
+                        )
+                        in inventory
+                        for item in required
+                    ):
+                        owners.append(parent_origin)
+        if len(owners) == 1:
+            embedded.add(origin)
+            if embedded_owners is not None:
+                embedded_owners[origin] = owners[0]
+        elif len(owners) > 1:
+            invalid[key] = "DEPENDENCY_ENVIRONMENT_AMBIGUOUS"
+    for origin, (key, row, distribution) in candidates.items():
+        if origin in embedded:
+            continue
+        if key in rows:
+            invalid[key] = "DEPENDENCY_ENVIRONMENT_AMBIGUOUS"
+            continue
+        rows[key] = row
         observed[key] = distribution
+    if embedded_sites is not None:
+        embedded_sites.update(
+            str(root)
+            for root, group in by_root.items()
+            if root not in unresolved_roots
+            and all(origin in embedded for origin, _candidate in group)
+        )
     return rows, invalid, observed
 
 
@@ -366,7 +548,11 @@ def _dependency_closure(requirements, rows, environment):
 
 # Inventory and relevant-closure rejection form one child-only audit.
 # pylint: disable=too-many-branches,too-many-statements,protected-access
-def observe_dependencies(packet: Mapping[str, Any]) -> DependencySnapshot:
+def observe_dependencies(
+    packet: Mapping[str, Any],
+    *,
+    _embedded_owners=None,
+) -> DependencySnapshot:
     """Inspect this interpreter's paths before candidate imports execute."""
     excluded = {Path(packet["code_root"]).resolve()}
     sites = tuple(
@@ -380,7 +566,12 @@ def observe_dependencies(packet: Mapping[str, Any]) -> DependencySnapshot:
             )
         ),
     )
-    rows, invalid, observed = _installed_metadata(sites)
+    embedded_sites = set()
+    rows, invalid, observed = _installed_metadata(
+        sites,
+        embedded_sites=embedded_sites,
+        embedded_owners=_embedded_owners,
+    )
     from .runtime import _requirements
 
     scanned = set()
@@ -422,7 +613,7 @@ def observe_dependencies(packet: Mapping[str, Any]) -> DependencySnapshot:
             "distributions": rows,
             "dependency_sites": list(
                 dependency_sites(
-                    sites,
+                    (site for site in sites if site not in embedded_sites),
                     explicit=packet.get("dependency_paths", ()),
                     distributions=rows.values(),
                 ),

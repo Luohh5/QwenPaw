@@ -367,6 +367,7 @@ async def admit_shared_dependencies(
     admission_token=None,
     snapshot=None,
     targets=(),
+    validate=None,
 ):
     """Audit and admit the exact consumer under environment exclusion."""
     from .execution.dependencies import DependencySnapshot
@@ -383,7 +384,11 @@ async def admit_shared_dependencies(
     # Release before reacquiring one changed root set; never re-enter prepare.
     for _attempt in range(2):
         async with environment_coordinator(keys):
+            if validate is not None:
+                validate()
             observed = await audit()
+            if validate is not None:
+                validate()
             if (
                 not isinstance(observed, DependencySnapshot)
                 or observed.dependency_sites is None
@@ -393,7 +398,11 @@ async def admit_shared_dependencies(
                 _canonical_dependency_roots,
                 observed.dependency_sites,
             )
-            if actual != keys:
+            if validate is not None:
+                validate()
+            if actual != keys and not (
+                validate is not None and actual.issubset(keys)
+            ):
                 keys = actual
                 continue
             _refine_admission(
@@ -409,6 +418,8 @@ async def admit_shared_dependencies(
                 usage_registry=usage_registry,
                 admission_token=admission_token,
             )
+            if validate is not None:
+                validate()
             if not decision.already_satisfied:
                 raise SharedDependencyError(decision)
             _refine_admission(
@@ -439,6 +450,7 @@ def evaluate_shared_dependencies(
     from packaging.version import Version
     from .execution.dependencies import (
         _installed_metadata,
+        _provides_loaded_modules,
         repair_marker,
         retains_installed_wheel_source,
     )
@@ -611,6 +623,33 @@ def evaluate_shared_dependencies(
             }
             for name, pin in evidence.distributions.items():
                 fresh = inventory.get(name)
+                if fresh is not None and pin.get("loaded_modules"):
+                    embedded_tops = set(pin.get("loaded_modules", ()))
+                    # Loaded embedded modules remain pinned to their owner.
+                    # A newly visible public provider would resolve differently
+                    # after restart, even when the owning wheel is unchanged.
+                    for provider_name, provider in {
+                        **inventory,
+                        **{
+                            key: row
+                            for key, row in snapshot.distributions.items()
+                            if str(
+                                canonical(Path(row["metadata_path"]).parent),
+                            )
+                            in (
+                                {target}
+                                if target is not None
+                                else visible or set()
+                            )
+                        },
+                    }.items():
+                        if provider_name in evidence.distributions:
+                            continue
+                        if _provides_loaded_modules(provider, embedded_tops):
+                            conflicts.append(
+                                f"host {use.plugin_id}: {provider_name} "
+                                "shadows a loaded embedded module",
+                            )
                 if fresh is None:
                     missing.append(f"{name}=={pin['version']}")
                 elif fresh["version"] != pin["version"] or (

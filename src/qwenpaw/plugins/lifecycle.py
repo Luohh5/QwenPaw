@@ -514,7 +514,7 @@ class PluginLifecycle:
         wheels=(),
         owns_dependency_env=True,
     ):
-        """Enforce dependency ownership while retaining read-only checks."""
+        """Enforce dependency ownership for preparation and probes."""
         owns_dependency_env = (
             self.delegate.owns_dependency_env(
                 binding.description.manifest.id,
@@ -527,6 +527,29 @@ class PluginLifecycle:
             wheels=wheels if owns_dependency_env else (),
             owns_dependency_env=owns_dependency_env,
         )
+
+    async def preflight_backend(
+        self,
+        binding,
+        *,
+        allow_install,
+        probe,
+        **kwargs,
+    ):
+        """Retain Python's independent audit before lifecycle/disk changes."""
+        from .python_backend import PythonBackend
+
+        snapshot = await self.prepare_backend(
+            binding,
+            allow_install=allow_install,
+            probe=probe,
+            **kwargs,
+        )
+        if snapshot is None and isinstance(binding.backend, PythonBackend):
+            snapshot = await binding.backend.audit_dependencies(
+                binding.description,
+            )
+        return snapshot
 
     def get_instance(self, plugin_id: str) -> PluginInstance | None:
         return self._instances.get(plugin_id)
@@ -1077,7 +1100,7 @@ class PluginLifecycle:
                     (load_config().plugins or {}).get(plugin_id),
                 )
             )
-            await self.prepare_backend(
+            await self.preflight_backend(
                 binding,
                 allow_install=False,
                 probe=probes_before_activation(binding),

@@ -1182,7 +1182,7 @@ async def continue_operation(directory, *, preflight=False):
             observed.distributions,
             observed.marker_environment,
         )
-        await loader.lifecycle.prepare_backend(
+        await loader.lifecycle.preflight_backend(
             binding,
             allow_install=False,
             probe=True,

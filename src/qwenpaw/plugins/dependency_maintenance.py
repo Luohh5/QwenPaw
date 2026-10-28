@@ -309,7 +309,7 @@ def file_lock(path, timeout=0, *, reader_site=None):
     try:
         while not _try_lock(descriptor):
             if reader_site is not None:
-                check_admission(reader_site)
+                check_admission(reader_site, check_repair=False)
             if time.monotonic() >= deadline:
                 raise RuntimeError(
                     "DEPENDENCY_ENVIRONMENT_BUSY: another operation owns the environment.",
@@ -341,7 +341,9 @@ def _lease_environment(sites, parent_pid=None, timeout=5):
         root = Path(identity)
         if identity in _READERS or not root.is_dir():
             continue
-        check_admission(root)
+        # A live additive writer also holds a temporary repair marker. Classify
+        # it only under the gate; maintenance still blocks new readers now.
+        check_admission(root, check_repair=False)
         permitted = authorized(root)
 
         @contextmanager

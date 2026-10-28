@@ -344,7 +344,7 @@ async def prepare_channel_upgrade():
                             plugin_id
                         ] = "OFFICIAL_CHANNEL_IDENTITY_MISMATCH"
                         continue
-                    await loader.lifecycle.prepare_backend(
+                    await loader.lifecycle.preflight_backend(
                         binding,
                         allow_install=True,
                         probe=True,

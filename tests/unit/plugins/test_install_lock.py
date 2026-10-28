@@ -426,6 +426,120 @@ else:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "repair", "maintenance"])
+async def test_reader_admission_waits_for_publication(tmp_path, outcome):
+    """A live writer's temporary repair marker is not an abandoned write."""
+    import asyncio
+    import sys
+
+    from qwenpaw.plugins import dependency_maintenance as maintenance
+
+    site = tmp_path / "site"
+    site.mkdir()
+    source = str(Path(lock_mod.__file__).resolve().parents[2])
+    script = (
+        f"import sys\nsys.path.insert(0, {source!r})\n"
+        + """
+from pathlib import Path
+from qwenpaw.plugins import dependency_maintenance as m
+site = Path(sys.argv[1])
+original = m._try_lock
+attempts = 0
+def observed(fd):
+    global attempts
+    acquired = original(fd)
+    if not acquired and attempts < 2:
+        attempts += 1
+        print('blocked', flush=True)
+        sys.stdin.readline()
+    return acquired
+m._try_lock = observed
+try:
+    m.lease_environment([site])
+    print('admitted', flush=True)
+    sys.stdin.readline()
+except RuntimeError as exc:
+    print(str(exc).split(':')[0], flush=True)
+finally:
+    m._close_readers()
+"""
+    )
+    peer = None
+    repair = maintenance.repair_marker(site)
+    barrier = maintenance.marker(site)
+
+    async def line():
+        return (
+            (await asyncio.wait_for(peer.stdout.readline(), 5))
+            .decode()
+            .strip()
+        )
+
+    async def resume():
+        peer.stdin.write(b"continue\n")
+        await peer.stdin.drain()
+
+    try:
+        with lock_mod.plugin_install_lock(
+            lock_mod.environment_install_lock_path(site),
+        ):
+            if outcome != "maintenance":
+                repair.write_text("publication pending")
+            peer = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-I",
+                "-c",
+                script,
+                str(site),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={
+                    **os.environ,
+                    "QWENPAW_DEPENDENCY_STATE_DIR": str(
+                        maintenance.state_root(),
+                    ),
+                },
+            )
+            assert await line() == "blocked"
+            if outcome == "maintenance":
+                barrier.write_text("{}")
+            await resume()
+            expected = (
+                "DEPENDENCY_MAINTENANCE_REQUIRED"
+                if outcome == "maintenance"
+                else "blocked"
+            )
+            assert await line() == expected
+            assert not maintenance.live_readers([site])
+            if outcome == "success":
+                repair.unlink()
+        if outcome != "maintenance":
+            await resume()
+            expected = (
+                "admitted"
+                if outcome == "success"
+                else "DEPENDENCY_REPAIR_REQUIRED"
+            )
+            assert await line() == expected
+            readers = maintenance.live_readers([site])
+            assert [row["pid"] for row in readers] == (
+                [peer.pid] if outcome == "success" else []
+            )
+            if outcome == "success":
+                await resume()
+        _stdout, stderr = await asyncio.wait_for(peer.communicate(), 5)
+        assert peer.returncode == 0, stderr.decode()
+        assert not maintenance.live_readers([site])
+    finally:
+        if peer is not None and peer.returncode is None:
+            peer.kill()
+            await peer.wait()
+        repair.unlink(missing_ok=True)
+        barrier.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
 async def test_async_lock_cancellation_waits_for_real_acquisition(lock_path):
     """A cancelled waiter cannot leave a late acquired descriptor locked."""
     import asyncio

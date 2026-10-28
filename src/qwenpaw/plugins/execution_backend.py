@@ -126,7 +126,11 @@ class ExecutionBackend(Protocol):
         wheels: tuple = (),
         owns_dependency_env: bool = True,
     ) -> DependencySnapshot | None:
-        """Prepare/probe as requested, optionally returning actual evidence."""
+        """Prepare/probe, optionally returning evidence already produced.
+
+        Final admission always audits under exclusion. Callers needing a
+        separate preflight retain that audit before lifecycle/disk changes.
+        """
 
     async def load_definition(
         self,

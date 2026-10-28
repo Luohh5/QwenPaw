@@ -547,6 +547,102 @@ async def test_async_loader_leases_before_loop_registry_publication(
     assert events == ["lease", "registry", "publish"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["stable", "changed", "preflight_invalid"])
+async def test_preparation_and_admission_keep_only_required_real_audits(
+    tmp_path,
+    monkeypatch,
+    case,
+):
+    import sys
+    from qwenpaw.plugins.dependency_gate import GateDecision
+    from qwenpaw.plugins.dependency_usage import (
+        DependencyDeclaration,
+        DependencyUsageRegistry,
+    )
+    from qwenpaw.plugins.execution_backend import BackendBinding
+    from qwenpaw.plugins.lifecycle import PluginLifecycle
+    from qwenpaw.plugins.ownership import RuntimeOwners
+    from qwenpaw.plugins.python_backend import PythonBackend
+
+    site, added, source = (
+        tmp_path / part for part in ("site", "added", "plugin")
+    )
+    for path in (site, added, source):
+        path.mkdir()
+    for root, name in ((site, "initial"), (added, "added")):
+        info = root / f"{name}-1.0.dist-info"
+        info.mkdir()
+        (info / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n",
+        )
+        (info / "RECORD").write_text(f"{info.name}/METADATA,,\n")
+    dormant = tmp_path / "not-yet-visible"
+    added.rename(dormant)
+    monkeypatch.setattr(sys, "path", [str(site), str(added)])
+
+    async def ensure(*args, **kwargs):
+        return GateDecision(False, True)
+
+    backend = PythonBackend(SimpleNamespace(ensure_dependencies=ensure))
+    description = SimpleNamespace(
+        manifest=SimpleNamespace(id="audit-count", sdk=None),
+        source_path=source,
+        payload=None,
+        requirements=(),
+    )
+    binding = BackendBinding(backend, description)
+    usage = DependencyUsageRegistry(RuntimeOwners())
+    loader = SimpleNamespace(registry=SimpleNamespace(dependency_usage=usage))
+    lifecycle = PluginLifecycle(loader)
+    real_audit, audits = backend.audit_dependencies, []
+    calls = []
+
+    async def counted(*args, **kwargs):
+        if case == "changed" and not calls:
+            # Keep the captured search path identity stable while a previously
+            # absent root becomes visible after lock hints were selected.
+            dormant.rename(added)
+        calls.append(True)
+        observed = await real_audit(*args, **kwargs)
+        audits.append(observed)
+        return observed
+
+    monkeypatch.setattr(backend, "audit_dependencies", counted)
+    if case == "preflight_invalid":
+        from qwenpaw.plugins.dependency_maintenance import repair_marker
+
+        marker = repair_marker(site)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("repair required")
+        with pytest.raises(RuntimeError, match="DEPENDENCY_REPAIR_REQUIRED"):
+            await lifecycle.preflight_backend(
+                binding,
+                allow_install=False,
+                probe=False,
+                owns_dependency_env=False,
+            )
+        assert len(calls) == 1
+        return
+    prepared = await lifecycle.prepare_backend(
+        binding,
+        allow_install=False,
+        probe=False,
+    )
+    assert calls == []
+    token = usage.declare(DependencyDeclaration("audit-count", None, (), None))
+    admitted = await PluginLoader._admit_dependencies(
+        loader,
+        binding,
+        token,
+        prepared,
+    )
+    assert len(audits) == (2 if case == "changed" else 1)
+    assert set(admitted.distributions) == (
+        {"initial", "added"} if case == "changed" else {"initial"}
+    )
+
+
 @pytest.fixture
 def controlled_import_snapshot(monkeypatch):
     """Exercise real module changes without scanning other suites' imports."""
@@ -595,6 +691,185 @@ def test_host_dependency_record_retains_loaded_ownership(tmp_path):
         stream.write("unrelated.py,,not-a-size\n")
     with pytest.raises(ValueError):
         _files_for_loaded_origins(distribution, origins)
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        "owned",
+        "unowned",
+        "independent",
+        "alias",
+        "namespace",
+        "namespace_overlap",
+        "namespace_parent",
+        "namespace_module",
+        "mixed",
+    ],
+)
+def test_dependency_directory_classification_retains_provider_ownership(
+    tmp_path,
+    layout,
+):
+    from qwenpaw.plugins.execution.dependencies import (
+        _installed_metadata,
+        dependency_sites,
+        observe_dependencies,
+    )
+    from qwenpaw.plugins.python_backend import _observe_host_dependencies
+
+    site = tmp_path / "site"
+    nested = site / "owner" / "_vendor"
+    nested.mkdir(parents=True)
+
+    def install(root, name, version, files):
+        info = root / f"{name}-{version}.dist-info"
+        info.mkdir()
+        (info / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
+        )
+        entries = [f"{info.name}/METADATA", f"{info.name}/RECORD", *files]
+        (info / "RECORD").write_text("".join(f"{p},,\n" for p in entries))
+        return info
+
+    namespace = layout.startswith("namespace")
+    loaded_module = "shared_namespace.one" if namespace else "sample_sdk"
+    module = {
+        "namespace": "shared_namespace/two.py",
+        "namespace_overlap": "shared_namespace/one.py",
+        "namespace_parent": "shared_namespace/__init__.py",
+        "namespace_module": "shared_namespace.py",
+    }.get(layout, "sample_sdk.py")
+    public = site / module
+    public.parent.mkdir(exist_ok=True)
+    public.write_text("VALUE = 'public'\n")
+    embedded = nested / (
+        "shared_namespace/one.py" if namespace else "sample_sdk.py"
+    )
+    embedded.parent.mkdir(exist_ok=True)
+    embedded.write_text("VALUE = 'embedded'\n")
+    public_info = install(site, "sample_sdk", "2.0", [module])
+    nested_info = install(
+        nested,
+        "sample_sdk",
+        "1.0",
+        [embedded.relative_to(nested).as_posix()],
+    )
+    owned = (
+        []
+        if layout == "unowned"
+        else [
+            path.relative_to(site).as_posix()
+            for path in (
+                embedded,
+                nested_info / "METADATA",
+                nested_info / "RECORD",
+            )
+        ]
+    )
+    owner_info = install(site, "owner", "1.0", owned)
+    if layout == "mixed":
+        neighbor = nested / "independent.py"
+        neighbor.write_text("VALUE = 'independent'\n")
+        neighbor_info = install(
+            nested,
+            "independent",
+            "1.0",
+            [neighbor.name],
+        )
+    if layout == "independent":
+        other = tmp_path / "independent"
+        other.mkdir()
+        install(other, "sample_sdk", "3.0", [])
+        paths = (site, nested, other)
+    elif layout == "alias":
+        alias = tmp_path / "site-alias"
+        alias.symlink_to(site, target_is_directory=True)
+        paths = (site, alias, alias / "owner/_vendor")
+    else:
+        paths = (site, nested)
+    classified = dependency_sites(paths)
+    # Lock hints stay conservative until the RECORD audit proves ownership.
+    assert classified[:2] == (str(site.resolve()), str(nested.resolve()))
+    packet = {"code_root": tmp_path / "plugin", "_audit_sites": paths}
+    snapshot = observe_dependencies(packet)
+    if layout not in {"unowned", "independent"}:
+        expected_sites = (
+            (str(site.resolve()), str(nested.resolve()))
+            if layout == "mixed"
+            else (str(site.resolve()),)
+        )
+        assert snapshot.dependency_sites == expected_sites
+        assert snapshot.distributions["sample-sdk"]["metadata_path"] == (
+            str(public_info)
+        )
+        if layout == "mixed":
+            assert snapshot.distributions["independent"]["metadata_path"] == (
+                str(neighbor_info)
+            )
+    else:
+        assert "sample-sdk" not in snapshot.distributions
+        assert _installed_metadata(classified)[1]["sample-sdk"] == (
+            "DEPENDENCY_ENVIRONMENT_AMBIGUOUS"
+        )
+        return
+    observed, imported = _observe_host_dependencies(
+        tmp_path / "plugin",
+        paths,
+        ((loaded_module, str(embedded)),),
+    )
+    assert observed.distributions["sample-sdk"]["metadata_path"] == (
+        str(public_info)
+    )
+    assert imported["owner"]["metadata_path"] == str(owner_info)
+    assert ("sample-sdk" in imported) is (layout != "namespace")
+    from dataclasses import replace
+    from qwenpaw.plugins.dependency_gate import evaluate_shared_dependencies
+
+    use = SimpleNamespace(
+        plugin_id="loaded-owner",
+        instance_id=None,
+        generation=None,
+        origin="host",
+        active=True,
+        environment=observed,
+        snapshot=replace(observed, distributions=imported),
+    )
+    decision = evaluate_shared_dependencies(
+        None,
+        observed,
+        plugin_id="incoming",
+        uses=(use,),
+    )
+    assert not decision.require_restart
+    assert not decision.host_conflicts
+    if layout == "namespace":
+        return
+
+    # Observe a real loaded embedded copy before the public provider exists.
+    import shutil
+
+    public.unlink()
+    shutil.rmtree(public_info)
+    before, imported = _observe_host_dependencies(
+        tmp_path / "plugin",
+        paths,
+        ((loaded_module, str(embedded)),),
+    )
+    public.write_text("VALUE = 'public'\n")
+    install(site, "sample_sdk", "2.0", [module])
+    use.snapshot = replace(before, distributions=imported)
+    decision = evaluate_shared_dependencies(
+        None,
+        observed,
+        plugin_id="incoming",
+        uses=(use,),
+    )
+    assert decision.require_restart
+    assert any(
+        "sample-sdk shadows a loaded embedded module" in conflict
+        for conflict in decision.host_conflicts
+    )
 
 
 @pytest.mark.asyncio
@@ -795,7 +1070,7 @@ async def test_async_dependency_targets_reject_changed_host_paths(
         )
     )
     admission = await backend.prepare_dependency_targets(
-        SimpleNamespace(id="test"),
+        SimpleNamespace(id="test", source_path=tmp_path / "plugin"),
     )
     admission.validate()
     if kind == "python":

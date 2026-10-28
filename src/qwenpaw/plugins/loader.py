@@ -1629,6 +1629,15 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 "DEPENDENCY_PLAN_UNVERIFIED: fresh audit unavailable",
             )
 
+        prepared = None
+        if snapshot is None:
+            prepare = getattr(
+                binding.backend,
+                "prepare_dependency_targets",
+                None,
+            )
+            if prepare is not None:
+                prepared = await prepare(binding.description)
         return await admit_shared_dependencies(
             lambda: audit(binding.description),
             plugin_id=binding.description.manifest.id,
@@ -1636,6 +1645,8 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             usage_registry=self.registry.dependency_usage,
             admission_token=token,
             snapshot=snapshot,
+            targets=prepared.targets if prepared is not None else (),
+            validate=prepared.validate if prepared is not None else None,
         )
 
     async def _dispose_then_undo_txn_disk(
@@ -1991,7 +2002,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         if activate and record.enabled:
             try:
                 if not prepared and probes_before_activation(binding):
-                    await self.lifecycle.prepare_backend(
+                    await self.lifecycle.preflight_backend(
                         binding,
                         allow_install=False,
                         probe=True,
@@ -3123,7 +3134,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 old_config.get("enabled", True)
                 and not restoring_saved_definition
             ):
-                await self.lifecycle.prepare_backend(
+                await self.lifecycle.preflight_backend(
                     restored_binding,
                     allow_install=False,
                     probe=probes_before_activation(restored_binding),
@@ -3275,7 +3286,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                     entry,
                     [str(entry.parent), str(source_path)],
                 )
-            await self.lifecycle.prepare_backend(
+            await self.lifecycle.preflight_backend(
                 binding,
                 allow_install=True,
                 probe=False,
@@ -3534,7 +3545,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         if self._has_runtime_custody(plugin_id):
             raise RuntimeError("CHANNEL_INSTANCE_STILL_OWNED; needs_restart")
         if enabled and not _bundled_seed:
-            await self.lifecycle.prepare_backend(
+            await self.lifecycle.preflight_backend(
                 candidate_binding,
                 allow_install=True,
                 probe=True,
@@ -3894,7 +3905,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             from .dependency_gate import SharedDependencyError
 
             try:
-                await self.lifecycle.prepare_backend(
+                await self.lifecycle.preflight_backend(
                     binding,
                     allow_install=True,
                     probe=True,

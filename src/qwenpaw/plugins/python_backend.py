@@ -113,14 +113,19 @@ def _host_dependency_state():
 def _observe_host_dependencies(code_root, paths, loaded_origins):
     """Read metadata and RECORD ownership using only detached origins."""
     from importlib.metadata import PathDistribution
-    from .execution.dependencies import observe_dependencies
+    from .execution.dependencies import (
+        _provides_loaded_modules,
+        observe_dependencies,
+    )
 
+    embedded_owners = {}
     snapshot = observe_dependencies(
         {
             "code_root": code_root,
             "_audit_sites": paths,
             "dependency_paths": (),
         },
+        _embedded_owners=embedded_owners,
     )
     loaded = {name: Path(origin) for name, origin in loaded_origins}
     resolved = {path: path.resolve() for path in set(loaded.values())}
@@ -134,12 +139,37 @@ def _observe_host_dependencies(code_root, paths, loaded_origins):
             relative_origins[root] = _relative_module_origins(origins, root)
         files = _files_for_loaded_origins(distribution, relative_origins[root])
         if files is not None:
-            if any(
-                os.path.normcase(os.path.normpath(item))
-                in relative_origins[root]
-                for item in files
-            ):
+            owned = {
+                os.path.normcase(os.path.normpath(item)) for item in files
+            }
+            if owned.intersection(relative_origins[root]):
                 imported[name] = row
+                embedded_roots = [
+                    Path(site).parent
+                    for site, owner in embedded_owners.items()
+                    if owner == row["metadata_path"]
+                ]
+                if embedded_roots:
+                    modules = {
+                        module_name
+                        for module_name, path in loaded.items()
+                        if module_name.split(".", 1)[0] not in row["top_level"]
+                        and any(
+                            resolved[path].is_relative_to(site)
+                            for site in embedded_roots
+                        )
+                        and owned.intersection(
+                            _relative_module_origins(
+                                (path, resolved[path]),
+                                root,
+                            ),
+                        )
+                    }
+                    if modules:
+                        imported[name] = {
+                            **row,
+                            "loaded_modules": tuple(sorted(modules)),
+                        }
             continue
         # Legacy metadata without a file inventory needs top-level origin
         # evidence; RECORD ownership never uses this guess.
@@ -158,6 +188,20 @@ def _observe_host_dependencies(code_root, paths, loaded_origins):
             for module_name, path in loaded.items()
         ):
             imported[name] = row
+    embedded_modules = {
+        module
+        for row in imported.values()
+        for module in row.get("loaded_modules", ())
+    }
+    if embedded_modules:
+        # Preserve the public-provider baseline too: existing coexistence is
+        # stable, while later additions or replacement must require restart.
+        for name, row in snapshot.distributions.items():
+            if name not in imported and _provides_loaded_modules(
+                row,
+                embedded_modules,
+            ):
+                imported[name] = row
     return snapshot, imported
 
 
@@ -248,18 +292,25 @@ class PythonBackend:
         )
 
     @staticmethod
-    async def prepare_dependency_targets(_description):
+    async def prepare_dependency_targets(description):
         from .execution.dependencies import dependency_sites
         from ..utils.io_utils import run_sync_io
 
-        paths = tuple(sys.path)
-        targets = await run_sync_io(
-            dependency_sites,
-            tuple(p for p in paths if p),
-        )
+        cwd = os.getcwd()
+        paths = _host_paths(cwd)
+
+        def discover():
+            code_root = Path(cwd, description.source_path).resolve()
+            return dependency_sites(
+                path
+                for path in paths
+                if not Path(path).resolve().is_relative_to(code_root)
+            )
+
+        targets = await run_sync_io(discover)
 
         def validate():
-            if tuple(sys.path) != paths:
+            if os.getcwd() != cwd or _host_paths(cwd) != paths:
                 raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
 
         prepared = PreparedDependencyTargets(
@@ -334,7 +385,7 @@ class PythonBackend:
             )
             if failed is not None:
                 raise RuntimeError("; ".join(failed.errors))
-        return await self.audit_dependencies(description)
+        return None
 
     async def audit_dependencies(
         self,
