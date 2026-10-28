@@ -133,7 +133,7 @@ export function AgentBackendFields({ form, open }: AgentBackendFieldsProps) {
                 </button>
               ))}
           </div>
-          <a href="/market?tab=plugins&view=market">
+          <a href="/market?tab=plugins&view=official">
             {t("agent.backend.installPlugin")}
           </a>
           {backend !== "qwenpaw" && selected?.status !== "available" && (

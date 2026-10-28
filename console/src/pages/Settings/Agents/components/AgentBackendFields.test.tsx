@@ -77,7 +77,7 @@ describe("AgentBackendFields", () => {
     expect(screen.getByText("agent.backend.nativeTitle")).toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: "agent.backend.installPlugin" }),
-    ).toHaveAttribute("href", expect.stringContaining("/market"));
+    ).toHaveAttribute("href", "/market?tab=plugins&view=official");
     expect(screen.queryByText("Codex")).not.toBeInTheDocument();
     expect(screen.queryByText("Qoder")).not.toBeInTheDocument();
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());

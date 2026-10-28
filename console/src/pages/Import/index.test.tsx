@@ -160,7 +160,7 @@ describe("ImportPage", () => {
       );
       expect(screen.getByTestId("location")).toHaveTextContent(
         `/market?tab=plugins&view=${
-          pluginState === "missing" ? "market" : "installed"
+          pluginState === "missing" ? "official" : "installed"
         }&plugin=qwenpaw-harness-codex`,
       );
       expect(actions.scan).not.toHaveBeenCalled();
@@ -195,7 +195,7 @@ describe("ImportPage", () => {
       );
       expect(screen.getByTestId("location")).toHaveTextContent(
         `/market?tab=plugins&view=${
-          pluginState === "missing" ? "market" : "installed"
+          pluginState === "missing" ? "official" : "installed"
         }&plugin=qwenpaw-harness-codex`,
       );
     },

@@ -206,7 +206,7 @@ function ImportWorkflow() {
   const manageHarness = (pluginId: string, state: string) =>
     navigate(
       `/market?tab=plugins&view=${
-        state === "missing" ? "market" : "installed"
+        state === "missing" ? "official" : "installed"
       }&plugin=${encodeURIComponent(pluginId)}`,
     );
   const [sourceSelections, setSourceSelections] = useState<

@@ -88,7 +88,13 @@ export default function PluginManagerPage() {
     {
       key: "official",
       label: t("pluginManager.officialTitle"),
-      children: <OfficialPluginList onInstalled={handleInstalled} />,
+      children: (
+        <OfficialPluginList
+          key={targetPlugin}
+          initialSearch={targetPlugin}
+          onInstalled={handleInstalled}
+        />
+      ),
     },
     {
       key: "market",

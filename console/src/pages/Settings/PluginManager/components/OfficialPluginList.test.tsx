@@ -71,6 +71,51 @@ describe("OfficialPluginList", () => {
     vi.restoreAllMocks();
   });
 
+  it("filters Harness plugins by the linked plugin ID and keeps search editable", () => {
+    hoisted.plugins.push(
+      makeEntry("1.0.0", {
+        id: "codex-1.0.0",
+        plugin_id: "qwenpaw-harness-codex",
+        name: "Codex",
+      }),
+      makeEntry("1.0.0", {
+        id: "qoder-1.0.0",
+        plugin_id: "qwenpaw-harness-qoder",
+        name: "Qoder",
+      }),
+    );
+    const onInstalled = vi.fn();
+    const { rerender } = render(
+      <OfficialPluginList
+        key="qwenpaw-harness-codex"
+        onInstalled={onInstalled}
+        initialSearch="qwenpaw-harness-codex"
+      />,
+    );
+    let search = screen.getByPlaceholderText("pluginManager.filterByName");
+    expect(search).toHaveValue("qwenpaw-harness-codex");
+    expect(screen.getByRole("article", { name: "Codex" })).toBeVisible();
+    expect(screen.queryByRole("article", { name: "Qoder" })).toBeNull();
+
+    rerender(
+      <OfficialPluginList
+        key="qwenpaw-harness-qoder"
+        onInstalled={onInstalled}
+        initialSearch="qwenpaw-harness-qoder"
+      />,
+    );
+    search = screen.getByPlaceholderText("pluginManager.filterByName");
+    expect(search).toHaveValue("qwenpaw-harness-qoder");
+    expect(screen.getByRole("article", { name: "Qoder" })).toBeVisible();
+    expect(screen.queryByRole("article", { name: "Codex" })).toBeNull();
+
+    fireEvent.change(search, { target: { value: "cOdEx" } });
+    expect(screen.getByRole("article", { name: "Codex" })).toBeVisible();
+    expect(screen.queryByRole("article", { name: "Qoder" })).toBeNull();
+    fireEvent.change(search, { target: { value: "" } });
+    expect(screen.getAllByRole("article")).toHaveLength(2);
+  });
+
   it("renders one card per plugin and defaults to its newest version", () => {
     hoisted.plugins.push(
       makeEntry("1.0.1"),
