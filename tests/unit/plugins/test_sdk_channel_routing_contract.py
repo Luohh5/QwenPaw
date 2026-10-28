@@ -1078,6 +1078,7 @@ async def test_lifecycle_terminal_callback_cannot_start_new_model_work(
 async def test_interrupt_reload_retains_blocked_terminal_until_public_retry(
     tmp_path,
     monkeypatch,
+    bounded_dependency_environment,
 ):
     from qwenpaw.app.channels.base import BaseChannel
     from qwenpaw.plugins import PluginBusyError

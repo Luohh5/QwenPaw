@@ -7,6 +7,30 @@ import pytest
 from qwenpaw.plugins.registry import PluginRegistry
 
 
+@pytest.fixture
+def bounded_dependency_environment(tmp_path, monkeypatch):
+    """Keep real dependency admission, with a small fixture-owned inventory."""
+    from qwenpaw.plugins import python_backend
+
+    site = tmp_path / "dependency-site"
+    metadata = site / "lifecycle_fixture-1.0.dist-info"
+    metadata.mkdir(parents=True)
+    (metadata / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: lifecycle-fixture\nVersion: 1.0\n",
+        encoding="utf-8",
+    )
+    (metadata / "RECORD").write_text(
+        f"{metadata.name}/METADATA,,\n{metadata.name}/RECORD,,\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        python_backend,
+        "_host_paths",
+        lambda cwd: (str(site),),
+    )
+    return site
+
+
 @pytest.fixture(name="short_interrupt_timeout")
 def bounded_interrupt_timeout(monkeypatch):
     """Exercise blocked lifecycle retries without the production 5s wait."""

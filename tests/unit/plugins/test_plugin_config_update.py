@@ -369,6 +369,7 @@ async def test_cancel_during_config_save_keeps_runtime_and_disk_consistent(
     fresh_registry,
     monkeypatch,
     save_succeeds,
+    bounded_dependency_environment,
 ):
     config_path = tmp_path / "config.json"
     monkeypatch.setattr(
@@ -411,10 +412,12 @@ async def test_cancel_during_config_save_keeps_runtime_and_disk_consistent(
         task.cancel()
         await asyncio.sleep(0)
         assert not task.done()
-    finally:
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
     expected = "new" if save_succeeds else "old"
     assert loader.lifecycle.get_instance("cfg").config == {"cmd": expected}
     assert workspace.plugins.slash_command_registry.names() == [expected]
