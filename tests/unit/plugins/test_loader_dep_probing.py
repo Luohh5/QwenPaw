@@ -1312,7 +1312,7 @@ spec = importlib.util.spec_from_file_location('maintenance', sys.argv[1])
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 site = Path(sys.argv[2])
-with m.file_lock(m._gate(site)):
+with m.file_lock(m._gate(site)), m.file_lock(m._admission_gate(site)):
     marker = m.repair_marker(site)
     marker.write_text('Shared dependency publication requires verification.\\n')
     print('READY', flush=True)
@@ -1341,7 +1341,13 @@ print('COMPLETED', flush=True)
             )
             == b"READY\n"
         )
-        gate_stat = maintenance._gate(site).stat()
+        gates = {
+            (stat.st_dev, stat.st_ino)
+            for stat in (
+                maintenance._gate(site).stat(),
+                maintenance._admission_gate(site).stat(),
+            )
+        }
         contended = asyncio.Event()
         loop = asyncio.get_running_loop()
 
@@ -1349,10 +1355,7 @@ print('COMPLETED', flush=True)
             def acquire(fd):
                 acquired = real_lock(fd)
                 stat = os.fstat(fd)
-                if (stat.st_dev, stat.st_ino) == (
-                    gate_stat.st_dev,
-                    gate_stat.st_ino,
-                ) and not acquired:
+                if (stat.st_dev, stat.st_ino) in gates and not acquired:
                     loop.call_soon_threadsafe(contended.set)
                 return acquired
 

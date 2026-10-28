@@ -480,8 +480,11 @@ finally:
         await peer.stdin.drain()
 
     try:
-        with lock_mod.plugin_install_lock(
-            lock_mod.environment_install_lock_path(site),
+        with (
+            lock_mod.plugin_install_lock(
+                lock_mod.environment_install_lock_path(site),
+            ),
+            maintenance.file_lock(maintenance._admission_gate(site)),
         ):
             if outcome != "maintenance":
                 repair.write_text("publication pending")
@@ -652,7 +655,7 @@ from pathlib import Path
 spec = importlib.util.spec_from_file_location('maintenance', sys.argv[1])
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
-m.lease_environment([Path(sys.argv[2])], parent_pid=int(sys.argv[3]))
+m.lease_environment([Path(sys.argv[2])], parent_pid=int(sys.argv[3]) or None)
 print('READY', flush=True)
 sys.stdin.readline()
 m._close_readers()
@@ -662,6 +665,12 @@ m._close_readers()
     async def observe():
         peer = None
         async with lock_mod.environment_observation(sites):
+            with pytest.raises(lock_mod.InstallLockError):
+                with lock_mod.plugin_install_lock(
+                    lock_mod.environment_install_lock_path(site),
+                    timeout=0,
+                ):
+                    pytest.fail("observation admitted a competing writer")
             # The parent custody is scoped, never inserted into lifetime leases.
             assert str(site.resolve()) not in maintenance._READERS
             assert [
@@ -677,7 +686,8 @@ m._close_readers()
                     script,
                     maintenance.__file__,
                     str(site),
-                    str(os.getpid()),
+                    # Independent CLI startup needs no inspection-parent proof.
+                    str(0 if exit_case == "normal" else os.getpid()),
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,

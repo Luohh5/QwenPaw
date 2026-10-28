@@ -324,6 +324,12 @@ def _gate(site):
     return _sidecar(site, ".lock")
 
 
+def _admission_gate(site):
+    # Observations hold the writer gate for their entire scan. Only actual
+    # publication or maintenance admission must exclude new readers.
+    return _sidecar(site, ".admission.lock")
+
+
 def _readers_dir(site):
     return _sidecar(site, "-readers")
 
@@ -360,7 +366,7 @@ def _lease_environment(sites, parent_pid=None, timeout=5):
                 yield
             else:
                 with file_lock(
-                    _gate(root),
+                    _admission_gate(root),
                     timeout=max(0, deadline - time.monotonic()),
                     reader_site=root,
                 ):
@@ -501,26 +507,29 @@ def maintenance_barrier(sites, operation_id, capability, *, ignore_pid=None):
         "token_hash": hashlib.sha256(capability.encode()).hexdigest(),
     }
     created = []
-    try:
-        for root in sites:
-            path = marker(root)
-            if path.exists() and authorized(root):
-                continue
-            with path.open("x", encoding="utf-8") as stream:
-                created.append(path)
-                os.chmod(path, 0o600)
-                json.dump(value, stream)
-                stream.flush()
-                os.fsync(stream.fileno())
-        if live_readers(sites, ignore_pid):
-            raise RuntimeError(
-                "DEPENDENCY_ENVIRONMENT_BUSY: another backend or child still uses the environment.",
-            )
-    except BaseException:
-        # No mutation has started; all gates still exclude other writers.
-        for path in created:
-            path.unlink(missing_ok=True)
-        raise
+    with ExitStack() as admission:
+        for root in sorted(sites, key=str):
+            admission.enter_context(file_lock(_admission_gate(root)))
+        try:
+            for root in sites:
+                path = marker(root)
+                if path.exists() and authorized(root):
+                    continue
+                with path.open("x", encoding="utf-8") as stream:
+                    created.append(path)
+                    os.chmod(path, 0o600)
+                    json.dump(value, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            if live_readers(sites, ignore_pid):
+                raise RuntimeError(
+                    "DEPENDENCY_ENVIRONMENT_BUSY: another backend or child still uses the environment.",
+                )
+        except BaseException:
+            # No mutation has started; all gates still exclude other writers.
+            for path in created:
+                path.unlink(missing_ok=True)
+            raise
     yield
 
 

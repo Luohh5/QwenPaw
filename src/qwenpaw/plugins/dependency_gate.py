@@ -1101,6 +1101,8 @@ async def _publish_additions(audit, evaluate, target, files):
     """Keep exclusion through exact-byte publication and child verification."""
     import asyncio
     from .execution.dependencies import repair_marker
+    from .dependency_maintenance import _admission_gate, file_lock
+    from .install_lock import async_lock
     from ..utils.io_utils import run_sync_io
 
     def mark(message):
@@ -1110,37 +1112,39 @@ async def _publish_additions(audit, evaluate, target, files):
         mark("Shared dependency publication requires verification.\n")
         _write_additions(target, files)
 
-    try:
-        await run_sync_io(publish)
-    except asyncio.CancelledError:
-        await run_sync_io(
-            mark,
-            "Cancelled dependency publication requires repair.\n",
-        )
-        raise
-    except Exception as exc:
-        raise SharedDependencyError(
-            GateDecision(
-                False,
-                False,
-                reason="Dependency publication failed; repair is required.",
-                reason_code="DEPENDENCY_REPAIR_REQUIRED",
-                require_restart=True,
-            ),
-        ) from exc
-    try:
-        await run_sync_io(lambda: repair_marker(target).unlink())
-        snapshot = await audit()
-        decision = await evaluate(snapshot)
-        if not decision.already_satisfied:
-            raise SharedDependencyError(decision)
-    except BaseException:
-        await run_sync_io(
-            mark,
-            "Dependency verification failed; repair required.\n",
-        )
-        raise
-    return snapshot
+    admission = await run_sync_io(_admission_gate, target)
+    async with async_lock(file_lock(admission, timeout=5)):
+        try:
+            await run_sync_io(publish)
+        except asyncio.CancelledError:
+            await run_sync_io(
+                mark,
+                "Cancelled dependency publication requires repair.\n",
+            )
+            raise
+        except Exception as exc:
+            raise SharedDependencyError(
+                GateDecision(
+                    False,
+                    False,
+                    reason="Dependency publication failed; repair is required.",
+                    reason_code="DEPENDENCY_REPAIR_REQUIRED",
+                    require_restart=True,
+                ),
+            ) from exc
+        try:
+            await run_sync_io(lambda: repair_marker(target).unlink())
+            snapshot = await audit()
+            decision = await evaluate(snapshot)
+            if not decision.already_satisfied:
+                raise SharedDependencyError(decision)
+        except BaseException:
+            await run_sync_io(
+                mark,
+                "Dependency verification failed; repair required.\n",
+            )
+            raise
+        return snapshot
 
 
 def _write_additions(target: Path, files: dict[str, bytes]) -> None:
