@@ -89,6 +89,9 @@ datas += collect_data_files(
     include_py_files=True,
 )
 
+# The native Code Mode worker runs under the bundled standalone CPython.
+datas.append((str(SRC / "modes/coding/_worker.py"), "qwenpaw/modes/coding"))
+
 # Collect package metadata for packages that use importlib.metadata at runtime.
 # Include required dependency metadata so SDK target installs can audit bundled
 # host packages as well as packages that query importlib.metadata themselves.

@@ -196,6 +196,7 @@ function ImportWorkflow() {
     loading,
     error,
     requirement,
+    detectError,
     detect,
     scan,
     start,
@@ -250,7 +251,13 @@ function ImportWorkflow() {
     void detect().catch(() => undefined);
   }, [detect]);
   useEffect(() => {
-    if (!job && sources.length && !sourceSelections[selectedAgent]) {
+    if (
+      !job &&
+      !loading &&
+      !detectError &&
+      sources.length &&
+      !sourceSelections[selectedAgent]
+    ) {
       updateSources(() =>
         sources
           .filter(
@@ -259,7 +266,15 @@ function ImportWorkflow() {
           .map((source) => source.source),
       );
     }
-  }, [job, selectedAgent, sourceSelections, sources, updateSources]);
+  }, [
+    detectError,
+    job,
+    loading,
+    selectedAgent,
+    sourceSelections,
+    sources,
+    updateSources,
+  ]);
   useEffect(() => {
     if (
       job?.state !== "awaiting_selection" ||
@@ -283,7 +298,11 @@ function ImportWorkflow() {
     setPluginConfirmed(false);
   }, [selectionKey]);
 
-  const current = !job ? 0 : job.state === "awaiting_selection" ? 1 : 2;
+  const current = !job
+    ? 0
+    : ["scanning", "awaiting_selection"].includes(job.state)
+    ? 1
+    : 2;
   const isDone = Boolean(
     job &&
       ["completed", "completed_with_issues", "failed", "interrupted"].includes(
@@ -291,6 +310,7 @@ function ImportWorkflow() {
       ),
   );
   const isCancelling = job?.state === "cancelling";
+  const sourceDetectionFailed = !job && Boolean(detectError);
   const percent = useMemo(() => completion(job?.providers ?? []), [job]);
 
   const updateSelection = (
@@ -524,9 +544,9 @@ function ImportWorkflow() {
           <Alert
             type="error"
             showIcon
-            message={error}
+            message={sourceDetectionFailed ? detectError : error}
             action={
-              requirement && (
+              requirement ? (
                 <Button
                   onClick={() =>
                     manageHarness(requirement.plugin_id, requirement.state)
@@ -540,7 +560,11 @@ function ImportWorkflow() {
                       : "common.enable",
                   )}
                 </Button>
-              )
+              ) : sourceDetectionFailed ? (
+                <Button onClick={() => void detect().catch(() => undefined)}>
+                  {t("common.retry")}
+                </Button>
+              ) : undefined
             }
           />
         )}
@@ -559,7 +583,7 @@ function ImportWorkflow() {
           </div>
         )}
 
-        {!job && (
+        {!job && !sourceDetectionFailed && (
           <section className={styles.section}>
             <div className={styles.sectionHeading}>
               <h3>
