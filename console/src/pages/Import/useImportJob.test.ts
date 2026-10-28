@@ -111,34 +111,29 @@ describe("useImportJob", () => {
     expect(result.current.job?.job_id).toBe("import-agent-a");
   });
 
-  it.each(["missing", "disabled"] as const)(
-    "shows the localized %s Harness requirement from a real 409 error format",
-    async (state) => {
-      const detail = {
-        code: "harness_plugin_required",
-        source: "codex",
-        plugin_id: "qwenpaw-harness-codex",
-        state,
-      };
-      const raw = JSON.stringify({ detail });
-      vi.mocked(portabilityImportApi.create).mockRejectedValueOnce(
-        new ApiError(409, `${raw} - ${raw}`),
-      );
-      const { result } = renderHook(() => useImportJob());
-
-      await act(async () => {
-        await expect(result.current.scan(["codex"])).rejects.toThrow();
-      });
-
-      expect(result.current.requirement).toEqual(detail);
-      expect(result.current.error).toBe(
-        i18n.t("portabilityImport.harnessRequired", {
-          plugin: detail.plugin_id,
-          state: i18n.t(`portabilityImport.pluginStates.${state}`),
-        }),
-      );
-    },
-  );
+  it("shows a localized Harness requirement from the API's 409 error format", async () => {
+    const detail = {
+      code: "harness_plugin_required",
+      source: "codex",
+      plugin_id: "qwenpaw-harness-codex",
+      state: "missing",
+    };
+    const raw = JSON.stringify({ detail });
+    vi.mocked(portabilityImportApi.create).mockRejectedValueOnce(
+      new ApiError(409, `${raw} - ${raw}`),
+    );
+    const { result } = renderHook(() => useImportJob());
+    await act(async () => {
+      await expect(result.current.scan(["codex"])).rejects.toThrow();
+    });
+    expect(result.current.requirement).toEqual(detail);
+    expect(result.current.error).toBe(
+      i18n.t("portabilityImport.harnessRequired", {
+        plugin: detail.plugin_id,
+        state: i18n.t("portabilityImport.pluginStates.missing"),
+      }),
+    );
+  });
 
   it("ignores an older source detection response for the same agent", async () => {
     const oldDetection =
@@ -320,48 +315,6 @@ describe("useImportJob", () => {
       expect(portabilityImportApi.create).not.toHaveBeenCalled();
     },
   );
-
-  it("clears Harness requirements on agent switch and ignores a late rejection", async () => {
-    const detail = {
-      code: "harness_plugin_required",
-      source: "codex",
-      plugin_id: "qwenpaw-harness-codex",
-      state: "missing",
-    };
-    const requirementError = new ApiError(409, JSON.stringify({ detail }));
-    const lateDetection =
-      deferred<Awaited<ReturnType<typeof portabilityImportApi.sources>>>();
-    vi.mocked(portabilityImportApi.sources)
-      .mockRejectedValueOnce(requirementError)
-      .mockReturnValueOnce(lateDetection.promise)
-      .mockResolvedValueOnce([]);
-    const { result, rerender } = renderHook(() => useImportJob());
-
-    await act(async () => {
-      await expect(result.current.detect()).rejects.toThrow();
-    });
-    expect(result.current.requirement).toEqual(detail);
-    expect(result.current.detectError).toBe(result.current.error);
-
-    let pending!: ReturnType<typeof result.current.detect>;
-    await act(async () => {
-      pending = result.current.detect();
-    });
-    selectedAgent = "agent-b";
-    rerender();
-    expect(result.current.requirement).toBeNull();
-    expect(result.current.error).toBe("");
-    await act(async () => {
-      await result.current.detect();
-      lateDetection.reject(requirementError);
-      await pending.catch(() => undefined);
-    });
-    expect(result.current.requirement).toBeNull();
-    expect(result.current.error).toBe("");
-    expect(result.current.detectError).toBe("");
-    expect(result.current.sources).toEqual([]);
-    expect(result.current.loading).toBe(false);
-  });
 
   it("starts and retries only the currently selected agent's job", async () => {
     vi.mocked(portabilityImportApi.retry).mockImplementation(

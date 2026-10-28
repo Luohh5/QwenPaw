@@ -1,5 +1,7 @@
 # Harness Settings Style Restoration Implementation Plan
 
+> 测试维护更新（2026-10-28）：本文保留历史实施/验收记录；旧测试路径、行号和命令不再是当前入口。当前四个核心测试、构建及手工验收边界以[精简方案](../specs/2026-10-28-harness-test-slimming.md)为准。
+
 > **For agentic workers:** Use superpowers:subagent-driven-development. Functional code and test code have separate authors.
 
 **Goal:** Restore the previous card-based third-party agent configuration design in both create and edit dialogs.

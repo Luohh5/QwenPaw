@@ -66,7 +66,6 @@ The migration does not download dependencies or activate resources. Existing
 automatic desktop updates do not perform this preparation; a skipped preparation
 requires explicit plugin installation and is not a seamless upgrade.
 
-
 ## Frontend build
 
 The plugin owns its account settings, authentication polling and locale assets.
@@ -91,3 +90,18 @@ same exported package before building. `frontend/dist/index.js` is the actual
 self-contained manifest entry; source/build files are excluded from the runtime
 archive. Build before packing. Registration uses SDK `harnesses.register` and
 host cleanup disposes the extension when disabled or removed.
+
+## Core tests
+
+Build the frontend and package both Harness ZIPs from the repository root:
+
+```sh
+bash scripts/pack/build_harness_frontends.sh
+python scripts/pack/generate_plugin_metadata.py --plugins-root plugins --dist dist/plugins \
+  --metadata-out dist/plugins/index.json --only qwenpaw-harness-codex --only qwenpaw-harness-qoder
+```
+
+In an environment containing only this plugin's pinned vendor SDK and the host
+SDK, run `python -m pytest plugins/harness/codex/tests/test_codex_harness.py -q`.
+This includes installing the built ZIP through the host; a missing ZIP fails the
+test. Live account and packaged desktop checks remain release acceptance steps.

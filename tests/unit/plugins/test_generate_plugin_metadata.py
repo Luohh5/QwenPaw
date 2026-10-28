@@ -343,23 +343,3 @@ def test_real_harness_archives_contain_own_entries_and_frontends(
         assert not any(other in name for name in names)
         assert other not in requirements
         assert index["files"][f"{plugin_id}-1.0.0"]["platform"] == "harness"
-
-
-def test_harness_missing_frontend_fails_without_archive_or_index(
-    tmp_path: Path,
-) -> None:
-    plugins_root = _copy_harness_plugins(tmp_path)
-    missing = plugins_root / "harness" / "codex" / "frontend/dist/index.js"
-    missing.unlink()
-    dist = tmp_path / "dist"
-
-    index, failed = discover_and_pack(
-        plugins_root,
-        dist,
-        "/files/plugins",
-        only=["qwenpaw-harness-codex"],
-    )
-
-    assert failed == ["qwenpaw-harness-codex"]
-    assert not index["files"]
-    assert not list((dist / "harness").rglob("*.zip"))

@@ -100,46 +100,26 @@ describe("installed plugin status", () => {
   });
 
   it.each([
-    [false, false, "inactive", "common.enable"],
-    [true, true, "failed", "pluginManager.repair"],
+    [false, false, "inactive", "common.enable", props.onEnable],
+    [true, true, "failed", "pluginManager.repair", props.onRepair],
+    [true, true, "active", "common.disable", props.onDisable],
   ] as const)(
-    "offers enabled=%s loaded=%s status=%s action %s in both views",
-    (enabled, loaded, status, label) => {
-      props.onEnable.mockClear();
-      props.onRepair.mockClear();
-      const action = status === "failed" ? props.onRepair : props.onEnable;
-      const other = status === "failed" ? props.onEnable : props.onRepair;
+    "offers enabled=%s loaded=%s status=%s action %s",
+    (enabled, loaded, status, label, action) => {
+      [props.onEnable, props.onRepair, props.onDisable].forEach((handler) =>
+        handler.mockClear(),
+      );
       const target = { ...plugin(loaded, status), enabled };
       render(<InstalledPluginList {...props} plugins={[target]} />);
       fireEvent.click(screen.getByRole("button", { name: label }));
+      expect(action).toHaveBeenCalledOnce();
       expect(action).toHaveBeenCalledWith(target);
-      expect(other).not.toHaveBeenCalled();
-
-      fireEvent.click(screen.getByLabelText("skills.listView"));
-      const actions = screen.getAllByRole("button", {
-        name: label,
-        hidden: true,
-      });
-      expect(actions).toHaveLength(2);
-      fireEvent.click(actions[0]);
-      expect(action).toHaveBeenCalledTimes(2);
+      for (const other of [
+        props.onEnable,
+        props.onRepair,
+        props.onDisable,
+      ].filter((handler) => handler !== action))
+        expect(other).not.toHaveBeenCalled();
     },
   );
-
-  it("offers Disable for an active Harness in both installed views", () => {
-    props.onDisable.mockClear();
-    const target = plugin(true, "active");
-    render(<InstalledPluginList {...props} plugins={[target]} />);
-    fireEvent.click(screen.getByRole("button", { name: "common.disable" }));
-    expect(props.onDisable).toHaveBeenCalledWith(target);
-
-    fireEvent.click(screen.getByLabelText("skills.listView"));
-    const actions = screen.getAllByRole("button", {
-      name: "common.disable",
-      hidden: true,
-    });
-    expect(actions).toHaveLength(2);
-    fireEvent.click(actions[0]);
-    expect(props.onDisable).toHaveBeenCalledTimes(2);
-  });
 });

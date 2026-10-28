@@ -1,5 +1,7 @@
 # 第三方 Harness 插件化 Implementation Plan
 
+> 测试维护更新（2026-10-28）：本文保留历史实施/验收记录；旧测试路径、行号和命令不再是当前入口。当前四个核心测试、构建及手工验收边界以[精简方案](../specs/2026-10-28-harness-test-slimming.md)为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. 2026-10-23 用户已授权执行；功能代码与测试代码由不同子 agent 编写，主 agent 协调集成与独立验证。
 
 **Goal:** 让不使用第三方 Harness 的用户不再安装、加载或装配其厂商运行集成，同时让开发者通过公开 `HarnessSpec` 独立实现新后端。

@@ -1,5 +1,7 @@
 # Harness frontend build boundary repair
 
+> 测试维护更新（2026-10-28）：本文保留历史实施/验收记录；旧测试路径、行号和命令不再是当前入口。当前四个核心测试、构建及手工验收边界以[精简方案](../specs/2026-10-28-harness-test-slimming.md)为准。
+
 > **For agentic workers:** Use superpowers:subagent-driven-development; production/config and test work have separate authors as requested by the user.
 
 **Goal:** Fix the reported Desktop Windows frontend compile failure while keeping optional Harness source out of Console production compilation and preserving all six cross-plugin test assertions.

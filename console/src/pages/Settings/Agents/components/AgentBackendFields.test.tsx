@@ -1,8 +1,17 @@
 // @vitest-environment jsdom
 import React from "react";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
-import { Form } from "antd";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
+import { Button, Form, Input, Tooltip } from "antd";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 import {
   harnessRegistry,
@@ -19,6 +28,49 @@ vi.mock("react-i18next", () => ({
 const owners = ["first-owner", "second-owner"];
 let rows: HarnessBackendDescriptor[] = [];
 let currentForm: ReturnType<typeof Form.useForm>[0];
+const originalHost = Object.getOwnPropertyDescriptor(window, "QwenPaw");
+const vendorFetch = vi.fn();
+let vendorSettings: Record<string, React.ComponentType<HarnessSettingsProps>>;
+
+beforeAll(async () => {
+  Object.defineProperty(window, "QwenPaw", {
+    configurable: true,
+    value: {
+      host: {
+        React,
+        antd: {
+          Button,
+          Input,
+          Tooltip,
+          App: {
+            useApp: () => ({ message: { success: vi.fn(), error: vi.fn() } }),
+          },
+        },
+        fetch: vendorFetch,
+        useLocale: () => "en",
+      },
+    },
+  });
+  // Load the real plugin modules without adding their separate TS projects to
+  // the Console production type-check graph. Vitest resolves the public SDK.
+  const modules = import.meta.glob<{
+    Settings: React.ComponentType<HarnessSettingsProps>;
+  }>("../../../../../../plugins/harness/*/frontend/src/Settings.tsx");
+  const [codex, qoder] = await Promise.all([
+    modules[
+      "../../../../../../plugins/harness/codex/frontend/src/Settings.tsx"
+    ](),
+    modules[
+      "../../../../../../plugins/harness/qoder/frontend/src/Settings.tsx"
+    ](),
+  ]);
+  vendorSettings = { codex: codex.Settings, qoder: qoder.Settings };
+});
+
+afterAll(() => {
+  if (originalHost) Object.defineProperty(window, "QwenPaw", originalHost);
+  else Reflect.deleteProperty(window, "QwenPaw");
+});
 
 function descriptor(
   id: string,
@@ -53,6 +105,19 @@ function BackendForm({
 
 describe("AgentBackendFields", () => {
   beforeEach(() => {
+    vendorFetch
+      .mockReset()
+      .mockImplementation(
+        async (path: string) =>
+          new Response(
+            JSON.stringify(
+              path.endsWith("/login")
+                ? { type: "external", loginId: "local" }
+                : { installed: true, authenticated: false, account: null },
+            ),
+            { headers: { "Content-Type": "application/json" } },
+          ),
+      );
     rows = [];
     harnessRegistry.syncCatalog([]);
     owners.forEach((owner) => harnessRegistry.disposeAll(owner));
@@ -86,6 +151,7 @@ describe("AgentBackendFields", () => {
         .mocked(globalThis.fetch)
         .mock.calls.every(([url]) => !String(url).includes("/harnesses/")),
     ).toBe(true);
+    expect(vendorFetch).not.toHaveBeenCalled();
     expect(currentForm.getFieldValue("backend")).toBe("qwenpaw");
   });
 
@@ -146,5 +212,66 @@ describe("AgentBackendFields", () => {
       preserved: true,
       model: "second-model",
     });
+
+    act(() => {
+      rows = [rows[0], descriptor("second", "second-owner", "disabled")];
+      harnessRegistry.syncCatalog(rows);
+    });
+    expect(screen.queryByText("second settings")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "agent.backend.states.disabled",
+    );
+    expect(currentForm.getFieldValue("backend")).toBe("second");
   });
+
+  it.each([
+    ["codex", "Codex executable", "Connect with ChatGPT"],
+    ["qoder", "Qoder executable", "Connect to Qoder"],
+  ])(
+    "passes saved and edited %s settings to its real status and login requests",
+    async (backend, binaryLabel, loginLabel) => {
+      rows = [descriptor(backend, "first-owner")];
+      harnessRegistry.syncCatalog(rows);
+      harnessRegistry.register("first-owner", {
+        backendId: backend,
+        SettingsComponent: vendorSettings[backend],
+      });
+      vi.spyOn(window, "open").mockReturnValue(null);
+      const saved = { binary: `/saved/${backend}`, model: "saved-model" };
+      renderWithProviders(<BackendForm backend={backend} settings={saved} />);
+
+      const connect = await screen.findByRole("button", { name: loginLabel });
+      await waitFor(() => expect(connect).toBeEnabled());
+      expect(vendorFetch).toHaveBeenCalledWith(`/harnesses/${backend}/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ settings: saved, device_code: false }),
+      });
+      const edited = { ...saved, binary: `/custom/${backend}` };
+      fireEvent.change(screen.getByRole("textbox", { name: binaryLabel }), {
+        target: { value: edited.binary },
+      });
+      expect(currentForm.getFieldValue("backend_settings")).toEqual(edited);
+      fireEvent.click(screen.getByRole("button", { name: "Detect" }));
+      await waitFor(() =>
+        expect(vendorFetch).toHaveBeenLastCalledWith(
+          `/harnesses/${backend}/status`,
+          expect.objectContaining({
+            body: JSON.stringify({ settings: edited, device_code: false }),
+          }),
+        ),
+      );
+      fireEvent.click(connect);
+      await waitFor(() =>
+        expect(vendorFetch).toHaveBeenCalledWith(
+          `/harnesses/${backend}/login`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ settings: edited, device_code: false }),
+          },
+        ),
+      );
+    },
+  );
 });

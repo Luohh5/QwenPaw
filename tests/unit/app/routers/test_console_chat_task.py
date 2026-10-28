@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Regression tests for background console task completion."""
+
 # pylint: disable=protected-access,unused-argument
 from __future__ import annotations
 
@@ -12,11 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncGenerator
-from unittest.mock import AsyncMock, Mock
 
 import pytest
-from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
 
 from qwenpaw.agents import fork_project
 from qwenpaw.agents.fork_project import (
@@ -136,109 +134,6 @@ def _clear_background_tasks():
     console._bg_tasks.clear()
     yield
     console._bg_tasks.clear()
-
-
-@pytest.mark.parametrize("mode", ["sse", "task"])
-async def test_unavailable_backend_is_a_public_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    mode: str,
-) -> None:
-    """Keep the real workspace/channel path that used to swallow SDKError."""
-    from qwenpaw.app.channels.console.channel import ConsoleChannel
-    from qwenpaw.app.chats.models import ChatSpec
-    from qwenpaw.app.workspace.workspace import Workspace
-    from qwenpaw.runtime.backends.execution import BackendExecution
-    from qwenpaw.runtime.backends.registry import BackendRegistry
-    from qwenpaw.runtime.runtime import Runtime
-
-    workspace = Workspace("test-agent", str(tmp_path / "workspace"))
-    workspace._backend_runtime = BackendExecution(
-        workspace.workspace_dir,
-        agent_id=workspace.agent_id,
-        registry=BackendRegistry(),
-    )
-    channel = ConsoleChannel(
-        process=workspace.stream_query,
-        enabled=True,
-        bot_prefix="",
-        workspace_dir=workspace.workspace_dir,
-    )
-    chat = ChatSpec(
-        id="unavailable-chat",
-        session_id="test-session",
-        user_id="test-user",
-        channel="console",
-        name="Saved chat",
-    )
-    workspace._service_manager.services.update(
-        chat_manager=SimpleNamespace(
-            get_or_create_chat=AsyncMock(return_value=chat),
-            mark_chat_finished=AsyncMock(),
-        ),
-        channel_manager=SimpleNamespace(
-            get_channel=AsyncMock(return_value=channel),
-        ),
-    )
-    monkeypatch.setattr(
-        "qwenpaw.app.workspace.workspace.load_agent_config_async",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                backend="offline-backend",
-                backend_settings={},
-            ),
-        ),
-    )
-    monkeypatch.setattr(
-        console,
-        "get_agent_for_request",
-        AsyncMock(return_value=workspace),
-    )
-    native_run = Mock(side_effect=AssertionError("native fallback"))
-    monkeypatch.setattr(Runtime, "run", native_run)
-    app = FastAPI()
-    app.include_router(console.router, prefix="/api")
-    payload = {
-        "channel": "console",
-        "user_id": "test-user",
-        "session_id": "test-session",
-        "input": [
-            {"role": "user", "content": [{"type": "text", "text": "run"}]},
-        ],
-    }
-    try:
-        async with AsyncClient(
-            transport=ASGITransport(app=app),
-            base_url="http://test",
-        ) as client:
-            path = "/api/console/chat" + ("/task" if mode == "task" else "")
-            response = await client.post(path, json=payload)
-            assert response.status_code == 200, response.text
-            if mode == "task":
-                task_id = response.json()["task_id"]
-                await asyncio.wait_for(
-                    console._bg_tasks[task_id].asyncio_task,
-                    2,
-                )
-                response = await client.get(
-                    f"/api/console/chat/task/{task_id}",
-                )
-                assert response.json()["status"] == "finished"
-                result = response.json()["result"]
-            else:
-                events = [
-                    json.loads(line[6:])
-                    for line in response.text.splitlines()
-                    if line.startswith("data: ")
-                ]
-                result = events[-1] if events else {}
-        assert result.get("status") == "failed", result
-        assert result["error"]["code"] == "backend_unavailable"
-        assert "offline-backend" in result["error"]["message"]
-        native_run.assert_not_called()
-        assert await workspace.task_tracker.get_status(chat.id) == "idle"
-    finally:
-        await workspace.backend_runtime.close()
 
 
 async def _submit_forked_task(

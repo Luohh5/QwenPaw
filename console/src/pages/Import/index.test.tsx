@@ -142,76 +142,51 @@ describe("ImportPage", () => {
     expect(actions.scan).toHaveBeenCalledWith(["codex", "qoder"]);
   });
 
-  it.each(["missing", "disabled", "failed"] as const)(
-    "keeps %s Harness sources inert and opens plugin management",
-    (pluginState) => {
+  it.each([
+    ["missing", "source", "pluginManager.installBtn", "official"],
+    ["disabled", "source", "common.enable", "installed"],
+    ["failed", "error", "pluginManager.repair", "installed"],
+  ])(
+    "guides a %s Harness requirement to plugin management",
+    (pluginState, origin, action, view) => {
+      const plugin_id = "qwenpaw-harness-codex";
       vi.mocked(useImportJob).mockReturnValue(
-        state({
-          sources: [
-            {
-              source: "codex",
-              name: "Codex",
-              detected: true,
-              plugin_id: "qwenpaw-harness-codex",
-              plugin_state: pluginState,
-            },
-          ],
-        }) as never,
+        state(
+          origin === "source"
+            ? {
+                sources: [
+                  {
+                    source: "codex",
+                    name: "Codex",
+                    detected: true,
+                    plugin_id,
+                    plugin_state: pluginState,
+                  },
+                ],
+              }
+            : {
+                sources: [],
+                error: "Harness plugin required",
+                requirement: {
+                  code: "harness_plugin_required",
+                  source: "codex",
+                  plugin_id,
+                  state: pluginState,
+                },
+              },
+        ) as never,
       );
       renderPage();
-      expect(screen.getByRole("checkbox", { name: "Codex" })).toBeDisabled();
-      fireEvent.click(
-        screen.getByRole("button", {
-          name:
-            pluginState === "missing"
-              ? "pluginManager.installBtn"
-              : pluginState === "failed"
-              ? "pluginManager.repair"
-              : "common.enable",
-        }),
-      );
+      if (origin === "source")
+        expect(screen.getByRole("checkbox", { name: "Codex" })).toBeDisabled();
+      fireEvent.click(screen.getByRole("button", { name: action }));
       expect(screen.getByTestId("location")).toHaveTextContent(
-        `/market?tab=plugins&view=${
-          pluginState === "missing" ? "official" : "installed"
-        }&plugin=qwenpaw-harness-codex`,
+        `/market?tab=plugins&view=${view}&plugin=${plugin_id}`,
       );
       expect(actions.scan).not.toHaveBeenCalled();
     },
   );
 
-  it.each(["missing", "disabled", "failed"] as const)(
-    "opens the %s plugin action from a scan error",
-    (pluginState) => {
-      vi.mocked(useImportJob).mockReturnValue(
-        state({
-          sources: [],
-          error: "Harness plugin required",
-          requirement: {
-            code: "harness_plugin_required",
-            source: "codex",
-            plugin_id: "qwenpaw-harness-codex",
-            state: pluginState,
-          },
-        }) as never,
-      );
-      renderPage();
-      fireEvent.click(
-        screen.getByRole("button", {
-          name:
-            pluginState === "missing"
-              ? "pluginManager.installBtn"
-              : pluginState === "failed"
-              ? "pluginManager.repair"
-              : "common.enable",
-        }),
-      );
-      expect(screen.getByTestId("location")).toHaveTextContent(
-        `/market?tab=plugins&view=${
-          pluginState === "missing" ? "official" : "installed"
-        }&plugin=qwenpaw-harness-codex`,
-      );
-    },
-  );
   it("isolates stale Agent A sources while Agent B retries detection", async () => {
     vi.mocked(actions.detect)
       .mockReset()

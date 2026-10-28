@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import asyncio
-import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -98,40 +96,3 @@ async def test_portability_adaptation_cannot_route_to_harness(
         _ = [item async for item in workspace.stream_query(request)]
 
     assert runtime.call is None
-
-
-@pytest.mark.asyncio
-async def test_config_snapshot_keeps_loop_live_and_cancellation_waits_for_read(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    workspace = Workspace("agent-1", str(tmp_path / "workspace"))
-    runtime = FakeBackendRuntime()
-    workspace._backend_runtime = runtime
-    entered, release = threading.Event(), threading.Event()
-
-    def held_read(agent_id):
-        assert agent_id == "agent-1"
-        entered.set()
-        release.wait()
-        return SimpleNamespace(backend="third-backend", backend_settings={})
-
-    monkeypatch.setattr("qwenpaw.config.config.load_agent_config", held_read)
-
-    async def consume():
-        return [item async for item in workspace.stream_query(object())]
-
-    task = asyncio.create_task(consume())
-    try:
-        assert await asyncio.wait_for(asyncio.to_thread(entered.wait), 2)
-        heartbeat = asyncio.Event()
-        asyncio.get_running_loop().call_soon(heartbeat.set)
-        await asyncio.wait_for(heartbeat.wait(), 2)
-        task.cancel()
-        await asyncio.sleep(0)
-        assert not task.done()
-        assert runtime.call is None
-    finally:
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task

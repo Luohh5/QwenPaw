@@ -7,8 +7,15 @@ import ptBR from "./pt-BR.json";
 import ru from "./ru.json";
 import vi from "./vi.json";
 import zh from "./zh.json";
-import { localMessages as codexMessages } from "../../../plugins/harness/codex/frontend/src/locale";
-import { localMessages as qoderMessages } from "../../../plugins/harness/qoder/frontend/src/locale";
+// Keep the plugins' separate TypeScript dependency trees out of Console builds.
+const pluginLocales = import.meta.glob<{
+  localMessages(locale: string): Record<string, string>;
+}>("../../../plugins/harness/*/frontend/src/locale.ts", { eager: true });
+const [codexMessages, qoderMessages] = ["codex", "qoder"].map(
+  (backend) =>
+    pluginLocales[`../../../plugins/harness/${backend}/frontend/src/locale.ts`]
+      .localMessages,
+);
 
 const locales = { en, id, ja, "pt-BR": ptBR, ru, vi, zh };
 

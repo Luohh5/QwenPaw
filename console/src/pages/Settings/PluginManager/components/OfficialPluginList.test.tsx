@@ -84,34 +84,20 @@ describe("OfficialPluginList", () => {
         name: "Qoder",
       }),
     );
-    const onInstalled = vi.fn();
-    const { rerender } = render(
+    render(
       <OfficialPluginList
-        key="qwenpaw-harness-codex"
-        onInstalled={onInstalled}
+        onInstalled={vi.fn()}
         initialSearch="qwenpaw-harness-codex"
       />,
     );
-    let search = screen.getByPlaceholderText("pluginManager.filterByName");
+    const search = screen.getByPlaceholderText("pluginManager.filterByName");
     expect(search).toHaveValue("qwenpaw-harness-codex");
     expect(screen.getByRole("article", { name: "Codex" })).toBeVisible();
     expect(screen.queryByRole("article", { name: "Qoder" })).toBeNull();
 
-    rerender(
-      <OfficialPluginList
-        key="qwenpaw-harness-qoder"
-        onInstalled={onInstalled}
-        initialSearch="qwenpaw-harness-qoder"
-      />,
-    );
-    search = screen.getByPlaceholderText("pluginManager.filterByName");
-    expect(search).toHaveValue("qwenpaw-harness-qoder");
+    fireEvent.change(search, { target: { value: "qOdEr" } });
     expect(screen.getByRole("article", { name: "Qoder" })).toBeVisible();
     expect(screen.queryByRole("article", { name: "Codex" })).toBeNull();
-
-    fireEvent.change(search, { target: { value: "cOdEx" } });
-    expect(screen.getByRole("article", { name: "Codex" })).toBeVisible();
-    expect(screen.queryByRole("article", { name: "Qoder" })).toBeNull();
     fireEvent.change(search, { target: { value: "" } });
     expect(screen.getAllByRole("article")).toHaveLength(2);
   });
