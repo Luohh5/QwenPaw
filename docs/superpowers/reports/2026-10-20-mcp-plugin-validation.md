@@ -1,5 +1,11 @@
 # MCP optional plugin and SDK 1.1 release validation
 
+**2026-10-21 performance follow-up:** the expanded
+[MCP performance investigation](2026-10-21-mcp-performance-diagnosis.md)
+identified a configured-source sequential-startup regression and additional SDK
+schema-validation cost. The functional checks below remain historical evidence;
+they do not establish unchanged performance for configured MCP services.
+
 Status: **measurement and validation evidence complete within the scope below**.
 The broad source run and its focused repairs are recorded separately; there was
 no invented single all-green broad run. All code-review findings are resolved
