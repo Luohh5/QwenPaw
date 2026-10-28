@@ -268,6 +268,26 @@ class DependencyUpgradeManager:
                 )
         return context
 
+    async def _prepare_consumer_targets(self):
+        """Capture every installed backend's roots before maintenance locks."""
+        targets = []
+        for manifest, source in await run_sync_io(
+            self.loader.discover_plugins,
+        ):
+            binding = await run_sync_io(
+                self.loader.backend_resolver.resolve,
+                source,
+                manifest,
+            )
+            prepare = getattr(
+                binding.backend,
+                "prepare_dependency_targets",
+                None,
+            )
+            if prepare is not None:
+                targets.append(await prepare(binding.description))
+        return targets
+
     async def _consumers(self, binding, snapshot):
         """Installed declarations participate even when currently inactive."""
         consumers = []

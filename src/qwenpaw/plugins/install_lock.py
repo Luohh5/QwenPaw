@@ -34,6 +34,7 @@ from .execution.dependencies import canonical_environment_path
 logger = logging.getLogger(__name__)
 
 _environment_locks: WeakKeyDictionary = WeakKeyDictionary()
+_observations: WeakKeyDictionary = WeakKeyDictionary()
 
 
 @contextlib.asynccontextmanager
@@ -95,6 +96,67 @@ async def environment_coordinator(targets):
                 locks.setdefault(key, asyncio.Lock()),
             )
         yield
+
+
+class ObservationRootsChanged(RuntimeError):
+    """Release the current observation before preparing these roots."""
+
+    def __init__(self, targets):
+        self.targets = targets
+        super().__init__("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+
+
+@contextlib.asynccontextmanager
+async def environment_observation(targets, *, timeout=300.0):
+    """Read and admit under ordered process and OS exclusion.
+
+    Only the current task can reuse its live scope, and only for covered
+    roots. A changed root set must release and prepare again; neither child
+    tasks nor an inherited context variable confer lock ownership.
+    """
+    from ..utils.io_utils import run_sync_io
+
+    targets = tuple(targets)
+    keys = frozenset(
+        await run_sync_io(
+            lambda: {str(canonical_environment_path(p)) for p in targets},
+        ),
+    )
+    task = asyncio.current_task()
+    held = _observations.get(task)
+    if held is not None:
+        if not keys <= held:
+            raise ObservationRootsChanged(keys)
+        yield
+        return
+    async with (
+        environment_coordinator(keys),
+        contextlib.AsyncExitStack() as stack,
+    ):
+        for key in sorted(keys):
+            path = await run_sync_io(environment_install_lock_path, Path(key))
+            await stack.enter_async_context(
+                async_lock(plugin_install_lock(path, timeout=timeout)),
+            )
+
+        def validate():
+            if {
+                str(canonical_environment_path(p)) for p in targets
+            } != keys or any(
+                str(canonical_environment_path(p)) != p or not Path(p).is_dir()
+                for p in keys
+            ):
+                raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
+
+        await run_sync_io(validate)
+        from .dependency_maintenance import observation_readers
+
+        await stack.enter_async_context(async_lock(observation_readers(keys)))
+        _observations[task] = keys
+        try:
+            yield
+        finally:
+            del _observations[task]
 
 
 # Poll interval while waiting for a contended lock.

@@ -624,3 +624,131 @@ async def test_async_lock_release_is_schedulable_and_exclusive(lock_path):
     assert len(exits) == 1
     competitor = _hold(lock_path)
     _release(competitor)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_case", ["normal", "cancel", 32, 33])
+async def test_observation_child_custody_is_temporary(
+    tmp_path,
+    monkeypatch,
+    exit_case,
+):
+    """Inspection children start under held gates without permanent readers."""
+    import asyncio
+    import sys
+
+    from qwenpaw.plugins import dependency_maintenance as maintenance
+    from .timing import WAIT_TIMEOUT
+
+    site = tmp_path / "inspection-site"
+    site.mkdir()
+    other = tmp_path / "other-inspection-site"
+    other.mkdir()
+    sites = [site, other]
+    script = """
+import importlib.util
+import sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('maintenance', sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.lease_environment([Path(sys.argv[2])], parent_pid=int(sys.argv[3]))
+print('READY', flush=True)
+sys.stdin.readline()
+m._close_readers()
+"""
+    ready, release = asyncio.Event(), asyncio.Event()
+
+    async def observe():
+        peer = None
+        async with lock_mod.environment_observation(sites):
+            # The parent custody is scoped, never inserted into lifetime leases.
+            assert str(site.resolve()) not in maintenance._READERS
+            assert [
+                row["pid"] for row in maintenance.live_readers([site])
+            ] == [
+                os.getpid(),
+            ]
+            try:
+                peer = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    script,
+                    maintenance.__file__,
+                    str(site),
+                    str(os.getpid()),
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env={
+                        **os.environ,
+                        "QWENPAW_DEPENDENCY_STATE_DIR": str(
+                            maintenance.state_root(),
+                        ),
+                    },
+                )
+                assert (
+                    await asyncio.wait_for(
+                        peer.stdout.readline(),
+                        WAIT_TIMEOUT,
+                    )
+                    == b"READY\n"
+                )
+                assert sorted(
+                    row["pid"] for row in maintenance.live_readers([site])
+                ) == sorted([os.getpid(), peer.pid])
+                peer.stdin.write(b"RELEASE\n")
+                await peer.stdin.drain()
+                _, error = await asyncio.wait_for(
+                    peer.communicate(),
+                    WAIT_TIMEOUT,
+                )
+                assert peer.returncode == 0, error
+                assert [
+                    row["pid"] for row in maintenance.live_readers([site])
+                ] == [
+                    os.getpid(),
+                ]
+                ready.set()
+                await release.wait()
+            finally:
+                if peer is not None and peer.returncode is None:
+                    peer.kill()
+                    await peer.communicate()
+
+    pending = asyncio.create_task(observe())
+    shared_paths = set()
+    try:
+        await asyncio.wait_for(ready.wait(), WAIT_TIMEOUT)
+        if isinstance(exit_case, int):
+            unlink = Path.unlink
+
+            def sharing_conflict(path, *args, **kwargs):
+                if path.suffix == ".lease" and path not in shared_paths:
+                    shared_paths.add(path)
+                    error = OSError("scanner still has stale lease open")
+                    error.winerror = exit_case
+                    raise error
+                return unlink(path, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "unlink", sharing_conflict)
+        if exit_case == "cancel":
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(pending, WAIT_TIMEOUT)
+        else:
+            release.set()
+            await asyncio.wait_for(pending, WAIT_TIMEOUT)
+    finally:
+        release.set()
+        if not pending.done():
+            await asyncio.wait_for(pending, WAIT_TIMEOUT)
+    if isinstance(exit_case, int):
+        assert shared_paths  # Cleanup encountered the simulated Windows race.
+        assert list(maintenance._readers_dir(site).glob("*.lease"))
+    # Closed descriptors are already non-live; the scanner reaps stale paths.
+    assert not maintenance.live_readers(sites)
+    for root in sites:
+        assert not list(maintenance._readers_dir(root).glob("*.lease"))
+        assert str(root.resolve()) not in maintenance._READERS

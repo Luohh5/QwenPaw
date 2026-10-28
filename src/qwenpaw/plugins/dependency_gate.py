@@ -11,7 +11,7 @@ import re
 import shlex
 import sys
 import tempfile
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
@@ -358,6 +358,77 @@ def _canonical_dependency_roots(paths):
     return {str(canonical_environment_path(path)) for path in paths}
 
 
+def _host_observation_roots(uses, sites, install_target=None):
+    from .execution.dependencies import dependency_sites
+
+    sites = _canonical_dependency_roots(sites)
+    target = (
+        next(iter(_canonical_dependency_roots((install_target,))))
+        if install_target is not None
+        else None
+    )
+    roots = set()
+    for use in uses:
+        if use.origin != "host" or use.snapshot is None:
+            continue
+        evidence = use.snapshot
+        visible = _canonical_dependency_roots(evidence.sites)
+        if use.environment is not None and (
+            target not in visible
+            if target is not None
+            else not sites.intersection(
+                _canonical_dependency_roots(use.environment.sites),
+            )
+        ):
+            continue
+        roots.update(
+            _canonical_dependency_roots(
+                evidence.dependency_sites
+                if evidence.dependency_sites is not None
+                else dependency_sites(evidence.sites),
+            ),
+        )
+    return roots
+
+
+async def _usage_observation_roots(usage, token, sites, install_target=None):
+    from ..utils.io_utils import run_sync_io
+
+    uses = usage.snapshot(None, admission_token=token).uses
+    return await run_sync_io(
+        _host_observation_roots,
+        uses,
+        sites,
+        install_target,
+    )
+
+
+@asynccontextmanager
+async def _shared_observation(targets, *, timeout=300.0):
+    from .install_lock import environment_observation, ObservationRootsChanged
+
+    try:
+        async with environment_observation(targets, timeout=timeout):
+            yield
+    except ObservationRootsChanged:
+        raise
+    except RuntimeError as exc:
+        code = str(exc).partition(":")[0]
+        if isinstance(exc, SharedDependencyError) or not code.startswith(
+            "DEPENDENCY_",
+        ):
+            raise
+        raise SharedDependencyError(
+            GateDecision(
+                False,
+                False,
+                reason=str(exc),
+                reason_code=code,
+                require_restart=code == "DEPENDENCY_REPAIR_REQUIRED",
+            ),
+        ) from exc
+
+
 async def admit_shared_dependencies(
     audit,
     *,
@@ -371,7 +442,7 @@ async def admit_shared_dependencies(
 ):
     """Audit and admit the exact consumer under environment exclusion."""
     from .execution.dependencies import DependencySnapshot
-    from .install_lock import environment_coordinator
+    from .install_lock import ObservationRootsChanged
     from ..utils.io_utils import run_sync_io
 
     keys = await run_sync_io(
@@ -385,10 +456,19 @@ async def admit_shared_dependencies(
     )
     # Release before reacquiring one changed root set; never re-enter prepare.
     for _attempt in range(2):
-        async with environment_coordinator(keys):
+        host_roots = await _usage_observation_roots(
+            usage_registry,
+            admission_token,
+            keys,
+        )
+        async with _shared_observation(keys | host_roots):
             if validate is not None:
                 validate()
-            observed = await audit()
+            try:
+                observed = await audit()
+            except ObservationRootsChanged as exc:
+                keys = set(exc.targets)
+                continue
             if validate is not None:
                 validate()
             if (
@@ -413,13 +493,16 @@ async def admit_shared_dependencies(
                 observed,
                 plugin_id,
             )
-            decision = await _evaluate_shared_dependencies_async(
-                requirements_file,
-                observed,
-                plugin_id=plugin_id,
-                usage_registry=usage_registry,
-                admission_token=admission_token,
-            )
+            try:
+                decision = await _evaluate_shared_dependencies_async(
+                    requirements_file,
+                    observed,
+                    plugin_id=plugin_id,
+                    usage_registry=usage_registry,
+                    admission_token=admission_token,
+                )
+            except ObservationRootsChanged:
+                continue
             if validate is not None:
                 validate()
             if not decision.already_satisfied:
@@ -784,19 +867,27 @@ async def _evaluate_shared_dependencies_async(
 ):
     """Read disk evidence against detached usage, then authorize on-loop."""
     from ..utils.io_utils import run_sync_io
+    from .install_lock import environment_observation
 
     while True:
         before = usage_registry.snapshot(
             None,
             admission_token=admission_token,
         )
-        decision = await run_sync_io(
-            evaluate_shared_dependencies,
-            requirements_file,
-            snapshot,
-            uses=before.uses,
-            **kwargs,
+        roots = await run_sync_io(
+            _host_observation_roots,
+            before.uses,
+            snapshot.dependency_sites or (),
+            kwargs.get("install_target"),
         )
+        async with environment_observation(roots):
+            decision = await run_sync_io(
+                evaluate_shared_dependencies,
+                requirements_file,
+                snapshot,
+                uses=before.uses,
+                **kwargs,
+            )
         current = usage_registry.snapshot(
             None,
             admission_token=admission_token,
@@ -820,16 +911,10 @@ async def prepare_shared_dependencies(
     wheel_tags=None,
     installer_python=None,
     collision_sites=(),
+    targets=(),
 ):
     """Coordinate, audit, query current usage and publish safe additions."""
-    from contextlib import AsyncExitStack
-    from .install_lock import (
-        async_lock,
-        canonical_environment_path as canonical,
-        environment_coordinator,
-        environment_install_lock_path,
-        plugin_install_lock,
-    )
+    from .install_lock import canonical_environment_path as canonical
     from .wheel_additions import validate_additions
     from .execution.dependencies import protected_dependency_target
     from ..utils.io_utils import run_sync_io
@@ -863,7 +948,10 @@ async def prepare_shared_dependencies(
 
     # A known destination waits before inspection so an in-flight marker is
     # not mistaken for inherited damage. Cold unknown inspection fails closed.
-    preliminary = None if target is not None else await audit()
+    preliminary = None
+    if target is None:
+        async with _shared_observation(targets):
+            preliminary = await audit()
     keys = (target,) if target is not None else preliminary.dependency_sites
     if keys is None:
         raise SharedDependencyError(
@@ -879,33 +967,25 @@ async def prepare_shared_dependencies(
             ),
         )
     keys = await run_sync_io(_canonical_dependency_roots, keys)
-    async with environment_coordinator(keys), AsyncExitStack() as stack:
-        if target is not None:
-            try:
-                await stack.enter_async_context(
-                    async_lock(
-                        plugin_install_lock(
-                            await run_sync_io(
-                                environment_install_lock_path,
-                                target,
-                            ),
-                            timeout=lock_timeout,
-                        ),
-                    ),
-                )
-            except RuntimeError as exc:
-                code = str(exc).partition(":")[0]
-                if not code.startswith("DEPENDENCY_"):
-                    raise
-                raise SharedDependencyError(
-                    GateDecision(
-                        False,
-                        False,
-                        reason=str(exc),
-                        reason_code=code,
-                        require_restart=code == "DEPENDENCY_REPAIR_REQUIRED",
-                    ),
-                ) from exc
+    observation_roots = await run_sync_io(
+        _canonical_dependency_roots,
+        (
+            *keys,
+            *targets,
+            *(
+                expected_snapshot.dependency_sites or ()
+                if expected_snapshot is not None
+                else ()
+            ),
+        ),
+    )
+    observation_roots |= await _usage_observation_roots(
+        usage_registry,
+        admission_token,
+        keys,
+        target,
+    )
+    async with _shared_observation(observation_roots, timeout=lock_timeout):
         snapshot = await audit()
         if expected_snapshot is not None and snapshot != expected_snapshot:
             raise SharedDependencyError(

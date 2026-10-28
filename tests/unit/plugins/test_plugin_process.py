@@ -1164,6 +1164,35 @@ async def staged_upgrade(tmp_path, monkeypatch, request):
         dependency_paths=(site,),
         dependency_install_target=site,
     )
+    # An installed Python backend has roots disjoint from the channel worker.
+    # Its real audit must remain covered when maintenance observes consumers.
+    import json
+    from qwenpaw.plugins import python_backend
+
+    independent_site = tmp_path / "independent-site"
+    independent_site.mkdir()
+    monkeypatch.setattr(
+        python_backend,
+        "_host_paths",
+        lambda cwd: (str(independent_site),),
+    )
+    independent = host.installed.parent / "independent-consumer"
+    independent.mkdir(parents=True)
+    (independent / "plugin.json").write_text(
+        json.dumps(
+            {
+                "id": "independent-consumer",
+                "version": "1.0.0",
+                "type": "tool",
+                "entry": {"backend": "main.py"},
+            },
+        ),
+    )
+    (independent / "main.py").write_text(
+        "class Plugin:\n    def register(self, api):\n        pass\n"
+        "plugin = Plugin()\n",
+    )
+    assert independent_site.resolve() != site.resolve()
     old = local_wheel(tmp_path / "old", version="0.5", value="0.5")
     with zipfile.ZipFile(next(old.glob("*.whl"))) as archive:
         archive.extractall(site)
@@ -1275,7 +1304,7 @@ async def test_cancelled_late_maintenance_entry_clears_own_marker(
         prepared.site,
         prepared.operation,
     )
-    original = maintenance.maintenance
+    original = maintenance.maintenance_barrier
     started, release = threading.Event(), threading.Event()
     requested = asyncio.Event()
 
@@ -1292,7 +1321,7 @@ async def test_cancelled_late_maintenance_entry_clears_own_marker(
         requested.set()
         return blocked_entry(*args, **kwargs)
 
-    monkeypatch.setattr(maintenance, "maintenance", slow_entry)
+    monkeypatch.setattr(maintenance, "maintenance_barrier", slow_entry)
     task_capabilities = []
 
     async def apply():
@@ -1328,7 +1357,13 @@ async def test_cancelled_late_maintenance_entry_clears_own_marker(
     assert digest(site) == prepared.before
     assert prepared.module.stat().st_mode == prepared.mode
     assert not prepared.host.installed.exists()
-    with original([site], "next-operation", "next-capability"):
+    # The standalone entry still acquires its own writer gates.
+    monkeypatch.setattr(maintenance, "maintenance_barrier", original)
+    with maintenance.maintenance(
+        [site],
+        "next-operation",
+        "next-capability",
+    ):
         maintenance.clear_maintenance([site], operation["id"])
         assert maintenance.marker(site).exists()
     maintenance.clear_maintenance([site], "next-operation")

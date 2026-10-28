@@ -695,16 +695,25 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         from .execution.dependencies import repair_marker
         from .dependency_maintenance import authorized
 
+        from .execution.dependencies import dependency_sites
+        from .install_lock import environment_observation
+
         host_paths = tuple(sys.path)
-
-        def repair_required():
-            return any(
-                repair_marker(path).exists() and not authorized(path)
-                for path in host_paths
-                if path and Path(path).is_dir()
-            )
-
-        if await run_sync_io(repair_required):
+        roots = await run_sync_io(dependency_sites, host_paths)
+        try:
+            async with environment_observation(roots):
+                dirty = await run_sync_io(
+                    lambda: any(
+                        repair_marker(path).exists() and not authorized(path)
+                        for path in host_paths
+                        if path and Path(path).is_dir()
+                    ),
+                )
+        except RuntimeError as exc:
+            if not str(exc).startswith("DEPENDENCY_REPAIR_REQUIRED"):
+                raise
+            dirty = True
+        if dirty:
             return GateDecision(
                 False,
                 False,
@@ -751,12 +760,20 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
     ) -> GateDecision:
         from ..utils.io_utils import run_sync_io
 
-        decision = await run_sync_io(
-            DependencyGate().evaluate,
-            requirements_file,
-            allow_install=allow_install,
-            plugin_id=plugin_id,
-        )
+        from .execution.dependencies import dependency_sites
+        from .install_lock import environment_observation
+
+        async def evaluate(install):
+            roots = await run_sync_io(dependency_sites, tuple(sys.path))
+            async with environment_observation(roots):
+                return await run_sync_io(
+                    DependencyGate().evaluate,
+                    requirements_file,
+                    allow_install=install,
+                    plugin_id=plugin_id,
+                )
+
+        decision = await evaluate(allow_install)
         if decision.unsupported:
             return decision
         if decision.already_satisfied or not decision.allow_install:
@@ -778,12 +795,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
             plugin_id,
             **source,
         )
-        recheck = await run_sync_io(
-            DependencyGate().evaluate,
-            requirements_file,
-            allow_install=False,
-            plugin_id=plugin_id,
-        )
+        recheck = await evaluate(False)
         if recheck.already_satisfied:
             return recheck
         recheck.allow_install = False
@@ -1053,11 +1065,15 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 DependencyDeclaration(
                     plugin_id,
                     spec.source_revision,
-                    ()
-                    if frozen
-                    else (
-                        tuple(str(item) for item in requirements.requirements)
-                        + tuple(requirements.unsupported)
+                    (
+                        ()
+                        if frozen
+                        else (
+                            tuple(
+                                str(item) for item in requirements.requirements
+                            )
+                            + tuple(requirements.unsupported)
+                        )
                     ),
                     None,
                 ),
@@ -1079,7 +1095,12 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 usage.observe(lease, snapshot)
 
             process.dependency_observer = observe
-            snapshot = (await process.audit(spec)).snapshot
+            from .install_lock import environment_observation
+
+            # The configured sites have parent reader custody. Unknown native
+            # interpreter sites remain subject to the child's cold audit.
+            async with environment_observation(paths):
+                snapshot = (await process.audit(spec)).snapshot
             observe(snapshot)
             wheel_tags = snapshot.supported_tags if frozen else None
             audit_process = process
@@ -1129,6 +1150,7 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                         root,
                     ),
                     install_target=target,
+                    targets=snapshot.dependency_sites or (),
                 )
             except SharedDependencyError as exc:
                 if exc.decision.require_restart or exc.decision.unsupported:
@@ -1409,9 +1431,11 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
                 expected_snapshot=snapshot,
                 wheel_tags=wheel_tags,
                 installer_python=spec.python_executable,
-                collision_sites=dependency_context.immutable_roots
-                if dependency_context
-                else (),
+                collision_sites=(
+                    dependency_context.immutable_roots
+                    if dependency_context
+                    else ()
+                ),
             )
         finally:
             await run_sync_io(cleanup.close)

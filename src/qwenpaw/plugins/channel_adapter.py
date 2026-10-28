@@ -722,10 +722,19 @@ class ChannelBackend:
                     usage.withdraw(token)
 
     async def audit_dependencies(self, description):
-        """Inspect actual child metadata under the caller's exclusion."""
-        async with self._dependency_inspection(description.payload) as values:
-            process, spec, _token, _usage = values
-            return (await process.audit(spec)).snapshot
+        """Fence configured roots; the child still verifies actual sites."""
+        from .install_lock import environment_observation
+
+        prepared = await self.prepare_dependency_targets(description)
+        async with environment_observation(prepared.targets):
+            prepared.validate()
+            async with self._dependency_inspection(
+                description.payload,
+            ) as values:
+                process, spec, _token, _usage = values
+                observed = (await process.audit(spec)).snapshot
+            prepared.validate()
+            return observed
 
     async def prepare_candidate(
         self,
@@ -760,6 +769,7 @@ class ChannelBackend:
                     usage_registry=usage,
                     admission_token=admission or token,
                     install_target=settings.dependency_install_target,
+                    targets=settings.dependency_paths,
                     wheels=wheels,
                 )
             except SharedDependencyError as exc:
@@ -792,5 +802,6 @@ class ChannelBackend:
                     usage_registry=usage,
                     admission_token=admission or token,
                     install_target=settings.dependency_install_target,
+                    targets=settings.dependency_paths,
                 )
             return await process.probe(spec) if probe else snapshot

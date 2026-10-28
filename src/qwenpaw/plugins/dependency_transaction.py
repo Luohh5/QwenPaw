@@ -1073,7 +1073,7 @@ def _reconcile_pending_commit(directory, operation):
 async def apply_operation(manager, operation_id):
     """Stop exact consumers, replace bytes, verify, and resume installation."""
     import asyncio
-    from .dependency_maintenance import maintenance, capability_context
+    from .dependency_maintenance import maintenance_barrier, capability_context
     from .dependency_upgrade import _source_hash, install_result
     from .execution.dependencies import DependencySnapshot
     from ..utils.io_utils import run_sync_io
@@ -1081,7 +1081,7 @@ async def apply_operation(manager, operation_id):
 
     directory = await run_sync_io(manager._directory, operation_id)
     loader = manager.loader
-    from .install_lock import async_lock
+    from .install_lock import async_lock, environment_observation
 
     async with async_lock(operation_lock(directory)):
         operation = await run_sync_io(manager._read, operation_id)
@@ -1244,39 +1244,56 @@ async def apply_operation(manager, operation_id):
                 )
                 mutated = True
 
-            async with async_lock(
-                maintenance(
-                    operation["payload"]["sites"],
-                    operation_id,
-                    operation["capability"],
-                    ignore_pid=os.getpid(),
+            # Lock the complete observed environment before entering the
+            # maintenance barrier; verification must not expand nested locks.
+            prepared_consumers = await manager._prepare_consumer_targets()
+            async with environment_observation(
+                (
+                    *(fresh.dependency_sites or ()),
+                    *operation["payload"]["sites"],
+                    *(
+                        root
+                        for prepared in prepared_consumers
+                        for root in prepared.targets
+                    ),
                 ),
-                on_acquired=claim_maintenance,
             ):
-                verified = await binding.backend.audit_dependencies(
-                    binding.description,
-                )
-                if (
-                    await run_sync_io(
-                        environment_fingerprint,
-                        verified.to_mapping(),
-                    )
-                    != operation["environment_fingerprint"]
+                for prepared in prepared_consumers:
+                    prepared.validate()
+                async with async_lock(
+                    maintenance_barrier(
+                        operation["payload"]["sites"],
+                        operation_id,
+                        operation["capability"],
+                        ignore_pid=os.getpid(),
+                    ),
+                    on_acquired=claim_maintenance,
                 ):
-                    raise RuntimeError(
-                        "DEPENDENCY_PLAN_STALE: environment changed while consumers stopped.",
+                    verified = await binding.backend.audit_dependencies(
+                        binding.description,
                     )
-                current = await manager._consumers(binding, verified)
-                manager._check_reviewed_usage(
-                    operation,
-                    current,
-                    allow_stopped=True,
-                )
-                if await imported_changes_async(operation["payload"]):
-                    raise RuntimeError(
-                        "DEPENDENCY_PLAN_STALE: a host import appeared during preparation; prepare a new confirmation.",
+                    if (
+                        await run_sync_io(
+                            environment_fingerprint,
+                            verified.to_mapping(),
+                        )
+                        != operation["environment_fingerprint"]
+                    ):
+                        raise RuntimeError(
+                            "DEPENDENCY_PLAN_STALE: environment changed while consumers stopped.",
+                        )
+                    current = await manager._consumers(binding, verified)
+                    manager._check_reviewed_usage(
+                        operation,
+                        current,
+                        allow_stopped=True,
                     )
-                await run_sync_io(publish, directory, operation)
+                    if await imported_changes_async(operation["payload"]):
+                        raise RuntimeError(
+                            "DEPENDENCY_PLAN_STALE: a host import appeared "
+                            "during preparation; prepare a new confirmation.",
+                        )
+                    await run_sync_io(publish, directory, operation)
             fresh = await binding.backend.audit_dependencies(
                 binding.description,
             )

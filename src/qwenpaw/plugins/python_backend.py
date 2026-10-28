@@ -413,6 +413,7 @@ class PythonBackend:
         """Read this host's metadata without importing candidate modules."""
         from ..utils.io_utils import run_sync_io
         from .execution.dependencies import observe_dependencies
+        from .install_lock import environment_observation
 
         factory = getattr(self.services, "dependency_environment", None)
         if context is None and factory is not None:
@@ -422,22 +423,36 @@ class PythonBackend:
         for _ in range(2):
             cwd = os.getcwd()
             paths = _host_paths(cwd)
-            snapshot = await run_sync_io(
-                observe_dependencies,
-                {
-                    "code_root": os.path.join(cwd, description.source_path),
-                    "_audit_sites": paths,
-                    "dependency_paths": (),
-                },
-            )
-            if validate is not None:
-                validate()
-            if context is not None and context.runtime_identity is not None:
-                from .channel_bootstrap import validate_runtime_identity
+            prepared = await self.prepare_dependency_targets(description)
+            async with environment_observation(prepared.targets):
+                prepared.validate()
+                if os.getcwd() != cwd or _host_paths(cwd) != paths:
+                    continue
+                snapshot = await run_sync_io(
+                    observe_dependencies,
+                    {
+                        "code_root": os.path.join(
+                            cwd,
+                            description.source_path,
+                        ),
+                        "_audit_sites": paths,
+                        "dependency_paths": (),
+                    },
+                )
+                if validate is not None:
+                    validate()
+                if (
+                    context is not None
+                    and context.runtime_identity is not None
+                ):
+                    from .channel_bootstrap import validate_runtime_identity
 
-                validate_runtime_identity(snapshot, context.runtime_identity)
-            if _host_paths(os.getcwd()) == paths:
-                return snapshot
+                    validate_runtime_identity(
+                        snapshot,
+                        context.runtime_identity,
+                    )
+                if _host_paths(os.getcwd()) == paths:
+                    return snapshot
         raise RuntimeError("Host dependency paths changed during audit")
 
     async def load_definition(
@@ -477,7 +492,7 @@ class PythonBackend:
         """Capture imported distribution origins at lifecycle boundaries."""
         from ..utils.io_utils import run_async_to_completion, run_sync_io
         from .execution.dependencies import dependency_sites
-        from .install_lock import environment_coordinator
+        from .install_lock import environment_observation
 
         plugin_id = description.manifest.id
 
@@ -499,7 +514,7 @@ class PythonBackend:
                         description.source_path,
                     )
                     roots = await run_sync_io(dependency_sites, paths)
-                    async with environment_coordinator(roots):
+                    async with environment_observation(roots):
                         if not valid():
                             return
                         try:

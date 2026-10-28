@@ -637,7 +637,10 @@ async def test_preparation_and_admission_keep_only_required_real_audits(
         token,
         prepared,
     )
-    assert len(audits) == (2 if case == "changed" else 1)
+    assert len(calls) == (2 if case == "changed" else 1)
+    # A newly visible root rejects the stale lock scope before scanning;
+    # only the retry can produce the complete admitted evidence.
+    assert audits == [admitted]
     assert set(admitted.distributions) == (
         {"initial", "added"} if case == "changed" else {"initial"}
     )
@@ -1257,3 +1260,156 @@ async def test_frozen_dependency_path_preparation_and_loop_publication(
         assert len(publications) == 1
         assert sys.path == [str(target), str(tmp_path / "host")]
         assert os.environ["QWENPAW_PLUGIN_SITE"] == str(target)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("leave_marker", [False, True])
+async def test_load_waits_for_dependency_writer(
+    tmp_path,
+    monkeypatch,
+    fresh_registry,
+    bounded_dependency_environment,
+    leave_marker,
+):
+    """Classify a publication marker only after its real writer exits."""
+    import asyncio
+    import json
+    import os
+    import sys
+    from contextlib import suppress
+
+    from .timing import WAIT_TIMEOUT
+
+    from qwenpaw.plugins import dependency_maintenance as maintenance
+    from qwenpaw.plugins import install_lock
+
+    site = bounded_dependency_environment
+    monkeypatch.syspath_prepend(str(site))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(tmp_path / "work"))
+    source = tmp_path / "plugins" / "publication-probe"
+    source.mkdir(parents=True)
+    (source / "plugin.json").write_text(
+        json.dumps(
+            {
+                "id": "publication-probe",
+                "version": "1.0.0",
+                "type": "tool",
+                "entry": {"backend": "main.py"},
+            },
+        ),
+    )
+    (source / "main.py").write_text(
+        "class Plugin:\n"
+        "    def register(self, api):\n"
+        "        pass\n"
+        "plugin = Plugin()\n",
+    )
+    writer_code = """
+import importlib.util
+import sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('maintenance', sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+site = Path(sys.argv[2])
+with m.file_lock(m._gate(site)):
+    marker = m.repair_marker(site)
+    marker.write_text('Shared dependency publication requires verification.\\n')
+    print('READY', flush=True)
+    assert sys.stdin.readline().strip() == 'RELEASE'
+    if sys.argv[3] == 'False':
+        marker.unlink()
+print('COMPLETED', flush=True)
+"""
+    writer = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        writer_code,
+        maintenance.__file__,
+        str(site),
+        str(leave_marker),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    loading = None
+    try:
+        assert (
+            await asyncio.wait_for(
+                writer.stdout.readline(),
+                WAIT_TIMEOUT,
+            )
+            == b"READY\n"
+        )
+        gate_stat = maintenance._gate(site).stat()
+        contended = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def observe_lock(real_lock):
+            def acquire(fd):
+                acquired = real_lock(fd)
+                stat = os.fstat(fd)
+                if (stat.st_dev, stat.st_ino) == (
+                    gate_stat.st_dev,
+                    gate_stat.st_ino,
+                ) and not acquired:
+                    loop.call_soon_threadsafe(contended.set)
+                return acquired
+
+            return acquire
+
+        monkeypatch.setattr(
+            install_lock,
+            "_acquire_os_lock",
+            observe_lock(install_lock._acquire_os_lock),
+        )
+        monkeypatch.setattr(
+            maintenance,
+            "_try_lock",
+            observe_lock(maintenance._try_lock),
+        )
+        loader = PluginLoader([source.parent])
+        loading = asyncio.create_task(
+            loader.load_all_plugins(
+                {"publication-probe": {"enabled": True}},
+                activate=True,
+            ),
+        )
+        await asyncio.wait_for(contended.wait(), WAIT_TIMEOUT)
+        assert not loading.done()
+        writer.stdin.write(b"RELEASE\n")
+        await writer.stdin.drain()
+        output, error = await asyncio.wait_for(
+            writer.communicate(),
+            WAIT_TIMEOUT,
+        )
+        assert writer.returncode == 0, error
+        assert output == b"COMPLETED\n"
+        records = await asyncio.wait_for(loading, WAIT_TIMEOUT)
+    finally:
+        if writer.returncode is None:
+            writer.kill()
+            await writer.communicate()
+        if loading is not None and not loading.done():
+            loading.cancel()
+            with suppress(asyncio.CancelledError):
+                await asyncio.wait_for(loading, WAIT_TIMEOUT)
+    record = records["publication-probe"]
+    if leave_marker:
+        assert record.status == "failed", record.diagnostics
+        assert "DEPENDENCY_REPAIR_REQUIRED" in str(record.diagnostics)
+        assert record.instance is None
+        assert not loader.registry.leftover_registrations("publication-probe")
+    else:
+        assert record.status == "active", record.diagnostics
+        await loader.unload_plugin("publication-probe")
+        # Reuse the same host registry: a transient marker must not retain an
+        # unknown host consumer that blocks every subsequent admission.
+        following = PluginLoader([source.parent])
+        records = await following.load_all_plugins(
+            {"publication-probe": {"enabled": True}},
+            activate=True,
+        )
+        record = records["publication-probe"]
+        assert record.status == "active", record.diagnostics
+        await following.unload_plugin("publication-probe")

@@ -370,26 +370,60 @@ def _lease_environment(sites, parent_pid=None, timeout=5):
             if identity in _READERS:
                 continue
             check_admission(root)
-            path = _readers_dir(root) / (
-                str(os.getpid()) + "-" + uuid4().hex + ".lease"
-            )
-            descriptor = _open_lock(path)
-            try:
-                if not _try_lock(descriptor):
-                    raise RuntimeError("DEPENDENCY_LEASE_UNAVAILABLE")
-                os.lseek(descriptor, 1, os.SEEK_SET)
-                os.write(
-                    descriptor,
-                    json.dumps(
-                        {"pid": os.getpid(), "site": str(root)},
-                    ).encode(),
-                )
-                check_admission(root)
-                _READERS[identity] = (descriptor, path)
-            except BaseException:
-                os.close(descriptor)
-                path.unlink(missing_ok=True)
-                raise
+            _READERS[identity] = _publish_reader(root)
+
+
+def _publish_reader(root):
+    """Publish one OS-owned reader; caller holds gate or parent custody."""
+    path = _readers_dir(root) / (
+        str(os.getpid()) + "-" + uuid4().hex + ".lease"
+    )
+    descriptor = _open_lock(path)
+    try:
+        if not _try_lock(descriptor):
+            raise RuntimeError("DEPENDENCY_LEASE_UNAVAILABLE")
+        os.lseek(descriptor, 1, os.SEEK_SET)
+        os.write(
+            descriptor,
+            json.dumps({"pid": os.getpid(), "site": str(root)}).encode(),
+        )
+        check_admission(root)
+        return descriptor, path
+    except BaseException:
+        os.close(descriptor)
+        path.unlink(missing_ok=True)
+        raise
+
+
+@contextmanager
+def observation_readers(sites):
+    """Temporary parent proof for inspection children, under caller's gates.
+
+    Separate lease files give overlapping scopes independent custody without
+    altering or releasing the process lifetime reader table.
+    """
+    readers = []
+    try:
+        for site in sites:
+            readers.append(_publish_reader(Path(site)))
+        yield
+    finally:
+        # Release every live lease before attempting pathname cleanup. A
+        # Windows scanner can still have a stale lease file open for reading.
+        with ExitStack() as cleanup:
+            for descriptor, _path in readers:
+                cleanup.callback(os.close, descriptor)
+        with ExitStack() as cleanup:
+            for _descriptor, path in readers:
+                cleanup.callback(_unlink_observation_reader, path)
+
+
+def _unlink_observation_reader(path):
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) not in {32, 33}:
+            raise
 
 
 def host_sites():
@@ -450,32 +484,44 @@ def maintenance(sites, operation_id, capability, *, ignore_pid=None):
             if str(canonical(root)) != str(root) or not root.is_dir():
                 raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
             check_admission(root)
-        value = {
-            "id": operation_id,
-            "token_hash": hashlib.sha256(capability.encode()).hexdigest(),
-        }
-        created = []
-        try:
-            for root in sites:
-                path = marker(root)
-                if path.exists() and authorized(root):
-                    continue
-                with path.open("x", encoding="utf-8") as stream:
-                    created.append(path)
-                    os.chmod(path, 0o600)
-                    json.dump(value, stream)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-            if live_readers(sites, ignore_pid):
-                raise RuntimeError(
-                    "DEPENDENCY_ENVIRONMENT_BUSY: another backend or child still uses the environment.",
-                )
-        except BaseException:
-            # No mutation has started; all gates still exclude other writers.
-            for path in created:
-                path.unlink(missing_ok=True)
-            raise
-        yield
+        with maintenance_barrier(
+            sites,
+            operation_id,
+            capability,
+            ignore_pid=ignore_pid,
+        ):
+            yield
+
+
+@contextmanager
+def maintenance_barrier(sites, operation_id, capability, *, ignore_pid=None):
+    """Create maintenance markers; caller must hold every site's gate."""
+    value = {
+        "id": operation_id,
+        "token_hash": hashlib.sha256(capability.encode()).hexdigest(),
+    }
+    created = []
+    try:
+        for root in sites:
+            path = marker(root)
+            if path.exists() and authorized(root):
+                continue
+            with path.open("x", encoding="utf-8") as stream:
+                created.append(path)
+                os.chmod(path, 0o600)
+                json.dump(value, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+        if live_readers(sites, ignore_pid):
+            raise RuntimeError(
+                "DEPENDENCY_ENVIRONMENT_BUSY: another backend or child still uses the environment.",
+            )
+    except BaseException:
+        # No mutation has started; all gates still exclude other writers.
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise
+    yield
 
 
 def clear_maintenance(sites, operation_id):
