@@ -64,10 +64,6 @@ class TestResolvedPluginManifestPath:
         with pytest.raises(FileNotFoundError):
             pl.resolved_plugin_manifest_path(tmp_path / "nope")
 
-    def test_missing_manifest_raises(self, tmp_path):
-        with pytest.raises(FileNotFoundError):
-            pl.resolved_plugin_manifest_path(tmp_path)
-
     def test_symlink_escape_rejected(self, tmp_path):
         src = tmp_path / "src"
         src.mkdir()

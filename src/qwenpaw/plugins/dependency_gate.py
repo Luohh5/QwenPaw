@@ -278,17 +278,6 @@ class DependencyGate:
                 reason="already satisfied",
             )
 
-        if not allow_install:
-            return GateDecision(
-                allow_install=False,
-                already_satisfied=False,
-                missing=missing,
-                reason=(
-                    f"Plugin '{plugin_id}' is missing dependencies: "
-                    + ", ".join(missing)
-                ),
-            )
-
         conflicts = [
             str(req)
             for req in reqs
@@ -307,6 +296,17 @@ class DependencyGate:
                     f"Plugin '{plugin_id}' declares host packages that "
                     f"are already imported ({', '.join(conflicts)}). "
                     "Restart the backend to apply."
+                ),
+            )
+
+        if not allow_install:
+            return GateDecision(
+                allow_install=False,
+                already_satisfied=False,
+                missing=missing,
+                reason=(
+                    f"Plugin '{plugin_id}' is missing dependencies: "
+                    + ", ".join(missing)
                 ),
             )
 

@@ -115,6 +115,18 @@ from qwenpaw.plugins.testing import PluginTestHost
 from qwenpaw.utils.runtime_environment import CERTIFI_REQUIREMENT
 source, root = map(Path, sys.argv[2:4])
 expected = set(json.loads(sys.argv[4]))
+# Unrelated stale metadata must not block a real manifest dependency install.
+if sys.argv[6] == 'tool':
+    duplicates = root.parent / 'duplicate-metadata'
+    for version in ('1.0', '2.0'):
+        info = duplicates / f'unrelated_probe-{version}.dist-info'
+        info.mkdir(parents=True)
+        (info / 'METADATA').write_text(
+            f'Metadata-Version: 2.1\nName: unrelated-probe\nVersion: {version}\n'
+        )
+    sys.path.append(str(duplicates))
+    assert {d.version for d in importlib.metadata.distributions()
+            if d.metadata['Name'] == 'unrelated-probe'} == {'1.0', '2.0'}
 commands, inputs = [], []
 spawn = subprocess.Popen
 
@@ -250,9 +262,9 @@ async def test_satisfied_and_marker_excluded_manifest_does_not_install(
     assert installer == []
 
 
-@pytest.mark.parametrize("dependency", ["httpx==0.0.1", "Pillow==0.0.1"])
+@pytest.mark.parametrize("dependency", ["httpx==0.0.1", "uvicorn==0.0.1"])
 @pytest.mark.parametrize("origin", ["manifest", "requirements"])
-async def test_manifest_cannot_replace_host_or_sdk_distribution(
+async def test_manifest_cannot_replace_protected_host_distribution(
     tmp_path,
     installer,
     dependency,
@@ -264,7 +276,10 @@ async def test_manifest_cannot_replace_host_or_sdk_distribution(
         dependency if origin == "requirements" else None,
     )
     async with PluginTestHost(tmp_path / "host") as host:
-        with pytest.raises(SDKRestartRequiredError):
+        with pytest.raises(
+            SDKRestartRequiredError,
+            match="Restart the backend",
+        ):
             await host.install(source)
         corrected = tmp_path / "corrected"
         corrected.mkdir()
@@ -293,17 +308,23 @@ async def test_manifest_unsupported_syntax_is_not_silently_ignored(
     assert installer == []
 
 
+@pytest.mark.parametrize("sdk", [False, True])
 async def test_both_constraints_apply_when_same_package_is_declared_twice(
     tmp_path,
     installer,
+    sdk,
 ):
     source = package(
         tmp_path,
-        ["packaging==0.0.1"],
-        f"packaging=={version('packaging')}\n",
+        ["httpx==0.0.1"],
+        f"httpx=={version('httpx')}\n",
+        sdk=sdk,
     )
     async with PluginTestHost(tmp_path / "host") as host:
-        with pytest.raises(SDKRestartRequiredError):
+        with pytest.raises(
+            SDKRestartRequiredError if sdk else SDKError,
+            match="httpx==0.0.1",
+        ):
             await host.install(source)
     assert installer == []
 
@@ -333,7 +354,7 @@ async def test_upgrade_rejection_keeps_old_tool_callable(tmp_path, installer):
     two = tool_package(tmp_path, "2.0.0")
     path = two / "plugin.json"
     manifest = json.loads(path.read_text())
-    manifest["dependencies"] = ["Pillow==0.0.1"]
+    manifest["dependencies"] = ["uvicorn==0.0.1"]
     path.write_text(json.dumps(manifest))
     async with PluginTestHost(tmp_path / "host") as host:
         assert (await host.install(one)).ok

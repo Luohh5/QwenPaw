@@ -115,9 +115,12 @@ class TestAcquireRelease:
 
 
 class TestContextManager:
-    def test_releases_after_the_block(self, lock_path):
+    def test_creates_lock_and_releases_after_the_block(self, lock_path):
+        assert not lock_path.parent.exists()
         with lock_mod.plugin_install_lock(lock_path) as first:
             assert first is True
+            assert lock_path.parent.is_dir()
+            assert lock_path.is_file()
 
         # A second fd can take the lock only if the first was released.
         fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)

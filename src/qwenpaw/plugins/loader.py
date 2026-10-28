@@ -759,28 +759,6 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         )
         if decision.unsupported:
             return decision
-        if decision.missing:
-            from ._sdk_dependencies import loaded_sdk_conflicts
-
-            conflicts = await run_sync_io(
-                loaded_sdk_conflicts,
-                source_path,
-                decision.missing,
-            )
-            if conflicts:
-                return GateDecision(
-                    allow_install=False,
-                    already_satisfied=False,
-                    missing=decision.missing,
-                    host_conflicts=conflicts,
-                    require_restart=True,
-                    reason=(
-                        f"Plugin '{plugin_id}' cannot safely replace "
-                        "distributions in this process "
-                        f"({', '.join(conflicts)}). "
-                        "Restart the backend to apply."
-                    ),
-                )
         if decision.already_satisfied or not decision.allow_install:
             return decision
         logger.info(
