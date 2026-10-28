@@ -262,6 +262,8 @@ def _installed_metadata(sites):
         parent = str(origin.parent)
         if parent not in parents:
             parents[parent] = str(canonical_environment_path(origin.parent))
+        # Preserve the audited site's spelling in the serialized snapshot.
+        origin = Path(parents[parent]) / origin.name
         installed_metadata = distribution.metadata
         name = installed_metadata.get("Name")
         version = installed_metadata.get("Version")

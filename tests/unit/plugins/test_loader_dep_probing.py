@@ -547,6 +547,56 @@ async def test_async_loader_leases_before_loop_registry_publication(
     assert events == ["lease", "registry", "publish"]
 
 
+@pytest.fixture
+def controlled_import_snapshot(monkeypatch):
+    """Exercise real module changes without scanning other suites' imports."""
+    from qwenpaw.plugins import dependency_transaction as transaction
+
+    snapshot = transaction._module_snapshot
+    names = {
+        "_qwenpaw_stale_dependency_test",
+        "_qwenpaw_other_import",
+        "_qwenpaw_added_import",
+        "_qwenpaw_supplemental_import",
+    }
+    monkeypatch.setattr(
+        transaction,
+        "_module_snapshot",
+        lambda: tuple(entry for entry in snapshot() if entry[0] in names),
+    )
+
+
+def test_host_dependency_record_retains_loaded_ownership(tmp_path):
+    import os
+    import sys
+    from importlib.metadata import PathDistribution
+    from pathlib import PurePosixPath
+    from qwenpaw.plugins.python_backend import _files_for_loaded_origins
+
+    info = tmp_path / "sample-1.0.dist-info"
+    info.mkdir()
+    source = tmp_path / "shared_ns" / "loaded.py"
+    source.parent.mkdir()
+    source.write_text("VALUE = 1")
+    record = info / "RECORD"
+    record.write_text(
+        "shared_ns/./loaded.py,,9\n"
+        "unrelated.py,,12\n"
+        "shared_ns/missing.py,,1\n",
+    )
+    paths = ["shared_ns/loaded.py", "shared_ns/missing.py"]
+    origins = {os.path.normcase(os.path.normpath(path)) for path in paths}
+    distribution = PathDistribution(info)
+    expected = paths[:1] if sys.version_info >= (3, 12) else paths
+    assert _files_for_loaded_origins(distribution, origins) == [
+        PurePosixPath(path) for path in expected
+    ]
+    with record.open("a") as stream:
+        stream.write("unrelated.py,,not-a-size\n")
+    with pytest.raises(ValueError):
+        _files_for_loaded_origins(distribution, origins)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "change,expected",
@@ -570,6 +620,7 @@ async def test_async_loader_leases_before_loop_registry_publication(
 async def test_dependency_import_resolution_rejects_changed_module(
     tmp_path,
     monkeypatch,
+    controlled_import_snapshot,
     change,
     expected,
 ):
@@ -642,6 +693,10 @@ async def test_dependency_import_resolution_rejects_changed_module(
             outside.__file__ = str(tmp_path / "missing.py")
     finally:
         release.set()
+        await asyncio.wait_for(
+            asyncio.gather(probe, return_exceptions=True),
+            5,
+        )
     if expected == "stale":
         with pytest.raises(RuntimeError, match="DEPENDENCY_PLAN_STALE"):
             await asyncio.wait_for(probe, 5)
@@ -656,6 +711,7 @@ async def test_dependency_import_resolution_rejects_changed_module(
 async def test_dependency_import_resolution_checks_supplemental_changes(
     tmp_path,
     monkeypatch,
+    controlled_import_snapshot,
     change,
 ):
     import asyncio

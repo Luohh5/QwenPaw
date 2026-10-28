@@ -50,6 +50,15 @@ print('sent')
     executable.chmod(0o700)
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
     native = module("imessage", "platform")
+    if sys.platform == "win32":
+        spawn = asyncio.create_subprocess_exec
+
+        async def spawn_script(command, *args, **kwargs):
+            if command == str(executable):
+                return await spawn(sys.executable, command, *args, **kwargs)
+            return await spawn(command, *args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn_script)
     monkeypatch.setattr(native.sys, "platform", "darwin")
     driver = module("imessage").IMessageDriver()
     peer, identity = bind("imessage", driver, tmp_path)

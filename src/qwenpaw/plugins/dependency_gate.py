@@ -1006,10 +1006,18 @@ async def _publish_additions(audit, evaluate, target, files):
 
 def _write_additions(target: Path, files: dict[str, bytes]) -> None:
     """Publish the exact validated bytes while the site lock remains held."""
+
+    def validate_path(path):
+        if not path.resolve().is_relative_to(target) or any(
+            parent.is_symlink()
+            for parent in (path, *path.parents)
+            if parent.is_relative_to(target)
+        ):
+            raise RuntimeError("DEPENDENCY_REPAIR_REQUIRED")
+
     for relative, content in files.items():
         path = target / relative
-        if not path.resolve().is_relative_to(target) or path.is_symlink():
-            raise RuntimeError("DEPENDENCY_REPAIR_REQUIRED")
+        validate_path(path)
         missing_parents = []
         parent = path.parent
         while not parent.exists():
@@ -1017,8 +1025,7 @@ def _write_additions(target: Path, files: dict[str, bytes]) -> None:
             parent = parent.parent
         for parent in reversed(missing_parents):
             parent.mkdir(mode=0o755, exist_ok=True)
-        if not path.resolve().is_relative_to(target) or path.is_symlink():
-            raise RuntimeError("DEPENDENCY_REPAIR_REQUIRED")
+        validate_path(path)
         mode = (
             0o755
             if relative in getattr(files, "executable_paths", ())

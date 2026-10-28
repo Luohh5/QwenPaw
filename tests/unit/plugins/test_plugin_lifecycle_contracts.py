@@ -2936,7 +2936,17 @@ async def test_update_config_cancel_restores_old_when_quiescent(
     task = asyncio.create_task(
         loader.lifecycle.update_config("cfg-cancel", {"cmd": "new"}),
     )
-    await started.wait()
+    ready = asyncio.create_task(started.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {task, ready},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if task in done:
+            pytest.fail(f"Update exited before reregister: {task.result()!r}")
+    finally:
+        ready.cancel()
+        await asyncio.gather(ready, return_exceptions=True)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

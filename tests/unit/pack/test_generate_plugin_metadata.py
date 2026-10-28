@@ -182,6 +182,7 @@ def _write_channel(plugins_root: Path, plugin_id="demo-channel", **settings):
     (plugin_dir / "plugin.py").write_text(
         "plugin = object()\n",
         encoding="utf-8",
+        newline="\n",
     )
     return plugin_dir
 

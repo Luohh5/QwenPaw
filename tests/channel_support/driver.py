@@ -15,7 +15,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def module(key, leaf="driver"):
     root = ROOT / "plugins" / "channel" / key
-    descriptor = json.loads((root / "channel.json").read_text())
+    descriptor = json.loads(
+        (root / "channel.json").read_text(encoding="utf-8"),
+    )
     package = descriptor["entrypoint"]["module"].rpartition(".")[0]
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
@@ -74,7 +76,9 @@ class HostPeer:
 
 def bind(key, driver, tmp_path):
     descriptor = json.loads(
-        (ROOT / "plugins" / "channel" / key / "channel.json").read_text(),
+        (ROOT / "plugins" / "channel" / key / "channel.json").read_text(
+            encoding="utf-8",
+        ),
     )
     peer = HostPeer(tmp_path)
     identity = IdentityParams(key, f"test-{key}", 1)

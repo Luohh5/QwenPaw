@@ -987,7 +987,7 @@ def legacy_start(request, host, tmp_path, monkeypatch):
     description = describe_channel(
         source,
         PluginManifest.from_dict(
-            json.loads((source / "plugin.json").read_text()),
+            json.loads((source / "plugin.json").read_text(encoding="utf-8")),
         ),
     )
     settings = replace(

@@ -299,10 +299,7 @@ def _try_lock(descriptor):
 
 def _open_lock(path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-    if os.fstat(descriptor).st_size == 0:
-        os.write(descriptor, b"\0")
-    return descriptor
+    return os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
 
 
 @contextmanager

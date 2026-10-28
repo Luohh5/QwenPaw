@@ -172,6 +172,11 @@ class TestTimeoutFailsClosed:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         held = _hold(lock_path)
         monkeypatch.setattr(lock_mod, "_RETRY_INTERVAL_SECONDS", 0.01)
+
+        def deny_write(*_args):
+            pytest.fail("Acquiring a lock must not write into a peer's lock")
+
+        monkeypatch.setattr(lock_mod.os, "write", deny_write)
         try:
             # Release from a timer thread so the retry loop can observe it.
             import threading

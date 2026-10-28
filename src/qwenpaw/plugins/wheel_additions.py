@@ -272,6 +272,110 @@ def _check_script_paths(scripts, directory, snapshot, target):
         raise dependency_error("DEPENDENCY_RESTART_REQUIRED")
 
 
+def _directories(files):
+    return {
+        str(parent)
+        for path in files
+        for parent in PurePosixPath(path).parents
+        if str(parent) != "."
+    }
+
+
+def _check_overlap(left, left_dirs, right, right_dirs, reason):
+    """Only implicit namespace directories may belong to two providers."""
+    left, right = (
+        {path.casefold() for path in paths} for paths in (left, right)
+    )
+    left_dirs, right_dirs = (
+        {path.casefold() for path in paths}
+        for paths in (left_dirs, right_dirs)
+    )
+    shared = left_dirs & right_dirs
+    initializers = {
+        str(PurePosixPath(path).parent)
+        for path in left | right
+        if PurePosixPath(path).name.startswith("__init__.")
+    }
+
+    def modules(paths):
+        return {
+            str(
+                PurePosixPath(path).with_name(
+                    PurePosixPath(path).name.split(".", 1)[0],
+                ),
+            )
+            for path in paths
+            if PurePosixPath(path).suffix in {".py", ".pyc", ".so", ".pyd"}
+        }
+
+    left_modules, right_modules = modules(left), modules(right)
+    if (
+        left & (right | right_dirs)
+        or right & left_dirs
+        or shared & initializers
+        or left_modules & (right_modules | right_dirs)
+        or right_modules & left_dirs
+    ):
+        raise dependency_error(reason)
+
+
+def _check_installed_tree(
+    files,
+    directories,
+    sites,
+    *,
+    replaced=(),
+    reason="DEPENDENCY_RESTART_REQUIRED",
+):
+    """Inspect only intersecting directories, retaining namespace siblings."""
+    replaced = {Path(path) for path in replaced}
+    owned_dirs = {parent for path in replaced for parent in path.parents}
+
+    def retained(path):
+        if path.is_symlink():
+            return True
+        if path in replaced:
+            return False
+        if replaced and path.name == "__pycache__" and path.is_dir():
+            # Orphaned bytecode is not an import provider. Keep the actual
+            # files for collision checks; replacement does not own them.
+            return any(
+                child.is_symlink()
+                or not child.is_file()
+                or child.suffix != ".pyc"
+                for child in path.iterdir()
+            )
+        if path in owned_dirs and path.is_dir():
+            return any(retained(child) for child in path.iterdir())
+        return True
+
+    for site in sites:
+        root = Path(site)
+        existing, existing_dirs = set(), set()
+        for relative in {".", *directories}:
+            directory = root / relative
+            if directory.is_symlink():
+                raise dependency_error(reason)
+            if not directory.is_dir():
+                continue
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if not retained(Path(entry.path)):
+                        continue
+                    path = str(PurePosixPath(relative) / entry.name)
+                    if entry.is_dir(follow_symlinks=False):
+                        existing_dirs.add(path)
+                    else:
+                        existing.add(path)
+        _check_overlap(
+            files,
+            directories,
+            existing,
+            existing_dirs,
+            reason,
+        )
+
+
 # Whole-set archive and collision validation is deliberately fail-closed.
 # pylint: disable=too-many-branches,too-many-boolean-expressions,too-many-statements
 def validate_additions(
@@ -346,8 +450,7 @@ def validate_additions(
             )
             stems = {top.split(".", 1)[0] for top in tops}
             if (
-                stems.intersection(occupied)
-                or {stem.casefold() for stem in stems} & script_directories
+                {stem.casefold() for stem in stems} & script_directories
                 or (
                     scripts
                     and directory.casefold()
@@ -360,18 +463,15 @@ def validate_additions(
                 _check_script_paths(scripts, directory, snapshot, target)
                 script_directories.add(directory.casefold())
                 script_paths.update(path.casefold() for path in scripts)
-            for top in tops:
-                for site in snapshot.sites:
-                    destination = Path(site) / top
-                    if destination.exists() or destination.is_symlink():
-                        raise dependency_error("DEPENDENCY_RESTART_REQUIRED")
-                    # Module and package suffix differences still shadow.
-                    stem = top.split(".", 1)[0]
-                    if (
-                        any(Path(site).glob(stem + ".*"))
-                        or (Path(site) / stem).exists()
-                    ):
-                        raise dependency_error("DEPENDENCY_RESTART_REQUIRED")
+            directories = _directories(members)
+            _check_overlap(
+                members,
+                directories,
+                files,
+                _directories(files),
+                "DEPENDENCY_PLAN_UNVERIFIED",
+            )
+            _check_installed_tree(members, directories, snapshot.sites)
             for site in snapshot.sites:
                 for origin in Path(site).glob("*.dist-info"):
                     text = origin / "METADATA"

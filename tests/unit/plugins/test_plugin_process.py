@@ -656,17 +656,20 @@ def dependency_files(tmp_path):
 
 
 def _dependency_snapshot(files):
-    rows, invalid, _ = _installed_metadata((files.site,))
+    site = str(maintenance.canonical(files.site))
+    rows, invalid, _ = _installed_metadata((site,))
     assert not invalid
-    return DependencySnapshot(
+    snapshot = DependencySnapshot(
         str(files.prefix / "bin/python"),
         str(files.prefix),
-        (str(files.site),),
+        (site,),
         default_environment(),
         ("py3-none-any",),
         rows,
-        (str(files.site),),
+        (site,),
     )
+    # Exercise the worker's wire contract, including native path identity.
+    return DependencySnapshot.from_mapping(snapshot.to_mapping())
 
 
 def _inventory(root):
@@ -677,6 +680,136 @@ def _inventory(root):
         )
         for path in root.rglob("*")
     }
+
+
+@pytest.mark.parametrize("placement", ["batch", "target", "sibling"])
+@pytest.mark.parametrize(
+    "conflict",
+    [None, "file", "module", "package", "nested_package"],
+)
+def test_namespace_additions_preserve_file_ownership(
+    tmp_path,
+    placement,
+    conflict,
+):
+    import hashlib
+
+    from qwenpaw.plugins.dependency_transaction import prepare_payload
+    from qwenpaw.plugins.dependency_gate import _write_additions
+    from qwenpaw.plugins.execution.errors import ProtocolValidationError
+    from qwenpaw.plugins.wheel_additions import (
+        WheelAddition,
+        validate_additions,
+    )
+
+    site = tmp_path / "plugin_runtime/site"
+    site.mkdir(parents=True)
+    first = _local_dependency_wheel(
+        tmp_path / "wheels",
+        "namespace-one",
+        "1.0",
+        {
+            (
+                "sample_namespace/nested/one.py"
+                if conflict == "nested_package"
+                else "sample_namespace/one.py"
+            ): b"VALUE = 1\n",
+        },
+    )
+    second_path = {
+        None: "sample_namespace/two.py",
+        "file": "sample_namespace/one.py",
+        "module": "sample_namespace.py",
+        "package": "sample_namespace/__init__.py",
+        "nested_package": "sample_namespace/nested/__init__.py",
+    }[conflict]
+    second = _local_dependency_wheel(
+        first.parent,
+        "namespace-two",
+        "1.0",
+        {second_path: b"VALUE = 2\n"},
+    )
+    wheels = [first, second]
+    installed = placement != "batch"
+    old_site = tmp_path / "sibling" if placement == "sibling" else site
+    if installed:
+        with zipfile.ZipFile(first) as archive:
+            archive.extractall(old_site)
+        wheels.remove(first)
+    sites = tuple(dict.fromkeys(map(str, (site, old_site))))
+    snapshot = DependencySnapshot(
+        sys.executable,
+        sys.prefix,
+        sites,
+        default_environment(),
+        ("py3-none-any",),
+        _installed_metadata((old_site,))[0] if installed else {},
+    )
+    additions = tuple(
+        WheelAddition(path, hashlib.sha256(path.read_bytes()).hexdigest())
+        for path in wheels
+    )
+    before = {root: _inventory(Path(root)) for root in sites}
+    if conflict:
+        with pytest.raises(
+            ProtocolValidationError,
+            match=(
+                "^DEPENDENCY_RESTART_REQUIRED$"
+                if installed
+                else "^DEPENDENCY_PLAN_UNVERIFIED$"
+            ),
+        ):
+            validate_additions(additions, snapshot, site)
+        if installed:
+            # Upgrade planning omits mutable sites; payload custody must still
+            # protect every unchanged namespace owner at publication time.
+            files, _ = validate_additions(
+                additions,
+                replace(snapshot, sites=()),
+                site,
+            )
+            operation = tmp_path / "operations/current"
+            operation.mkdir(parents=True)
+            with pytest.raises(
+                RuntimeError,
+                match="DEPENDENCY_PLAN_UNVERIFIED",
+            ):
+                prepare_payload(
+                    operation,
+                    snapshot.to_mapping(),
+                    (),
+                    {"namespace-two": site},
+                    files,
+                    [{"path": str(second)}],
+                )
+    else:
+        files, proposed = validate_additions(additions, snapshot, site)
+        operation = tmp_path / "operations/current"
+        operation.mkdir(parents=True)
+        payload = prepare_payload(
+            operation,
+            snapshot.to_mapping(),
+            (),
+            {name: site for name in proposed.distributions},
+            files,
+            [{"path": str(wheel)} for wheel in wheels],
+        )
+        assert set(payload["new"]) == {str(site / path) for path in files}
+        for path, row in payload["new"].items():
+            assert (operation / row["payload"]).read_bytes() == files[
+                Path(path).relative_to(site).as_posix()
+            ]
+        publication = tmp_path / "publication"
+        real = publication / "real"
+        real.mkdir(parents=True)
+        (publication / "sample_namespace").symlink_to(
+            real,
+            target_is_directory=True,
+        )
+        with pytest.raises(RuntimeError, match="DEPENDENCY_REPAIR_REQUIRED"):
+            _write_additions(publication, {second_path: files[second_path]})
+        assert not list(real.iterdir())
+    assert {root: _inventory(Path(root)) for root in sites} == before
 
 
 def _prepare_dependency_operation(files, context=None):
@@ -1216,7 +1349,10 @@ async def test_frozen_ordinary_loader_gate_installs_missing_sdk_in_overlay(
     )
     source = tmp_path / "ordinary-plugin"
     source.mkdir()
-    (source / "requirements.txt").write_text("sample-shared-sdk==1.0\n")
+    (source / "requirements.txt").write_text(
+        "sample-shared-sdk==1.0\nsample-namespace-one==1.0\n"
+        "sample-namespace-two==1.0\n",
+    )
     (source / "plugin.json").write_text(
         json.dumps(
             {
@@ -1228,12 +1364,21 @@ async def test_frozen_ordinary_loader_gate_installs_missing_sdk_in_overlay(
     )
     (source / "main.py").write_text(
         "import sample_shared_sdk\n"
+        "from sample_namespace import one, two\n"
         "class Plugin:\n"
         "    def register(self, api): pass\n"
         "    def sdk_value(self): return sample_shared_sdk.VALUE\n"
+        "    def namespace_value(self): return one.VALUE + two.VALUE\n"
         "plugin = Plugin()\n",
     )
     wheels = local_wheel(tmp_path / "wheels")
+    for name in ("one", "two"):
+        _local_dependency_wheel(
+            wheels,
+            f"sample-namespace-{name}",
+            "1.0",
+            {f"sample_namespace/{name}.py": f"VALUE = {name!r}\n".encode()},
+        )
     local_certifi_wheel(wheels)
     for name, value in {
         "PIP_NO_INDEX": "1",
@@ -1291,6 +1436,7 @@ async def test_frozen_ordinary_loader_gate_installs_missing_sdk_in_overlay(
         record = await host.loader.load_plugin_from_path(source)
         assert record.status == "active", record.diagnostics
         assert record.instance.sdk_value() == "offline-sdk"
+        assert record.instance.namespace_value() == "onetwo"
         sdk = importlib.import_module("sample_shared_sdk")
         assert sdk.VALUE == "offline-sdk"
         assert Path(sdk.__file__).parent == runtime.dependency_install_target
@@ -1311,6 +1457,12 @@ async def test_frozen_ordinary_loader_gate_installs_missing_sdk_in_overlay(
                 await host.loader.unload_plugin("ordinary-plugin")
         finally:
             sys.modules.pop("sample_shared_sdk", None)
+            for name in (
+                "sample_namespace",
+                "sample_namespace.one",
+                "sample_namespace.two",
+            ):
+                sys.modules.pop(name, None)
             importlib.invalidate_caches()
             await host.close()
     assert bundle_inventory() == before

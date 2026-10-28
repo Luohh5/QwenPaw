@@ -321,11 +321,38 @@ async def test_active_tts_interrupt_joins_native_synth_and_retains_call(
         assert len(driver._platform._calls) == 1
 
 
-async def test_stop_closes_asr_call_and_backend(vendor, tmp_path):
+async def test_stop_closes_asr_call_and_backend(vendor, tmp_path, monkeypatch):
     async with running(vendor, tmp_path) as (driver, peer, identity):
         call = await incoming(vendor)
         asr = vendor.asrs[-1]
         platform = driver._platform
-        await driver.stop()
+        ended = asyncio.Event()
+        callbacks = []
+        on_ended = platform.backend.on_call_ended
+        close_asr = type(asr).__aexit__
+
+        async def notify_ended(call_id):
+            callbacks.append(asyncio.current_task())
+            ended.set()
+            await on_ended(call_id)
+
+        async def exit_asr(self, *args):
+            await asyncio.wait_for(ended.wait(), 3)
+            await close_asr(self, *args)
+
+        monkeypatch.setattr(platform.backend, "on_call_ended", notify_ended)
+        monkeypatch.setattr(type(asr), "__aexit__", exit_asr)
+        stop = asyncio.create_task(driver.stop())
+        done, _ = await asyncio.wait({stop}, timeout=3)
+        if not done:
+            # Release the native callback even when the regression returns.
+            for task in callbacks:
+                task.cancel()
+        await stop
+        assert done, "Native ended callback and driver.stop mutually waited"
+        assert ended.is_set()
         assert call.hangups >= 1 and asr.closed
         assert not platform._calls and driver._platform is None
+        assert all(
+            not thread.is_alive() for thread in vendor.phones[-1].threads
+        )

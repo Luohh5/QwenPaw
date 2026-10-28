@@ -532,19 +532,31 @@ describe("ChannelDrawer builtin channel rendering", () => {
     expect(screen.queryByText("channels.autoCollapseThinking")).toBeNull();
   });
 
-  it("hides tool-call/result length inputs when the toggles are off", () => {
-    const { unmount } = renderDrawer({ activeKey: "telegram" });
-    // default: both toggles on, length fields present
-    expect(screen.getByText("channels.toolCallMaxLength")).toBeTruthy();
-    expect(screen.getByText("channels.toolResultMaxLength")).toBeTruthy();
-    unmount();
-
+  it.each([
+    ["show_tool_calls", "toolCallMaxLength"],
+    ["show_tool_results", "toolResultMaxLength"],
+  ])("saves %s when its length field unmounts", async (field, length) => {
+    const onSubmit = vi.fn();
     renderDrawer({
-      activeKey: "telegram",
-      initialValues: { show_tool_calls: false, show_tool_results: false },
+      activeKey: "console",
+      onSubmit,
+      initialValues: {
+        show_tool_calls: true,
+        show_tool_results: true,
+        tool_call_max_length: 200,
+        tool_result_max_length: 500,
+      },
     });
-    expect(screen.queryByText("channels.toolCallMaxLength")).toBeNull();
-    expect(screen.queryByText("channels.toolResultMaxLength")).toBeNull();
+    expect(screen.getByText(`channels.${length}`)).toBeTruthy();
+    fireEvent.click(document.getElementById(field)!);
+    expect(screen.queryByText(`channels.${length}`)).toBeNull();
+    await waitFor(
+      () =>
+        expect(onSubmit).toHaveBeenCalledWith(
+          expect.objectContaining({ [field]: false }),
+        ),
+      { timeout: 2000 },
+    );
   });
 });
 

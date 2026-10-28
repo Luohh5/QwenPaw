@@ -65,9 +65,13 @@ def _files_for_loaded_origins(distribution, origins):
             raise ValueError("Invalid RECORD row")
         if len(row) == 3 and row[2]:
             int(row[2])
-        path = PurePosixPath(row[0])
+        path = row[0]
+        # Keep anchor semantics for unusual paths without allocating a Path
+        # for every unrelated, ordinary relative RECORD entry.
+        if path.startswith("//") or "\\" in path or ":" in path:
+            path = str(PurePosixPath(path))
         if os.path.normcase(os.path.normpath(path)) in origins:
-            candidates.append(path)
+            candidates.append(PurePosixPath(path))
     if sys.version_info < (3, 12):
         return candidates
     # Validate every row before checking candidates, and check all candidates

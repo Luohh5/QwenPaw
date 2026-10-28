@@ -4,9 +4,9 @@ import asyncio
 import json
 from nio import AsyncClient
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 import pytest
 from qwenpaw.channel_protocol.models import SendParams
+from qwenpaw.utils.media_paths import file_url_to_path
 from tests.channel_support.driver import bind, module
 
 from aiohttp import web
@@ -346,7 +346,7 @@ async def test_native_media_event_is_downloaded_and_admitted_once(
     assert len(parts) == 1 and payload["sender_id"] == "@user:example.com"
     part = parts[0]
     uri = getattr(part, "data" if kind == "audio" else kind + "_url")
-    path = Path(unquote(urlparse(uri).path))
+    path = Path(file_url_to_path(uri))
     assert uri.startswith("file://") and path.is_relative_to(
         Path(platform.config["workspace_dir"]),
     )

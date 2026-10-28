@@ -1988,9 +1988,11 @@ export function ChannelDrawer({
         values[field] = form.getFieldValue(field);
       return values;
     };
-    // Ignore unregistered drafts while retaining this authorization batch.
-    const values = structuredClone(readValues());
-    const validationValues = JSON.stringify(values);
+    // Registration changes when conditional controls mount/unmount. Observe
+    // the full store for edits, but submit only active fields after validation.
+    const validationValues = JSON.stringify(form.getFieldsValue(true));
+    const validationFields = JSON.stringify(Object.keys(form.getFieldsValue()));
+    const revision = formRevision.current;
     const generation = scopeGeneration.current;
     const capturedAuthorization = authorization.current
       ? {
@@ -2000,30 +2002,13 @@ export function ChannelDrawer({
           custody: authorization.current.custody,
         }
       : undefined;
-    const snapshot = { ...initialValues, ...values };
-    const { auth_method, ...rest } = snapshot;
-    const body =
-      activeKey !== "matrix"
-        ? snapshot
-        : auth_method === "password"
-        ? { ...rest, access_token: "" }
-        : auth_method === "token"
-        ? { ...rest, password: "", encryption: false }
-        : rest;
-    const job = captureChannelSaveJob({
-      agentId,
-      channel: activeKey,
-      body: normalizeChannelSubmitValues(activeKey, body),
-      authSession: capturedAuthorization?.provenance.token,
-      formRevision: formRevision.current,
-    });
     const currentScope = () =>
       generation === scopeGeneration.current &&
-      (useAgentStore.getState().selectedAgent || "default") === job.agentId;
+      (useAgentStore.getState().selectedAgent || "default") === agentId;
     const current = () =>
       currentScope() &&
-      job.formRevision === formRevision.current &&
-      JSON.stringify(readValues()) === validationValues;
+      revision === formRevision.current &&
+      JSON.stringify(form.getFieldsValue(true)) === validationValues;
     try {
       await form.validateFields();
     } catch (error) {
@@ -2047,6 +2032,33 @@ export function ChannelDrawer({
       }
     }
     if (!current()) return undefined;
+    if (
+      JSON.stringify(Object.keys(form.getFieldsValue())) !== validationFields
+    ) {
+      try {
+        await form.validateFields();
+      } catch {
+        return undefined;
+      }
+      if (!current()) return undefined;
+    }
+    const snapshot = { ...initialValues, ...structuredClone(readValues()) };
+    const { auth_method, ...rest } = snapshot;
+    const body =
+      activeKey !== "matrix"
+        ? snapshot
+        : auth_method === "password"
+        ? { ...rest, access_token: "" }
+        : auth_method === "token"
+        ? { ...rest, password: "", encryption: false }
+        : rest;
+    const job = captureChannelSaveJob({
+      agentId,
+      channel: activeKey,
+      body: normalizeChannelSubmitValues(activeKey, body),
+      authSession: capturedAuthorization?.provenance.token,
+      formRevision: revision,
+    });
     // Validation transfers custody to this immutable task. Later navigation,
     // unmount or retry must not reread the form or discard the validated write.
     const save = async () => {

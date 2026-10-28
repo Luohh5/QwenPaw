@@ -186,8 +186,6 @@ def plugin_install_lock(
     deadline = time.monotonic() + max(timeout, 0.0)
     try:
         try:
-            if os.name == "nt" and os.fstat(fd).st_size == 0:
-                os.write(fd, b"\0")
             while True:
                 os.lseek(fd, 0, os.SEEK_SET)
                 acquired = _acquire_os_lock(fd)

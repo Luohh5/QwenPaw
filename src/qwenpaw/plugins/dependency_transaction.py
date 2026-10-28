@@ -352,6 +352,19 @@ def prepare_payload(
             raise RuntimeError(
                 "DEPENDENCY_PLAN_UNVERIFIED: shared installed ownership.",
             )
+    from .wheel_additions import _check_installed_tree, _directories
+    from .execution.errors import ProtocolValidationError
+
+    try:
+        _check_installed_tree(
+            files,
+            _directories(files),
+            snapshot["sites"],
+            replaced=old_files,
+            reason="DEPENDENCY_PLAN_UNVERIFIED",
+        )
+    except ProtocolValidationError as exc:
+        raise RuntimeError(str(exc)) from exc
     new_files = {}
     for wheel in wheels:
         import zipfile
@@ -381,55 +394,6 @@ def prepare_payload(
                 "DEPENDENCY_ENVIRONMENT_PROTECTED: dependency site is not writable.",
             )
         info = metadata_path.split("/", 1)[0]
-        owned_tops = {
-            path.split("/", 1)[0]
-            for path in files
-            if path.split("/", 1)[0] == info
-        }
-        # Wheels have disjoint validated top-level providers except script dirs.
-        with zipfile.ZipFile(wheel["path"]) as archive:
-            tops = {
-                name.split("/", 1)[0]
-                for name in archive.namelist()
-                if not name.split("/", 1)[0].endswith(".data")
-            }
-        for top in tops - {info}:
-            stem = top.split(".", 1)[0]
-            for visible in snapshot["sites"]:
-                root = Path(visible)
-                for provider in root.glob(stem + ".*"):
-                    if (
-                        provider.suffix.lower()
-                        in {".py", ".pyc", ".so", ".pyd"}
-                        and str(canonical(provider)) not in old_files
-                    ):
-                        raise RuntimeError(
-                            "DEPENDENCY_PLAN_UNVERIFIED: another import provider would be shadowed.",
-                        )
-                package = root / stem
-                if package.is_symlink():
-                    raise RuntimeError(
-                        "DEPENDENCY_PLAN_UNVERIFIED: import provider is a symlink.",
-                    )
-                if package.is_dir():
-                    initializers = list(package.glob("__init__.*"))
-                    if any(
-                        str(canonical(path)) not in old_files
-                        for path in initializers
-                    ):
-                        raise RuntimeError(
-                            "DEPENDENCY_PLAN_UNVERIFIED: another package would be shadowed.",
-                        )
-                    if f"{stem}/__init__.py" in files and any(
-                        path.is_file()
-                        and "__pycache__" not in path.parts
-                        and str(canonical(path)) not in old_files
-                        for path in package.rglob("*")
-                    ):
-                        raise RuntimeError(
-                            "DEPENDENCY_PLAN_UNVERIFIED: namespace sibling ownership would change.",
-                        )
-        owned_tops.update(tops)
         prefix = canonical(snapshot["prefix"])
         # Inferred launcher caches stay in old custody, not the new RECORD.
         external_scripts = {
@@ -513,20 +477,15 @@ def prepare_payload(
             rows = io.StringIO(newline="")
             csv.writer(rows, lineterminator="\n").writerows(record_rows)
             files[record_path] = rows.getvalue().encode()
+        owned_paths = {
+            row[0]
+            for row in csv.reader(
+                files[f"{info}/RECORD"].decode("utf-8").splitlines(),
+            )
+        }
         for relative, content in files.items():
-            if relative in relocated:
+            if relative in relocated or relative not in owned_paths:
                 continue
-            if relative.split("/", 1)[0] not in owned_tops:
-                # Relocated scripts are matched against the wheel's data dir.
-                if relative.split("/", 1)[0] not in {"bin", "Scripts"}:
-                    continue
-                script_name = Path(relative).name
-                with zipfile.ZipFile(wheel["path"]) as archive:
-                    if not any(
-                        item.endswith(".data/scripts/" + script_name)
-                        for item in archive.namelist()
-                    ):
-                        continue
             destination = site / relative
             resolved = canonical(destination)
             if (

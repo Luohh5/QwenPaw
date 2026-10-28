@@ -30,6 +30,7 @@ class CallBinding:
     closing: bool = False
     cleanup_error: object = None
     cleanup_task: object = None
+    cleanup_done: object = None
 
     @property
     def session_id(self):
@@ -373,17 +374,31 @@ class SIPPlatform:
 
     async def _end_call(self, call, *, hangup=False):
         if call.closing and call.cleanup_error is None:
-            owner = call.cleanup_task
             if (
-                owner is not None
-                and owner is not asyncio.current_task()
-                and not owner.done()
+                call.cleanup_task is not asyncio.current_task()
+                and call.cleanup_done is not None
             ):
-                await asyncio.shield(owner)
+                error = await asyncio.shield(call.cleanup_done)
+                if error is not None:
+                    raise RuntimeError("SIP_CALL_STOP_INCOMPLETE") from error
             return
         call.cleanup_task = asyncio.current_task()
+        completion = asyncio.get_running_loop().create_future()
+        call.cleanup_done = completion
         call.closing = True
         call.cleanup_error = None
+        try:
+            await self._cleanup_call(call, hangup=hangup)
+        except BaseException as exc:
+            call.cleanup_error = exc
+            raise
+        finally:
+            # A native reader may await this while close() later joins it.
+            # Complete this call's cleanup, not the enclosing stop task.
+            completion.set_result(call.cleanup_error)
+            call.cleanup_task = None
+
+    async def _cleanup_call(self, call, *, hangup):
         self._interrupt(call)
         failures = []
         try:

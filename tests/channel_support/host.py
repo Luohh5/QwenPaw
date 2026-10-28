@@ -118,19 +118,29 @@ class Host:
         source = self.root / ("incoming-" + version) / KEY
         source.mkdir(parents=True)
         manifest = json.loads(
-            (ROOT / "plugins/channel/feishu/plugin.json").read_text(),
+            (ROOT / "plugins/channel/feishu/plugin.json").read_text(
+                encoding="utf-8",
+            ),
         )
         manifest["version"] = version
-        (source / "plugin.json").write_text(json.dumps(manifest))
+        (source / "plugin.json").write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
         descriptor = json.loads(
-            (ROOT / "plugins/channel/feishu/channel.json").read_text(),
+            (ROOT / "plugins/channel/feishu/channel.json").read_text(
+                encoding="utf-8",
+            ),
         )
         descriptor["entrypoint"] = {
             "scope": "runner",
             "module": "sample",
             "qualname": "Driver",
         }
-        (source / "channel.json").write_text(json.dumps(descriptor))
+        (source / "channel.json").write_text(
+            json.dumps(descriptor),
+            encoding="utf-8",
+        )
         (source / "requirements.txt").write_text(
             "sample-shared-sdk==1.0\n" if sdk else "",
         )
@@ -138,7 +148,12 @@ class Host:
         (source / "sample.py").write_text(
             f"FAIL_START={fail_start!r}\n"
             + prefix
-            + Path(__file__).with_name("sample_channel.py").read_text(),
+            + Path(__file__)
+            .with_name("sample_channel.py")
+            .read_text(
+                encoding="utf-8",
+            ),
+            encoding="utf-8",
         )
         return source
 
