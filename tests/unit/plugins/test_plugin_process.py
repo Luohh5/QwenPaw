@@ -316,7 +316,8 @@ async def test_forced_stop_reaps_uncooperative_process_tree(tmp_path, process):
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(
-    os.name != "nt", reason="Windows Job and venv host ownership"
+    os.name != "nt",
+    reason="Windows Job and venv host ownership",
 )
 async def test_host_exit_reaps_uncooperative_process_tree(tmp_path):
     import json
@@ -337,11 +338,9 @@ async def test_host_exit_reaps_uncooperative_process_tree(tmp_path):
         ),
     )
     (site / "test-runtime.pth").write_text(
-        sysconfig.get_path("purelib") + "\n"
+        sysconfig.get_path("purelib") + "\n",
     )
-    executable = runtime / (
-        "Scripts/python.exe" if os.name == "nt" else "bin/python"
-    )
+    executable = runtime / "Scripts/python.exe"
     script = """
 import asyncio, json, os, sys
 from pathlib import Path

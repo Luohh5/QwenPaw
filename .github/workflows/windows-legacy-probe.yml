@@ -23,38 +23,23 @@ jobs:
         run: |
           python -m pip install --upgrade 'pip>=26.2.2' 'certifi>=2026.10.19'
           python -m pip install -e '.[dev,test,full]' 'setuptools<82'
-      - name: Enable temporary worker diagnostics
-        run: python windows_unit_diagnostics.py
-      - name: Compare inherited and DEVNULL SDK stdin
+      - name: Verify old failures and core process lifecycle
         run: |
           python - <<'PYTEST'
           import json, subprocess, sys
-          from pathlib import Path
-          nodes = [
-              'tests/unit/plugins/test_plugin_process.py::test_forced_stop_reaps_uncooperative_process_tree',
+          nodes = json.load(open('windows-nodes.json'))
+          nodes.extend([
               'tests/unit/plugins/test_plugin_process.py::test_host_exit_reaps_uncooperative_process_tree',
-          ]
-          worker = Path('tests/channel_support/worker.py')
-          baseline = worker.read_text()
-          marker = '                # DIAGNOSTIC_SDK_STDIN\n'
-          assert baseline.count(marker) == 1
-          results = {}
-          try:
-              for case in ('inherited', 'devnull'):
-                  worker.write_text(baseline.replace(marker, '                stdin=subprocess.DEVNULL,\n' if case == 'devnull' else ''))
-                  print('DIAGNOSTIC SDK STDIN CASE:', case, flush=True)
-                  results[case] = subprocess.call([sys.executable, '-m', 'pytest', '-vv', '-s', '--no-cov', '--durations=15', f'--junitxml=windows-{case}.xml', *nodes])
-          finally:
-              worker.write_text(baseline)
-              Path('windows-stdin-ab.json').write_text(json.dumps(results, indent=2))
-          print('DIAGNOSTIC SDK STDIN RESULTS:', results, flush=True)
-          raise SystemExit(results['devnull'])
+              'tests/unit/plugins/test_plugin_process.py::test_lifecycle_bidirectional_ipc_logs_and_repeated_stop',
+              'tests/unit/plugins/test_plugin_process.py::test_crash_restarts_generation_and_retains_host_handler',
+              'tests/unit/plugins/test_plugin_process.py::test_cancel_inflight_call_cleans_up_and_next_request_succeeds',
+              'tests/unit/plugins/test_plugin_process.py::test_large_text_and_attachment_payload_roundtrip_is_exact',
+          ])
+          raise SystemExit(subprocess.call([sys.executable, '-m', 'pytest', '-vv', '-s', '--no-cov', '--durations=15', '--junitxml=windows-unit.xml', *nodes]))
           PYTEST
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-unit-results
-          path: |
-            windows-*.xml
-            windows-stdin-ab.json
+          path: windows-unit.xml
