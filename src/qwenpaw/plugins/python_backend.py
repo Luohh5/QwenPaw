@@ -183,6 +183,37 @@ def _host_dependency_state():
     return paths, tuple(loaded)
 
 
+def _stdlib_modules(loaded_origins, resolved):
+    """Recognize interpreter-owned sources, never merely standard names."""
+    from .execution.dependencies import _dependency_protection_roots
+
+    packages, standard, _ = _dependency_protection_roots()
+    package_parts = tuple(Path(site).parts for site in packages)
+    standard_parts = tuple(Path(site).parts for site in standard)
+    trusted = set()
+    for name, origin in loaded_origins:
+        top = name.split(".", 1)[0]
+        path = resolved[str(Path(origin))]
+        parts = path.parts
+        if path.drive:
+            # Canonical roots normalize the anchor, not directory spelling.
+            parts = (parts[0].lower(), *parts[1:])
+        if (
+            top not in sys.stdlib_module_names
+            or {"site-packages", "dist-packages"}.intersection(parts)
+            or any(parts[: len(site)] == site for site in package_parts)
+        ):
+            continue
+        if any(
+            len(parts) > len(site)
+            and parts[: len(site)] == site
+            and parts[len(site)].split(".", 1)[0] == top
+            for site in standard_parts
+        ):
+            trusted.add(name)
+    return trusted
+
+
 def _observe_host_dependencies(
     code_root,
     paths,
@@ -193,6 +224,7 @@ def _observe_host_dependencies(
     _embedded_owners=None,
     _covered=None,
     _resolved=None,
+    _module_owners=None,
 ):
     """Read metadata and RECORD ownership using only detached origins."""
     from importlib.metadata import PathDistribution
@@ -226,6 +258,21 @@ def _observe_host_dependencies(
     )
     relative_modules = {}
     imported = {}
+    if _module_owners is not None:
+        _module_owners.update(
+            (name, {}) for name in _stdlib_modules(loaded_origins, resolved)
+        )
+
+    def retain(modules, package, row):
+        if _module_owners is None:
+            return
+        for module in modules:
+            owned = dict(row)
+            embedded = owned.pop("loaded_modules", ())
+            if module in embedded:
+                owned["loaded_modules"] = (module,)
+            _module_owners.setdefault(module, {})[package] = owned
+
     for name, row in snapshot.distributions.items():
         root = Path(row["metadata_path"]).parent
         distribution = PathDistribution(Path(row["metadata_path"]))
@@ -279,6 +326,7 @@ def _observe_host_dependencies(
                             **row,
                             "loaded_modules": tuple(sorted(modules)),
                         }
+                retain(matched_modules, name, imported[name])
             continue
         # Legacy metadata without a file inventory needs top-level origin
         # evidence; RECORD ownership never uses this guess.
@@ -299,6 +347,7 @@ def _observe_host_dependencies(
         }
         if legacy_modules:
             imported[name] = row
+            retain(legacy_modules, name, row)
             if _covered is not None:
                 _covered.update(legacy_modules)
     embedded_modules = {
@@ -316,6 +365,15 @@ def _observe_host_dependencies(
                 record_reads=record_reads,
             ):
                 imported[name] = row
+        if _module_owners is not None:
+            for module in embedded_modules:
+                for name, row in imported.items():
+                    if _provides_loaded_modules(
+                        row,
+                        {module},
+                        record_reads=record_reads,
+                    ):
+                        retain({module}, name, row)
     return snapshot, imported
 
 
@@ -375,6 +433,7 @@ def _observe_host_delta(
     baseline,
     *,
     inventory=None,
+    _module_owners=None,
 ):
     """Resolve only changed modules; uncertain providers use the old observer."""
     from .execution.dependencies import read_dependency_inventory
@@ -390,6 +449,16 @@ def _observe_host_delta(
         (name, origin)
         for name, origin in loaded_origins
         if not resolved[str(Path(origin))].is_relative_to(root)
+    )
+    if not loaded_origins:
+        return replace(baseline, distributions={}), {}
+    standard_modules = _stdlib_modules(loaded_origins, resolved)
+    if _module_owners is not None:
+        _module_owners.update((name, {}) for name in standard_modules)
+    loaded_origins = tuple(
+        (name, origin)
+        for name, origin in loaded_origins
+        if name not in standard_modules
     )
     if not loaded_origins:
         return replace(baseline, distributions={}), {}
@@ -431,6 +500,7 @@ def _observe_host_delta(
             loaded_origins,
             inventory=inventory,
             _resolved=resolved,
+            _module_owners=_module_owners,
         )
     snapshot = replace(
         baseline,
@@ -448,6 +518,7 @@ def _observe_host_delta(
         _embedded_owners=view.embedded_owners,
         _covered=covered,
         _resolved=resolved,
+        _module_owners=_module_owners,
     )
     if required - covered:
         return _observe_host_dependencies(
@@ -456,6 +527,7 @@ def _observe_host_delta(
             loaded_origins,
             inventory=inventory,
             _resolved=resolved,
+            _module_owners=_module_owners,
         )
     return observed, imported
 
@@ -878,7 +950,7 @@ class PythonBackend:
         """Retain value-only import history; resolve changed sources only."""
         import weakref
         from ..utils.io_utils import run_async_to_completion, run_sync_io
-        from .execution.dependencies import dependency_sites
+        from .execution.dependencies import _inventory_sites, dependency_sites
         from .install_lock import environment_observation, observation_inputs
 
         plugin_id = description.manifest.id
@@ -921,39 +993,87 @@ class PythonBackend:
                         baselines = usage._host_observer_baselines = {}
                     previous = baselines.get(key)
                     current = detached(loaded)
-                    changed = tuple(
-                        (name, origin)
-                        for name, identity, origin in loaded
-                        if previous is None
-                        or name not in previous[0]
-                        or previous[0][name][0]() is not identity[0]
-                        or previous[0][name][1:] != (identity[1], origin)
-                    )
                     roots = await run_sync_io(dependency_sites, paths)
                     async with environment_observation(roots):
                         if not valid():
                             return
-                        if previous is not None and not changed:
-                            snapshot = previous[1]
+                        sites = await run_sync_io(
+                            _inventory_sites,
+                            code_root,
+                            paths,
+                        )
+                        # Changed roots invalidate current ownership while
+                        # previous remains the append-only pin history.
+                        baseline = (
+                            previous
+                            if previous is not None
+                            and previous[1].sites == sites
+                            else None
+                        )
+                        changed = tuple(
+                            (name, origin)
+                            for name, identity, origin in loaded
+                            if baseline is None
+                            or name not in baseline[0]
+                            or baseline[0][name][0]() is not identity[0]
+                            or baseline[0][name][1:] != (identity[1], origin)
+                        )
+                        evidence_key = (
+                            os.path.abspath(sys.executable),
+                            paths,
+                            sites,
+                        )
+                        evidence = getattr(
+                            usage,
+                            "_host_module_evidence",
+                            None,
+                        )
+                        if evidence is None:
+                            evidence = usage._host_module_evidence = {}
+                        shared = (
+                            evidence.get(evidence_key)
+                            if previous is None or baseline is not None
+                            else None
+                        )
+                        reusable = shared[1] if shared is not None else {}
+                        owners = {
+                            name: rows
+                            for name, (state, rows) in reusable.items()
+                            if name in current
+                            and state[0]() is current[name][0]()
+                            and state[1:] == current[name][1:]
+                        }
+                        pending = tuple(
+                            (name, origin)
+                            for name, origin in changed
+                            if name not in owners
+                        )
+                        if baseline is not None and not changed:
+                            snapshot = baseline[1]
                             imported = snapshot.distributions
+                        elif not pending and shared is not None:
+                            snapshot = shared[0]
+                            imported = {}
                         else:
                             try:
-                                if previous is None:
+                                if baseline is None:
                                     snapshot, imported = await run_sync_io(
                                         _observe_host_dependencies,
                                         code_root,
                                         paths,
-                                        changed,
+                                        pending,
                                         inventory=observation_inputs(),
+                                        _module_owners=owners,
                                     )
                                 else:
                                     snapshot, imported = await run_sync_io(
                                         _observe_host_delta,
                                         code_root,
                                         paths,
-                                        changed,
-                                        previous[1],
+                                        pending,
+                                        baseline[1],
                                         inventory=observation_inputs(),
+                                        _module_owners=owners,
                                     )
                             except Exception:
                                 logger.debug(
@@ -964,12 +1084,34 @@ class PythonBackend:
                                 return
                         if (
                             _host_dependency_state() == (paths, loaded)
+                            and snapshot.sites == sites
                             and snapshot.dependency_sites is not None
                             and set(snapshot.dependency_sites) <= set(roots)
                         ):
                             if not valid():
                                 return
                             old = previous[1].distributions if previous else {}
+                            for name, _origin in changed:
+                                for package, row in owners.get(
+                                    name,
+                                    {},
+                                ).items():
+                                    existing = imported.get(package)
+                                    if existing is not None:
+                                        modules = set(
+                                            existing.get("loaded_modules", ()),
+                                        )
+                                        modules.update(
+                                            row.get("loaded_modules", ()),
+                                        )
+                                        if modules:
+                                            row = {
+                                                **row,
+                                                "loaded_modules": tuple(
+                                                    sorted(modules),
+                                                ),
+                                            }
+                                    imported[package] = row
                             # Historical ownership is append-only, including
                             # imports removed from sys.modules during teardown.
                             history = replace(
@@ -977,6 +1119,14 @@ class PythonBackend:
                                 distributions={**imported, **old},
                             )
                             baselines[key] = (current, history)
+                            evidence[evidence_key] = (
+                                replace(snapshot, distributions={}),
+                                {
+                                    name: (current[name], rows)
+                                    for name, rows in owners.items()
+                                    if name in current
+                                },
+                            )
                             if history.distributions:
                                 usage.observe_host(token, history)
                             return

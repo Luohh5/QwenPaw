@@ -930,6 +930,7 @@ def test_dependency_sites_classify_batch_once(tmp_path, monkeypatch):
 
 
 def test_host_delta_skips_own_source_inventory(tmp_path, monkeypatch):
+    import json
     from collections import Counter
     from pathlib import PureWindowsPath
     from qwenpaw.plugins.execution import dependencies as deps
@@ -976,6 +977,48 @@ def test_host_delta_skips_own_source_inventory(tmp_path, monkeypatch):
     assert imported == {}
     assert calls == []
     assert resolved[own] == 1
+    observe, full_calls = backend._observe_host_dependencies, []
+
+    def counted_observe(*args, **kwargs):
+        if kwargs.get("_snapshot") is None:
+            full_calls.append(args)
+        return observe(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "_observe_host_dependencies", counted_observe)
+    shadow = tmp_path / "external" / "json.py"
+    shadow.parent.mkdir()
+    shadow.write_text("VALUE = 3\n")
+    # A standard-library name alone cannot establish trusted provenance.
+    _, imported = backend._observe_host_delta(
+        source,
+        (site,),
+        (("json", str(shadow)),),
+        baseline,
+    )
+    assert imported == {}
+    assert len(full_calls) == 1
+    full_calls.clear()
+    unowned = site / "sdk" / "unowned.py"
+    unowned.parent.mkdir()
+    unowned.write_text("VALUE = 4\n")
+    _, imported = backend._observe_host_delta(
+        source,
+        (site,),
+        (("sdk", str(external)), ("sdk.unowned", str(unowned))),
+        baseline,
+    )
+    assert imported["sdk"]["metadata_path"] == expected_metadata
+    assert len(full_calls) == 1
+    full_calls.clear()
+    _, imported = backend._observe_host_delta(
+        source,
+        (site,),
+        (("json", json.__file__),),
+        baseline,
+    )
+    assert imported == {}
+    assert full_calls == []
+    calls.clear()
     alias = source / "linked.py"
     try:
         alias.symlink_to(external)
@@ -1012,6 +1055,28 @@ def test_host_delta_skips_own_source_inventory(tmp_path, monkeypatch):
     )
     assert imported["sdk"]["metadata_path"] == expected_metadata
     assert windows_resolved == {"C:\\sdk.py": 1, "C:\\SDK.py": 1}
+    with monkeypatch.context() as patch:
+        patch.setattr(backend, "Path", PureWindowsPath)
+        patch.setattr(
+            deps,
+            "_dependency_protection_roots",
+            lambda: (
+                {"c:/Python/Lib/site-packages"},
+                {"c:/Python/Lib"},
+                set(),
+            ),
+        )
+        for directory, expected in (("lib", set()), ("Lib", {"json"})):
+            origin = str(
+                PureWindowsPath(f"C:/Python/{directory}/json/__init__.py"),
+            )
+            assert (
+                backend._stdlib_modules(
+                    (("json", origin),),
+                    {origin: PureWindowsPath(origin)},
+                )
+                == expected
+            )
 
 
 @pytest.mark.asyncio
@@ -1019,7 +1084,10 @@ async def test_host_observation_reuses_only_scoped_raw_inputs(
     tmp_path,
     monkeypatch,
 ):
+    import asyncio
+    import os
     from collections import Counter
+    from email.parser import Parser
     from importlib.metadata import PathDistribution
     from qwenpaw.plugins.execution import dependencies as deps
     from qwenpaw.plugins import python_backend as backend
@@ -1036,13 +1104,24 @@ async def test_host_observation_reuses_only_scoped_raw_inputs(
     module.parent.mkdir()
     module.write_text("VALUE = 1\n")
     metadata, record = info / "METADATA", info / "RECORD"
-    metadata.write_text("Name: sdk\nVersion: 1.0\n")
+    headers = (
+        "Name: sdk\r\nVersion: 1.0\r\nRequires-Python: >=3.11\r\n"
+        "Requires-Dist: child>=1;\r\n    extra == 'optional'\r\n"
+    )
+    metadata.write_text(headers + "\r\n" + "Long description.\r\n" * 4096)
     record_text = "shared_ns/actual.py,,\n"
     record.write_text(record_text)
     expected_metadata = str(deps.canonical_environment_path(info))
     loaded = (("shared_ns.actual", str(module)),)
     read_text, reader = PathDistribution.read_text, deps.csv.reader
+    expected = PathDistribution(info).metadata
+    parse, parsed = Parser.parsestr, []
     reads, parses = Counter(), []
+
+    def counted_headers(parser, text, *args, **kwargs):
+        if text and text.startswith("Name: sdk"):
+            parsed.append(text)
+        return parse(parser, text, *args, **kwargs)
 
     def counted_read(distribution, filename):
         if Path(distribution._path) == info:
@@ -1057,8 +1136,16 @@ async def test_host_observation_reuses_only_scoped_raw_inputs(
 
     monkeypatch.setattr(PathDistribution, "read_text", counted_read)
     monkeypatch.setattr(deps.csv, "reader", counted_parse)
+    monkeypatch.setattr(Parser, "parsestr", counted_headers)
     async with environment_observation((site,)):
         inputs = observation_inputs()
+        async with environment_observation((site,)):
+            assert observation_inputs() is inputs
+
+        async def inherited_inputs():
+            return observation_inputs()
+
+        assert await asyncio.create_task(inherited_inputs()) is None
         baseline, first = backend._observe_host_dependencies(
             source,
             (site,),
@@ -1066,6 +1153,12 @@ async def test_host_observation_reuses_only_scoped_raw_inputs(
             inventory=inputs,
         )
         assert first["sdk"]["metadata_path"] == expected_metadata
+        assert first["sdk"]["requires_dist"] == tuple(
+            expected.get_all("Requires-Dist"),
+        )
+        assert parsed and all(
+            "Long description." not in text for text in parsed
+        )
         first["sdk"]["version"] = "mutated consumer row"
         # Its module top-level differs from the distribution name, forcing
         # delta's conservative full fallback to share the same raw inputs.
@@ -1086,9 +1179,15 @@ async def test_host_observation_reuses_only_scoped_raw_inputs(
             inventory=inputs,
         )
         assert excluded.distributions == imported == {}
+        metadata_stat, record_stat = metadata.stat(), record.stat()
         with observation_write():
             metadata.write_text("Name: sdk\nVersion: 2.0\n")
             record.write_text("unrelated.py,,\n")
+            for path, stat in (
+                (metadata, metadata_stat),
+                (record, record_stat),
+            ):
+                os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
         current, imported = backend._observe_host_dependencies(
             source,
             (site,),
@@ -1101,6 +1200,8 @@ async def test_host_observation_reuses_only_scoped_raw_inputs(
     assert observation_inputs() is None
     metadata.write_text("Name: sdk\nVersion: 3.0\n")
     record.write_text(record_text)
+    for path, stat in ((metadata, metadata_stat), (record, record_stat)):
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
     async with environment_observation((site,)):
         assert observation_inputs() is not inputs
         _, imported = backend._observe_host_dependencies(
@@ -1245,7 +1346,8 @@ async def test_host_dependency_boundaries_keep_preexisting_and_removed_imports(
 
     site = tmp_path / "site"
     site.mkdir()
-    monkeypatch.setattr(sys, "path", [str(site)])
+    future = tmp_path / "future-site"
+    monkeypatch.setattr(sys, "path", [str(site), str(future)])
     description = SimpleNamespace(
         manifest=SimpleNamespace(id="host-history"),
         source_path=tmp_path / "plugin",
@@ -1339,7 +1441,155 @@ async def test_host_dependency_boundaries_keep_preexisting_and_removed_imports(
             for row in host.snapshot.distributions.values()
         )
 
+    async def observe_source(source, revision, admission=None):
+        incoming = SimpleNamespace(
+            manifest=description.manifest,
+            source_path=source,
+        )
+        admission = admission or usage.declare(
+            DependencyDeclaration("host-history", revision, (), None),
+        )
+        await PythonBackend.observe_host_dependencies(
+            incoming,
+            usage,
+            admission,
+        )
+        return admission, [
+            use
+            for use in usage.snapshot().uses
+            if use.origin == "host" and use.source_revision == revision
+        ]
 
+    if layout == "ordinary":
+        import os
+        from qwenpaw.plugins import python_backend as backend
+
+        monkeypatch.delitem(sys.modules, "_qwenpaw_own_source")
+        state = backend._host_dependency_state
+
+        def owned_state():
+            paths, loaded = state()
+            return paths, tuple(row for row in loaded if row[0] in names)
+
+        monkeypatch.setattr(backend, "_host_dependency_state", owned_state)
+        observe, full_calls = backend._observe_host_dependencies, []
+
+        def counted_observe(*args, **kwargs):
+            if kwargs.get("_snapshot") is None:
+                full_calls.append(args)
+            return observe(*args, **kwargs)
+
+        monkeypatch.setattr(
+            backend,
+            "_observe_host_dependencies",
+            counted_observe,
+        )
+        other_token, other_hosts = await observe_source(
+            tmp_path / "other-plugin",
+            "other-source",
+        )
+        other_host = other_hosts[0]
+        remaining = names[-1].replace("_", "-")
+        assert set(other_host.snapshot.distributions) == {remaining}
+        assert other_host.snapshot.distributions[remaining]["version"] == "1.0"
+        assert full_calls == []
+        future.mkdir()
+        _, other_hosts = await observe_source(
+            tmp_path / "other-plugin",
+            "other-source",
+            other_token,
+        )
+        other_host = other_hosts[0]
+        assert other_host.snapshot is not None
+        assert other_host.environment is not None
+        assert other_host.snapshot.distributions[remaining]["version"] == "1.0"
+        from qwenpaw.plugins.execution.dependencies import (
+            canonical_environment_path,
+        )
+
+        assert (
+            str(canonical_environment_path(future))
+            in other_host.snapshot.sites
+        )
+        future.rmdir()
+        _, other_hosts = await observe_source(
+            tmp_path / "other-plugin",
+            "other-source",
+            other_token,
+        )
+        assert other_hosts[0].environment is not None
+        assert (
+            other_hosts[0].snapshot.distributions[remaining]["version"]
+            == "1.0"
+        )
+        assert (
+            str(canonical_environment_path(future))
+            in other_hosts[0].snapshot.sites
+        )
+        # The same module object moving to another file must establish fresh
+        # ownership; neither module count nor an existing row proves its owner.
+        metadata = site / f"{names[0]}-1.0.dist-info" / "METADATA"
+        stamp = metadata.stat()
+        metadata.write_text(f"Name: {names[0]}\nVersion: 2.0\n")
+        os.utime(metadata, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        sys.modules[names[-1]].__file__ = str(site / f"{names[0]}.py")
+        _, other_hosts = await observe_source(
+            tmp_path / "other-plugin",
+            "other-source",
+            other_token,
+        )
+        other_host = other_hosts[0]
+        assert set(other_host.snapshot.distributions) == {
+            remaining,
+            names[0].replace("_", "-"),
+        }
+        assert other_host.snapshot.distributions[remaining]["version"] == "1.0"
+        assert (
+            other_host.snapshot.distributions[names[0].replace("_", "-")][
+                "version"
+            ]
+            == "2.0"
+        )
+        assert set(host.snapshot.distributions) == expected
+        assert all(
+            row["version"] == "1.0"
+            for row in host.snapshot.distributions.values()
+        )
+        _, excluded_hosts = await observe_source(site, "excluded-source")
+        assert excluded_hosts == []
+    elif layout == "namespace_alias":
+        from qwenpaw.plugins import python_backend as backend
+
+        unclaimed = site / "unclaimed.py"
+        unclaimed.write_text("VALUE = 1\n")
+        module = ModuleType("unclaimed")
+        module.__file__ = str(unclaimed)
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        state = backend._host_dependency_state
+
+        def unclaimed_state():
+            paths, loaded = state()
+            return paths, tuple(row for row in loaded if row[0] == "unclaimed")
+
+        monkeypatch.setattr(backend, "_host_dependency_state", unclaimed_state)
+        for revision in ("unclaimed-before", "unclaimed-after"):
+            if revision == "unclaimed-after":
+                info = site / "claimed-1.0.dist-info"
+                info.mkdir()
+                (info / "METADATA").write_text("Name: claimed\nVersion: 1.0\n")
+                (info / "RECORD").write_text("unclaimed.py,,\n")
+            _, histories = await observe_source(tmp_path / revision, revision)
+            if revision == "unclaimed-before":
+                assert histories == []
+            else:
+                assert set(histories[0].snapshot.distributions) == {"claimed"}
+                assert (
+                    histories[0].snapshot.distributions["claimed"]["version"]
+                    == "1.0"
+                )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "layout",
     [
@@ -1358,9 +1608,10 @@ async def test_host_dependency_boundaries_keep_preexisting_and_removed_imports(
         "non_cache_file",
     ],
 )
-def test_dependency_directory_classification_retains_provider_ownership(
+async def test_dependency_directory_classification_retains_provider_ownership(
     tmp_path,
     layout,
+    monkeypatch,
 ):
     from qwenpaw.plugins.execution.dependencies import (
         _installed_metadata,
@@ -1504,6 +1755,46 @@ def test_dependency_directory_classification_retains_provider_ownership(
         canonical_environment_path(owner_info),
     )
     assert ("sample-sdk" in imported) is (layout != "namespace")
+    if layout in {"owned", "namespace"}:
+        import sys
+        from types import ModuleType
+        from qwenpaw.plugins.dependency_usage import (
+            DependencyDeclaration,
+            DependencyUsageRegistry,
+        )
+        from qwenpaw.plugins.ownership import RuntimeOwners
+        from qwenpaw.plugins.python_backend import PythonBackend
+
+        usage = DependencyUsageRegistry(RuntimeOwners())
+        with monkeypatch.context() as patch:
+            patch.setattr(sys, "path", list(map(str, paths)))
+            loaded = ModuleType(loaded_module)
+            loaded.__file__ = str(embedded)
+            patch.setitem(sys.modules, loaded_module, loaded)
+            for revision in ("first", "second"):
+                description = SimpleNamespace(
+                    manifest=SimpleNamespace(id="embedded-history"),
+                    source_path=tmp_path / revision,
+                )
+                token = usage.declare(
+                    DependencyDeclaration(
+                        "embedded-history",
+                        revision,
+                        (),
+                        None,
+                    ),
+                )
+                await PythonBackend.observe_host_dependencies(
+                    description,
+                    usage,
+                    token,
+                )
+                host = next(
+                    use
+                    for use in usage.snapshot().uses
+                    if use.origin == "host" and use.source_revision == revision
+                )
+                assert host.snapshot.distributions == imported
     from dataclasses import replace
     from qwenpaw.plugins.dependency_gate import evaluate_shared_dependencies
 
