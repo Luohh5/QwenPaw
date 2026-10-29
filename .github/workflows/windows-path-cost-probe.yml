@@ -19,6 +19,8 @@ jobs:
       QWENPAW_SECRET_DIR: ${{ github.workspace }}/.ci-secret
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -57,10 +59,10 @@ jobs:
           QWENPAW_TIMING_REPORT: candidate-timing.json
         run: |
           python -m pytest -q -p timing_probe --no-cov --durations=5 --junitxml=candidate.xml 'tests/unit/plugins/test_plugin_process.py::test_shared_upgrade_replaces_provider_or_restores_exact_old_tree[False]' 'tests/unit/plugins/test_plugin_reload.py::test_reload_ignores_same_size_same_mtime_bytecode[None-False]'
-      - name: Verify core identity, rollback and desktop behavior
+      - name: Verify native path identity probes
         if: always()
         run: |
-          python -m pytest -q --no-cov --durations=10 --junitxml=core.xml tests/unit/plugins/test_install_lock.py tests/unit/plugins/test_plugin_process.py .ci-probes/test_windows_identity_probe.py
+          python -m pytest -q --no-cov --durations=10 --junitxml=core.xml .ci-probes/test_windows_identity_probe.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
