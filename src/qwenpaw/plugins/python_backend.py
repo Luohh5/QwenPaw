@@ -118,19 +118,30 @@ def _files_for_loaded_origins(
     record = _read_record(distribution, metadata_path, record_reads)
     if not record:
         return distribution.files
-    candidates = []
-    for row in csv.reader(record.splitlines()):
-        if not 1 <= len(row) <= 3:
-            raise ValueError("Invalid RECORD row")
-        if len(row) == 3 and row[2]:
-            int(row[2])
-        path = row[0]
-        # Keep anchor semantics for unusual paths without allocating a Path
-        # for every unrelated, ordinary relative RECORD entry.
-        if path.startswith("//") or "\\" in path or ":" in path:
-            path = str(PurePosixPath(path))
-        if os.path.normcase(os.path.normpath(path)) in origins:
-            candidates.append(PurePosixPath(path))
+    key = ("host_paths", metadata_path)
+    if (
+        record_reads is None
+        or metadata_path is None
+        or key not in record_reads
+    ):
+        paths = []
+        for row in csv.reader(record.splitlines()):
+            if not 1 <= len(row) <= 3:
+                raise ValueError("Invalid RECORD row")
+            if len(row) == 3 and row[2]:
+                int(row[2])
+            path = row[0]
+            # Retain unusual anchor semantics without a Path per ordinary row.
+            if path.startswith("//") or "\\" in path or ":" in path:
+                path = str(PurePosixPath(path))
+            paths.append((os.path.normcase(os.path.normpath(path)), path))
+        if record_reads is not None and metadata_path is not None:
+            record_reads[key] = tuple(paths)
+    else:
+        paths = record_reads[key]
+    candidates = [
+        PurePosixPath(path) for name, path in paths if name in origins
+    ]
     if sys.version_info < (3, 12):
         return candidates
     # Validate every row before checking candidates, and check all candidates
@@ -177,9 +188,11 @@ def _observe_host_dependencies(
     paths,
     loaded_origins,
     *,
+    inventory=None,
     _snapshot=None,
     _embedded_owners=None,
     _covered=None,
+    _resolved=None,
 ):
     """Read metadata and RECORD ownership using only detached origins."""
     from importlib.metadata import PathDistribution
@@ -189,7 +202,9 @@ def _observe_host_dependencies(
     )
 
     embedded_owners = dict(_embedded_owners or {})
-    record_reads = {}
+    record_reads = (
+        inventory.setdefault("records", {}) if inventory is not None else {}
+    )
     snapshot = _snapshot or observe_dependencies(
         {
             "code_root": code_root,
@@ -198,20 +213,34 @@ def _observe_host_dependencies(
         },
         _embedded_owners=embedded_owners,
         _record_reads=record_reads,
+        _inventory=inventory,
     )
     loaded = {name: Path(origin) for name, origin in loaded_origins}
-    resolved = {path: path.resolve() for path in set(loaded.values())}
-    origins = {*resolved, *resolved.values()}
-    relative_origins = {}
+    resolved = (
+        _resolved
+        if _resolved is not None
+        else {
+            path: Path(path).resolve()
+            for path in dict.fromkeys(str(path) for path in loaded.values())
+        }
+    )
+    relative_modules = {}
     imported = {}
     for name, row in snapshot.distributions.items():
         root = Path(row["metadata_path"]).parent
         distribution = PathDistribution(Path(row["metadata_path"]))
-        if root not in relative_origins:
-            relative_origins[root] = _relative_module_origins(origins, root)
+        if root not in relative_modules:
+            indexed = relative_modules[root] = {}
+            for module_name, path in loaded.items():
+                for origin in _relative_module_origins(
+                    (path, resolved[str(path)]),
+                    root,
+                ):
+                    indexed.setdefault(origin, set()).add(module_name)
+        indexed = relative_modules[root]
         files = _files_for_loaded_origins(
             distribution,
-            relative_origins[root],
+            indexed,
             metadata_path=row["metadata_path"],
             record_reads=record_reads,
         )
@@ -219,19 +248,15 @@ def _observe_host_dependencies(
             owned = {
                 os.path.normcase(os.path.normpath(item)) for item in files
             }
-            if owned.intersection(relative_origins[root]):
+            matched_modules = {
+                module_name
+                for origin in owned.intersection(indexed)
+                for module_name in indexed[origin]
+            }
+            if matched_modules:
                 imported[name] = row
                 if _covered is not None:
-                    _covered.update(
-                        module_name
-                        for module_name, path in loaded.items()
-                        if owned.intersection(
-                            _relative_module_origins(
-                                (path, resolved[path]),
-                                root,
-                            ),
-                        )
-                    )
+                    _covered.update(matched_modules)
                 embedded_roots = [
                     Path(site).parent
                     for site, owner in embedded_owners.items()
@@ -240,17 +265,13 @@ def _observe_host_dependencies(
                 if embedded_roots:
                     modules = {
                         module_name
-                        for module_name, path in loaded.items()
+                        for module_name in matched_modules
                         if module_name.split(".", 1)[0] not in row["top_level"]
                         and any(
-                            resolved[path].is_relative_to(site)
+                            resolved[str(loaded[module_name])].is_relative_to(
+                                site,
+                            )
                             for site in embedded_roots
-                        )
-                        and owned.intersection(
-                            _relative_module_origins(
-                                (path, resolved[path]),
-                                root,
-                            ),
                         )
                     }
                     if modules:
@@ -267,11 +288,11 @@ def _observe_host_dependencies(
             if module_name.split(".", 1)[0] in row["top_level"]
             and (
                 (
-                    resolved[path].parent == root
-                    and resolved[path].name.split(".", 1)[0]
+                    resolved[str(path)].parent == root
+                    and resolved[str(path)].name.split(".", 1)[0]
                     == module_name.split(".", 1)[0]
                 )
-                or resolved[path].is_relative_to(
+                or resolved[str(path)].is_relative_to(
                     root / module_name.split(".", 1)[0],
                 )
             )
@@ -347,41 +368,70 @@ def _check_read_history(view, uses):
                 )
 
 
-def _observe_host_delta(code_root, paths, loaded_origins, baseline):
+def _observe_host_delta(
+    code_root,
+    paths,
+    loaded_origins,
+    baseline,
+    *,
+    inventory=None,
+):
     """Resolve only changed modules; uncertain providers use the old observer."""
     from .execution.dependencies import read_dependency_inventory
 
-    view, _ = read_dependency_inventory(code_root, paths, ())
+    root = Path(code_root).resolve()
+    resolved = {
+        path: Path(path).resolve()
+        for path in dict.fromkeys(
+            str(Path(origin)) for _name, origin in loaded_origins
+        )
+    }
+    loaded_origins = tuple(
+        (name, origin)
+        for name, origin in loaded_origins
+        if not resolved[str(Path(origin))].is_relative_to(root)
+    )
+    if not loaded_origins:
+        return replace(baseline, distributions={}), {}
+    view, _ = read_dependency_inventory(
+        code_root,
+        paths,
+        (),
+        inventory=inventory,
+    )
     rows = {}
     unresolved = set()
     required = set()
-    root = Path(code_root).resolve()
+    by_root = {}
+    for package, row in view.distributions.items():
+        parent = Path(row["metadata_path"]).parent
+        index = by_root.setdefault(str(parent), (parent, {}))[1]
+        for top in row["top_level"]:
+            index.setdefault(top, {})[package] = row
+    dependency_roots = tuple(Path(site) for site in view.dependency_sites)
     for name, origin in loaded_origins:
-        path = Path(origin).resolve()
-        if path.is_relative_to(root):
-            continue
-        if any(
-            path.is_relative_to(Path(site)) for site in view.dependency_sites
-        ):
+        path = resolved[str(Path(origin))]
+        if any(path.is_relative_to(site) for site in dependency_roots):
             required.add(name)
         matched = False
-        for package, row in view.distributions.items():
-            parent = Path(row["metadata_path"]).parent
+        for parent, index in by_root.values():
             if not path.is_relative_to(parent):
                 continue
             first = path.relative_to(parent).parts[0].split(".", 1)[0]
-            if (
-                first in row["top_level"]
-                or name.split(".", 1)[0] in row["top_level"]
-            ):
-                rows[package] = row
-                matched = True
-        if not matched and any(
-            path.is_relative_to(Path(site)) for site in view.dependency_sites
-        ):
+            for top in {first, name.split(".", 1)[0]}:
+                candidates = index.get(top, {})
+                rows.update(candidates)
+                matched = matched or bool(candidates)
+        if not matched:
             unresolved.add(name)
     if unresolved:
-        return _observe_host_dependencies(code_root, paths, loaded_origins)
+        return _observe_host_dependencies(
+            code_root,
+            paths,
+            loaded_origins,
+            inventory=inventory,
+            _resolved=resolved,
+        )
     snapshot = replace(
         baseline,
         sites=view.sites,
@@ -394,11 +444,19 @@ def _observe_host_delta(code_root, paths, loaded_origins, baseline):
         paths,
         loaded_origins,
         _snapshot=snapshot,
+        inventory=inventory,
         _embedded_owners=view.embedded_owners,
         _covered=covered,
+        _resolved=resolved,
     )
     if required - covered:
-        return _observe_host_dependencies(code_root, paths, loaded_origins)
+        return _observe_host_dependencies(
+            code_root,
+            paths,
+            loaded_origins,
+            inventory=inventory,
+            _resolved=resolved,
+        )
     return observed, imported
 
 
@@ -821,7 +879,7 @@ class PythonBackend:
         import weakref
         from ..utils.io_utils import run_async_to_completion, run_sync_io
         from .execution.dependencies import dependency_sites
-        from .install_lock import environment_observation
+        from .install_lock import environment_observation, observation_inputs
 
         plugin_id = description.manifest.id
 
@@ -886,6 +944,7 @@ class PythonBackend:
                                         code_root,
                                         paths,
                                         changed,
+                                        inventory=observation_inputs(),
                                     )
                                 else:
                                     snapshot, imported = await run_sync_io(
@@ -894,6 +953,7 @@ class PythonBackend:
                                         paths,
                                         changed,
                                         previous[1],
+                                        inventory=observation_inputs(),
                                     )
                             except Exception:
                                 logger.debug(
