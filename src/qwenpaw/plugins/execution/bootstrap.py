@@ -45,6 +45,7 @@ _STARTUP_ENVIRONMENT = (
             "USERPROFILE",
             "WINDIR",
             "QWENPAW_DEPENDENCY_MAINTENANCE",
+            "QWENPAW_DEPENDENCY_READER_SCOPE",
             "QWENPAW_DEPENDENCY_STATE_DIR",
         },
     )

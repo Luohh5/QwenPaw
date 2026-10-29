@@ -762,3 +762,87 @@ m._close_readers()
     for root in sites:
         assert not list(maintenance._readers_dir(root).glob("*.lease"))
         assert str(root.resolve()) not in maintenance._READERS
+
+
+@_POSIX_FLOCK
+def test_scoped_reader_custody_across_process_exit(tmp_path, monkeypatch):
+    """Scoped readers exclude host maintenance until normal or abrupt exit."""
+    import subprocess
+    import sys
+
+    from qwenpaw.plugins import dependency_maintenance as maintenance
+
+    site = tmp_path / "site"
+    site.mkdir()
+    state = tmp_path / "state"
+    monkeypatch.setattr(maintenance, "_STATE_ROOT", state)
+    monkeypatch.setattr(maintenance, "_READER_SCOPE", "")
+    monkeypatch.setenv("QWENPAW_DEPENDENCY_STATE_DIR", str(state))
+    scope = "a" * 64
+    directory = maintenance.prepare_reader_scope([site], scope)[0]
+    script = """
+import os
+import sys
+from pathlib import Path
+import importlib.util
+spec = importlib.util.spec_from_file_location("maintenance", sys.argv[2])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+site = Path(sys.argv[1])
+scope = m.reader_scope()
+os.environ['QWENPAW_DEPENDENCY_READER_SCOPE'] = 'b' * 64
+assert m.reader_scope() == scope
+with m.file_lock(m._gate(site)):
+    with m.observation_readers([site]):
+        assert any(row['pid'] == os.getpid() for row in m.live_readers([site]))
+m.lease_environment([site])
+print('held', flush=True)
+sys.stdin.readline()
+"""
+    env = dict(os.environ, QWENPAW_DEPENDENCY_READER_SCOPE=scope)
+    for crash in (False, True):
+        with subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                script,
+                str(site),
+                maintenance.__file__,
+            ],
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ) as peer:
+            try:
+                assert peer.stdout.readline().strip() == "held"
+                assert [
+                    row["pid"] for row in maintenance.live_readers([site])
+                ] == [peer.pid]
+                assert list(directory.glob("*.lease"))
+                with pytest.raises(RuntimeError, match="BUSY"):
+                    with maintenance.maintenance([site], "test", "token"):
+                        pytest.fail("scoped reader admitted maintenance")
+            finally:
+                if crash:
+                    peer.kill()
+                _, stderr = peer.communicate("release\n", timeout=5)
+            assert peer.returncode == (-9 if crash else 0), stderr
+        if not crash:
+            assert not list(directory.glob("*.lease"))
+        assert not maintenance.live_readers([site])
+        assert not list(directory.glob("*.lease"))
+        with maintenance.maintenance([site], "test", "token"):
+            pass
+        maintenance.clear_maintenance([site], "test")
+
+    # A malformed namespace entry must fail promptly rather than block on FIFO.
+    invalid = directory / "invalid.lease"
+    os.mkfifo(invalid)
+    try:
+        with pytest.raises(RuntimeError, match="LEASE_INVALID"):
+            maintenance.live_readers([site])
+    finally:
+        invalid.unlink()

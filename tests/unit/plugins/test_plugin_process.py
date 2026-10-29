@@ -518,6 +518,14 @@ async def test_runtime_roots_interpreter_and_dependency_visible_in_worker(
     from qwenpaw.plugins import dependency_maintenance as maintenance
 
     selected_root = maintenance.state_root()
+    if layout == "source":
+        scope = "a" * 64
+        monkeypatch.setattr(maintenance, "_READER_SCOPE", scope)
+        monkeypatch.setenv("QWENPAW_DEPENDENCY_READER_SCOPE", "b" * 64)
+        maintenance.prepare_reader_scope(
+            (*runtime.dependency_paths, *maintenance.host_sites()),
+            scope,
+        )
     key = "QWENPAW_DEPENDENCY_STATE_DIR"
     store._apply_to_environ({key: str(tmp_path / "untrusted-state")})
     assert maintenance.state_root() == selected_root
@@ -525,6 +533,10 @@ async def test_runtime_roots_interpreter_and_dependency_visible_in_worker(
     await process.start(spec)
     probe = await process.call("sample.probe", {})
     assert Path(probe["dependency_state"]) == selected_root
+    if layout == "source":
+        directory = maintenance._readers_dir(site) / scope
+        assert list(directory.glob(f"{probe['pid']}-*.lease"))
+        assert not list(maintenance._readers_dir(site).glob("*.lease"))
     assert any(
         row["pid"] == probe["pid"] for row in maintenance.live_readers([site])
     )
