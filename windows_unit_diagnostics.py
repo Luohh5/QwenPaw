@@ -11,7 +11,7 @@ s = p.read_text().replace('            self._tree = ProcessTree(self._process.pi
                     return
                 data = (ctypes.c_size_t * 32)()
                 ok = tree._kernel.QueryInformationJobObject(tree._job, 3, ctypes.byref(data), ctypes.sizeof(data), None)
-                print(f"DIAGNOSTIC host={os.getpid()} leader={child.pid} job_ok={ok} job_pids={list(data)} exit={child.returncode}", flush=True)
+                print(f"DIAGNOSTIC host={os.getpid()} leader={child.pid} job_ok={ok} job_pids={list(data)} exit={child.returncode}", file=sys.stderr, flush=True)
             asyncio.get_running_loop().call_later(0.2, diagnostic_job)''')
 # Do not dump worker stderr, as byte tests depend on exactly existing logger behavior.
 p.write_text(s)
