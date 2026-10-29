@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Tests for PluginLoader dependency probing and uv discovery.
+"""Tests for PluginLoader dependency probing and installer security.
 
 Covers the static helpers that decide whether a requirement is already
-satisfied (metadata probe + import probe) and locate the ``uv`` binary,
-which previously had no unit coverage.
+satisfied (metadata probe + import probe) and enforce installer security.
 """
 
 # pylint: disable=protected-access,redefined-outer-name,unused-argument,use-implicit-booleaness-not-comparison  # noqa: E501
@@ -133,59 +132,6 @@ class TestFindUnsatisfiedDependencies:
         )
         result = PluginLoader._find_unsatisfied_dependencies(req_file)
         assert result == ["this-missing-one-abc"]
-
-
-# ---------------------------------------------------------------------------
-# _find_uv
-# ---------------------------------------------------------------------------
-
-
-class TestFindUv:
-    def test_found_on_path(self, monkeypatch):
-        monkeypatch.setattr(
-            "qwenpaw.plugins.loader.shutil.which",
-            lambda name: "/usr/local/bin/uv" if name == "uv" else None,
-        )
-        assert PluginLoader._find_uv() == "/usr/local/bin/uv"
-
-    def test_not_on_path_falls_back_to_home(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "qwenpaw.plugins.loader.shutil.which",
-            lambda name: None,
-        )
-        home = tmp_path / "home"
-        (home / ".local" / "bin").mkdir(parents=True)
-        uv_bin = home / ".local" / "bin" / "uv"
-        uv_bin.write_text("#!/bin/sh\n", encoding="utf-8")
-        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-        monkeypatch.delenv("LOCALAPPDATA", raising=False)
-        assert PluginLoader._find_uv() == str(uv_bin)
-
-    def test_not_found_anywhere_returns_none(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "qwenpaw.plugins.loader.shutil.which",
-            lambda name: None,
-        )
-        home = tmp_path / "home"
-        home.mkdir()
-        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-        monkeypatch.delenv("LOCALAPPDATA", raising=False)
-        assert PluginLoader._find_uv() is None
-
-    def test_windows_localappdata_candidate(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "qwenpaw.plugins.loader.shutil.which",
-            lambda name: None,
-        )
-        home = tmp_path / "home"
-        home.mkdir()
-        local_app = tmp_path / "localapp"
-        uv_exe = local_app / "Programs" / "uv" / "uv.exe"
-        uv_exe.parent.mkdir(parents=True)
-        uv_exe.write_text("MZ", encoding="utf-8")
-        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-        monkeypatch.setenv("LOCALAPPDATA", str(local_app))
-        assert PluginLoader._find_uv() == str(uv_exe)
 
 
 @pytest.mark.parametrize(

@@ -38,7 +38,7 @@
 独立测试运行真实宿主代理、worker 和生产 Driver，只替换外部 SDK/网络边界。
 
 ```sh
-QWENPAW_WORKING_DIR=/tmp/qwenpaw-channel-tests python -I -m pytest --confcutdir tests/fixtures/channel_plugins tests/fixtures/channel_plugins/feishu_process_suite.py -q
+python -m pytest tests/unit/channels/test_feishu.py -q
 ```
 
 真实机器人与原生桌面运行效果尚未验证，保留为正式发布前检查。

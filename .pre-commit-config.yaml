@@ -15,13 +15,11 @@ repos:
         exclude: '(?x)(.*/skills/.*|^scripts/pack/|^e2e/)'
       - id: check-toml
       - id: check-docstring-first
-        # These files are executable fragments loaded by isolated tests, not
-        # standalone modules with normal import and docstring layout.
-        exclude: '(?x)(.*/skills/.*|^scripts/pack/|^e2e/|^tests/fixtures/)'
+        exclude: '(?x)(.*/skills/.*|^scripts/pack/|^e2e/)'
       - id: check-json
         exclude: '(?x)(.*/skills/.*|^scripts/pack/|^e2e/)'
       - id: fix-encoding-pragma
-        exclude: '(?x)(.*/skills/.*|^scripts/pack/|^e2e/|^tests/fixtures/)'
+        exclude: '(?x)(.*/skills/.*|^scripts/pack/|^e2e/)'
       - id: detect-private-key
       - id: trailing-whitespace
         # Preserve unified-diff context markers and checksummed patch bytes.
@@ -31,19 +29,18 @@ repos:
     rev: v3.1.0
     hooks:
       - id: add-trailing-comma
-        exclude: '(?x)(.*/skills/.*|^scripts/pack/|^e2e/|^tests/fixtures/)'
+        exclude: '(?x)(.*/skills/.*|^scripts/pack/|^e2e/)'
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.7.0
     hooks:
       - id: mypy
         # The author fixture is checked strictly against the installed SDK by
-        # scripts/check_plugin_sdk_artifacts.py during manual artifact validation.
+        # scripts/check_plugin_sdk_artifacts.py during CI artifact validation.
         exclude:
           (?x)(
           pb2\.py$
           | grpc\.py$
           | ^docs
-          | ^tests/fixtures/
           | \.html$
           | .*/skills/.*
           | ^e2e/
@@ -66,13 +63,13 @@ repos:
     hooks:
       - id: black
         args: [ --line-length=79 ]
-        exclude: '(?x)(.*/skills/.*|^scripts/pack/|^e2e/|^tests/fixtures/)'
+        exclude: '(?x)(.*/skills/.*|^scripts/pack/|^e2e/)'
   - repo: https://github.com/PyCQA/flake8
     rev: 6.1.0
     hooks:
       - id: flake8
         args: [ "--extend-ignore=E203", "--max-line-length=120"]
-        exclude: '(?x)(.*/skills/.*|^scripts/pack/|^e2e/|^tests/fixtures/)'
+        exclude: '(?x)(.*/skills/.*|^scripts/pack/|^e2e/)'
   - repo: https://github.com/pylint-dev/pylint
     rev: v3.0.2
     hooks:

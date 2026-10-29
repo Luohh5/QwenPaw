@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Disposable dependency installers with explicit pip/uv selection."""
+"""Disposable pip environments with verified installer integrity."""
 
 import ensurepip
 import os
@@ -24,8 +24,8 @@ def expose(source, destination):
             shutil.copy2(source, destination)
 
 
-def dependency_python(root, *, installer="pip"):
-    """Reuse host dependencies, exposing exactly one pip or none for uv."""
+def dependency_python(root):
+    """Reuse host dependencies, exposing exactly one pip installation."""
     venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(root)
     python = root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     library = Path(
@@ -48,10 +48,6 @@ def dependency_python(root, *, installer="pip"):
                 entry.suffix == ".pth" and entry.name != "pywin32.pth"
             ) or entry.name == "__pycache__":
                 continue
-            if installer == "uv" and (
-                entry.name == "pip" or entry.name.startswith("pip-")
-            ):
-                continue
             destination = library / entry.name
             if not destination.exists():
                 # Audits resolve metadata origins within the observed site.
@@ -62,7 +58,7 @@ def dependency_python(root, *, installer="pip"):
     source = library / "qwenpaw"
     if not source.exists():
         expose(Path(qwenpaw.__file__).resolve().parent, source)
-    if installer == "pip" and not (library / "pip").exists():
+    if not (library / "pip").exists():
         bundled = next(
             (Path(ensurepip.__file__).parent / "_bundled").glob("pip-*.whl"),
         )
@@ -73,13 +69,11 @@ def dependency_python(root, *, installer="pip"):
             str(python),
             "-I",
             "-c",
-            "import importlib.metadata as m, importlib.util, sys; "
+            "import importlib.metadata as m, importlib.util; "
             "items = [d for d in m.distributions() "
             "if d.metadata['Name'].lower() == 'pip']; "
-            "assert len(items) == int(sys.argv[1] == 'pip'), items; "
-            "assert (importlib.util.find_spec('pip') is not None) "
-            "== (sys.argv[1] == 'pip')",
-            installer,
+            "assert len(items) == 1, items; "
+            "assert importlib.util.find_spec('pip') is not None",
         ],
         check=True,
         capture_output=True,

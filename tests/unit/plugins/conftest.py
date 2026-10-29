@@ -41,14 +41,6 @@ def bounded_interrupt_timeout(monkeypatch):
 
 
 @pytest.fixture()
-def short_stream_stop_timeout(monkeypatch, short_interrupt_timeout):
-    """Scale nested stream stops with the outer interruption budget."""
-    from qwenpaw.plugins import custody
-
-    monkeypatch.setattr(custody, "TASK_STOP_SECONDS", short_interrupt_timeout)
-
-
-@pytest.fixture()
 def fresh_registry():
     """Reset the singleton and restore it even if a test fails."""
     old = PluginRegistry._instance

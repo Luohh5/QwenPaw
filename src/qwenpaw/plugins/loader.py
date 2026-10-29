@@ -2212,37 +2212,6 @@ class PluginLoader:  # pylint: disable=too-many-public-methods
         return self._loaded_plugins
 
     @staticmethod
-    def _find_uv() -> Optional[str]:
-        """Return the path to the ``uv`` binary, or ``None`` if not found.
-
-        Checks PATH first, then well-known install locations for both
-        Unix (``~/.local/bin/uv``, ``~/.cargo/bin/uv``) and
-        Windows (``%LOCALAPPDATA%\\Programs\\uv\\uv.exe``,
-        ``%USERPROFILE%\\.cargo\\bin\\uv.exe``).
-        """
-        # shutil.which honours PATHEXT on Windows and handles .exe
-        if found := shutil.which("uv"):
-            return found
-
-        home = Path.home()
-        candidates = [
-            home / ".local" / "bin" / "uv",  # Linux/macOS script install
-            home / ".cargo" / "bin" / "uv",  # Linux/macOS cargo install
-        ]
-        # Windows-specific locations
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if local_app_data:
-            candidates.append(
-                Path(local_app_data) / "Programs" / "uv" / "uv.exe",
-            )
-        candidates.append(home / ".cargo" / "bin" / "uv.exe")
-
-        for candidate in candidates:
-            if candidate.is_file():
-                return str(candidate)
-        return None
-
-    @staticmethod
     def _run_subprocess_with_streaming_log(
         cmd: list[str],
         *,
