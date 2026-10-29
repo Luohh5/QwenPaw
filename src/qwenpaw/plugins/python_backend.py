@@ -604,6 +604,7 @@ class PythonBackend:
         from .execution.dependencies import (
             read_dependency_inventory,
         )
+        from .execution.errors import ProtocolValidationError
         from .install_lock import observation_inputs
 
         del snapshot
@@ -644,11 +645,26 @@ class PythonBackend:
                     )
                     if isinstance(exc, SharedDependencyError):
                         raise
+                    missing = (
+                        [str(exc)]
+                        if isinstance(exc, ProtocolValidationError)
+                        and code == "DEPENDENCY_UNSATISFIED"
+                        and str(exc) != code
+                        else []
+                    )
                     raise SharedDependencyError(
                         GateDecision(
                             False,
                             False,
-                            reason=f"{code}: {exc}",
+                            missing=missing,
+                            reason=(
+                                f"{code}: {description.manifest.id}"
+                                + (
+                                    f": {', '.join(missing)}"
+                                    if missing
+                                    else ""
+                                )
+                            ),
                             reason_code=code,
                             require_restart=code
                             == "DEPENDENCY_REPAIR_REQUIRED",

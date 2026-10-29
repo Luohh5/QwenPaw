@@ -782,7 +782,10 @@ def read_dependency_inventory(
             Version(row["version"]),
             prereleases=True,
         ):
-            raise dependency_error("DEPENDENCY_UNSATISFIED")
+            raise ProtocolValidationError(
+                requirement.name if requirement.url else str(requirement),
+                reason_code="DEPENDENCY_UNSATISFIED",
+            )
         relevant.add(name)
         # Derive import providers from the same installed RECORD as full audit.
         tops = set(row["top_level"])

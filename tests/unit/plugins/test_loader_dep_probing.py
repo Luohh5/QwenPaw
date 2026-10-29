@@ -620,6 +620,8 @@ async def test_preparation_and_admission_keep_only_required_real_audits(
         "empty",
         "satisfied",
         "missing",
+        "missing_package",
+        "transitive",
         "repair",
         "stale",
         "duplicate",
@@ -651,6 +653,10 @@ async def test_existing_dependency_read_admission_keeps_safety_boundaries(
     (info / "METADATA").write_text("Name: sample\nVersion: 1.0\n")
     (info / "RECORD").write_text("sample.py,,\n")
     (site / "sample.py").write_text("VALUE = 1\n")
+    if case == "transitive":
+        (info / "METADATA").write_text(
+            "Name: sample\nVersion: 1.0\nRequires-Dist: child>=2\n",
+        )
     if case == "duplicate":
         duplicate = site / "sample-1.1.dist-info"
         duplicate.mkdir()
@@ -667,6 +673,8 @@ async def test_existing_dependency_read_admission_keeps_safety_boundaries(
             ("sample>=1",) if case not in {"empty", "repair", "stale"} else ()
         )
     )
+    if case == "missing_package":
+        requirements = ("absent>=1",)
     description = PluginDescription(
         SimpleNamespace(id="read-consumer", sdk=None),
         source,
@@ -756,7 +764,15 @@ async def test_existing_dependency_read_admission_keeps_safety_boundaries(
         assert rejected.value.decision.reason_code in expected
         assert usage.snapshot().uses[-1].environment is None
         return
-    if case in {"missing", "repair", "stale", "duplicate", "bad_record"}:
+    if case in {
+        "missing",
+        "missing_package",
+        "transitive",
+        "repair",
+        "stale",
+        "duplicate",
+        "bad_record",
+    }:
         if case == "stale":
             with pytest.raises(
                 ValueError,
@@ -778,6 +794,8 @@ async def test_existing_dependency_read_admission_keeps_safety_boundaries(
                 rejected.value.decision.reason_code
                 in {
                     "missing": {"DEPENDENCY_UNSATISFIED"},
+                    "missing_package": {"DEPENDENCY_UNSATISFIED"},
+                    "transitive": {"DEPENDENCY_UNSATISFIED"},
                     "repair": {"DEPENDENCY_REPAIR_REQUIRED"},
                     "duplicate": {"DEPENDENCY_ENVIRONMENT_AMBIGUOUS"},
                     "bad_record": {
@@ -786,6 +804,17 @@ async def test_existing_dependency_read_admission_keeps_safety_boundaries(
                     },
                 }[case]
             )
+            if case in {"missing", "missing_package", "transitive"}:
+                failed_requirement = {
+                    "missing": "sample>=2",
+                    "missing_package": "absent>=1",
+                    "transitive": "child>=2",
+                }[case]
+                assert str(rejected.value).startswith(
+                    "DEPENDENCY_UNSATISFIED: read-consumer: "
+                    f"{failed_requirement}",
+                )
+                assert rejected.value.decision.missing == [failed_requirement]
         if replacement is not None:
             assert usage.has_declaration(replacement)
         assert all(
@@ -816,6 +845,7 @@ async def test_existing_dependency_read_admission_keeps_safety_boundaries(
         assert runtime.active and runtime.environment == uses[0].environment
         assert runtime.snapshot is None
         assert usage.capture_admissions((lease,))[lease] is token
+    assert audited == []
     assert {
         p.relative_to(site): p.read_bytes()
         for p in site.rglob("*")
