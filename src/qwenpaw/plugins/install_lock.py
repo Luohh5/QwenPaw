@@ -261,8 +261,13 @@ def plugin_install_lock(
         # Wait for an additive writer before classifying its repair marker.
         check_lock_admission(lock_path, check_repair=False)
     try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        if environment_lock:
+            from .dependency_maintenance import open_coordination_lock
+
+            fd = open_coordination_lock(lock_path)
+        else:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
     except OSError as exc:
         raise InstallLockError("INSTALL_LOCK_UNAVAILABLE") from exc
     acquired = False
