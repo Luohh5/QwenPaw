@@ -35,6 +35,57 @@ from .module_isolation import (
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class _ReadAdmissionContext:
+    description: PluginDescription
+    source_digest: str
+    paths: tuple[str, ...]
+    executable: str
+    runtime_identity: object = None
+
+
+def _read_source_identity(description):
+    """Fingerprint dependency declarations, without scanning plugin assets."""
+    import hashlib
+
+    from .architecture import PluginManifest
+    from .dependency_gate import parse_requirements_file, manifest_requirements
+    from .execution.dependencies import dependency_error
+    import json
+
+    manifest_path = description.source_path / "plugin.json"
+    if (
+        manifest_path.is_file()
+        and PluginManifest.model_validate(
+            json.loads(manifest_path.read_text(encoding="utf-8")),
+        )
+        != description.manifest
+    ):
+        raise dependency_error("DEPENDENCY_ORIGIN_INVALID")
+    if description.requirements_path is not None:
+        parsed = parse_requirements_file(description.requirements_path)
+        current = tuple(
+            dict.fromkeys(
+                [str(item) for item in parsed.requirements]
+                + parsed.unsupported
+                + manifest_requirements(
+                    description.manifest.model_dump(mode="json"),
+                ),
+            ),
+        )
+        if current != description.requirements:
+            raise dependency_error("DEPENDENCY_ORIGIN_INVALID")
+    digest = hashlib.sha256()
+    digest.update(str(description.source_path.resolve()).encode())
+    for name in ("plugin.json", "requirements.txt"):
+        path = description.source_path / name
+        digest.update(name.encode())
+        content = path.read_bytes() if path.is_file() else b""
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
 class _EntryPointNotFoundError(FileNotFoundError):
     """Missing declared source, distinct from failures inside plugin code."""
 
@@ -107,18 +158,29 @@ def _host_dependency_state():
         if module is None:
             continue
         origin = module.__dict__.get("__file__")
+        locations = tuple(module.__dict__.get("__path__", ()))
+        if not isinstance(origin, str) and locations:
+            origin = locations[0]
         if isinstance(origin, str):
             loaded.append(
                 (
                     name,
-                    id(module),
+                    (module, locations),
                     os.path.join(cwd, origin),
                 ),
             )
     return paths, tuple(loaded)
 
 
-def _observe_host_dependencies(code_root, paths, loaded_origins):
+def _observe_host_dependencies(
+    code_root,
+    paths,
+    loaded_origins,
+    *,
+    _snapshot=None,
+    _embedded_owners=None,
+    _covered=None,
+):
     """Read metadata and RECORD ownership using only detached origins."""
     from importlib.metadata import PathDistribution
     from .execution.dependencies import (
@@ -126,9 +188,9 @@ def _observe_host_dependencies(code_root, paths, loaded_origins):
         observe_dependencies,
     )
 
-    embedded_owners = {}
+    embedded_owners = dict(_embedded_owners or {})
     record_reads = {}
-    snapshot = observe_dependencies(
+    snapshot = _snapshot or observe_dependencies(
         {
             "code_root": code_root,
             "_audit_sites": paths,
@@ -159,6 +221,17 @@ def _observe_host_dependencies(code_root, paths, loaded_origins):
             }
             if owned.intersection(relative_origins[root]):
                 imported[name] = row
+                if _covered is not None:
+                    _covered.update(
+                        module_name
+                        for module_name, path in loaded.items()
+                        if owned.intersection(
+                            _relative_module_origins(
+                                (path, resolved[path]),
+                                root,
+                            ),
+                        )
+                    )
                 embedded_roots = [
                     Path(site).parent
                     for site, owner in embedded_owners.items()
@@ -188,8 +261,10 @@ def _observe_host_dependencies(code_root, paths, loaded_origins):
             continue
         # Legacy metadata without a file inventory needs top-level origin
         # evidence; RECORD ownership never uses this guess.
-        if any(
-            module_name.split(".", 1)[0] in row["top_level"]
+        legacy_modules = {
+            module_name
+            for module_name, path in loaded.items()
+            if module_name.split(".", 1)[0] in row["top_level"]
             and (
                 (
                     resolved[path].parent == root
@@ -200,9 +275,11 @@ def _observe_host_dependencies(code_root, paths, loaded_origins):
                     root / module_name.split(".", 1)[0],
                 )
             )
-            for module_name, path in loaded.items()
-        ):
+        }
+        if legacy_modules:
             imported[name] = row
+            if _covered is not None:
+                _covered.update(legacy_modules)
     embedded_modules = {
         module
         for row in imported.values()
@@ -219,6 +296,110 @@ def _observe_host_dependencies(code_root, paths, loaded_origins):
             ):
                 imported[name] = row
     return snapshot, imported
+
+
+def _check_read_history(view, uses):
+    from .dependency_gate import SharedDependencyError, GateDecision
+    from .execution.dependencies import _provides_loaded_modules
+
+    def refuse(code, detail):
+        raise SharedDependencyError(
+            GateDecision(
+                False,
+                False,
+                reason=f"{code}: {detail}",
+                reason_code=code,
+                require_restart=code == "DEPENDENCY_RESTART_REQUIRED",
+                unsupported=(
+                    [detail] if code == "DEPENDENCY_PLAN_UNVERIFIED" else []
+                ),
+            ),
+        )
+
+    for use in uses:
+        if use.origin != "host":
+            continue
+        if use.environment is None or use.snapshot is None:
+            refuse("DEPENDENCY_PLAN_UNVERIFIED", "host history unavailable")
+        if not set(use.environment.sites).intersection(view.dependency_sites):
+            continue
+        for name, old in use.snapshot.distributions.items():
+            fresh = view.distributions.get(name)
+            if (
+                name in view.invalid
+                or fresh is None
+                or old["version"] != fresh["version"]
+                or old["metadata_path"] != fresh["metadata_path"]
+            ):
+                refuse(
+                    "DEPENDENCY_RESTART_REQUIRED",
+                    "loaded dependency differs",
+                )
+            modules = old.get("loaded_modules", ())
+            if modules and any(
+                provider not in use.snapshot.distributions
+                and _provides_loaded_modules(row, set(modules))
+                for provider, row in view.distributions.items()
+            ):
+                refuse(
+                    "DEPENDENCY_RESTART_REQUIRED",
+                    "loaded embedded provider shadowed",
+                )
+
+
+def _observe_host_delta(code_root, paths, loaded_origins, baseline):
+    """Resolve only changed modules; uncertain providers use the old observer."""
+    from .execution.dependencies import read_dependency_inventory
+
+    view, _ = read_dependency_inventory(code_root, paths, ())
+    rows = {}
+    unresolved = set()
+    required = set()
+    root = Path(code_root).resolve()
+    for name, origin in loaded_origins:
+        path = Path(origin).resolve()
+        if path.is_relative_to(root):
+            continue
+        if any(
+            path.is_relative_to(Path(site)) for site in view.dependency_sites
+        ):
+            required.add(name)
+        matched = False
+        for package, row in view.distributions.items():
+            parent = Path(row["metadata_path"]).parent
+            if not path.is_relative_to(parent):
+                continue
+            first = path.relative_to(parent).parts[0].split(".", 1)[0]
+            if (
+                first in row["top_level"]
+                or name.split(".", 1)[0] in row["top_level"]
+            ):
+                rows[package] = row
+                matched = True
+        if not matched and any(
+            path.is_relative_to(Path(site)) for site in view.dependency_sites
+        ):
+            unresolved.add(name)
+    if unresolved:
+        return _observe_host_dependencies(code_root, paths, loaded_origins)
+    snapshot = replace(
+        baseline,
+        sites=view.sites,
+        dependency_sites=view.dependency_sites,
+        distributions=rows,
+    )
+    covered = set()
+    observed, imported = _observe_host_dependencies(
+        code_root,
+        paths,
+        loaded_origins,
+        _snapshot=snapshot,
+        _embedded_owners=view.embedded_owners,
+        _covered=covered,
+    )
+    if required - covered:
+        return _observe_host_dependencies(code_root, paths, loaded_origins)
+    return observed, imported
 
 
 async def _probe_incoming(
@@ -403,6 +584,135 @@ class PythonBackend:
                 raise RuntimeError("; ".join(failed.errors))
         return None
 
+    async def admit_existing(
+        self,
+        description,
+        *,
+        usage,
+        token,
+        snapshot=None,
+    ):
+        """Admit a candidate closure without producing full audit evidence."""
+        from packaging.markers import default_environment
+        from ..utils.io_utils import run_sync_io
+        from .dependency_gate import (
+            _shared_observation,
+            SharedDependencyError,
+            GateDecision,
+        )
+        from .dependency_usage import DependencyEnvironment
+        from .execution.dependencies import (
+            read_dependency_inventory,
+        )
+        from .install_lock import observation_inputs
+
+        del snapshot
+        if not usage.has_declaration(token, plugin_id=description.manifest.id):
+            raise ValueError("DEPENDENCY_DECLARATION_MISMATCH")
+        prepared = await self.prepare_dependency_targets(description)
+        cwd = os.getcwd()
+        paths = _host_paths(cwd)
+        factory = getattr(self.services, "dependency_environment", None)
+        context = await run_sync_io(factory) if factory is not None else None
+        async with _shared_observation(prepared.targets):
+            prepared.validate()
+            for attempt in range(2):
+                before = _host_dependency_state()
+                before_usage = usage.snapshot()
+                try:
+                    view, _ = await run_sync_io(
+                        read_dependency_inventory,
+                        description.source_path,
+                        paths,
+                        description.requirements,
+                        inventory=observation_inputs(),
+                    )
+                    digest = await run_sync_io(
+                        _read_source_identity,
+                        description,
+                    )
+                    await run_sync_io(
+                        _check_read_history,
+                        view,
+                        before_usage.uses,
+                    )
+                except Exception as exc:
+                    code = getattr(
+                        exc,
+                        "reason_code",
+                        "DEPENDENCY_PLAN_UNVERIFIED",
+                    )
+                    if isinstance(exc, SharedDependencyError):
+                        raise
+                    raise SharedDependencyError(
+                        GateDecision(
+                            False,
+                            False,
+                            reason=f"{code}: {exc}",
+                            reason_code=code,
+                            require_restart=code
+                            == "DEPENDENCY_REPAIR_REQUIRED",
+                        ),
+                    ) from exc
+                prepared.validate()
+                if not set(view.dependency_sites) <= {
+                    str(path) for path in prepared.targets
+                }:
+                    raise SharedDependencyError(
+                        GateDecision(
+                            False,
+                            False,
+                            reason="DEPENDENCY_PLAN_UNVERIFIED: admission roots changed",
+                            reason_code="DEPENDENCY_PLAN_UNVERIFIED",
+                        ),
+                    )
+                if (
+                    before == _host_dependency_state()
+                    and usage.snapshot().revision == before_usage.revision
+                ):
+                    break
+                if attempt == 1:
+                    raise SharedDependencyError(
+                        GateDecision(
+                            False,
+                            False,
+                            reason="DEPENDENCY_PLAN_UNVERIFIED: imports changed",
+                            reason_code="DEPENDENCY_PLAN_UNVERIFIED",
+                        ),
+                    )
+            environment = DependencyEnvironment(
+                os.path.abspath(sys.executable),
+                view.dependency_sites,
+                dict(default_environment()),
+            )
+            if context is not None and context.runtime_identity is not None:
+                identity = context.runtime_identity
+                expected = {
+                    "python_version": ".".join(map(str, identity["version"])),
+                    "implementation_name": identity["implementation"],
+                    "sys_platform": identity["sys_platform"],
+                    "platform_system": identity["system"],
+                    "platform_machine": identity["machine"],
+                }
+                if any(
+                    environment.marker_environment.get(key) != value
+                    for key, value in expected.items()
+                ):
+                    raise ValueError("CHANNEL_RUNTIME_IDENTITY_MISMATCH")
+            usage.admit_read(
+                token,
+                environment,
+                description=description,
+                context=_ReadAdmissionContext(
+                    description,
+                    digest,
+                    paths,
+                    environment.executable,
+                    context.runtime_identity if context is not None else None,
+                ),
+            )
+        return None
+
     async def audit_dependencies(
         self,
         description,
@@ -413,7 +723,7 @@ class PythonBackend:
         """Read this host's metadata without importing candidate modules."""
         from ..utils.io_utils import run_sync_io
         from .execution.dependencies import observe_dependencies
-        from .install_lock import environment_observation
+        from .install_lock import environment_observation, observation_inputs
 
         factory = getattr(self.services, "dependency_environment", None)
         if context is None and factory is not None:
@@ -437,7 +747,9 @@ class PythonBackend:
                         ),
                         "_audit_sites": paths,
                         "dependency_paths": (),
+                        "_requirements": description.requirements,
                     },
+                    _inventory=observation_inputs(),
                 )
                 if validate is not None:
                     validate()
@@ -489,7 +801,8 @@ class PythonBackend:
 
     @staticmethod
     async def observe_host_dependencies(description, usage, token):
-        """Capture imported distribution origins at lifecycle boundaries."""
+        """Retain value-only import history; resolve changed sources only."""
+        import weakref
         from ..utils.io_utils import run_async_to_completion, run_sync_io
         from .execution.dependencies import dependency_sites
         from .install_lock import environment_observation
@@ -503,6 +816,12 @@ class PythonBackend:
             if valid():
                 usage.observe_host(token, None)
 
+        def detached(loaded):
+            return {
+                name: (weakref.ref(identity[0]), identity[1], origin)
+                for name, identity, origin in loaded
+            }
+
         async def observe():
             if not valid():
                 return
@@ -513,47 +832,77 @@ class PythonBackend:
                         os.getcwd(),
                         description.source_path,
                     )
+                    key = (
+                        await run_sync_io(
+                            lambda: str(Path(code_root).resolve()),
+                        ),
+                        paths,
+                    )
+                    baselines = getattr(
+                        usage,
+                        "_host_observer_baselines",
+                        None,
+                    )
+                    if baselines is None:
+                        baselines = usage._host_observer_baselines = {}
+                    previous = baselines.get(key)
+                    current = detached(loaded)
+                    changed = tuple(
+                        (name, origin)
+                        for name, identity, origin in loaded
+                        if previous is None
+                        or name not in previous[0]
+                        or previous[0][name][0]() is not identity[0]
+                        or previous[0][name][1:] != (identity[1], origin)
+                    )
                     roots = await run_sync_io(dependency_sites, paths)
                     async with environment_observation(roots):
                         if not valid():
                             return
-                        try:
-                            snapshot, imported = await run_sync_io(
-                                _observe_host_dependencies,
-                                code_root,
-                                paths,
-                                tuple(
-                                    (name, origin)
-                                    for name, _, origin in loaded
-                                ),
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Host dependency evidence unavailable",
-                                exc_info=True,
-                            )
-                            unknown()
-                            return
-                        fresh = _host_dependency_state() == (paths, loaded)
-                        covered = (
-                            snapshot.dependency_sites is not None
-                            and set(snapshot.dependency_sites) <= set(roots)
-                        )
-                        if fresh and covered:
-                            if valid():
-                                usage.refine(
-                                    token,
-                                    snapshot,
-                                    plugin_id=plugin_id,
-                                )
-                                if imported:
-                                    usage.observe_host(
-                                        token,
-                                        replace(
-                                            snapshot,
-                                            distributions=imported,
-                                        ),
+                        if previous is not None and not changed:
+                            snapshot = previous[1]
+                            imported = snapshot.distributions
+                        else:
+                            try:
+                                if previous is None:
+                                    snapshot, imported = await run_sync_io(
+                                        _observe_host_dependencies,
+                                        code_root,
+                                        paths,
+                                        changed,
                                     )
+                                else:
+                                    snapshot, imported = await run_sync_io(
+                                        _observe_host_delta,
+                                        code_root,
+                                        paths,
+                                        changed,
+                                        previous[1],
+                                    )
+                            except Exception:
+                                logger.debug(
+                                    "Host dependency evidence unavailable",
+                                    exc_info=True,
+                                )
+                                unknown()
+                                return
+                        if (
+                            _host_dependency_state() == (paths, loaded)
+                            and snapshot.dependency_sites is not None
+                            and set(snapshot.dependency_sites) <= set(roots)
+                        ):
+                            if not valid():
+                                return
+                            old = previous[1].distributions if previous else {}
+                            # Historical ownership is append-only, including
+                            # imports removed from sys.modules during teardown.
+                            history = replace(
+                                snapshot,
+                                distributions={**imported, **old},
+                            )
+                            baselines[key] = (current, history)
+                            if history.distributions:
+                                usage.observe_host(token, history)
                             return
                         if attempt == 1:
                             unknown()

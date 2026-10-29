@@ -289,6 +289,30 @@ class DependencyUpgradeManager:
         return targets
 
     async def _consumers(self, binding, snapshot):
+        """Collect all consumers within one stable, ordered observation."""
+        from .install_lock import environment_observation
+
+        prepared = await self._prepare_consumer_targets()
+        roots = tuple(
+            dict.fromkeys(
+                (
+                    *(snapshot.dependency_sites or ()),
+                    *(root for row in prepared for root in row.targets),
+                    *(
+                        site
+                        for use in self.loader.registry.dependency_usage.snapshot().uses
+                        if use.environment is not None
+                        for site in use.environment.sites
+                    ),
+                ),
+            ),
+        )
+        async with environment_observation(roots):
+            for row in prepared:
+                row.validate()
+            return await self._collect_consumers(binding, snapshot)
+
+    async def _collect_consumers(self, binding, snapshot):
         """Installed declarations participate even when currently inactive."""
         consumers = []
         plugin_id = binding.description.manifest.id
@@ -323,7 +347,25 @@ class DependencyUpgradeManager:
                         "environment": observed.to_mapping(),
                     },
                 )
-        for use in self.loader.registry.dependency_usage.snapshot().uses:
+        from .dependency_gate import complete_read_uses
+        from .install_lock import observation_inputs
+
+        uses = await run_sync_io(
+            complete_read_uses,
+            tuple(
+                use
+                for use in self.loader.registry.dependency_usage.snapshot().uses
+                if (use.plugin_id != plugin_id or use.origin == "host")
+                and (
+                    use.environment is None
+                    or set(use.environment.sites).intersection(
+                        snapshot.dependency_sites or (),
+                    )
+                )
+            ),
+            inventory=observation_inputs(),
+        )
+        for use in uses:
             if use.plugin_id == plugin_id and use.origin != "host":
                 continue
             if (
@@ -616,9 +658,11 @@ class DependencyUpgradeManager:
             encoding="utf-8",
         )
         command = [
-            context.python_executable
-            if context is not None
-            else snapshot.executable,
+            (
+                context.python_executable
+                if context is not None
+                else snapshot.executable
+            ),
             "-I",
             "-B",
             "-m",
@@ -686,13 +730,17 @@ class DependencyUpgradeManager:
         # collisions are checked below against exact installed ownership.
         clean = replace(
             snapshot,
-            sites=tuple(map(str, context.immutable_roots))
-            if context is not None
-            else (),
+            sites=(
+                tuple(map(str, context.immutable_roots))
+                if context is not None
+                else ()
+            ),
             supported_tags=wheel_tags or snapshot.supported_tags,
-            executable=context.python_executable
-            if context is not None
-            else snapshot.executable,
+            executable=(
+                context.python_executable
+                if context is not None
+                else snapshot.executable
+            ),
             distributions={
                 name: row
                 for name, row in snapshot.distributions.items()

@@ -1149,7 +1149,9 @@ def test_record_rejects_duplicate_installed_ownership(dependency_files):
 
 @pytest_asyncio.fixture
 async def staged_upgrade(tmp_path, monkeypatch, request):
-    broken_source = getattr(request, "param", False)
+    scenario = getattr(request, "param", False)
+    broken_source = scenario is True
+    shared_reader = scenario == "shared_reader"
     host = await Host.create(tmp_path, monkeypatch)
     site = tmp_path / "plugin_runtime/site"
     site.mkdir(parents=True)
@@ -1164,13 +1166,13 @@ async def staged_upgrade(tmp_path, monkeypatch, request):
         dependency_paths=(site,),
         dependency_install_target=site,
     )
-    # An installed Python backend has roots disjoint from the channel worker.
-    # Its real audit must remain covered when maintenance observes consumers.
+    # Keep disjoint installed-consumer coverage and exercise a read consumer
+    # sharing the writer environment without a prebuilt full snapshot.
     import json
     from qwenpaw.plugins import python_backend
 
-    independent_site = tmp_path / "independent-site"
-    independent_site.mkdir()
+    independent_site = site if shared_reader else tmp_path / "independent-site"
+    independent_site.mkdir(exist_ok=True)
     monkeypatch.setattr(
         python_backend,
         "_host_paths",
@@ -1192,7 +1194,34 @@ async def staged_upgrade(tmp_path, monkeypatch, request):
         "class Plugin:\n    def register(self, api):\n        pass\n"
         "plugin = Plugin()\n",
     )
-    assert independent_site.resolve() != site.resolve()
+    assert (independent_site.resolve() == site.resolve()) is shared_reader
+    independent_manifest, _ = next(
+        (manifest, path)
+        for manifest, path in host.loader.discover_plugins()
+        if manifest.id == "independent-consumer"
+    )
+    independent_binding = host.loader.backend_resolver.resolve(
+        independent,
+        independent_manifest,
+    )
+    usage = host.registry.dependency_usage
+    read_token = usage.declare(
+        independent_binding.description.dependency_declaration(),
+    )
+    assert (
+        await independent_binding.backend.admit_existing(
+            independent_binding.description,
+            usage=usage,
+            token=read_token,
+        )
+        is None
+    )
+    read_use = next(
+        use
+        for use in usage.snapshot().uses
+        if use.plugin_id == "independent-consumer"
+    )
+    assert read_use.snapshot is None and read_use.environment is not None
     old = local_wheel(tmp_path / "old", version="0.5", value="0.5")
     with zipfile.ZipFile(next(old.glob("*.whl"))) as archive:
         archive.extractall(site)
@@ -1245,7 +1274,11 @@ async def staged_upgrade(tmp_path, monkeypatch, request):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("staged_upgrade", [False, True], indirect=True)
+@pytest.mark.parametrize(
+    "staged_upgrade",
+    [False, True, "shared_reader"],
+    indirect=True,
+)
 async def test_shared_upgrade_replaces_provider_or_restores_exact_old_tree(
     staged_upgrade,
 ):
@@ -1291,6 +1324,17 @@ async def test_shared_upgrade_replaces_provider_or_restores_exact_old_tree(
     assert (site / "neighbor.txt").read_bytes() == (
         b"preserve unrelated bytes\x00"
     )
+    from qwenpaw.plugins.dependency_usage import DependencyDeclaration
+
+    usage = host.registry.dependency_usage
+    unknown = usage.declare(
+        DependencyDeclaration("unknown-host", "unknown", (), None),
+    )
+    usage.observe_host(unknown, None)
+    usage.withdraw(unknown)
+    with pytest.raises(SharedDependencyError) as rejected:
+        await manager.stage(source)
+    assert rejected.value.decision.reason_code == "DEPENDENCY_PLAN_UNVERIFIED"
 
 
 @pytest.mark.asyncio

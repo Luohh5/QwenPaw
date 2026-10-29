@@ -503,10 +503,12 @@ async def test_preparation_and_admission_keep_only_required_real_audits(
     import sys
     from qwenpaw.plugins.dependency_gate import GateDecision
     from qwenpaw.plugins.dependency_usage import (
-        DependencyDeclaration,
         DependencyUsageRegistry,
     )
-    from qwenpaw.plugins.execution_backend import BackendBinding
+    from qwenpaw.plugins.execution_backend import (
+        BackendBinding,
+        PluginDescription,
+    )
     from qwenpaw.plugins.lifecycle import PluginLifecycle
     from qwenpaw.plugins.ownership import RuntimeOwners
     from qwenpaw.plugins.python_backend import PythonBackend
@@ -531,30 +533,36 @@ async def test_preparation_and_admission_keep_only_required_real_audits(
         return GateDecision(False, True)
 
     backend = PythonBackend(SimpleNamespace(ensure_dependencies=ensure))
-    description = SimpleNamespace(
-        manifest=SimpleNamespace(id="audit-count", sdk=None),
-        source_path=source,
-        payload=None,
+    description = PluginDescription(
+        SimpleNamespace(id="audit-count", sdk=None),
+        source,
+        None,
+        None,
+        source_identity="source",
         requirements=(),
     )
     binding = BackendBinding(backend, description)
     usage = DependencyUsageRegistry(RuntimeOwners())
-    loader = SimpleNamespace(registry=SimpleNamespace(dependency_usage=usage))
+    loader = PluginLoader.__new__(PluginLoader)
+    loader.registry = SimpleNamespace(dependency_usage=usage)
     lifecycle = PluginLifecycle(loader)
     real_audit, audits = backend.audit_dependencies, []
-    calls = []
+    real_targets = backend.prepare_dependency_targets
 
     async def counted(*args, **kwargs):
-        if case == "changed" and not calls:
-            # Keep the captured search path identity stable while a previously
-            # absent root becomes visible after lock hints were selected.
-            dormant.rename(added)
-        calls.append(True)
         observed = await real_audit(*args, **kwargs)
         audits.append(observed)
         return observed
 
+    async def targets(*args, **kwargs):
+        prepared = await real_targets(*args, **kwargs)
+        if case == "changed":
+            dormant.rename(added)
+            sys.path.append(str(tmp_path / "new-search-root"))
+        return prepared
+
     monkeypatch.setattr(backend, "audit_dependencies", counted)
+    monkeypatch.setattr(backend, "prepare_dependency_targets", targets)
     if case == "preflight_invalid":
         from qwenpaw.plugins.dependency_maintenance import repair_marker
 
@@ -568,28 +576,251 @@ async def test_preparation_and_admission_keep_only_required_real_audits(
                 probe=False,
                 owns_dependency_env=False,
             )
-        assert len(calls) == 1
+        assert audits == []
         return
     prepared = await lifecycle.prepare_backend(
         binding,
         allow_install=False,
         probe=False,
     )
-    assert calls == []
-    token = usage.declare(DependencyDeclaration("audit-count", None, (), None))
-    admitted = await PluginLoader._admit_dependencies(
-        loader,
-        binding,
-        token,
-        prepared,
+    assert audits == []
+    token = usage.declare(description.dependency_declaration())
+    if case == "changed":
+        with pytest.raises(
+            RuntimeError,
+            match="DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED",
+        ):
+            await PluginLoader._admit_dependencies(
+                loader,
+                binding,
+                token,
+                prepared,
+            )
+        assert usage.snapshot().uses[0].environment is None
+    else:
+        assert (
+            await PluginLoader._admit_dependencies(
+                loader,
+                binding,
+                token,
+                prepared,
+            )
+            is None
+        )
+        use = usage.snapshot().uses[0]
+        assert str(site.resolve()) in use.environment.sites
+        assert use.snapshot is None
+    assert audits == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "empty",
+        "satisfied",
+        "missing",
+        "repair",
+        "stale",
+        "duplicate",
+        "bad_record",
+        "fresh_metadata",
+        "fresh_record",
+        "child_record",
+    ],
+)
+async def test_existing_dependency_read_admission_keeps_safety_boundaries(
+    tmp_path,
+    monkeypatch,
+    case,
+):
+    import sys
+    from qwenpaw.plugins.dependency_gate import SharedDependencyError
+    from qwenpaw.plugins.dependency_usage import (
+        DependencyUsageRegistry,
     )
-    assert len(calls) == (2 if case == "changed" else 1)
-    # A newly visible root rejects the stale lock scope before scanning;
-    # only the retry can produce the complete admitted evidence.
-    assert audits == [admitted]
-    assert set(admitted.distributions) == (
-        {"initial", "added"} if case == "changed" else {"initial"}
+    from qwenpaw.plugins.ownership import RuntimeKey, RuntimeOwners
+    from qwenpaw.plugins.execution_backend import PluginDescription
+    from qwenpaw.plugins.python_backend import PythonBackend
+
+    site, source = tmp_path / "site", tmp_path / "plugin"
+    site.mkdir()
+    source.mkdir()
+    info = site / "sample-1.0.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Name: sample\nVersion: 1.0\n")
+    (info / "RECORD").write_text("sample.py,,\n")
+    (site / "sample.py").write_text("VALUE = 1\n")
+    if case == "duplicate":
+        duplicate = site / "sample-1.1.dist-info"
+        duplicate.mkdir()
+        (duplicate / "METADATA").write_text("Name: sample\nVersion: 1.1\n")
+        (duplicate / "RECORD").write_text("other_sample.py,,\n")
+        (site / "other_sample.py").write_text("VALUE = 2\n")
+    if case == "bad_record":
+        (info / "RECORD").write_text("sample.py,,not-a-size\n")
+    monkeypatch.setattr(sys, "path", [str(site)])
+    requirements = (
+        ("sample>=2",)
+        if case == "missing"
+        else (
+            ("sample>=1",) if case not in {"empty", "repair", "stale"} else ()
+        )
     )
+    description = PluginDescription(
+        SimpleNamespace(id="read-consumer", sdk=None),
+        source,
+        None,
+        None,
+        source_identity="source",
+        requirements=requirements,
+    )
+    owners = RuntimeOwners()
+    usage = DependencyUsageRegistry(owners)
+    declaration = description.dependency_declaration()
+    token = usage.declare(declaration)
+    replacement = None
+    if case == "stale":
+        usage.withdraw(token)
+        replacement = usage.declare(declaration)
+    if case == "repair":
+        from qwenpaw.plugins.dependency_maintenance import repair_marker
+
+        marker = repair_marker(site)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("repair required")
+    backend = PythonBackend(SimpleNamespace())
+    audited = []
+    real_audit = backend.audit_dependencies
+
+    async def audit(*args, **kwargs):
+        audited.append(True)
+        return await real_audit(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "audit_dependencies", audit)
+    before = {
+        p.relative_to(site): p.read_bytes()
+        for p in site.rglob("*")
+        if p.is_file()
+    }
+    if case in {"fresh_metadata", "fresh_record", "child_record"}:
+        import asyncio
+        import os
+        from qwenpaw.plugins.install_lock import environment_observation
+
+        async with environment_observation((site,)):
+            assert (
+                await backend.admit_existing(
+                    description,
+                    usage=usage,
+                    token=token,
+                )
+                is None
+            )
+            changed = info / (
+                "METADATA" if case == "fresh_metadata" else "RECORD"
+            )
+            stamp = changed.stat()
+            changed.write_text(
+                "Name: sample\nVersion: 0.5\n"
+                if case == "fresh_metadata"
+                else "sample.py,,not-a-size\n",
+            )
+            os.utime(changed, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            fresh_token = usage.declare(declaration)
+            pending = (
+                asyncio.create_task(
+                    backend.admit_existing(
+                        description,
+                        usage=usage,
+                        token=fresh_token,
+                    ),
+                )
+                if case == "child_record"
+                else None
+            )
+        with pytest.raises(SharedDependencyError) as rejected:
+            if pending is not None:
+                await pending
+            else:
+                await backend.admit_existing(
+                    description,
+                    usage=usage,
+                    token=fresh_token,
+                )
+        expected = (
+            {"DEPENDENCY_UNSATISFIED"}
+            if case == "fresh_metadata"
+            else {"DEPENDENCY_METADATA_INVALID", "DEPENDENCY_PLAN_UNVERIFIED"}
+        )
+        assert rejected.value.decision.reason_code in expected
+        assert usage.snapshot().uses[-1].environment is None
+        return
+    if case in {"missing", "repair", "stale", "duplicate", "bad_record"}:
+        if case == "stale":
+            with pytest.raises(
+                ValueError,
+                match="DEPENDENCY_DECLARATION_MISMATCH",
+            ):
+                await backend.admit_existing(
+                    description,
+                    usage=usage,
+                    token=token,
+                )
+        else:
+            with pytest.raises(SharedDependencyError) as rejected:
+                await backend.admit_existing(
+                    description,
+                    usage=usage,
+                    token=token,
+                )
+            assert (
+                rejected.value.decision.reason_code
+                in {
+                    "missing": {"DEPENDENCY_UNSATISFIED"},
+                    "repair": {"DEPENDENCY_REPAIR_REQUIRED"},
+                    "duplicate": {"DEPENDENCY_ENVIRONMENT_AMBIGUOUS"},
+                    "bad_record": {
+                        "DEPENDENCY_METADATA_INVALID",
+                        "DEPENDENCY_PLAN_UNVERIFIED",
+                    },
+                }[case]
+            )
+        if replacement is not None:
+            assert usage.has_declaration(replacement)
+        assert all(
+            use.snapshot is None and use.environment is None
+            for use in usage.snapshot().uses
+        )
+    else:
+        assert (
+            await backend.admit_existing(description, usage=usage, token=token)
+            is None
+        )
+        uses = usage.snapshot().uses
+        assert len(uses) == 1
+        assert uses[0].environment is not None
+        assert str(site.resolve()) in uses[0].environment.sites
+        assert uses[0].snapshot is None
+        assert audited == []
+        lease = owners.reserve(
+            "read-consumer",
+            RuntimeKey("plugin", "read-consumer", "test"),
+            source,
+            instance_id="first",
+        )
+        usage.bind(lease, token)
+        runtime = next(
+            use for use in usage.snapshot().uses if use.origin == "runtime"
+        )
+        assert runtime.active and runtime.environment == uses[0].environment
+        assert runtime.snapshot is None
+        assert usage.capture_admissions((lease,))[lease] is token
+    assert {
+        p.relative_to(site): p.read_bytes()
+        for p in site.rglob("*")
+        if p.is_file()
+    } == before
 
 
 @pytest.fixture
@@ -641,6 +872,7 @@ def test_host_dependency_record_retains_loaded_ownership(tmp_path):
     (info / "METADATA").write_text("Name: sample\nVersion: 1.0\n")
     loaded = (("shared_ns.loaded", str(source)),)
     original = record.read_text()
+    record_stat = record.stat()
     _, imported = _observe_host_dependencies(
         tmp_path / "plugin",
         (tmp_path,),
@@ -648,6 +880,7 @@ def test_host_dependency_record_retains_loaded_ownership(tmp_path):
     )
     assert "sample" in imported
     record.write_text("unrelated.py,,12\n")
+    os.utime(record, ns=(record_stat.st_atime_ns, record_stat.st_mtime_ns))
     _, imported = _observe_host_dependencies(
         tmp_path / "plugin",
         (tmp_path,),
@@ -655,16 +888,173 @@ def test_host_dependency_record_retains_loaded_ownership(tmp_path):
     )
     assert "sample" not in imported
     record.write_text(original)
+    os.utime(record, ns=(record_stat.st_atime_ns, record_stat.st_mtime_ns))
     _, imported = _observe_host_dependencies(
         tmp_path / "plugin",
         (tmp_path,),
         loaded,
     )
     assert "sample" in imported
+    # Admission generations retain independent historical pins, even when
+    # later observations no longer contain the module or show a new version.
+    from dataclasses import replace
+    from qwenpaw.plugins.dependency_usage import (
+        DependencyDeclaration,
+        DependencyUsageRegistry,
+    )
+    from qwenpaw.plugins.ownership import RuntimeOwners
+
+    usage = DependencyUsageRegistry(RuntimeOwners())
+    declaration = DependencyDeclaration("history", "old", (), None)
+    old_token = usage.declare(declaration)
+    candidate = usage.declare(
+        replace(declaration, source_revision="candidate"),
+    )
+    snapshot, imported = _observe_host_dependencies(
+        tmp_path / "plugin",
+        (tmp_path,),
+        loaded,
+    )
+    snapshot = replace(snapshot, distributions=imported)
+    usage.observe_host(old_token, snapshot)
+    metadata = info / "METADATA"
+    metadata_stat = metadata.stat()
+    metadata.write_text("Name: sample\nVersion: 2.0\n")
+    os.utime(
+        metadata,
+        ns=(metadata_stat.st_atime_ns, metadata_stat.st_mtime_ns),
+    )
+    current, current_imported = _observe_host_dependencies(
+        tmp_path / "plugin",
+        (tmp_path,),
+        loaded,
+    )
+    assert current_imported["sample"]["version"] == "2.0"
+    usage.observe_host(
+        candidate,
+        replace(current, distributions=current_imported),
+    )
+    usage.observe_host(old_token, replace(current, distributions={}))
+    usage.withdraw(old_token)
+    historical = {
+        use.source_revision: use
+        for use in usage.snapshot().uses
+        if use.origin == "host"
+    }
+    assert (
+        historical["old"].snapshot.distributions["sample"]["version"] == "1.0"
+    )
+    assert (
+        historical["candidate"].snapshot.distributions["sample"]["version"]
+        == "2.0"
+    )
+    assert usage.has_declaration(candidate)
+    metadata.write_text("Name: sample\nVersion: 1.0\n")
     with record.open("a") as stream:
         stream.write("unrelated.py,,not-a-size\n")
     with pytest.raises(ValueError):
         _files_for_loaded_origins(distribution, origins)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layout", ["ordinary", "namespace_alias", "unknown"])
+async def test_host_dependency_boundaries_keep_preexisting_and_removed_imports(
+    tmp_path,
+    monkeypatch,
+    layout,
+):
+    import sys
+    from types import ModuleType
+    from qwenpaw.plugins.dependency_usage import (
+        DependencyDeclaration,
+        DependencyUsageRegistry,
+    )
+    from qwenpaw.plugins.ownership import RuntimeOwners
+    from qwenpaw.plugins.python_backend import PythonBackend
+
+    site = tmp_path / "site"
+    site.mkdir()
+    monkeypatch.setattr(sys, "path", [str(site)])
+    description = SimpleNamespace(
+        manifest=SimpleNamespace(id="host-history"),
+        source_path=tmp_path / "plugin",
+    )
+    usage = DependencyUsageRegistry(RuntimeOwners())
+    token = usage.declare(
+        DependencyDeclaration("host-history", "source", (), None),
+    )
+    names = [
+        "_qwenpaw_before_register",
+        "_qwenpaw_in_register",
+        "_qwenpaw_in_teardown",
+    ]
+    rows = (
+        [(name, f"{name}.py") for name in names]
+        if layout == "ordinary"
+        else [
+            ("real-owner", "shared_ns/actual.py"),
+            ("shared-ns", "shared_ns/other.py"),
+            ("plainowner", "plainowner.py"),
+        ]
+    )
+    for owner, relative in rows:
+        info = site / f"{owner}-1.0.dist-info"
+        info.mkdir()
+        (info / "METADATA").write_text(f"Name: {owner}\nVersion: 1.0\n")
+        (info / "RECORD").write_text(f"{relative},,\n")
+        path = site / relative
+        path.parent.mkdir(exist_ok=True)
+        path.write_text("VALUE = 1\n")
+    if layout != "ordinary":
+        await PythonBackend.observe_host_dependencies(
+            description,
+            usage,
+            token,
+        )
+        if layout == "unknown":
+            (site / "real-owner-1.0.dist-info/RECORD").write_text(
+                "shared_ns/actual.py,,not-a-size\n",
+            )
+    events = (
+        [(name,) for name in names]
+        if layout == "ordinary"
+        else [("plainowner", "shared_ns.actual")]
+    )
+    for added in events:
+        for name in added:
+            module = ModuleType(name)
+            module.__file__ = str(site / (name.replace(".", "/") + ".py"))
+            monkeypatch.setitem(sys.modules, name, module)
+        await PythonBackend.observe_host_dependencies(
+            description,
+            usage,
+            token,
+        )
+        if layout != "ordinary" or added == (names[1],):
+            for name in names[:2] if layout == "ordinary" else added:
+                monkeypatch.delitem(sys.modules, name)
+            await PythonBackend.observe_host_dependencies(
+                description,
+                usage,
+                token,
+            )
+    usage.withdraw(token)
+    histories = [use for use in usage.snapshot().uses if use.origin == "host"]
+    assert len(histories) == 1
+    host = histories[0]
+    if layout == "unknown":
+        assert host.environment is None and host.snapshot is None
+    else:
+        expected = (
+            {name.replace("_", "-") for name in names}
+            if layout == "ordinary"
+            else {"real-owner", "plainowner"}
+        )
+        assert set(host.snapshot.distributions) == expected
+        assert all(
+            row["version"] == "1.0"
+            for row in host.snapshot.distributions.values()
+        )
 
 
 @pytest.mark.parametrize(
@@ -1064,9 +1454,11 @@ async def test_dependency_import_resolution_checks_supplemental_changes(
         if passes <= 2 or change == "continuous":
             module = ModuleType("_qwenpaw_supplemental_import")
             module.__file__ = str(
-                source
-                if change == "relevant" and passes == 2
-                else others[passes - 1],
+                (
+                    source
+                    if change == "relevant" and passes == 2
+                    else others[passes - 1]
+                ),
             )
             monkeypatch.setitem(sys.modules, module.__name__, module)
         release.set()

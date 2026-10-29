@@ -394,6 +394,40 @@ def _installed_metadata(
     embedded_sites=None,
     embedded_owners=None,
     record_reads=None,
+    inventory=None,
+):
+    """Reuse unfiltered metadata only in a caller-owned observation."""
+    key = ("metadata", tuple(str(site) for site in sites))
+    if inventory is None or key not in inventory:
+        embedded, owners = set(), {}
+        result = _read_installed_metadata(
+            sites,
+            embedded_sites=embedded,
+            embedded_owners=owners,
+            record_reads=record_reads,
+        )
+        if inventory is not None:
+            inventory[key] = (result, embedded, owners)
+    else:
+        result, embedded, owners = inventory[key]
+    if embedded_sites is not None:
+        embedded_sites.update(embedded)
+    if embedded_owners is not None:
+        embedded_owners.update(owners)
+    rows, invalid, observed = result
+    return (
+        {name: dict(row) for name, row in rows.items()},
+        dict(invalid),
+        dict(observed),
+    )
+
+
+def _read_installed_metadata(
+    sites,
+    *,
+    embedded_sites=None,
+    embedded_owners=None,
+    record_reads=None,
 ):
     """Read metadata headers and invalid names without importing code."""
     # pylint: disable=protected-access
@@ -614,8 +648,11 @@ def observe_dependencies(
     *,
     _embedded_owners=None,
     _record_reads=None,
+    _inventory=None,
 ) -> DependencySnapshot:
     """Inspect this interpreter's paths before candidate imports execute."""
+    if _record_reads is None and _inventory is not None:
+        _record_reads = _inventory.setdefault("records", {})
     excluded = {Path(packet["code_root"]).resolve()}
     sites = tuple(
         dict.fromkeys(
@@ -634,13 +671,17 @@ def observe_dependencies(
         embedded_sites=embedded_sites,
         embedded_owners=_embedded_owners,
         record_reads=_record_reads,
+        inventory=_inventory,
     )
     from .runtime import _requirements
 
     scanned = set()
     environment = default_environment()
     for name, _ in _dependency_closure(
-        _requirements(packet.get("requirements_path")),
+        packet.get(
+            "_requirements",
+            _requirements(packet.get("requirements_path")),
+        ),
         rows,
         environment,
     ):
@@ -683,6 +724,93 @@ def observe_dependencies(
             ),
         },
     )
+
+
+@dataclass(frozen=True)
+class _ReadInventory:
+    """Scoped metadata for a read decision, deliberately not audit evidence."""
+
+    sites: tuple[str, ...]
+    dependency_sites: tuple[str, ...]
+    marker_environment: Mapping[str, str]
+    distributions: Mapping[str, Mapping[str, Any]]
+    invalid: Mapping[str, str]
+    embedded_owners: Mapping[str, str]
+
+
+def read_dependency_inventory(
+    code_root,
+    paths,
+    requirements,
+    *,
+    inventory=None,
+):
+    """Check just the candidate closure and its actual imported providers."""
+    root = Path(code_root).resolve()
+    sites = tuple(
+        dict.fromkeys(
+            str(canonical_environment_path(path))
+            for path in paths
+            if path
+            and Path(path).is_dir()
+            and not Path(path).resolve().is_relative_to(root)
+        ),
+    )
+    records = (
+        inventory.setdefault("records", {}) if inventory is not None else {}
+    )
+    embedded = set()
+    embedded_owners = {}
+    rows, invalid, observed = _installed_metadata(
+        sites,
+        embedded_sites=embedded,
+        embedded_owners=embedded_owners,
+        record_reads=records,
+        inventory=inventory,
+    )
+    environment = default_environment()
+    relevant = set()
+    for name, requirement in _dependency_closure(
+        requirements,
+        rows,
+        environment,
+    ):
+        if name in invalid:
+            raise dependency_error(invalid[name])
+        row = rows.get(name)
+        if row is None or not requirement.specifier.contains(
+            Version(row["version"]),
+            prereleases=True,
+        ):
+            raise dependency_error("DEPENDENCY_UNSATISFIED")
+        relevant.add(name)
+        # Derive import providers from the same installed RECORD as full audit.
+        tops = set(row["top_level"])
+        for item in observed[name].files or ():
+            parts = str(item).replace("\\", "/").split("/")
+            if (
+                len(parts) == 2
+                and parts[0] in {"bin", "Scripts"}
+                and not parts[1].casefold().startswith("__init__.")
+            ):
+                continue
+            if parts[0] not in {"", ".", ".."} and not parts[0].endswith(
+                (".dist-info", ".egg-info"),
+            ):
+                tops.add(parts[0].split(".", 1)[0])
+        row["top_level"] = tuple(sorted(tops))
+    for name in invalid:
+        rows.pop(name, None)
+    view = _ReadInventory(
+        sites,
+        dependency_sites(site for site in sites if site not in embedded),
+        environment,
+        rows,
+        invalid,
+        embedded_owners,
+    )
+    check_import_origins(view, root, relevant)
+    return view, relevant
 
 
 def validate_driver(component: Any) -> None:
@@ -810,7 +938,10 @@ def require_dependencies(
 
     relevant = set()
     for name, requirement in _dependency_closure(
-        _requirements(packet.get("requirements_path")),
+        packet.get(
+            "_requirements",
+            _requirements(packet.get("requirements_path")),
+        ),
         snapshot.distributions,
         snapshot.marker_environment,
     ):

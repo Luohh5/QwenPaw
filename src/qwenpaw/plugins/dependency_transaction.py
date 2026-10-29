@@ -1075,13 +1075,16 @@ async def apply_operation(manager, operation_id):
     import asyncio
     from .dependency_maintenance import maintenance_barrier, capability_context
     from .dependency_upgrade import _source_hash, install_result
-    from .execution.dependencies import DependencySnapshot
     from ..utils.io_utils import run_sync_io
     from .lifecycle import UnloadMode
 
     directory = await run_sync_io(manager._directory, operation_id)
     loader = manager.loader
-    from .install_lock import async_lock, environment_observation
+    from .install_lock import (
+        async_lock,
+        environment_observation,
+        observation_write,
+    )
 
     async with async_lock(operation_lock(directory)):
         operation = await run_sync_io(manager._read, operation_id)
@@ -1293,7 +1296,8 @@ async def apply_operation(manager, operation_id):
                             "DEPENDENCY_PLAN_STALE: a host import appeared "
                             "during preparation; prepare a new confirmation.",
                         )
-                    await run_sync_io(publish, directory, operation)
+                    with observation_write():
+                        await run_sync_io(publish, directory, operation)
             fresh = await binding.backend.audit_dependencies(
                 binding.description,
             )
@@ -1391,7 +1395,8 @@ async def apply_operation(manager, operation_id):
                                 raise RuntimeError(
                                     "DEPENDENCY_REPAIR_REQUIRED: new consumer remains active.",
                                 )
-                    await run_sync_io(rollback, directory)
+                    with observation_write():
+                        await run_sync_io(rollback, directory)
                     loader.registry.dependency_usage.restore_rebased(rebased)
                     await run_sync_io(
                         restore_source,
