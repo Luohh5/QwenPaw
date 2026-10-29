@@ -25,25 +25,14 @@ jobs:
           python -m pip install -e '.[dev,test,full]' 'setuptools<82'
       - name: Enable temporary worker diagnostics
         run: python windows_unit_diagnostics.py
-      - name: Reproduce worker startup and process tree failures
+      - name: Verify old failures and core host exit
         run: |
-          python -m pytest -vv -s --no-cov --durations=15 --junitxml=windows-worker.xml \
-            tests/unit/plugins/test_manifest_dependencies.py \
-            'tests/unit/plugins/test_plugin_process.py::test_runtime_roots_interpreter_and_dependency_visible_in_worker[frozen]' \
-            tests/unit/plugins/test_plugin_process.py::test_frozen_ordinary_loader_gate_installs_missing_sdk_in_overlay \
-            tests/unit/plugins/test_plugin_process.py::test_forced_stop_reaps_uncooperative_process_tree
-      - name: Recheck current lifecycle fixes
-        if: always()
-        run: |
-          python -m pytest -vv --no-cov --durations=15 --junitxml=windows-lifecycle.xml \
-            tests/unit/plugins/test_pawapp_service_lifecycle.py::test_cancelled_startup_stops_sidecar \
-            tests/unit/plugins/test_plugin_config_update.py::test_cancel_during_config_save_keeps_runtime_and_disk_consistent \
-            'tests/unit/plugins/test_plugin_lifecycle_contracts.py::test_interrupt_waits_for_actual_command_exit[control-False]' \
-            'tests/unit/plugins/test_plugin_lifecycle_contracts.py::test_interrupt_waits_for_actual_command_exit[mode-False]' \
-            tests/unit/plugins/test_sdk_channel_bridge.py::test_old_queued_channel_payload_cannot_run_on_replacement_generation \
-            tests/unit/plugins/test_sdk_channel_routing_contract.py::test_interrupt_reload_retains_blocked_terminal_until_public_retry \
-            tests/unit/plugins/test_tool_config_concurrency.py \
-            tests/unit/plugins/test_workspace_projection.py::test_unload_drains_boot_channel_start
+          python - <<'PYTEST'
+          import json, subprocess, sys
+          nodes = json.load(open('windows-nodes.json'))
+          nodes.append('tests/unit/plugins/test_plugin_process.py::test_host_exit_reaps_uncooperative_process_tree')
+          raise SystemExit(subprocess.call([sys.executable, '-m', 'pytest', '-vv', '-s', '--no-cov', '--durations=15', '--junitxml=windows-unit.xml', *nodes]))
+          PYTEST
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4

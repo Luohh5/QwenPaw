@@ -2231,11 +2231,13 @@ site = Path(sys.argv[2])
 with m.file_lock(m._gate(site)), m.file_lock(m._admission_gate(site)):
     marker = m.repair_marker(site)
     marker.write_text('Shared dependency publication requires verification.\\n')
-    print('READY', flush=True)
+    sys.stdout.buffer.write(b'READY\\n')
+    sys.stdout.buffer.flush()
     assert sys.stdin.readline().strip() == 'RELEASE'
     if sys.argv[3] == 'False':
         marker.unlink()
-print('COMPLETED', flush=True)
+sys.stdout.buffer.write(b'COMPLETED\\n')
+sys.stdout.buffer.flush()
 """
     writer = await asyncio.create_subprocess_exec(
         sys.executable,
