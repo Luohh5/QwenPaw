@@ -1,16 +1,13 @@
 name: Windows legacy plugin diagnostic
-
 on:
   push:
     branches: [diagnostic/windows-legacy-20261029]
   workflow_dispatch:
-
 permissions:
   contents: read
-
 jobs:
-  legacy-plugin:
-    name: Legacy plugin lifecycle - Python 3.11 - Windows
+  windows-unit:
+    name: Windows worker and lifecycle regressions
     runs-on: windows-latest
     timeout-minutes: 30
     defaults:
@@ -22,51 +19,34 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
-      - name: Secure Python certificate dependencies
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade 'pip>=26.2.2'
-          python -m pip install --upgrade 'certifi>=2026.10.19'
-      - name: Install the nightly dependency set
-        run: python -m pip install -e '.[dev,test,full]' 'setuptools<82'
-      - name: Run the unchanged lifecycle test
+          python -m pip install --upgrade 'pip>=26.2.2' 'certifi>=2026.10.19'
+          python -m pip install -e '.[dev,test,full]' 'setuptools<82'
+      - name: Enable temporary worker diagnostics
+        run: python windows_unit_diagnostics.py
+      - name: Reproduce worker startup and process tree failures
         run: |
-          python -m pytest -vv --no-cov --timeout=300 --durations=5 \
-            --junitxml=windows-legacy-original.xml \
-            tests/integration/test_legacy_plugin_subprocess.py::test_legacy_plugin_install_upgrade_restart_and_uninstall
-      - name: Verify scoped dependency observations on Windows
-        run: |
-          python -m pytest -q --no-cov tests/unit/plugins/test_loader_dep_probing.py \
-            -k 'classify_batch_once or skips_own_source_inventory or reuses_only_scoped_raw_inputs or boundaries_keep or directory_classification_retains'
-      - name: Add temporary timing and stack observations
+          python -m pytest -vv -s --no-cov --durations=15 --junitxml=windows-worker.xml \
+            tests/unit/plugins/test_manifest_dependencies.py \
+            'tests/unit/plugins/test_plugin_process.py::test_runtime_roots_interpreter_and_dependency_visible_in_worker[frozen]' \
+            tests/unit/plugins/test_plugin_process.py::test_frozen_ordinary_loader_gate_installs_missing_sdk_in_overlay \
+            tests/unit/plugins/test_plugin_process.py::test_forced_stop_reaps_uncooperative_process_tree
+      - name: Recheck current lifecycle fixes
         if: always()
         run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
-          root = Path('windows-profile').resolve()
-          root.mkdir(exist_ok=True)
-          fixture = Path('tests/integration/fixtures/legacy_plugin_probe.py')
-          profile = "import atexit\nimport faulthandler\nimport functools\nimport inspect\nimport json\nimport os\nfrom pathlib import Path\nimport sys\nimport threading\nimport time\n\n_started = time.perf_counter()\n_phase = sys.argv[-1]\n_root = Path(os.environ['QWENPAW_DIAGNOSTIC_DIR'])\n_root.mkdir(parents=True, exist_ok=True)\n_events = (_root / f'{_phase}-{os.getpid()}.jsonl').open('a', encoding='utf-8')\n_trace = (_root / f'{_phase}-{os.getpid()}.stack.txt').open('w', encoding='utf-8')\n_stats, _active = {}, {}\n_guard = threading.Lock()\n\ndef _emit(event):\n    with _guard:\n        _events.write(json.dumps({'phase': _phase, 'elapsed': round(time.perf_counter() - _started, 4), **event}) + '\\n')\n        _events.flush()\n\n_emit({'event': 'imports_started'})\nfaulthandler.dump_traceback_later(8, repeat=True, file=_trace)\n\ndef _snapshot(event):\n    _emit({'event': event, 'stats': {key: list(value) for key, value in list(_stats.items())}, 'active': {str(key): list(value) for key, value in list(_active.items())}})\n\ndef _periodic():\n    while True:\n        time.sleep(5)\n        _snapshot('sample')\n\nthreading.Thread(target=_periodic, daemon=True).start()\natexit.register(lambda: _snapshot('exit'))\n\ndef _install_profile():\n    import qwenpaw.plugins.execution.dependencies as deps\n    import qwenpaw.plugins.python_backend as backend\n    import qwenpaw.plugins.dependency_maintenance as maintenance\n    from qwenpaw.plugins.lifecycle import PluginLifecycle\n    _emit({'event': 'imports_finished'})\n\n    def measure(owner, name):\n        original = getattr(owner, name)\n        label = getattr(owner, '__name__', type(owner).__name__) + '.' + name\n        row = _stats.setdefault(label, [0, 0.0])\n        def enter():\n            stack = _active.setdefault(threading.get_ident(), [])\n            stack.append(label)\n            return stack, time.perf_counter()\n        def leave(stack, begin):\n            row[0] += 1\n            row[1] += time.perf_counter() - begin\n            stack.pop()\n        if inspect.iscoroutinefunction(original):\n            @functools.wraps(original)\n            async def measured(*args, **kwargs):\n                stack, begin = enter()\n                try:\n                    return await original(*args, **kwargs)\n                finally:\n                    leave(stack, begin)\n        else:\n            @functools.wraps(original)\n            def measured(*args, **kwargs):\n                stack, begin = enter()\n                try:\n                    return original(*args, **kwargs)\n                finally:\n                    leave(stack, begin)\n        value = staticmethod(measured) if isinstance(inspect.getattr_static(owner, name), staticmethod) else measured\n        setattr(owner, name, value)\n\n    for owner, names in [\n        (deps, ['read_dependency_inventory', 'observe_dependencies', '_read_installed_metadata', 'dependency_sites', 'protected_dependency_target']),\n        (backend, ['_observe_host_dependencies', '_observe_host_delta', '_check_read_history', '_files_for_loaded_origins']),\n        (maintenance, ['canonical', '_existing_path', '_enumerated_path', '_try_lock']),\n        (backend.PythonBackend, ['admit_existing', 'observe_host_dependencies']),\n        (PluginLifecycle, ['reload', 'update_config', 'set_enabled', 'unload']),\n    ]:\n        for name in names:\n            measure(owner, name)\n"
-          text = fixture.read_text(encoding='utf-8')
-          text = text.replace('PLUGIN_ID = ', profile + '\n\nPLUGIN_ID = ', 1)
-          text = text.replace('    loader = PluginLoader(', '    _install_profile()\n    loader = PluginLoader(', 1)
-          fixture.write_text(text, encoding='utf-8')
-          with Path(os.environ['GITHUB_ENV']).open('a', encoding='utf-8') as stream:
-              stream.write('QWENPAW_DIAGNOSTIC_DIR=' + str(root) + '\n')
-          PY
-      - name: Profile the same lifecycle test
-        if: always()
-        run: |
-          python -m pytest -vv --no-cov --timeout=300 --durations=5 \
-            --junitxml=windows-legacy-result.xml \
-            tests/integration/test_legacy_plugin_subprocess.py::test_legacy_plugin_install_upgrade_restart_and_uninstall
-      - name: Upload test result
+          python -m pytest -vv --no-cov --durations=15 --junitxml=windows-lifecycle.xml \
+            tests/unit/plugins/test_pawapp_service_lifecycle.py::test_cancelled_startup_stops_sidecar \
+            tests/unit/plugins/test_plugin_config_update.py::test_cancel_during_config_save_keeps_runtime_and_disk_consistent \
+            'tests/unit/plugins/test_plugin_lifecycle_contracts.py::test_interrupt_waits_for_actual_command_exit[control-False]' \
+            'tests/unit/plugins/test_plugin_lifecycle_contracts.py::test_interrupt_waits_for_actual_command_exit[mode-False]' \
+            tests/unit/plugins/test_sdk_channel_bridge.py::test_old_queued_channel_payload_cannot_run_on_replacement_generation \
+            tests/unit/plugins/test_sdk_channel_routing_contract.py::test_interrupt_reload_retains_blocked_terminal_until_public_retry \
+            tests/unit/plugins/test_tool_config_concurrency.py \
+            tests/unit/plugins/test_workspace_projection.py::test_unload_drains_boot_channel_start
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-legacy-result
-          path: |
-            windows-legacy-result.xml
-            windows-legacy-original.xml
-            windows-profile/
-          if-no-files-found: ignore
+          name: windows-unit-results
+          path: windows-*.xml
