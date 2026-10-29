@@ -211,53 +211,72 @@ class DependencySnapshot:
         }
 
 
-def protected_dependency_target(path):
-    """Protect local stdlib/support while preserving actual package sites."""
-    target = canonical_environment_path(path)
+def _dependency_protection_roots(resolved=None):
+    """Resolve common protection inputs once per synchronous classification."""
+    if resolved is None:
+        resolved = {}
+
+    def canonical_roots(paths):
+        for path in paths:
+            if path and str(path) not in resolved:
+                resolved[str(path)] = canonical_environment_path(path)
+        return {str(resolved[str(path)]) for path in paths if path}
+
+    package_roots = canonical_roots(
+        (
+            sysconfig.get_path("purelib"),
+            sysconfig.get_path("platlib"),
+        ),
+    )
+    standard = canonical_roots(
+        (
+            sysconfig.get_path("stdlib"),
+            sysconfig.get_path("platstdlib"),
+            sysconfig.get_config_var("DESTSHARED"),
+        ),
+    )
+    source = Path(__file__).resolve()
+    support = canonical_roots((source.parents[3], source.parent))
+    return package_roots, standard, support - package_roots
+
+
+def _protected_dependency_target(target, roots):
+    package_roots, standard, support = roots
 
     def contains(root):
         parts = Path(root).parts
         return target.parts[: len(parts)] == parts
 
-    package_roots = {
-        str(canonical_environment_path(path))
-        for path in (
-            sysconfig.get_path("purelib"),
-            sysconfig.get_path("platlib"),
-        )
-        if path
-    }
-    standard = {
-        str(canonical_environment_path(path))
-        for path in (
-            sysconfig.get_path("stdlib"),
-            sysconfig.get_path("platstdlib"),
-            sysconfig.get_config_var("DESTSHARED"),
-        )
-        if path
-    }
-    support = {
-        str(canonical_environment_path(Path(__file__).resolve().parents[3])),
-        str(canonical_environment_path(Path(__file__).resolve().parent)),
-    }
-    return any(contains(root) for root in support - package_roots) or (
+    return any(contains(root) for root in support) or (
         any(contains(root) for root in standard)
         and not any(contains(root) for root in package_roots)
+    )
+
+
+def protected_dependency_target(path):
+    """Protect local stdlib/support while preserving actual package sites."""
+    return _protected_dependency_target(
+        canonical_environment_path(path),
+        _dependency_protection_roots(),
     )
 
 
 def dependency_sites(sites, *, explicit=(), distributions=()):
     """Classify roots without granting explicit paths protected writes."""
     del explicit, distributions
-    return tuple(
-        dict.fromkeys(
-            str(canonical_environment_path(path))
-            for path in sites
-            if path
-            and Path(path).is_dir()
-            and not protected_dependency_target(path)
-        ),
-    )
+    roots = None
+    resolved = {}
+    classified = {}
+    for path in dict.fromkeys(str(path) for path in sites if path):
+        if Path(path).is_dir():
+            if roots is None:
+                roots = _dependency_protection_roots(resolved)
+            if str(path) not in resolved:
+                resolved[str(path)] = canonical_environment_path(path)
+            target = resolved[str(path)]
+            if not _protected_dependency_target(target, roots):
+                classified[str(target)] = None
+    return tuple(classified)
 
 
 def _read_record(distribution, metadata_path, records):
@@ -271,7 +290,16 @@ def _read_record(distribution, metadata_path, records):
 
 def _record_entries(distribution, *, metadata_path=None, record_reads=None):
     """Validate RECORD once without allocating a Path for each file."""
+    key = ("entries", metadata_path)
     record = _read_record(distribution, metadata_path, record_reads)
+    if record_reads is not None and metadata_path is not None:
+        if key not in record_reads:
+            record_reads[key] = _parse_record_entries(record)
+        return record_reads[key]
+    return _parse_record_entries(record)
+
+
+def _parse_record_entries(record):
     if not record:
         return None
     entries = []

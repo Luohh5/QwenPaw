@@ -872,6 +872,245 @@ def controlled_import_snapshot(monkeypatch):
     )
 
 
+def test_dependency_sites_classify_batch_once(tmp_path, monkeypatch):
+    from collections import Counter
+    from pathlib import PureWindowsPath
+    from qwenpaw.plugins.execution import dependencies as deps
+
+    standard = tmp_path / "stdlib"
+    package = standard / "site-packages"
+    roots = [package / "sdk", standard / "encodings", tmp_path / "overlay"]
+    for path in roots:
+        path.mkdir(parents=True)
+    monkeypatch.setattr(
+        deps.sysconfig,
+        "get_path",
+        lambda name: str(
+            package if name in {"purelib", "platlib"} else standard,
+        ),
+    )
+    monkeypatch.setattr(deps.sysconfig, "get_config_var", lambda name: None)
+    canonical, calls = deps.canonical_environment_path, Counter()
+
+    def counted(path):
+        calls[str(path)] += 1
+        return canonical(path)
+
+    monkeypatch.setattr(deps, "canonical_environment_path", counted)
+    assert deps.dependency_sites(roots * 3, explicit=roots) == (
+        str(canonical(roots[0])),
+        str(canonical(roots[2])),
+    )
+    assert calls[str(standard)] == calls[str(package)] == 1
+    assert all(calls[str(path)] == 1 for path in roots)
+    assert deps.protected_dependency_target(roots[1])
+    assert not deps.protected_dependency_target(roots[0])
+    monkeypatch.setattr(deps, "Path", PureWindowsPath)
+    package = PureWindowsPath("C:/Python/Lib/site-packages")
+    protection = ({str(package)}, {str(package.parent)}, set())
+    assert not deps._protected_dependency_target(package / "sdk", protection)
+    assert deps._protected_dependency_target(
+        PureWindowsPath("C:/Python/Lib/SITE-PACKAGES/sdk"),
+        protection,
+    )
+
+    class WindowsDirectory(PureWindowsPath):
+        def is_dir(self):
+            return True
+
+        def resolve(self):
+            return self
+
+    monkeypatch.setattr(deps, "Path", WindowsDirectory)
+    monkeypatch.setattr(deps, "canonical_environment_path", WindowsDirectory)
+    distinct = [
+        WindowsDirectory(f"C:/external/{name}") for name in ("sdk", "SDK")
+    ]
+    assert deps.dependency_sites(distinct) == tuple(map(str, distinct))
+
+
+def test_host_delta_skips_own_source_inventory(tmp_path, monkeypatch):
+    from collections import Counter
+    from pathlib import PureWindowsPath
+    from qwenpaw.plugins.execution import dependencies as deps
+    from qwenpaw.plugins import python_backend as backend
+
+    site, source = tmp_path / "site", tmp_path / "plugin"
+    site.mkdir()
+    source.mkdir()
+    external = site / "sdk.py"
+    external.write_text("VALUE = 1\n")
+    own = source / "main.py"
+    own.write_text("VALUE = 2\n")
+    info = site / "sdk-1.0.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Name: sdk\nVersion: 1.0\n")
+    (info / "RECORD").write_text("sdk.py,,\n")
+    baseline, imported = backend._observe_host_dependencies(
+        source,
+        (site,),
+        (("sdk", str(external)),),
+    )
+    assert imported["sdk"]["version"] == "1.0"
+    read_inventory, calls = deps.read_dependency_inventory, []
+    resolve, resolved = Path.resolve, Counter()
+
+    def counted_resolve(path, *args, **kwargs):
+        resolved[path] += 1
+        return resolve(path, *args, **kwargs)
+
+    def counted(*args, **kwargs):
+        calls.append(args)
+        return read_inventory(*args, **kwargs)
+
+    monkeypatch.setattr(deps, "read_dependency_inventory", counted)
+    monkeypatch.setattr(Path, "resolve", counted_resolve)
+    observed, imported = backend._observe_host_delta(
+        source,
+        (site,),
+        (("main", str(own)),),
+        baseline,
+    )
+    assert observed.sites == baseline.sites
+    assert imported == {}
+    assert calls == []
+    assert resolved[own] == 1
+    alias = source / "linked.py"
+    try:
+        alias.symlink_to(external)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    _, imported = backend._observe_host_delta(
+        source,
+        (site,),
+        (("sdk", str(alias)),),
+        baseline,
+    )
+    assert imported["sdk"]["metadata_path"] == str(info.resolve())
+    assert len(calls) == 1
+    assert resolved[alias] == 1
+    windows_resolved = Counter()
+
+    class WindowsOrigin(PureWindowsPath):
+        def resolve(self):
+            windows_resolved[str(self)] += 1
+            return own if self.name == "sdk.py" else external
+
+    monkeypatch.setattr(
+        backend,
+        "Path",
+        lambda path: WindowsOrigin(path)
+        if str(path).startswith("C:")
+        else Path(path),
+    )
+    _, imported = backend._observe_host_delta(
+        source,
+        (site,),
+        (("main", "C:/sdk.py"), ("sdk", "C:/SDK.py")),
+        baseline,
+    )
+    assert imported["sdk"]["metadata_path"] == str(info.resolve())
+    assert windows_resolved == {"C:\\sdk.py": 1, "C:\\SDK.py": 1}
+
+
+@pytest.mark.asyncio
+async def test_host_observation_reuses_only_scoped_raw_inputs(
+    tmp_path,
+    monkeypatch,
+):
+    from collections import Counter
+    from importlib.metadata import PathDistribution
+    from qwenpaw.plugins.execution import dependencies as deps
+    from qwenpaw.plugins import python_backend as backend
+    from qwenpaw.plugins.install_lock import (
+        environment_observation,
+        observation_inputs,
+        observation_write,
+    )
+
+    site, source = tmp_path / "site", tmp_path / "plugin"
+    info = site / "sdk-1.0.dist-info"
+    info.mkdir(parents=True)
+    module = site / "shared_ns" / "actual.py"
+    module.parent.mkdir()
+    module.write_text("VALUE = 1\n")
+    metadata, record = info / "METADATA", info / "RECORD"
+    metadata.write_text("Name: sdk\nVersion: 1.0\n")
+    record_text = "shared_ns/actual.py,,\n"
+    record.write_text(record_text)
+    loaded = (("shared_ns.actual", str(module)),)
+    read_text, reader = PathDistribution.read_text, deps.csv.reader
+    reads, parses = Counter(), []
+
+    def counted_read(distribution, filename):
+        if Path(distribution._path) == info:
+            reads[filename] += 1
+        return read_text(distribution, filename)
+
+    def counted_parse(lines, *args, **kwargs):
+        lines = tuple(lines)
+        if lines == tuple(record_text.splitlines()):
+            parses.append(lines)
+        return reader(lines, *args, **kwargs)
+
+    monkeypatch.setattr(PathDistribution, "read_text", counted_read)
+    monkeypatch.setattr(deps.csv, "reader", counted_parse)
+    async with environment_observation((site,)):
+        inputs = observation_inputs()
+        baseline, first = backend._observe_host_dependencies(
+            source,
+            (site,),
+            loaded,
+            inventory=inputs,
+        )
+        assert first["sdk"]["metadata_path"] == str(info.resolve())
+        first["sdk"]["version"] = "mutated consumer row"
+        # Its module top-level differs from the distribution name, forcing
+        # delta's conservative full fallback to share the same raw inputs.
+        _, imported = backend._observe_host_delta(
+            tmp_path / "other-plugin",
+            (site,),
+            loaded,
+            baseline,
+            inventory=inputs,
+        )
+        assert imported["sdk"]["version"] == "1.0"
+        assert reads["METADATA"] == reads["RECORD"] == 1
+        assert len(parses) == 1
+        excluded, imported = backend._observe_host_dependencies(
+            site,
+            (site,),
+            loaded,
+            inventory=inputs,
+        )
+        assert excluded.distributions == imported == {}
+        with observation_write():
+            metadata.write_text("Name: sdk\nVersion: 2.0\n")
+            record.write_text("unrelated.py,,\n")
+        current, imported = backend._observe_host_dependencies(
+            source,
+            (site,),
+            loaded,
+            inventory=inputs,
+        )
+        assert current.distributions["sdk"]["version"] == "2.0"
+        assert imported == {}
+        assert reads["METADATA"] == reads["RECORD"] == 2
+    assert observation_inputs() is None
+    metadata.write_text("Name: sdk\nVersion: 3.0\n")
+    record.write_text(record_text)
+    async with environment_observation((site,)):
+        assert observation_inputs() is not inputs
+        _, imported = backend._observe_host_dependencies(
+            source,
+            (site,),
+            loaded,
+            inventory=observation_inputs(),
+        )
+        assert imported["sdk"]["version"] == "3.0"
+        assert reads["METADATA"] == reads["RECORD"] == 3
+
+
 def test_host_dependency_record_retains_loaded_ownership(tmp_path):
     import os
     import sys
@@ -1068,6 +1307,18 @@ async def test_host_dependency_boundaries_keep_preexisting_and_removed_imports(
                 usage,
                 token,
             )
+    if layout == "ordinary":
+        own = description.source_path / "main.py"
+        own.parent.mkdir()
+        own.touch()
+        module = ModuleType("_qwenpaw_own_source")
+        module.__file__ = str(own)
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        await PythonBackend.observe_host_dependencies(
+            description,
+            usage,
+            token,
+        )
     usage.withdraw(token)
     histories = [use for use in usage.snapshot().uses if use.origin == "host"]
     assert len(histories) == 1
