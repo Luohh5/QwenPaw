@@ -1,0 +1,72 @@
+name: Windows dependency path cost comparison
+on:
+  push:
+    branches: [diagnostic/windows-path-cost-20261029]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-cost:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONPATH: .ci-probes
+      QWENPAW_DEPENDENCY_STATE_DIR: ${{ github.workspace }}/.ci-state
+      QWENPAW_WORKING_DIR: ${{ github.workspace }}/.ci-work
+      QWENPAW_SECRET_DIR: ${{ github.workspace }}/.ci-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade 'pip>=26.2.2' 'certifi>=2026.10.19'
+          python -m pip install -e '.[dev,test,full]' 'setuptools<82'
+      - name: Compare original operation costs
+        env:
+          QWENPAW_TIMING_REPORT: baseline-timing.json
+        run: |
+          python - <<'PYBASE'
+          from pathlib import Path
+          import shutil, subprocess
+          for name in ('dependency_maintenance.py','dependency_transaction.py','dependency_upgrade.py'):
+              path=Path('src/qwenpaw/plugins')/name
+              shutil.copy2(path,Path('.ci-probes')/name)
+              path.write_bytes(subprocess.check_output(['git','show','5e674abf9:'+path.as_posix()]))
+          PYBASE
+          python -m pytest -q -p timing_probe --no-cov --durations=5 --junitxml=baseline.xml 'tests/unit/plugins/test_plugin_process.py::test_shared_upgrade_replaces_provider_or_restores_exact_old_tree[False]' 'tests/unit/plugins/test_plugin_reload.py::test_reload_ignores_same_size_same_mtime_bytecode[None-False]'
+      - name: Restore candidate
+        if: always()
+        run: |
+          python - <<'PYCANDIDATE'
+          from pathlib import Path
+          import shutil
+          for name in ('dependency_maintenance.py','dependency_transaction.py','dependency_upgrade.py'):
+              source=Path('.ci-probes')/name
+              if source.exists():
+                  shutil.copy2(source,Path('src/qwenpaw/plugins')/name)
+          PYCANDIDATE
+      - name: Compare optimized operation costs
+        if: always()
+        env:
+          QWENPAW_TIMING_REPORT: candidate-timing.json
+        run: |
+          python -m pytest -q -p timing_probe --no-cov --durations=5 --junitxml=candidate.xml 'tests/unit/plugins/test_plugin_process.py::test_shared_upgrade_replaces_provider_or_restores_exact_old_tree[False]' 'tests/unit/plugins/test_plugin_reload.py::test_reload_ignores_same_size_same_mtime_bytecode[None-False]'
+      - name: Verify core identity, rollback and desktop behavior
+        if: always()
+        run: |
+          python -m pytest -q --no-cov --durations=10 --junitxml=core.xml tests/unit/plugins/test_install_lock.py tests/unit/plugins/test_plugin_process.py .ci-probes/test_windows_identity_probe.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-path-cost-results
+          path: |
+            *-timing.json
+            baseline.xml
+            candidate.xml
+            core.xml

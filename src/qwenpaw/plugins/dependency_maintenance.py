@@ -93,7 +93,11 @@ def _enumerated_path(path):
 
 
 def _existing_path(path):
-    """Query kernel spelling without requiring directory enumeration."""
+    """Recover spelling for an existing, strictly resolved path."""
+    if sys.platform == "win32":
+        # Windows realpath already uses GetFinalPathNameByHandleW. Preserve
+        # its spelling (including case-sensitive names), not an ancestor scan.
+        return Path(os.path.normcase(path.anchor)).joinpath(*path.parts[1:])
     if sys.platform == "darwin":
         import fcntl
 

@@ -131,11 +131,15 @@ def environment_fingerprint(snapshot):
 def visible_distributions(distributions, sites):
     """Select provider rows by physical site identity without changing them."""
     visible = {str(canonical(site)) for site in sites}
-    return {
-        name: row
-        for name, row in distributions.items()
-        if str(canonical(Path(row["metadata_path"]).parent)) in visible
-    }
+    visibility, result = {}, {}
+    for name, row in distributions.items():
+        site = Path(row["metadata_path"]).parent
+        key = str(site)
+        if key not in visibility:
+            visibility[key] = str(canonical(site)) in visible
+        if visibility[key]:
+            result[name] = row
+    return result
 
 
 def verify_providers(observed, proposed, changes, *, full_metadata=True):
