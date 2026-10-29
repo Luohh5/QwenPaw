@@ -573,20 +573,22 @@ class DependencyUpgradeManager:
         immutable = (
             context.immutable_providers() if context is not None else {}
         )
-        protected = {
-            name
-            for name, row in snapshot.distributions.items()
-            if (
-                context is not None
-                and context.protected(Path(row["metadata_path"]).parent)
-            )
-            or not dependency_site_is_mutable(
-                Path(row["metadata_path"]).parent,
-                snapshot.prefix,
-                directory.parent.parent / "plugin_runtime",
-                context.to_mapping() if context is not None else None,
-            )
-        }
+        policy = context.to_mapping() if context is not None else None
+        site_protection, protected = {}, set()
+        for name, row in snapshot.distributions.items():
+            site = Path(row["metadata_path"]).parent
+            key = str(site)
+            if key not in site_protection:
+                site_protection[key] = (
+                    context is not None and context.protected(site)
+                ) or not dependency_site_is_mutable(
+                    site,
+                    snapshot.prefix,
+                    directory.parent.parent / "plugin_runtime",
+                    policy,
+                )
+            if site_protection[key]:
+                protected.add(name)
         protected.update(immutable)
         for value in requirements:
             requirement = Requirement(value)
