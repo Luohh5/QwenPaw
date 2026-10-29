@@ -946,6 +946,7 @@ def test_host_delta_skips_own_source_inventory(tmp_path, monkeypatch):
     info.mkdir()
     (info / "METADATA").write_text("Name: sdk\nVersion: 1.0\n")
     (info / "RECORD").write_text("sdk.py,,\n")
+    expected_metadata = str(deps.canonical_environment_path(info))
     baseline, imported = backend._observe_host_dependencies(
         source,
         (site,),
@@ -986,7 +987,7 @@ def test_host_delta_skips_own_source_inventory(tmp_path, monkeypatch):
         (("sdk", str(alias)),),
         baseline,
     )
-    assert imported["sdk"]["metadata_path"] == str(info.resolve())
+    assert imported["sdk"]["metadata_path"] == expected_metadata
     assert len(calls) == 1
     assert resolved[alias] == 1
     windows_resolved = Counter()
@@ -1000,7 +1001,7 @@ def test_host_delta_skips_own_source_inventory(tmp_path, monkeypatch):
         backend,
         "Path",
         lambda path: WindowsOrigin(path)
-        if str(path).startswith("C:")
+        if str(path).replace("\\", "/") in {"C:/sdk.py", "C:/SDK.py"}
         else Path(path),
     )
     _, imported = backend._observe_host_delta(
@@ -1009,7 +1010,7 @@ def test_host_delta_skips_own_source_inventory(tmp_path, monkeypatch):
         (("main", "C:/sdk.py"), ("sdk", "C:/SDK.py")),
         baseline,
     )
-    assert imported["sdk"]["metadata_path"] == str(info.resolve())
+    assert imported["sdk"]["metadata_path"] == expected_metadata
     assert windows_resolved == {"C:\\sdk.py": 1, "C:\\SDK.py": 1}
 
 
@@ -1038,6 +1039,7 @@ async def test_host_observation_reuses_only_scoped_raw_inputs(
     metadata.write_text("Name: sdk\nVersion: 1.0\n")
     record_text = "shared_ns/actual.py,,\n"
     record.write_text(record_text)
+    expected_metadata = str(deps.canonical_environment_path(info))
     loaded = (("shared_ns.actual", str(module)),)
     read_text, reader = PathDistribution.read_text, deps.csv.reader
     reads, parses = Counter(), []
@@ -1063,7 +1065,7 @@ async def test_host_observation_reuses_only_scoped_raw_inputs(
             loaded,
             inventory=inputs,
         )
-        assert first["sdk"]["metadata_path"] == str(info.resolve())
+        assert first["sdk"]["metadata_path"] == expected_metadata
         first["sdk"]["version"] = "mutated consumer row"
         # Its module top-level differs from the distribution name, forcing
         # delta's conservative full fallback to share the same raw inputs.
@@ -1362,6 +1364,7 @@ def test_dependency_directory_classification_retains_provider_ownership(
 ):
     from qwenpaw.plugins.execution.dependencies import (
         _installed_metadata,
+        canonical_environment_path,
         dependency_sites,
         observe_dependencies,
     )
@@ -1458,8 +1461,11 @@ def test_dependency_directory_classification_retains_provider_ownership(
     else:
         paths = (site, nested)
     classified = dependency_sites(paths)
+    site_key, nested_key = (
+        str(canonical_environment_path(root)) for root in (site, nested)
+    )
     # Lock hints stay conservative until the RECORD audit proves ownership.
-    assert classified[:2] == (str(site.resolve()), str(nested.resolve()))
+    assert classified[:2] == (site_key, nested_key)
     packet = {"code_root": tmp_path / "plugin", "_audit_sites": paths}
     snapshot = observe_dependencies(packet)
     if layout not in {
@@ -1470,17 +1476,15 @@ def test_dependency_directory_classification_retains_provider_ownership(
         "non_cache_file",
     }:
         expected_sites = (
-            (str(site.resolve()), str(nested.resolve()))
-            if layout == "mixed"
-            else (str(site.resolve()),)
+            (site_key, nested_key) if layout == "mixed" else (site_key,)
         )
         assert snapshot.dependency_sites == expected_sites
         assert snapshot.distributions["sample-sdk"]["metadata_path"] == (
-            str(public_info)
+            str(canonical_environment_path(public_info))
         )
         if layout == "mixed":
             assert snapshot.distributions["independent"]["metadata_path"] == (
-                str(neighbor_info)
+                str(canonical_environment_path(neighbor_info))
             )
     else:
         assert "sample-sdk" not in snapshot.distributions
@@ -1494,9 +1498,11 @@ def test_dependency_directory_classification_retains_provider_ownership(
         ((loaded_module, str(embedded)),),
     )
     assert observed.distributions["sample-sdk"]["metadata_path"] == (
-        str(public_info)
+        str(canonical_environment_path(public_info))
     )
-    assert imported["owner"]["metadata_path"] == str(owner_info)
+    assert imported["owner"]["metadata_path"] == str(
+        canonical_environment_path(owner_info),
+    )
     assert ("sample-sdk" in imported) is (layout != "namespace")
     from dataclasses import replace
     from qwenpaw.plugins.dependency_gate import evaluate_shared_dependencies

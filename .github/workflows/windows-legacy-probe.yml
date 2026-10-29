@@ -28,16 +28,17 @@ jobs:
           python -m pip install --upgrade 'certifi>=2026.10.19'
       - name: Install the nightly dependency set
         run: python -m pip install -e '.[dev,test,full]' 'setuptools<82'
-      - name: Verify scoped dependency observations on Windows
-        run: |
-          python -m pytest -q --no-cov tests/unit/plugins/test_loader_dep_probing.py \
-            -k 'classify_batch_once or skips_own_source_inventory or reuses_only_scoped_raw_inputs or boundaries_keep or directory_classification_retains'
       - name: Run the unchanged lifecycle test
         run: |
           python -m pytest -vv --no-cov --timeout=300 --durations=5 \
             --junitxml=windows-legacy-original.xml \
             tests/integration/test_legacy_plugin_subprocess.py::test_legacy_plugin_install_upgrade_restart_and_uninstall
+      - name: Verify scoped dependency observations on Windows
+        run: |
+          python -m pytest -q --no-cov tests/unit/plugins/test_loader_dep_probing.py \
+            -k 'classify_batch_once or skips_own_source_inventory or reuses_only_scoped_raw_inputs or boundaries_keep or directory_classification_retains'
       - name: Add temporary timing and stack observations
+        if: always()
         run: |
           python - <<'PY'
           import os
@@ -54,6 +55,7 @@ jobs:
               stream.write('QWENPAW_DIAGNOSTIC_DIR=' + str(root) + '\n')
           PY
       - name: Profile the same lifecycle test
+        if: always()
         run: |
           python -m pytest -vv --no-cov --timeout=300 --durations=5 \
             --junitxml=windows-legacy-result.xml \
