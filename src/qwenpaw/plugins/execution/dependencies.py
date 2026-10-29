@@ -11,6 +11,7 @@ from importlib.util import source_from_cache
 import inspect
 import os
 from pathlib import Path
+import re
 import sys
 import sysconfig
 from typing import Any, Mapping
@@ -450,6 +451,20 @@ def _installed_metadata(
     )
 
 
+class _HeaderDistribution(metadata.PathDistribution):
+    """Use the native metadata parser without its unused description body."""
+
+    def read_text(self, filename):
+        value = super().read_text(filename)
+        if value and (
+            boundary := re.search(r"\A(?:\r\n|\n|\r)|\n\r?\n|\r\r", value)
+        ):
+            # Keep the separator: empty headers with a body are still a
+            # present METADATA file and must not fall through to PKG-INFO.
+            return value[: boundary.end()]
+        return value
+
+
 def _read_installed_metadata(
     sites,
     *,
@@ -483,7 +498,11 @@ def _read_installed_metadata(
             parents[parent] = str(canonical_environment_path(origin.parent))
         # Preserve the audited site's spelling in the serialized snapshot.
         origin = Path(parents[parent]) / origin.name
-        installed_metadata = distribution.metadata
+        installed_metadata = (
+            _HeaderDistribution(distribution._path)
+            if type(distribution) is metadata.PathDistribution
+            else distribution
+        ).metadata
         name = installed_metadata.get("Name")
         version = installed_metadata.get("Version")
         key = str(canonicalize_name(name or origin.name.split("-", 1)[0]))
@@ -669,6 +688,20 @@ def _dependency_closure(requirements, rows, environment):
             )
 
 
+def _inventory_sites(code_root, paths):
+    """Resolve ordered search roots with this consumer's source exclusion."""
+    root = Path(code_root).resolve()
+    return tuple(
+        dict.fromkeys(
+            str(canonical_environment_path(path))
+            for path in paths
+            if path
+            and Path(path).is_dir()
+            and not Path(path).resolve().is_relative_to(root)
+        ),
+    )
+
+
 # Inventory and relevant-closure rejection form one child-only audit.
 # pylint: disable=too-many-branches,too-many-statements,protected-access
 def observe_dependencies(
@@ -681,18 +714,7 @@ def observe_dependencies(
     """Inspect this interpreter's paths before candidate imports execute."""
     if _record_reads is None and _inventory is not None:
         _record_reads = _inventory.setdefault("records", {})
-    excluded = {Path(packet["code_root"]).resolve()}
-    sites = tuple(
-        dict.fromkeys(
-            str(canonical_environment_path(item))
-            for item in packet["_audit_sites"]
-            if item
-            and Path(item).is_dir()
-            and not any(
-                Path(item).resolve().is_relative_to(root) for root in excluded
-            )
-        ),
-    )
+    sites = _inventory_sites(packet["code_root"], packet["_audit_sites"])
     embedded_sites = set()
     rows, invalid, observed = _installed_metadata(
         sites,
@@ -775,15 +797,7 @@ def read_dependency_inventory(
 ):
     """Check just the candidate closure and its actual imported providers."""
     root = Path(code_root).resolve()
-    sites = tuple(
-        dict.fromkeys(
-            str(canonical_environment_path(path))
-            for path in paths
-            if path
-            and Path(path).is_dir()
-            and not Path(path).resolve().is_relative_to(root)
-        ),
-    )
+    sites = _inventory_sites(root, paths)
     records = (
         inventory.setdefault("records", {}) if inventory is not None else {}
     )
