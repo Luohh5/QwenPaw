@@ -17,6 +17,7 @@ import subprocess
 import pytest
 
 from qwenpaw.plugins.loader import PluginLoader
+from qwenpaw.plugins.execution.dependencies import canonical_environment_path
 
 # ---------------------------------------------------------------------------
 # _is_requirement_satisfied
@@ -608,7 +609,7 @@ async def test_preparation_and_admission_keep_only_required_real_audits(
             is None
         )
         use = usage.snapshot().uses[0]
-        assert str(site.resolve()) in use.environment.sites
+        assert str(canonical_environment_path(site)) in use.environment.sites
         assert use.snapshot is None
     assert audits == []
 
@@ -829,7 +830,9 @@ async def test_existing_dependency_read_admission_keeps_safety_boundaries(
         uses = usage.snapshot().uses
         assert len(uses) == 1
         assert uses[0].environment is not None
-        assert str(site.resolve()) in uses[0].environment.sites
+        assert (
+            str(canonical_environment_path(site)) in uses[0].environment.sites
+        )
         assert uses[0].snapshot is None
         assert audited == []
         lease = owners.reserve(
@@ -1108,7 +1111,9 @@ async def test_host_observation_reuses_only_scoped_raw_inputs(
         "Name: sdk\r\nVersion: 1.0\r\nRequires-Python: >=3.11\r\n"
         "Requires-Dist: child>=1;\r\n    extra == 'optional'\r\n"
     )
-    metadata.write_text(headers + "\r\n" + "Long description.\r\n" * 4096)
+    metadata.write_bytes(
+        (headers + "\r\n" + "Long description.\r\n" * 4096).encode("utf-8"),
+    )
     record_text = "shared_ns/actual.py,,\n"
     record.write_text(record_text)
     expected_metadata = str(deps.canonical_environment_path(info))
