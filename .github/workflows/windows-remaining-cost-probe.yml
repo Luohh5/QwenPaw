@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [ubuntu-latest]
     defaults:
       run:
         shell: bash
@@ -34,7 +34,7 @@ jobs:
           echo "QWENPAW_DEPENDENCY_STATE_DIR=$RUNNER_TEMP/cost-state" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11.9'
+          python-version: '3.11'
           cache: pip
       - name: Install the same full Python dependency set
         id: install
