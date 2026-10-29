@@ -656,7 +656,8 @@ spec = importlib.util.spec_from_file_location('maintenance', sys.argv[1])
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 m.lease_environment([Path(sys.argv[2])], parent_pid=int(sys.argv[3]) or None)
-print('READY', flush=True)
+sys.stdout.buffer.write(b'READY\\n')
+sys.stdout.buffer.flush()
 sys.stdin.readline()
 m._close_readers()
 """
@@ -728,9 +729,19 @@ m._close_readers()
                     await peer.communicate()
 
     pending = asyncio.create_task(observe())
+    ready_wait = asyncio.create_task(ready.wait())
     shared_paths = set()
     try:
-        await asyncio.wait_for(ready.wait(), WAIT_TIMEOUT)
+        done, _ = await asyncio.wait_for(
+            asyncio.wait(
+                {pending, ready_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            ),
+            WAIT_TIMEOUT,
+        )
+        if pending in done:
+            await pending
+        assert ready.is_set()
         if isinstance(exit_case, int):
             unlink = Path.unlink
 
@@ -751,6 +762,8 @@ m._close_readers()
             release.set()
             await asyncio.wait_for(pending, WAIT_TIMEOUT)
     finally:
+        ready_wait.cancel()
+        await asyncio.gather(ready_wait, return_exceptions=True)
         release.set()
         if not pending.done():
             await asyncio.wait_for(pending, WAIT_TIMEOUT)

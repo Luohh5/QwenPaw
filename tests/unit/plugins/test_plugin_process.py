@@ -315,6 +315,94 @@ async def test_forced_stop_reaps_uncooperative_process_tree(tmp_path, process):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="Windows Job and venv host ownership",
+)
+async def test_host_exit_reaps_uncooperative_process_tree(tmp_path):
+    import json
+    import sysconfig
+    import venv
+    from contextlib import suppress
+
+    import psutil
+
+    from .timing import WAIT_TIMEOUT
+
+    runtime = tmp_path / "runtime"
+    venv.EnvBuilder(with_pip=False, symlinks=False).create(runtime)
+    site = Path(
+        sysconfig.get_path(
+            "purelib",
+            vars={"base": str(runtime), "platbase": str(runtime)},
+        ),
+    )
+    (site / "test-runtime.pth").write_text(
+        sysconfig.get_path("purelib") + "\n",
+    )
+    executable = runtime / "Scripts/python.exe"
+    script = """
+import asyncio, json, os, sys
+from pathlib import Path
+sys.path[:0] = [sys.argv[1], str(Path(sys.argv[1]) / 'src')]
+from qwenpaw.plugins.execution import PluginProcess
+from tests.channel_support.process import launch, eventually
+
+async def main():
+    process = PluginProcess()
+    spec, marker = launch(
+        Path(sys.argv[2]), mode='tree', restart_limit=2,
+        python_executable=Path(sys.argv[3]),
+    )
+    await process.start(spec)
+    await eventually(marker.exists)
+    probe = await process.call('sample.probe', {})
+    data = json.dumps([os.getpid(), probe['pid'], int(marker.read_text())])
+    sys.stdout.buffer.write(data.encode() + b'\\n')
+    sys.stdout.buffer.flush()
+    await asyncio.Event().wait()
+
+asyncio.run(main())
+"""
+    host = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        script,
+        str(ROOT),
+        str(tmp_path),
+        str(executable),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    members = []
+    owner = psutil.Process(host.pid)
+    try:
+        line = await asyncio.wait_for(host.stdout.readline(), WAIT_TIMEOUT)
+        assert line, await host.stderr.read()
+        host_pid, worker_pid, descendant = json.loads(line)
+        owner = psutil.Process(host_pid)
+        members = owner.children(recursive=True)
+        assert {worker_pid, descendant} <= {member.pid for member in members}
+        assert len({host_pid, worker_pid, descendant}) == 3
+        assert all(alive(member.pid) for member in members)
+        owner.kill()
+        await asyncio.wait_for(host.wait(), WAIT_TIMEOUT)
+        await eventually(lambda: all(not alive(p.pid) for p in members))
+    finally:
+        with suppress(psutil.NoSuchProcess, PermissionError):
+            members.extend(psutil.Process(host.pid).children(recursive=True))
+        with suppress(psutil.NoSuchProcess):
+            owner.kill()
+        for member in members:
+            with suppress(psutil.NoSuchProcess):
+                member.kill()
+        with suppress(ProcessLookupError):
+            if host.returncode is None:
+                host.kill()
+        await asyncio.wait_for(host.communicate(), WAIT_TIMEOUT)
+
+
+@pytest.mark.asyncio
 async def test_cancel_inflight_call_cleans_up_and_next_request_succeeds(
     tmp_path,
     process,
@@ -806,7 +894,9 @@ def test_namespace_additions_preserve_file_ownership(
             files,
             [{"path": str(wheel)} for wheel in wheels],
         )
-        assert set(payload["new"]) == {str(site / path) for path in files}
+        assert set(payload["new"]) == {
+            str(maintenance.canonical(site / path)) for path in files
+        }
         for path, row in payload["new"].items():
             assert (operation / row["payload"]).read_bytes() == files[
                 Path(path).relative_to(site).as_posix()
@@ -1035,7 +1125,7 @@ def test_native_launcher_publish_and_exact_rollback(
             _dependency_snapshot(files).distributions["sample-shared-sdk"],
             alias,
         )
-        assert str(launcher.resolve()) in owned
+        assert str(maintenance.canonical(launcher)) in owned
         files.prefix = alias
     operation = _prepare_dependency_operation(files)
     cache = launcher.parent / "__pycache__/sdk.cpython-313.opt-1.pyc"
