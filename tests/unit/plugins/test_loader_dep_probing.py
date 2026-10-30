@@ -1093,14 +1093,37 @@ def test_host_delta_skips_own_source_inventory(tmp_path, monkeypatch):
     unowned = site / "sdk" / "unowned.py"
     unowned.parent.mkdir()
     unowned.write_text("VALUE = 4\n")
-    _, imported = backend._observe_host_delta(
-        source,
-        (site,),
-        (("sdk", str(external)), ("sdk.unowned", str(unowned))),
-        baseline,
+    relative, files = (
+        backend._relative_module_origins,
+        backend._files_for_loaded_origins,
     )
+    indexes, matches = Counter(), Counter()
+
+    def counted_relative(origins, root):
+        indexes[root] += 1
+        return relative(origins, root)
+
+    def counted_files(distribution, origins, **kwargs):
+        matches[kwargs.get("metadata_path")] += 1
+        return files(distribution, origins, **kwargs)
+
+    resolved.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(backend, "_relative_module_origins", counted_relative)
+        patch.setattr(backend, "_files_for_loaded_origins", counted_files)
+        _, imported = backend._observe_host_delta(
+            source,
+            (site,),
+            (("sdk", str(external)), ("sdk.unowned", str(unowned))),
+            baseline,
+        )
     assert imported["sdk"]["metadata_path"] == expected_metadata
     assert len(full_calls) == 1
+    # The required-but-uncovered fallback still audits the full inventory,
+    # while reusing this synchronous batch's origin index and RECORD match.
+    assert indexes == {site: 2}
+    assert matches == {expected_metadata: 1}
+    assert resolved[external] == resolved[unowned] == 1
     full_calls.clear()
     _, imported = backend._observe_host_delta(
         source,
@@ -1452,6 +1475,30 @@ def test_host_dependency_record_retains_loaded_ownership(tmp_path):
         == "2.0"
     )
     assert usage.has_declaration(candidate)
+    pinned = {
+        **current_imported["sample"],
+        "loaded_modules": ("shared_ns.loaded",),
+    }
+    usage.observe_host(
+        candidate,
+        replace(current, distributions={"sample": pinned}),
+    )
+    moved = {
+        **pinned,
+        "metadata_path": str(tmp_path / "other" / info.name),
+        "loaded_modules": ("shared_ns.other",),
+    }
+    usage.observe_host(
+        candidate,
+        replace(current, distributions={"sample": moved}),
+    )
+    uncertain = next(
+        use
+        for use in usage.snapshot().uses
+        if use.origin == "host" and use.source_revision == "candidate"
+    )
+    assert uncertain.snapshot.distributions["sample"] == pinned
+    assert uncertain.environment is None
     metadata.write_text("Name: sample\nVersion: 1.0\n")
     with record.open("a") as stream:
         stream.write("unrelated.py,,not-a-size\n")
@@ -1604,8 +1651,10 @@ async def test_host_dependency_boundaries_keep_preexisting_and_removed_imports(
 
         monkeypatch.setattr(backend, "_host_dependency_state", owned_state)
         observe, full_calls = backend._observe_host_dependencies, []
+        observed_modules = []
 
         def counted_observe(*args, **kwargs):
+            observed_modules.append(tuple(name for name, _ in args[2]))
             if kwargs.get("_snapshot") is None:
                 full_calls.append(args)
             return observe(*args, **kwargs)
@@ -1624,6 +1673,23 @@ async def test_host_dependency_boundaries_keep_preexisting_and_removed_imports(
         assert set(other_host.snapshot.distributions) == {remaining}
         assert other_host.snapshot.distributions[remaining]["version"] == "1.0"
         assert full_calls == []
+        assert observed_modules == []
+        # Positive ownership is reusable only for this exact module object,
+        # including all namespace search locations, even at the same origin.
+        replacement = ModuleType(names[-1])
+        replacement.__file__ = sys.modules[names[-1]].__file__
+        monkeypatch.setitem(sys.modules, names[-1], replacement)
+        for locations in (None, [str(site)], [str(site), str(future)]):
+            if locations is not None:
+                replacement.__path__ = locations
+            observed_modules.clear()
+            _, other_hosts = await observe_source(
+                tmp_path / "other-plugin",
+                "other-source",
+                other_token,
+            )
+            assert observed_modules == [(names[-1],)]
+            assert set(other_hosts[0].snapshot.distributions) == {remaining}
         future.mkdir()
         _, other_hosts = await observe_source(
             tmp_path / "other-plugin",
@@ -1926,6 +1992,7 @@ async def test_dependency_directory_classification_retains_provider_ownership(
                     if use.origin == "host" and use.source_revision == revision
                 )
                 assert host.snapshot.distributions == imported
+            history_description, history_token = description, token
             from importlib.metadata import PathDistribution
             from qwenpaw.plugins.execution import dependencies as deps
             from qwenpaw.plugins.execution_backend import PluginDescription
@@ -2005,6 +2072,84 @@ async def test_dependency_directory_classification_retains_provider_ownership(
             assert rejected.value.decision.reason_code == (
                 "DEPENDENCY_PLAN_UNVERIFIED"
             )
+            if layout == "namespace":
+                # Fresh ownership of another embedded namespace member must
+                # augment the old pin instead of replacing its module set.
+                second_name = "shared_namespace.two"
+                second = nested / "shared_namespace/two.py"
+                second.write_text("VALUE = 'second embedded'\n")
+                for info, relative in (
+                    (nested_info, second.relative_to(nested)),
+                    (owner_info, second.relative_to(site)),
+                ):
+                    with (info / "RECORD").open("a") as stream:
+                        stream.write(f"{relative.as_posix()},,\n")
+                owner_metadata = (owner_info / "METADATA").read_text()
+                (owner_info / "METADATA").write_text(
+                    "Name: owner\nVersion: 2.0\n",
+                )
+                second_module = ModuleType(second_name)
+                second_module.__file__ = str(second)
+                patch.setitem(sys.modules, second_name, second_module)
+                await PythonBackend.observe_host_dependencies(
+                    history_description,
+                    usage,
+                    history_token,
+                )
+                history = next(
+                    use
+                    for use in usage.snapshot().uses
+                    if use.origin == "host" and use.source_revision == "second"
+                )
+                owner = history.snapshot.distributions["owner"]
+                assert owner["version"] == "1.0"
+                assert owner["loaded_modules"] == (
+                    loaded_module,
+                    second_name,
+                )
+                # A different owner origin cannot represent the new member
+                # under the retained pin; preserve that pin and fail closed.
+                third_name = "shared_namespace.three"
+                third = nested / "shared_namespace/three.py"
+                third.write_text("VALUE = 'third embedded'\n")
+                for info, relative in (
+                    (nested_info, third.relative_to(nested)),
+                    (owner_info, third.relative_to(site)),
+                ):
+                    with (info / "RECORD").open("a") as stream:
+                        stream.write(f"{relative.as_posix()},,\n")
+                moved_info = owner_info.with_name("owner-2.0.dist-info")
+                owner_info.rename(moved_info)
+                moved_record = moved_info / "RECORD"
+                moved_record.write_text(
+                    moved_record.read_text().replace(
+                        owner_info.name,
+                        moved_info.name,
+                    ),
+                )
+                third_module = ModuleType(third_name)
+                third_module.__file__ = str(third)
+                patch.setitem(sys.modules, third_name, third_module)
+                await PythonBackend.observe_host_dependencies(
+                    history_description,
+                    usage,
+                    history_token,
+                )
+                changed = next(
+                    use
+                    for use in usage.snapshot().uses
+                    if use.origin == "host" and use.source_revision == "second"
+                )
+                assert changed.snapshot.distributions["owner"] == owner
+                assert changed.environment is None
+                moved_record.write_text(
+                    moved_record.read_text().replace(
+                        moved_info.name,
+                        owner_info.name,
+                    ),
+                )
+                moved_info.rename(owner_info)
+                (owner_info / "METADATA").write_text(owner_metadata)
     from dataclasses import replace
     from qwenpaw.plugins.dependency_gate import evaluate_shared_dependencies
 
