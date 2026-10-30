@@ -1181,6 +1181,14 @@ async def prepare_shared_dependencies(
             )
         except Exception as exc:
             code = getattr(exc, "reason_code", "DEPENDENCY_PLAN_UNVERIFIED")
+            logger.info(
+                "Dependency preparation failed: plugin=%s "
+                "stage=wheel-validation code=%s exception=%s errno=%s",
+                ascii(str(plugin_id))[1:-1][:160],
+                ascii(str(code))[1:-1][:160],
+                type(exc).__name__,
+                exc.errno if isinstance(exc, OSError) else None,
+            )
             raise SharedDependencyError(
                 GateDecision(
                     False,
