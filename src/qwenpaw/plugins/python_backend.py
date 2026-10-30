@@ -377,9 +377,14 @@ def _observe_host_dependencies(
     return snapshot, imported
 
 
-def _check_read_history(view, uses):
+def _check_read_history(view, uses, *, inventory=None):
     from .dependency_gate import SharedDependencyError, GateDecision
     from .execution.dependencies import _provides_loaded_modules
+
+    records = (
+        inventory.setdefault("records", {}) if inventory is not None else {}
+    )
+    record_names = {}
 
     def refuse(code, detail):
         raise SharedDependencyError(
@@ -417,7 +422,12 @@ def _check_read_history(view, uses):
             modules = old.get("loaded_modules", ())
             if modules and any(
                 provider not in use.snapshot.distributions
-                and _provides_loaded_modules(row, set(modules))
+                and _provides_loaded_modules(
+                    row,
+                    set(modules),
+                    record_reads=records,
+                    record_names=record_names,
+                )
                 for provider, row in view.distributions.items()
             ):
                 refuse(
@@ -620,7 +630,7 @@ class PythonBackend:
 
     @staticmethod
     async def prepare_dependency_targets(description):
-        from .execution.dependencies import dependency_sites
+        from .execution.dependencies import _dependency_sites, _inventory_sites
         from ..utils.io_utils import run_sync_io
 
         cwd = os.getcwd()
@@ -628,11 +638,9 @@ class PythonBackend:
 
         def discover():
             code_root = Path(cwd, description.source_path).resolve()
-            return dependency_sites(
-                path
-                for path in paths
-                if not Path(path).resolve().is_relative_to(code_root)
-            )
+            resolved = {}
+            sites = _inventory_sites(code_root, paths, resolved)
+            return _dependency_sites(sites, resolved)
 
         targets = await run_sync_io(discover)
 
@@ -766,6 +774,7 @@ class PythonBackend:
                         _check_read_history,
                         view,
                         before_usage.uses,
+                        inventory=observation_inputs(),
                     )
                 except Exception as exc:
                     code = getattr(
