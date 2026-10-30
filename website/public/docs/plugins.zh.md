@@ -291,7 +291,7 @@ plugin = Plugin()
 | --- | --- |
 | `status`、`start_login`、`logout` | 显式状态/认证操作，返回 `HarnessStatus`、`HarnessLogin` 或 None。 |
 | `models`、`discover_skills`、`discover_mcp` | 公开模型/发现 DTO 的 tuple；目录枚举不能触发这些操作。 |
-| `run_turn` | `HarnessEvent` 异步流，保留正文、推理、工具开始/进度/完成及完成/取消/错误语义。 |
+| `run_turn` | `HarnessEvent` 的 `AsyncIterator`，提供异步 `aclose()` 时会调用它；保留正文、推理、工具开始/进度/完成及完成/取消/错误语义。 |
 | `run_command`、`reset_session`、`history` | 受管会话操作，历史直接使用公开 `HarnessHistoryItem` / `HarnessHistoryKind`。 |
 | `close` | 幂等异步清理，等待真实客户端和进程停止。 |
 | `HarnessArchiveBackend` | `external_history=True` 时的可选在线读取接口，只返回 JSON 快照或公开历史，不返回裸客户端。 |

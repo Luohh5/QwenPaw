@@ -319,7 +319,7 @@ real worker completes. Do not construct asyncio clients or locks in worker threa
 | --- | --- |
 | `status`, `start_login`, `logout` | Explicit status/authentication calls; return `HarnessStatus`, `HarnessLogin`, or None. |
 | `models`, `discover_skills`, `discover_mcp` | Tuples of public picker/discovery DTOs; no discovery during catalog enumeration. |
-| `run_turn` | Async iterator of `HarnessEvent`; text, reasoning, tool start/progress/completion, completed/cancelled/error preserve wire values. |
+| `run_turn` | `AsyncIterator` of `HarnessEvent`; async `aclose()` is used when provided; text, reasoning, tool start/progress/completion, completed/cancelled/error preserve wire values. |
 | `run_command`, `reset_session`, `history` | Managed session operations; history uses public `HarnessHistoryItem` and `HarnessHistoryKind`. |
 | `close` | Idempotent async cleanup that waits for real clients/processes to stop. |
 | `HarnessArchiveBackend` | Optional online archive operations when `external_history=True`; return JSON snapshots/public history, never raw clients. |

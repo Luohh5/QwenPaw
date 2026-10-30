@@ -408,6 +408,73 @@ async def test_stream_attachments_history_restore_and_clear(host, tmp_path):
     )
 
 
+@pytest.mark.parametrize("close_fails", [False, True])
+async def test_iterator_cleanup_finalizes_response_and_history(
+    host,
+    monkeypatch,
+    close_fails,
+):
+    from agentscope.state import AgentState
+    from qwenpaw.app.chats.utils import agentscope_msg_to_message
+    from qwenpaw.plugins.harnesses import HarnessEvent, HarnessEventKind
+
+    workspace = await host._workspace("one")
+    runtime = workspace.backend_runtime
+    await host.harness_status("codex", workspace_id="one")
+    backend = plugin(host).created[0]
+
+    class Events:
+        def __init__(self):
+            self.events = iter(
+                [
+                    HarnessEvent(HarnessEventKind.TEXT_DELTA, text="full "),
+                    HarnessEvent(HarnessEventKind.TEXT_DELTA, text="answer"),
+                    HarnessEvent(HarnessEventKind.COMPLETED),
+                ],
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.events)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+    stream = Events()
+    close = AsyncMock(side_effect=RuntimeError("cleanup failed"))
+    if close_fails:
+        stream.aclose = close
+    monkeypatch.setattr(backend, "run_turn", Mock(return_value=stream))
+    append = AsyncMock(wraps=runtime._session_bridge.append_turn)
+    monkeypatch.setattr(runtime._session_bridge, "append_turn", append)
+    events = await collect(runtime)
+    response = events[-1]
+    assert response.status == ("failed" if close_fails else "completed")
+    assert response.output[0].status == "completed"
+    assert [item.text for item in response.output[0].content] == [
+        "full answer",
+    ]
+    if close_fails:
+        close.assert_awaited_once_with()
+        assert response.error["code"] == "harness_error"
+        assert "cleanup failed" in response.error["message"]
+    append.assert_awaited_once()
+    saved = await workspace.session.get_session_state_dict(
+        "same",
+        "alice",
+        "console",
+    )
+    restored = agentscope_msg_to_message(
+        list(AgentState.model_validate(saved["agent"]["state"]).context),
+    )
+    assert [(item.role, item.content[0].text) for item in restored] == [
+        ("user", "hello"),
+        ("assistant", "full answer"),
+    ]
+
+
 async def test_concurrent_model_settings_and_status_reuse_backend(host):
     runtime = (await host._workspace("one")).backend_runtime
     settings = [

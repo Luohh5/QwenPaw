@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -36,6 +37,9 @@ from ...schemas import AgentResponse, ContentType, MessageType, RunStatus
 from ...utils.io_utils import run_async_to_completion, run_sync_io
 from .session import HarnessSessionBridge
 from .streaming import TextStream, ToolStream
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -573,7 +577,20 @@ class BackendExecution:
                 error_text = str(exc)
             finally:
                 if event_stream is not None:
-                    await event_stream.aclose()
+                    try:
+                        close = getattr(event_stream, "aclose", None)
+                        if callable(close):
+                            await close()
+                    except (asyncio.CancelledError, GeneratorExit) as exc:
+                        if interrupted is None:
+                            interrupted = exc
+                        cancelled = True
+                    except Exception as exc:
+                        logger.exception("Harness event stream close failed")
+                        if not error_text and not cancelled:
+                            error_text = (
+                                f"Harness event stream close failed: {exc}"
+                            )
                 final_items = text_stream.finish()
                 response.status = (
                     RunStatus.Failed
