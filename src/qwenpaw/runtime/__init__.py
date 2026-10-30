@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """QwenPaw runtime — agent lifecycle, streaming, and tool guard."""
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .runtime import Runtime as Runtime
+
 __all__ = ["Runtime"]
 
 

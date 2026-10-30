@@ -208,7 +208,10 @@ asyncio.run(main())
   "name": "Echo harness",
   "version": "1.0.0",
   "entry": { "backend": "main.py" },
-  "sdk": { "version": "1.1.0", "capabilities": ["harnesses", "resources", "storage"] },
+  "sdk": {
+    "version": "1.1.0",
+    "capabilities": ["harnesses", "resources", "storage"]
+  },
   "meta": { "harnesses": [{ "id": "echo-backend", "label": "Echo" }] }
 }
 ```
@@ -287,14 +290,14 @@ plugin = Plugin()
 只在线程中执行有界文件/发现操作，并在真实 worker 完成前保留锁；不要在线程中
 创建 asyncio 客户端、锁或执行完整模块/生命周期。
 
-| 公开方法 | 返回值与职责 |
-| --- | --- |
-| `status`、`start_login`、`logout` | 显式状态/认证操作，返回 `HarnessStatus`、`HarnessLogin` 或 None。 |
-| `models`、`discover_skills`、`discover_mcp` | 公开模型/发现 DTO 的 tuple；目录枚举不能触发这些操作。 |
-| `run_turn` | `HarnessEvent` 的 `AsyncIterator`，提供异步 `aclose()` 时会调用它；保留正文、推理、工具开始/进度/完成及完成/取消/错误语义。 |
-| `run_command`、`reset_session`、`history` | 受管会话操作，历史直接使用公开 `HarnessHistoryItem` / `HarnessHistoryKind`。 |
-| `close` | 幂等异步清理，等待真实客户端和进程停止。 |
-| `HarnessArchiveBackend` | `external_history=True` 时的可选在线读取接口，只返回 JSON 快照或公开历史，不返回裸客户端。 |
+| 公开方法                                    | 返回值与职责                                                                                                                |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `status`、`start_login`、`logout`           | 显式状态/认证操作，返回 `HarnessStatus`、`HarnessLogin` 或 None。                                                           |
+| `models`、`discover_skills`、`discover_mcp` | 公开模型/发现 DTO 的 tuple；目录枚举不能触发这些操作。                                                                      |
+| `run_turn`                                  | `HarnessEvent` 的 `AsyncIterator`，提供异步 `aclose()` 时会调用它；保留正文、推理、工具开始/进度/完成及完成/取消/错误语义。 |
+| `run_command`、`reset_session`、`history`   | 受管会话操作，历史直接使用公开 `HarnessHistoryItem` / `HarnessHistoryKind`。                                                |
+| `close`                                     | 幂等异步清理，等待真实客户端和进程停止。                                                                                    |
+| `HarnessArchiveBackend`                     | `external_history=True` 时的可选在线读取接口，只返回 JSON 快照或公开历史，不返回裸客户端。                                  |
 
 通过冻结的 `HarnessCapabilities` 声明模型、推理/工具流、续接、附件、Skill/MCP
 投影与发现、命令、审批 preset 及可选在线历史能力。不支持的操作抛出
@@ -322,11 +325,13 @@ const { React } = getHost().host;
 const registration = getHost().harnesses.register("echo-owner", {
   backendId: "echo-backend",
   SettingsComponent: (props: HarnessSettingsProps) =>
-    props.open ? React.createElement("input", {
-      value: String(props.value.prefix ?? ""),
-      onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
-        props.onChange({ ...props.value, prefix: event.target.value }),
-    }) : null,
+    props.open
+      ? React.createElement("input", {
+          value: String(props.value.prefix ?? ""),
+          onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+            props.onChange({ ...props.value, prefix: event.target.value }),
+        })
+      : null,
 });
 // registration.dispose() 只撤销这次注册。
 ```

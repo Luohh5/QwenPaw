@@ -180,7 +180,7 @@ async def until(predicate):
 
 
 NATIVE_CHILD = r"""
-import asyncio, builtins, json, shutil, sys
+import asyncio, builtins, json, re, shutil, sys
 from pathlib import Path
 from unittest.mock import patch
 forbidden = (
@@ -201,13 +201,25 @@ def guarded_which(command, *args, **kwargs):
         raise AssertionError("vendor CLI probe")
     return original_which(command, *args, **kwargs)
 
-def no_process(event, args):
-    if event in {"subprocess.Popen", "os.system", "os.posix_spawn", "os.fork"}:
-        processes.append(event)
-        raise AssertionError("process launch")
+def no_vendor_process(event, args):
+    # Native governance may probe the OS sandbox (for example bwrap on Linux).
+    # Audit command-bearing launches, while allowing native worker processes.
+    if event in {"subprocess.Popen", "os.posix_spawn", "os.exec"}:
+        command = args[:2]
+    elif event == "os.system":
+        command = args[:1]
+    else:
+        return
+    if re.search(
+        r"(?i)(?<![a-z0-9_])(codex|qoder|qodercli|openai_codex|"
+        r"codex_cli_bin|qoder_agent_sdk)(?![a-z0-9_])",
+        str(command),
+    ):
+        processes.append(command)
+        raise AssertionError("vendor process launch")
 
 builtins.__import__, shutil.which = guarded_import, guarded_which
-sys.addaudithook(no_process)
+sys.addaudithook(no_vendor_process)
 from agentscope.formatter import OpenAIChatFormatter
 from agentscope.model import ChatModelBase
 from agentscope.model._model_response import ChatResponse

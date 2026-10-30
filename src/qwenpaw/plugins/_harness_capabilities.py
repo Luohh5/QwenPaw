@@ -7,7 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 from ..utils.io_utils import run_sync_io
 from ..agents.skill_system import (
@@ -26,7 +26,7 @@ from ..drivers.constants import (
     PROTOCOL_MCP,
     SUBJECT_UNKNOWN_USER,
 )
-from ..drivers.contracts import CredentialRef, DriverCard
+from ..drivers.contracts import CredentialRef, DriverCard, DriverCardError
 from ..drivers.credentials.bindings import (
     implicit_auth_headers,
     resolve_binding,
@@ -39,6 +39,7 @@ from .harnesses import (
     HarnessMCPServerDefinition,
     HarnessRuntimeCapabilities,
     HarnessSkillDefinition,
+    MCPTransport,
     MCPToolPolicy,
 )
 
@@ -140,6 +141,11 @@ class HarnessCapabilityResolver:
 
         endpoint = card.endpoint
         transport = str(endpoint.get("transport") or "stdio")
+        if transport not in {"stdio", "streamable_http", "sse"}:
+            raise DriverCardError(
+                f"DriverCard {card.name} has unsupported MCP transport: "
+                f"{transport}",
+            )
         env = resolve_binding(endpoint.get("env") or {}, credentials)
         headers = resolve_binding(
             endpoint.get("headers") or {},
@@ -156,7 +162,7 @@ class HarnessCapabilityResolver:
             display_name=str(
                 card.config.get("display_name") or card.name,
             ),
-            transport=transport,
+            transport=cast(MCPTransport, transport),
             command=str(endpoint.get("command") or ""),
             args=tuple(str(item) for item in endpoint.get("args") or []),
             cwd=(

@@ -259,6 +259,9 @@ class PluginRegistry:  # pylint:disable=too-many-public-methods
             app: The root ``FastAPI`` instance.
         """
         self._plugin_http_app = app
+        from ._harness_http import install_gateway
+
+        install_gateway(self, app)
 
     def get_plugin_http_app(self) -> Optional[Any]:
         """Return the application that owns the native plugin lifecycle."""

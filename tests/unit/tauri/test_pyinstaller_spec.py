@@ -8,7 +8,6 @@ import runpy
 
 import pytest
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SPEC_PATH = REPO_ROOT / "scripts" / "pack-tauri" / "qwenpaw.spec"
 
@@ -173,6 +172,25 @@ def test_desktop_spec_reaches_analysis_without_vendor_sdks(
     )
     monkeypatch.syspath_prepend(str(tmp_path))
 
+    # Stage the real spec and collectors with a controlled Console input so
+    # this backend unit test does not require a complete frontend build.
+    staged_root = tmp_path / "repo"
+    staged_pack = staged_root / "scripts" / "pack-tauri"
+    staged_pack.mkdir(parents=True)
+    for name in ("qwenpaw.spec", "collect_runtime_metadata.py"):
+        (staged_pack / name).symlink_to(SPEC_PATH.parent / name)
+    for name in ("src", "packages", "plugins"):
+        (staged_root / name).symlink_to(
+            REPO_ROOT / name,
+            target_is_directory=True,
+        )
+    console_dist = staged_root / "console" / "dist"
+    console_dist.mkdir(parents=True)
+    (console_dist / "index.html").write_text(
+        "<!doctype html>",
+        encoding="utf-8",
+    )
+
     class ReachedAnalysis(Exception):
         """Stop before the expensive onedir build."""
 
@@ -184,9 +202,9 @@ def test_desktop_spec_reaches_analysis_without_vendor_sdks(
 
     with pytest.raises(ReachedAnalysis):
         runpy.run_path(
-            str(SPEC_PATH),
+            str(staged_pack / "qwenpaw.spec"),
             init_globals={
-                "SPECPATH": str(SPEC_PATH.parent),
+                "SPECPATH": str(staged_pack),
                 "Analysis": stop_at_analysis,
             },
         )

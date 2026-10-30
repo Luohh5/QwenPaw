@@ -231,7 +231,10 @@ Save the following manifest as `plugin.json` and the complete example as `main.p
   "name": "Echo harness",
   "version": "1.0.0",
   "entry": { "backend": "main.py" },
-  "sdk": { "version": "1.1.0", "capabilities": ["harnesses", "resources", "storage"] },
+  "sdk": {
+    "version": "1.1.0",
+    "capabilities": ["harnesses", "resources", "storage"]
+  },
   "meta": { "harnesses": [{ "id": "echo-backend", "label": "Echo" }] }
 }
 ```
@@ -315,14 +318,14 @@ keep synchronous construction pure, and use an async factory for preparation.
 Offload only bounded filesystem/discovery operations, preserving locks until their
 real worker completes. Do not construct asyncio clients or locks in worker threads.
 
-| Public operation | Result and responsibility |
-| --- | --- |
-| `status`, `start_login`, `logout` | Explicit status/authentication calls; return `HarnessStatus`, `HarnessLogin`, or None. |
-| `models`, `discover_skills`, `discover_mcp` | Tuples of public picker/discovery DTOs; no discovery during catalog enumeration. |
-| `run_turn` | `AsyncIterator` of `HarnessEvent`; async `aclose()` is used when provided; text, reasoning, tool start/progress/completion, completed/cancelled/error preserve wire values. |
-| `run_command`, `reset_session`, `history` | Managed session operations; history uses public `HarnessHistoryItem` and `HarnessHistoryKind`. |
-| `close` | Idempotent async cleanup that waits for real clients/processes to stop. |
-| `HarnessArchiveBackend` | Optional online archive operations when `external_history=True`; return JSON snapshots/public history, never raw clients. |
+| Public operation                            | Result and responsibility                                                                                                                                                   |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `status`, `start_login`, `logout`           | Explicit status/authentication calls; return `HarnessStatus`, `HarnessLogin`, or None.                                                                                      |
+| `models`, `discover_skills`, `discover_mcp` | Tuples of public picker/discovery DTOs; no discovery during catalog enumeration.                                                                                            |
+| `run_turn`                                  | `AsyncIterator` of `HarnessEvent`; async `aclose()` is used when provided; text, reasoning, tool start/progress/completion, completed/cancelled/error preserve wire values. |
+| `run_command`, `reset_session`, `history`   | Managed session operations; history uses public `HarnessHistoryItem` and `HarnessHistoryKind`.                                                                              |
+| `close`                                     | Idempotent async cleanup that waits for real clients/processes to stop.                                                                                                     |
+| `HarnessArchiveBackend`                     | Optional online archive operations when `external_history=True`; return JSON snapshots/public history, never raw clients.                                                   |
 
 Declare supported behavior in frozen `HarnessCapabilities`: model/reasoning/tool
 streaming, resume, attachments, skill/MCP projection/discovery, command and approval
@@ -356,11 +359,13 @@ const { React } = getHost().host;
 const registration = getHost().harnesses.register("echo-owner", {
   backendId: "echo-backend",
   SettingsComponent: (props: HarnessSettingsProps) =>
-    props.open ? React.createElement("input", {
-      value: String(props.value.prefix ?? ""),
-      onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
-        props.onChange({ ...props.value, prefix: event.target.value }),
-    }) : null,
+    props.open
+      ? React.createElement("input", {
+          value: String(props.value.prefix ?? ""),
+          onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+            props.onChange({ ...props.value, prefix: event.target.value }),
+        })
+      : null,
 });
 // registration.dispose() revokes this registration only.
 ```

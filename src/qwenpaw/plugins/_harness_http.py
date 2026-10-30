@@ -86,15 +86,16 @@ class _Gateway:
                 self.app.router.routes.remove(route)
         self.routes = []
         self.app.openapi_schema = None
-        if not self.entries:
-            return
         snapshot = dict(self.entries)
         router = APIRouter(prefix="/harnesses", tags=["harnesses"])
 
         def owner(provider_id):
             entry = snapshot.get(provider_id)
             if entry is None:
-                raise HTTPException(404, "Backend is unavailable")
+                raise HTTPException(
+                    404,
+                    {"code": "backend_unavailable", "backend_id": provider_id},
+                )
             try:
                 entry.assert_active()
             except SDKError as exc:
@@ -216,14 +217,30 @@ class _Gateway:
         )
 
 
+def install_gateway(registry, app):
+    """Keep the host management API available even without contributions."""
+    gateway = getattr(registry, "_harness_gateway", None)
+    if gateway is None:
+        gateway = registry._harness_gateway = _Gateway(registry, app)
+    elif gateway.app is app:
+        return gateway
+    else:
+        for route in gateway.routes:
+            if route in gateway.app.router.routes:
+                gateway.app.router.routes.remove(route)
+        gateway.app.openapi_schema = None
+        gateway.routes = []
+        gateway.app = app
+    gateway.refresh()
+    return gateway
+
+
 def activate_gateway(context, backend_id):
     registry = context._api._registry
     app = registry.get_plugin_http_app()
     if app is None:
         return
-    gateway = getattr(registry, "_harness_gateway", None)
-    if gateway is None:
-        gateway = registry._harness_gateway = _Gateway(registry, app)
+    gateway = install_gateway(registry, app)
     gateway.entries[backend_id] = registry.backend_registry._entries[
         backend_id
     ]

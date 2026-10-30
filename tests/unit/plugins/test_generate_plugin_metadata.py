@@ -263,10 +263,18 @@ def _copy_harness_plugins(root: Path) -> Path:
             plugins_root / "harness" / vendor,
             ignore=shutil.ignore_patterns(
                 "node_modules",
+                "dist",
                 "__pycache__",
                 ".pytest_cache",
             ),
         )
+        # Backend unit CI has no frontend build. Supply only the declared
+        # entry; compiled bundles are covered by the Harness packaging job.
+        frontend_entry = (
+            plugins_root / "harness" / vendor / "frontend/dist/index.js"
+        )
+        frontend_entry.parent.mkdir(parents=True)
+        frontend_entry.write_text("export {};\n", encoding="utf-8")
     return plugins_root
 
 
