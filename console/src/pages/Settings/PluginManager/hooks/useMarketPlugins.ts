@@ -10,6 +10,7 @@ import {
 } from "@/api/modules/pluginMarket";
 import { installPlugin, type InstallPluginResult } from "@/api/modules/plugin";
 import { isMarketPluginCompatible } from "@/utils/pluginCompatibility";
+import { runPluginInstall } from "../dependencyUpgrade";
 
 export { isMarketPluginCompatible } from "@/utils/pluginCompatibility";
 
@@ -258,7 +259,11 @@ export function useMarketPlugins({
       setInstallingId(entry.id);
       try {
         const downloadUrl = buildMarketDownloadUrl(entry);
-        const result = await installPlugin(downloadUrl, { force: true });
+        const result = await runPluginInstall(
+          () => installPlugin(downloadUrl, { force: true }),
+          tRef.current,
+        );
+        if (result === null) return;
         message.success(
           `${tRef.current("pluginManager.installSuccess")}: ${result.name}`,
         );

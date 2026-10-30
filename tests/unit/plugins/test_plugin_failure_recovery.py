@@ -13,6 +13,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from qwenpaw.app.channels.manager import ChannelManager
+from qwenpaw.app.routers.plugins import (
+    UpdatePluginConfigRequest,
+    uninstall_plugin,
+    update_plugin_config,
+)
 from qwenpaw.app.workspace.workspace_plugins import WorkspacePlugins
 from qwenpaw.plugins.api import PluginApi
 from qwenpaw.plugins.architecture import PluginManifest, PluginRecord
@@ -705,10 +710,6 @@ async def test_memory_config_rejected_before_any_teardown(
     assert inst.has_runtime_ledger()
     assert loader.get_loaded_plugin("memory-plugin").status == "active"
     from fastapi import HTTPException
-    from qwenpaw.app.routers.plugins import (
-        UpdatePluginConfigRequest,
-        update_plugin_config,
-    )
 
     request = SimpleNamespace(
         app=SimpleNamespace(state=SimpleNamespace(plugin_loader=loader)),
@@ -746,7 +747,7 @@ async def test_channel_failed_projection_can_retry_cleanup(
         lambda *a, **k: ch,
     )
     monkeypatch.setattr(
-        "qwenpaw.plugins.workspace_projector.channel_passes_gates",
+        "qwenpaw.plugins.api.channel_passes_gates",
         lambda *_: True,
     )
     loader = PluginLoader([])
@@ -947,14 +948,27 @@ async def test_workspace_stop_continues_after_failed_plugin_revoke(
     old = Workspace.__new__(Workspace)
     old.agent_id = "retiring"
     old._started = old._start_attempted = True
-    old._service_manager = SimpleNamespace(stop_all=AsyncMock())
+    old._service_manager = SimpleNamespace(stop_all=AsyncMock(), services={})
     backend = SimpleNamespace(close=AsyncMock())
     old._backend_runtime = backend
-    registry.projector = SimpleNamespace(
-        revoke_workspace=AsyncMock(
-            side_effect=[QuiescenceError("plugin still alive"), None],
-        ),
+    registry.projector = WorkspaceProjector(lambda: [])
+    registry.projector.track_workspace(old)
+    token, revokes = object(), []
+
+    async def revoke(workspace, binding):
+        assert workspace is old and binding is token
+        revokes.append(binding)
+        if len(revokes) == 1:
+            raise QuiescenceError("plugin still alive")
+
+    registry.projector.intend(
+        "worker",
+        "retiring-worker",
+        "recovery",
+        lambda _ws: token,
+        revoke,
     )
+    await registry.projector.project_workspace(old)
 
     with pytest.raises(QuiescenceError, match="plugin still alive"):
         await old.stop(final=final, preserve_reused=preserve_reused)
@@ -966,10 +980,13 @@ async def test_workspace_stop_continues_after_failed_plugin_revoke(
     backend.close.assert_awaited_once()
     assert old._started and old._start_attempted
     assert old._backend_runtime is None
+    assert old in registry.projector.workspaces()
 
     await old.stop(final=final, preserve_reused=preserve_reused)
     assert not old._started and not old._start_attempted
     backend.close.assert_awaited_once()
+    assert old not in registry.projector.workspaces()
+    assert revokes == [token, token]
 
 
 @pytest.mark.asyncio
@@ -981,22 +998,26 @@ async def test_workspace_stop_retains_failed_backend_for_retry(registry):
     old._started = old._start_attempted = True
     old._service_manager = SimpleNamespace(
         stop_all=AsyncMock(side_effect=[RuntimeError("service busy"), None]),
+        services={},
     )
     backend = SimpleNamespace(
         close=AsyncMock(side_effect=[RuntimeError("backend busy"), None]),
     )
     old._backend_runtime = backend
-    registry.projector = SimpleNamespace(revoke_workspace=AsyncMock())
+    registry.projector = WorkspaceProjector(lambda: [])
+    registry.projector.track_workspace(old)
     with pytest.raises(RuntimeError) as raised:
         await old.stop(final=False)
     assert "service busy" in str(raised.value)
     assert "backend busy" in str(raised.value)
     assert old._backend_runtime is backend
     assert old._started and old._start_attempted
+    assert old in registry.projector.workspaces()
     await old.stop(final=False)
     assert old._backend_runtime is None
     assert not old._started and not old._start_attempted
     assert backend.close.await_count == 2
+    assert old not in registry.projector.workspaces()
 
 
 @pytest.mark.asyncio
@@ -1005,7 +1026,6 @@ async def test_unresolved_restart_cleanup_returns_http_conflict(
     registry,
 ):
     from fastapi import HTTPException
-    from qwenpaw.app.routers.plugins import uninstall_plugin
 
     root = tmp_path / "plugins" / "disk-plugin"
     root.mkdir(parents=True)

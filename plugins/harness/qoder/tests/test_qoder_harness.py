@@ -489,7 +489,7 @@ async def test_actual_zip_manifest_registration_and_host_call(
     ), "Build and package Harness plugins before vendor tests"
     with zipfile.ZipFile(archive) as zipped:
         zipped.extractall(tmp_path / "unpacked")
-    source = tmp_path / "unpacked" / "qoder"
+    source = tmp_path / "unpacked" / plugin_id
     manifest = json.loads((source / "plugin.json").read_text())
     assert (
         manifest["id"] == plugin_id

@@ -149,10 +149,29 @@ def test_desktop_spec_collects_reme_entry_point_plugins():
     assert {"reme-ai", *plugin_distributions} <= _metadata_packages()
 
 
-def test_desktop_spec_reaches_analysis_without_vendor_sdks() -> None:
-    """Execute real collection code; the full frozen build runs separately."""
+def test_desktop_spec_reaches_analysis_without_vendor_sdks(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Run real collectors with a bounded installed full dependency graph."""
     assert importlib.util.find_spec("qoder_agent_sdk") is None
     assert importlib.util.find_spec("codex_cli_bin") is None
+
+    # The core test environment does not install desktop's full extra. Its
+    # editable metadata may also predate a dependency move to a plugin.
+    # Keep the selected full graph explicit while collecting its installed
+    # transitive distributions through the production metadata collector.
+    metadata = tmp_path / "qwenpaw-0.0.0.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: qwenpaw\nVersion: 0.0.0\n"
+        "Provides-Extra: full\n"
+        "Requires-Dist: openai; extra == 'full'\n"
+        "Requires-Dist: pydantic; extra == 'full'\n"
+        "Requires-Dist: httpx; extra == 'full'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
 
     class ReachedAnalysis(Exception):
         """Stop before the expensive onedir build."""

@@ -24,6 +24,7 @@ import { reloadFrontendPlugin, reloadPawApp } from "@/plugins/usePluginLoader";
 import { refreshHarnessCatalog } from "@/plugins/harnesses";
 import { removePluginRuntime } from "@/plugins/pluginRuntimeCleanup";
 import { removePluginAppState } from "@/os/osCleanup";
+import { runPluginInstall } from "../dependencyUpgrade";
 
 const MARKET_PAGE_SIZE = 50;
 const MARKET_MAX_PAGES = 20;
@@ -182,7 +183,11 @@ export function usePluginManager() {
       if (!update || updatingId !== null || updatingAll) return;
       setUpdatingId(plugin.id);
       try {
-        await installPlugin(update.source, { force: true });
+        const result = await runPluginInstall(
+          () => installPlugin(update.source, { force: true }),
+          t,
+        );
+        if (result === null) return;
         await reloadInstalledPluginRuntime(plugin);
         message.success(t("pluginManager.updateSuccess"));
       } catch (err) {
@@ -202,13 +207,21 @@ export function usePluginManager() {
     setUpdatingAll(true);
     const completedIds = new Set<string>();
     const failedPluginNames: string[] = [];
+    let cancelled = false;
     try {
       for (const plugin of plugins ?? []) {
         const update = updates.get(plugin.id);
         if (!update) continue;
         setUpdatingId(plugin.id);
         try {
-          await installPlugin(update.source, { force: true });
+          const result = await runPluginInstall(
+            () => installPlugin(update.source, { force: true }),
+            t,
+          );
+          if (result === null) {
+            cancelled = true;
+            break;
+          }
           await reloadInstalledPluginRuntime(plugin);
           completedIds.add(plugin.id);
           setUpdates((current) => {
@@ -216,10 +229,15 @@ export function usePluginManager() {
             next.delete(plugin.id);
             return next;
           });
-        } catch {
-          failedPluginNames.push(plugin.name);
+        } catch (error) {
+          failedPluginNames.push(
+            error instanceof Error && error.message
+              ? `${plugin.name}: ${error.message}`
+              : plugin.name,
+          );
         }
       }
+      if (cancelled) return;
       if (failedPluginNames.length === 0) {
         message.success(t("pluginManager.updateAllSuccess"));
       } else {
@@ -255,9 +273,20 @@ export function usePluginManager() {
       const failureKey = `pluginManager.${action}Failed`;
       try {
         if (action === "repair") {
-          const result = await repairPluginDependencies(plugin.id);
-          if (!result.enabled || result.status !== "active")
-            throw new Error(result.diagnostics.join("\n") || t(failureKey));
+          const result = await runPluginInstall(
+            () => repairPluginDependencies(plugin.id),
+            t,
+          );
+          if (result === null) return;
+          const active =
+            "status" in result
+              ? result.enabled && result.status === "active"
+              : result.loaded;
+          if (!active)
+            throw new Error(
+              ("diagnostics" in result && result.diagnostics.join("\n")) ||
+                t(failureKey),
+            );
         } else {
           const result = await setPluginEnabled(plugin.id, action === "enable");
           if (action === "enable") {

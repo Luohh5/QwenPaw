@@ -7,7 +7,7 @@ const hoisted = vi.hoisted(() => ({
     success: vi.fn(),
     error: vi.fn(),
   },
-  stableT: (k: string) => k,
+  stableT: vi.fn((k: string, _options?: unknown) => k),
   fetchPluginsMock: vi.fn(),
   fetchPluginCatalogMock: vi.fn(),
   fetchMarketPluginsMock: vi.fn(),
@@ -15,6 +15,8 @@ const hoisted = vi.hoisted(() => ({
   uninstallPluginMock: vi.fn(),
   setPluginEnabledMock: vi.fn(),
   repairPluginDependenciesMock: vi.fn(),
+  applyDependencyUpgradeMock: vi.fn(),
+  cancelDependencyUpgradeMock: vi.fn(),
   // Captured Modal.confirm options; initialized per-test in beforeEach.
   modalConfirmMock: vi.fn(),
   refreshMock: vi.fn(),
@@ -37,6 +39,8 @@ vi.mock("@/api/modules/plugin", () => ({
   uninstallPlugin: hoisted.uninstallPluginMock,
   setPluginEnabled: hoisted.setPluginEnabledMock,
   repairPluginDependencies: hoisted.repairPluginDependenciesMock,
+  applyDependencyUpgrade: hoisted.applyDependencyUpgradeMock,
+  cancelDependencyUpgrade: hoisted.cancelDependencyUpgradeMock,
 }));
 
 vi.mock("@/api/modules/pluginMarket", () => ({
@@ -87,6 +91,8 @@ describe("usePluginManager", () => {
     uninstallPluginMock.mockReset();
     hoisted.setPluginEnabledMock.mockReset();
     hoisted.repairPluginDependenciesMock.mockReset();
+    hoisted.applyDependencyUpgradeMock.mockReset();
+    hoisted.cancelDependencyUpgradeMock.mockReset();
     hoisted.fetchPluginCatalogMock
       .mockReset()
       .mockResolvedValue({ plugins: [] });
@@ -202,6 +208,75 @@ describe("usePluginManager", () => {
           expect.stringContaining(diagnostic),
         );
         expect(messageMock.success).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it.each(["loaded", "not-loaded", "cancelled"])(
+    "handles a %s shared dependency upgrade during repair",
+    async (outcome) => {
+      const target = { ...makePlugin(), status: "failed", enabled: true };
+      const operation = {
+        id: `repair-${outcome}`,
+        plugin_id: target.id,
+        status: "needs_confirmation",
+        changes: [],
+        affected_instances: [],
+        requires_restart: false,
+        message: "Review dependency repair",
+      };
+      hoisted.repairPluginDependenciesMock.mockRejectedValueOnce(
+        Object.assign(new Error("Review dependency repair"), {
+          code: "DEPENDENCY_UPGRADE_REQUIRED",
+          operation,
+        }),
+      );
+      hoisted.applyDependencyUpgradeMock.mockResolvedValueOnce({
+        ...operation,
+        status: "succeeded",
+        result: { id: target.id, loaded: outcome === "loaded" },
+      });
+      hoisted.cancelDependencyUpgradeMock.mockResolvedValueOnce({
+        ...operation,
+        status: "cancelled",
+      });
+      const { result } = renderHook(() => usePluginManager());
+      let pending!: Promise<void>;
+      await act(async () => {
+        pending = result.current.repairOne(target);
+      });
+      await waitFor(() => expect(modalConfirmMock).toHaveBeenCalledOnce());
+      const confirm = modalConfirmMock.mock.calls[0][0] as {
+        onOk: () => void;
+        onCancel: () => void;
+      };
+      await act(async () => {
+        if (outcome === "cancelled") confirm.onCancel();
+        else confirm.onOk();
+        await pending;
+      });
+      expect(hoisted.repairPluginDependenciesMock).toHaveBeenCalledWith(
+        target.id,
+      );
+      expect(hoisted.setPluginEnabledMock).not.toHaveBeenCalled();
+      expect(refreshMock).toHaveBeenCalledOnce();
+      if (outcome === "cancelled") {
+        expect(hoisted.cancelDependencyUpgradeMock).toHaveBeenCalledWith(
+          operation.id,
+        );
+        expect(hoisted.applyDependencyUpgradeMock).not.toHaveBeenCalled();
+        expect(messageMock.success).not.toHaveBeenCalled();
+        expect(messageMock.error).not.toHaveBeenCalled();
+      } else {
+        expect(hoisted.applyDependencyUpgradeMock).toHaveBeenCalledWith(
+          operation.id,
+        );
+        expect(messageMock.success).toHaveBeenCalledTimes(
+          outcome === "loaded" ? 1 : 0,
+        );
+        expect(messageMock.error).toHaveBeenCalledTimes(
+          outcome === "loaded" ? 0 : 1,
+        );
       }
     },
   );
@@ -458,4 +533,42 @@ describe("usePluginManager", () => {
       "pluginManager.updateAllResult",
     );
   });
+});
+
+it("update-all includes the actionable conflict in its failure summary", async () => {
+  const plugin = {
+    id: "conflicted",
+    name: "Conflicted",
+    version: "1.0.0",
+  } as PluginInfo;
+  hoisted.pluginsData = [plugin];
+  hoisted.fetchPluginCatalogMock.mockResolvedValue({
+    plugins: [
+      {
+        plugin_id: "conflicted",
+        name: "Conflicted",
+        version: "2.0.0",
+        install_url: "https://example.invalid/conflict.zip",
+        upgrade_available: true,
+      },
+    ],
+  });
+  hoisted.fetchMarketPluginsMock.mockResolvedValue({ plugins: [], total: 0 });
+  hoisted.installPluginMock.mockRejectedValue(
+    new Error(
+      "DEPENDENCY_CONFLICT: disable the incompatible consumer before retrying",
+    ),
+  );
+  const { result } = renderHook(() => usePluginManager());
+  await waitFor(() => expect(result.current.updates.size).toBe(1));
+  hoisted.stableT.mockClear();
+  await act(async () => {
+    await result.current.updateAll();
+  });
+  const summary = hoisted.stableT.mock.calls.find(
+    ([key]) => key === "pluginManager.updateAllResult",
+  );
+  expect(JSON.stringify(summary?.[1])).toContain(
+    "disable the incompatible consumer before retrying",
+  );
 });
