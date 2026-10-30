@@ -65,7 +65,7 @@ jobs:
       - name: Install core without vendor SDKs
         run: |
           python -m pip install --upgrade "pip>=26.2.2"
-          python -m pip install -e ".[test]" build mypy
+          python -m pip install -e ".[test]" build mypy wheel
           python -c "from importlib.util import find_spec; assert all(find_spec(name) is None for name in ('openai_codex', 'codex_cli_bin', 'qoder_agent_sdk'))"
       - name: Build independent Harness frontends using public SDK
         run: bash scripts/pack/build_harness_frontends.sh
