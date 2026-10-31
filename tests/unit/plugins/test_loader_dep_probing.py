@@ -231,13 +231,18 @@ async def test_dependency_failure_logs_bounded_redacted_pip_tail(
         "PIP_INDEX_URL=https://private-user:private-password@example.test/"
         "?token=private-config\nresolver-tail-marker\n"
     )
+    fake_pip_script = tmp_path / "fake_pip.py"
+    fake_pip_script.write_text(
+        f"print({output!r}); raise SystemExit(23)",
+        encoding="utf-8",
+    )
     popen = subprocess.Popen
     runner = loader._run_subprocess_with_streaming_log
     results = []
 
     def fake_pip(_command, **kwargs):
         return popen(
-            [sys.executable, "-c", f"print({output!r}); raise SystemExit(23)"],
+            [sys.executable, str(fake_pip_script)],
             **kwargs,
         )
 

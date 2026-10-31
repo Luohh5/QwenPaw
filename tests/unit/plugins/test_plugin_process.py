@@ -36,6 +36,7 @@ from qwenpaw.plugins.dependency_upgrade import DependencyUpgradeManager
 from qwenpaw.plugins.execution.dependencies import (
     DependencySnapshot,
     _installed_metadata,
+    canonical_environment_path,
 )
 from tests.channel_support.host import (
     Host,
@@ -672,10 +673,13 @@ async def test_runtime_roots_interpreter_and_dependency_visible_in_worker(
         snapshot=snapshot,
         validate=lambda: None,
     )
-    assert str(site.resolve()) in admitted.dependency_sites
+    assert str(canonical_environment_path(site)) in admitted.dependency_sites
     if layout == "frozen":
         assert expected_support in runtime.dependency_paths
-        assert str(expected_support.resolve()) not in admitted.dependency_sites
+        assert (
+            str(canonical_environment_path(expected_support))
+            not in admitted.dependency_sites
+        )
         native = Path(admitted.prefix) / (
             "Lib/site-packages"
             if os.name == "nt"
@@ -684,7 +688,10 @@ async def test_runtime_roots_interpreter_and_dependency_visible_in_worker(
                 "site-packages"
             )
         )
-        assert str(native.resolve()) in admitted.dependency_sites
+        assert (
+            str(canonical_environment_path(native))
+            in admitted.dependency_sites
+        )
     await process.start(spec)
     probe = await process.call("sample.probe", {})
     assert Path(probe["dependency_state"]) == selected_root
