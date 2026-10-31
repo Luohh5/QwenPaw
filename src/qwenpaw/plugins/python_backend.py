@@ -8,7 +8,7 @@ import importlib.util
 import logging
 import os
 import sys
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Callable
@@ -737,6 +737,28 @@ class PythonBackend:
             if failed is not None:
                 raise RuntimeError("; ".join(failed.errors))
         return None
+
+    @asynccontextmanager
+    async def read_admission_scope(self, descriptions):
+        """Share raw inputs across adjacent reads owned by this task."""
+        from .dependency_gate import _shared_observation
+
+        prepared = [
+            await self.prepare_dependency_targets(description)
+            for description in descriptions
+        ]
+        async with _shared_observation(
+            tuple(
+                dict.fromkeys(
+                    str(p) for item in prepared for p in item.targets
+                ),
+            ),
+        ):
+            for item in prepared:
+                item.validate()
+            yield
+            for item in prepared:
+                item.validate()
 
     async def admit_existing(
         self,

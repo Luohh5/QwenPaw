@@ -125,14 +125,22 @@ class DependencySnapshot:
         if "dependency_sites" in data and (
             not isinstance(package_sites, list)
             or any(
-                not isinstance(site, str)
-                or not Path(site).is_absolute()
-                or str(Path(site).resolve())
-                not in {str(Path(root).resolve()) for root in data["sites"]}
+                not isinstance(site, str) or not Path(site).is_absolute()
                 for site in package_sites
             )
         ):
             raise dependency_error()
+        if package_sites:
+            resolved = {
+                root: str(Path(root).resolve())
+                for root in dict.fromkeys(data["sites"])
+            }
+            roots = set(resolved.values())
+            for site in dict.fromkeys(package_sites):
+                if site not in resolved:
+                    resolved[site] = str(Path(site).resolve())
+                if resolved[site] not in roots:
+                    raise dependency_error()
         environment = data["marker_environment"]
         if (
             not isinstance(environment, Mapping)

@@ -997,6 +997,39 @@ def test_dependency_sites_classify_batch_once(tmp_path, monkeypatch):
     assert deps.protected_dependency_target(aliases[1])
     assert not deps.protected_dependency_target(aliases[0])
     assert not deps.protected_dependency_target(aliases[2])
+    # Transport validation must keep physical aliases and recheck each call.
+    import sys
+    from packaging.markers import default_environment
+    from qwenpaw.plugins.execution.errors import ProtocolValidationError
+
+    payload = {
+        "executable": sys.executable,
+        "prefix": sys.prefix,
+        "sites": list(map(str, roots)) * 2,
+        "marker_environment": default_environment(),
+        "supported_tags": ["py3-none-any"],
+        "distributions": {},
+        "dependency_sites": list(map(str, aliases)) * 2,
+    }
+    assert (
+        deps.DependencySnapshot.from_mapping(payload).to_mapping() == payload
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    aliases[0].unlink()
+    aliases[0].symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ProtocolValidationError):
+        deps.DependencySnapshot.from_mapping(payload)
+    for dependency_sites in (None, []):
+        independent = dict(payload)
+        if dependency_sites is None:
+            del independent["dependency_sites"]
+        else:
+            independent["dependency_sites"] = dependency_sites
+        assert deps.DependencySnapshot.from_mapping(
+            independent,
+        ).dependency_sites == (None if dependency_sites is None else ())
+
     monkeypatch.setattr(deps, "Path", PureWindowsPath)
     package = PureWindowsPath("C:/Python/Lib/site-packages")
     protection = ({str(package)}, {str(package.parent)}, set())
@@ -1019,6 +1052,36 @@ def test_dependency_sites_classify_batch_once(tmp_path, monkeypatch):
         WindowsDirectory(f"C:/external/{name}") for name in ("sdk", "SDK")
     ]
     assert deps.dependency_sites(distinct) == tuple(map(str, distinct))
+
+    # Value simulation: the scope must defer Windows identity to its gate.
+    import asyncio
+    from contextlib import asynccontextmanager
+    from qwenpaw.plugins import dependency_gate
+    from qwenpaw.plugins.python_backend import PythonBackend
+
+    backend, observed = PythonBackend(SimpleNamespace()), []
+
+    async def prepared_target(path):
+        return SimpleNamespace(targets=(path,), validate=lambda: None)
+
+    @asynccontextmanager
+    async def observe_targets(paths):
+        observed.extend(map(str, paths))
+        yield
+
+    monkeypatch.setattr(backend, "prepare_dependency_targets", prepared_target)
+    monkeypatch.setattr(
+        dependency_gate,
+        "_shared_observation",
+        observe_targets,
+    )
+
+    async def enter_scope():
+        async with backend.read_admission_scope(distinct):
+            pass
+
+    asyncio.run(enter_scope())
+    assert observed == list(map(str, distinct))
 
 
 def test_host_delta_skips_own_source_inventory(tmp_path, monkeypatch):
