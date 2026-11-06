@@ -1018,11 +1018,7 @@ async def test_update_replaces_worker_and_preserves_data(
         assert alive(before["pid"])
         assert (await host.identity(ws))[1]["sdk"] == "old-sdk"
         result = await manager.apply(operation["id"])
-        print("DIAGNOSTIC_UPGRADE_RESULT " + json.dumps({
-            key: result.get(key)
-            for key in ("id", "status", "retryable", "message", "error")
-        }, ensure_ascii=True), flush=True)
-        assert result["status"] == "succeeded", result.get("error", result)
+        assert result["status"] == "succeeded", result
     else:
         report = await host.loader.lifecycle.reload(KEY, new_source=candidate)
         assert report.ok, report.errors

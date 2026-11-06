@@ -413,7 +413,6 @@ class ChannelBackend:
             (asyncio.current_task(), description.manifest.id),
         )
         if scope is None:
-            print("DIAGNOSTIC_PROBE no_scope", flush=True)
             return await inspect()
         prepared = await self.prepare_dependency_targets(description)
         settings = self.runtime_for(description)
@@ -471,7 +470,6 @@ class ChannelBackend:
                 witness,
                 cached[1] if cached is not None else None,
             )
-            print("DIAGNOSTIC_PROBE " + repr({"stage": "lookup", "scope": id(scope), "source": str(description.source_path), "key": repr(key), "cached": cached is not None, "same_witness": cached is not None and cached[0] == current, "changed_paths": [row[0] for row in current if cached is not None and row not in cached[0]]}), flush=True)
             if cached is not None and cached[0] == current:
                 # Source identity must still be current after registration or rebase.
                 fresh = await run_sync_io(
@@ -483,7 +481,6 @@ class ChannelBackend:
                     fresh.dependency_declaration()
                     == description.dependency_declaration()
                 ):
-                    print("DIAGNOSTIC_PROBE cache_hit", flush=True)
                     return cached[1]
             before_roots = await run_sync_io(witness)
             observed = await inspect()
@@ -492,7 +489,11 @@ class ChannelBackend:
             after = await run_sync_io(witness)
             if before_roots != after:
                 raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
-            from .dependency_gate import GateDecision, SharedDependencyError
+            from .dependency_gate import (
+                GateDecision,
+                SharedDependencyError,
+                _canonical_dependency_roots,
+            )
             from .execution.dependencies import (
                 DependencyReadEvidence,
                 read_dependency_inventory,
@@ -500,7 +501,6 @@ class ChannelBackend:
             from .execution.errors import ProtocolValidationError
 
             if not isinstance(snapshot, DependencyReadEvidence):
-                print("DIAGNOSTIC_PROBE non_read_evidence " + type(snapshot).__name__, flush=True)
                 return observed
             metadata_before = await run_sync_io(witness, snapshot)
             try:
@@ -542,8 +542,9 @@ class ChannelBackend:
                 or view.warnings != snapshot.warnings
             ):
                 raise RuntimeError("DEPENDENCY_ENVIRONMENT_IDENTITY_CHANGED")
-            print("DIAGNOSTIC_PROBE " + repr({"stage": "store", "scope": id(scope), "roots": tuple(map(str, roots)), "dependency_sites": snapshot.dependency_sites, "subset": set(snapshot.dependency_sites or ()) <= set(map(str, roots))}), flush=True)
-            if set(snapshot.dependency_sites or ()) <= set(map(str, roots)):
+            if _canonical_dependency_roots(
+                snapshot.dependency_sites or (),
+            ) <= _canonical_dependency_roots(roots):
                 await scope[0].enter_async_context(
                     async_lock(observation_readers(roots)),
                 )

@@ -1,4 +1,4 @@
-name: Windows channel cache and source backup diagnostic
+name: Windows channel regression verification
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   reproduce:
-    name: Channel cache and source backup - Windows Python 3.11.9
+    name: Channel regression verification - Windows Python 3.11.9
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
@@ -26,14 +26,14 @@ jobs:
           python -m pip install -e ".[dev,test,full]" "setuptools<82" -c diagnostics/windows-ci-constraints.txt
           python -m pip freeze --all > diagnostic-artifacts/installed-packages.txt
           python -c "import sys,platform,locale,json; print(json.dumps({'python':sys.version,'executable':sys.executable,'platform':platform.platform(),'encoding':locale.getpreferredencoding(False),'utf8_mode':sys.flags.utf8_mode},indent=2))" > diagnostic-artifacts/environment.json
-      - name: Run only the failed upgrade case
+      - name: Run only related channel and source cases
         shell: pwsh
         env:
           QWENPAW_WORKING_DIR: ${{ runner.temp }}/qwenpaw-diagnostic-working
           QWENPAW_SECRET_DIR: ${{ runner.temp }}/qwenpaw-diagnostic-secret
           QWENPAW_BACKUP_DIR: ${{ runner.temp }}/qwenpaw-diagnostic-backup
         run: |
-          python -m pytest "tests/unit/channels/test_channel_host.py::test_real_agent_stream_final_reply_and_saved_session" "tests/unit/plugins/test_plugin_process.py::test_source_backup_and_restore_preserve_contents_and_mode" -vv --tb=long --no-cov --timeout=180 --capture=tee-sys --basetemp=diagnostic-temp 2>&1 | Tee-Object -FilePath diagnostic-artifacts/pytest-output.log
+          python -m pytest "tests/unit/channels/test_channel_host.py::test_real_agent_stream_final_reply_and_saved_session" "tests/unit/channels/test_channel_host.py::test_channel_preflight_rechecks_metadata_read_during_probe" "tests/unit/channels/test_channel_host.py::test_update_replaces_worker_and_preserves_data[True]" "tests/unit/plugins/test_plugin_process.py::test_source_backup_and_restore_preserve_contents_and_mode" -vv --tb=long --no-cov --timeout=180 --capture=tee-sys --basetemp=diagnostic-temp 2>&1 | Tee-Object -FilePath diagnostic-artifacts/pytest-output.log
           exit $LASTEXITCODE
       - name: Upload diagnostic output
         if: always()
