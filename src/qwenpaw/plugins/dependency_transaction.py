@@ -1395,6 +1395,14 @@ async def apply_operation(manager, operation_id):
                 install_result(record),
             )
         except BaseException as exc:
+            # Diagnostic branch only: no locals or retained plan capabilities.
+            import traceback
+
+            detail = "".join(traceback.format_exception(exc))
+            capability = operation.get("capability")
+            if capability:
+                detail = detail.replace(capability, "<redacted>")
+            print("DIAGNOSTIC_UPGRADE_FIRST_EXCEPTION\n" + detail, file=sys.stderr, flush=True)
             if (
                 isinstance(exc, asyncio.CancelledError)
                 and operation["status"] == "waiting_restart"
