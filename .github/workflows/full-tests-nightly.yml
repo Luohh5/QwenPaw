@@ -1,4 +1,4 @@
-name: Windows dependency upgrade diagnostic
+name: Windows channel cache and source backup diagnostic
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   reproduce:
-    name: Shared dependency upgrade - Windows Python 3.11.9
+    name: Channel cache and source backup - Windows Python 3.11.9
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
@@ -33,7 +33,7 @@ jobs:
           QWENPAW_SECRET_DIR: ${{ runner.temp }}/qwenpaw-diagnostic-secret
           QWENPAW_BACKUP_DIR: ${{ runner.temp }}/qwenpaw-diagnostic-backup
         run: |
-          python -m pytest "tests/unit/channels/test_channel_host.py::test_update_replaces_worker_and_preserves_data[True]" -vv --tb=long --no-cov --timeout=180 --capture=tee-sys --basetemp=diagnostic-temp 2>&1 | Tee-Object -FilePath diagnostic-artifacts/pytest-output.log
+          python -m pytest "tests/unit/channels/test_channel_host.py::test_real_agent_stream_final_reply_and_saved_session" "tests/unit/plugins/test_plugin_process.py::test_source_backup_and_restore_preserve_contents_and_mode" -vv --tb=long --no-cov --timeout=180 --capture=tee-sys --basetemp=diagnostic-temp 2>&1 | Tee-Object -FilePath diagnostic-artifacts/pytest-output.log
           exit $LASTEXITCODE
       - name: Upload diagnostic output
         if: always()
