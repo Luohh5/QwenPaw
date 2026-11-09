@@ -1697,3 +1697,20 @@ class LarkOapiPlatform:
 
 
 __all__ = ["FeishuDeliveryError", "LarkOapiPlatform"]
+
+# Temporary Windows issue #8538 instrumentation: no decision changes.
+def _issue8538_observe_async(name):
+    original = getattr(LarkOapiPlatform, name)
+    async def observed(self, *args, **kwargs):
+        started = time.monotonic()
+        logger.warning("ISSUE8538_PLATFORM_BEGIN %s", name)
+        try:
+            result = await original(self, *args, **kwargs)
+        except BaseException:
+            logger.warning("ISSUE8538_PLATFORM_ERROR %s %.6f", name, time.monotonic()-started, exc_info=True)
+            raise
+        logger.warning("ISSUE8538_PLATFORM_OK %s %.6f", name, time.monotonic()-started)
+        return result
+    setattr(LarkOapiPlatform, name, observed)
+for _issue8538_method in ("prepare", "_probe_credentials", "_fetch_bot_open_id", "connect"):
+    _issue8538_observe_async(_issue8538_method)

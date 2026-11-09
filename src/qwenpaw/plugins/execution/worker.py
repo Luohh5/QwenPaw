@@ -182,10 +182,18 @@ async def run(
         )
 
     async def connect() -> None:
+        import time
+        import traceback
+        started = time.monotonic()
+        print("ISSUE8538_WORKER_CONNECT_BEGIN", json.dumps({"pid": os.getpid(), "loop": type(asyncio.get_running_loop()).__name__}), file=sys.stderr, flush=True)
         try:
             await component.start(packet["config"])
-        except Exception:
+        except Exception as exc:
+            print("ISSUE8538_WORKER_CONNECT_ERROR", json.dumps({"pid": os.getpid(), "elapsed": time.monotonic()-started, "type": type(exc).__name__}), file=sys.stderr, flush=True)
+            traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
             await runtime.state(context, runtime.failed_state)
+        else:
+            print("ISSUE8538_WORKER_CONNECT_OK", json.dumps({"pid": os.getpid(), "elapsed": time.monotonic()-started}), file=sys.stderr, flush=True)
 
     mode = packet.get("mode", "run")
     if not isinstance(mode, str) or mode not in {
