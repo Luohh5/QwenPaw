@@ -29,8 +29,8 @@ jobs:
       - name: Reproduce against the real released frozen backend
         shell: pwsh
         run: |
-          python diagnostics/creator8595/run_desktop.py --root dist/reported --label released-pristine --untraced
-          python diagnostics/creator8595/run_desktop.py --root dist/reported --label released-seeded
+          python diagnostics/creator8595/run_desktop.py --root dist/reported --label released-no-hubs-pristine --disable-hubs --untraced
+          python diagnostics/creator8595/run_desktop.py --root dist/reported --label released-no-hubs-seeded --disable-hubs
       - uses: actions/upload-artifact@v4
         if: always()
         with:

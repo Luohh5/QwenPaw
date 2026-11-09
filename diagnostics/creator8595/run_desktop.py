@@ -2,7 +2,7 @@
 import argparse,json,os,pathlib,subprocess,time,urllib.request,urllib.error,shutil,traceback,sys
 sys.stdout.reconfigure(encoding="utf-8",errors="backslashreplace")
 sys.stderr.reconfigure(encoding="utf-8",errors="backslashreplace")
-p=argparse.ArgumentParser();p.add_argument('--root',required=True);p.add_argument('--label',required=True);p.add_argument('--untraced',action='store_true');args=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--root',required=True);p.add_argument('--label',required=True);p.add_argument('--untraced',action='store_true');p.add_argument('--disable-hubs',action='store_true');args=p.parse_args()
 repo=pathlib.Path.cwd();resources=pathlib.Path(args.root).resolve();out=repo/'diagnostic-results'/args.label;out.mkdir(parents=True,exist_ok=True)
 found=list(resources.rglob('qwenpaw-backend.exe'))
 if not found: raise SystemExit('No frozen backend found under '+str(resources))
@@ -14,6 +14,8 @@ env['PYTHONIOENCODING']='utf-8';env['QWENPAW_LOG_LEVEL']='debug';env['CREATOR_AU
 for key in ('QWENPAW_TAURI_RESOURCE_DIR','QWENPAW_CHANNEL_RUNTIME_MANIFEST','QWENPAW_DESKTOP_PY_RUNTIME','QWENPAW_CHANNEL_SUPPORT_ROOT','QWENPAW_CHANNEL_DEPENDENCY_PATHS','PYTHONPATH'):
     env.pop(key,None)
 work=pathlib.Path(env['QWENPAW_WORKING_DIR']);work.mkdir(parents=True,exist_ok=True)
+if args.disable_hubs:
+    (work/'config.json').write_text(json.dumps({'plugins':{name:{'enabled':False} for name in ('aliyun-hub','clawhub-hub','modelscope-hub','qwenpaw-hub')}}),encoding='utf-8')
 summary={'label':args.label,'executable':str(exe),'resources':str(resources),'events':[]}
 plugin=out/'diagnostic-plugin';plugin.mkdir(exist_ok=True)
 (plugin/'plugin.json').write_text(json.dumps({'id':'creator-issue-diagnostic','name':'Temporary Creator diagnostics','version':'1.0.0','entry':{'backend':'main.py'},'dependencies':[]}),encoding='utf-8')
