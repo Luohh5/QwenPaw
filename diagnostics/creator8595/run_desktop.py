@@ -1,6 +1,8 @@
 """Run the real frozen sidecar in a disposable CI workspace, through HTTP."""
-import argparse,json,os,pathlib,subprocess,time,urllib.request,urllib.error,shutil,traceback
-p=argparse.ArgumentParser();p.add_argument('--root',required=True);p.add_argument('--label',required=True);args=p.parse_args()
+import argparse,json,os,pathlib,subprocess,time,urllib.request,urllib.error,shutil,traceback,sys
+sys.stdout.reconfigure(encoding="utf-8",errors="backslashreplace")
+sys.stderr.reconfigure(encoding="utf-8",errors="backslashreplace")
+p=argparse.ArgumentParser();p.add_argument('--root',required=True);p.add_argument('--label',required=True);p.add_argument('--untraced',action='store_true');args=p.parse_args()
 repo=pathlib.Path.cwd();resources=pathlib.Path(args.root).resolve();out=repo/'diagnostic-results'/args.label;out.mkdir(parents=True,exist_ok=True)
 found=list(resources.rglob('qwenpaw-backend.exe'))
 if not found: raise SystemExit('No frozen backend found under '+str(resources))
@@ -16,6 +18,8 @@ summary={'label':args.label,'executable':str(exe),'resources':str(resources),'ev
 plugin=out/'diagnostic-plugin';plugin.mkdir(exist_ok=True)
 (plugin/'plugin.json').write_text(json.dumps({'id':'creator-issue-diagnostic','name':'Temporary Creator diagnostics','version':'1.0.0','entry':{'backend':'main.py'},'dependencies':[]}),encoding='utf-8')
 shutil.copyfile(repo/'diagnostics/creator8595/diagnostic_plugin.py',plugin/'main.py')
+if not args.untraced:
+    seeded=work/'plugins'/'creator-issue-diagnostic';seeded.parent.mkdir(parents=True,exist_ok=True);shutil.copytree(plugin,seeded,dirs_exist_ok=True)
 stdout=(out/'stdout.log').open('w',encoding='utf-8');stderr=(out/'stderr.log').open('w',encoding='utf-8')
 proc=subprocess.Popen([str(exe)],cwd=exe.parent,env=env,stdout=stdout,stderr=stderr)
 base=None
@@ -44,7 +48,14 @@ try:
             except Exception: pass
         time.sleep(1)
     else: raise TimeoutError('Frozen backend did not become ready')
-    request('POST','/api/plugins/install',{'source':str(plugin.resolve())},120)
+    # Wait for the actual desktop background startup to settle before installing.
+    startup_deadline=time.monotonic()+180
+    while time.monotonic()<startup_deadline:
+        texts=[file.read_text(encoding='utf-8',errors='replace') for file in work.glob('*.log')]
+        if any('Background startup completed' in text for text in texts):break
+        if proc.poll() is not None:raise RuntimeError('Backend exited during startup')
+        time.sleep(1)
+    else:raise TimeoutError('Desktop background startup did not finish')
     url='https://agentscope-platform-sg-bucket.oss-accelerate.aliyuncs.com/plugin-platform/qwenpaw-creator/2.0.4/qwenpaw-creator-2.0.4.zip'
     code,body=request('POST','/api/plugins/install',{'source':url},900)
     if code==409 and isinstance(body,dict) and isinstance(body.get('detail'),dict) and body['detail'].get('code')=='DEPENDENCY_UPGRADE_REQUIRED':

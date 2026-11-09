@@ -1,10 +1,16 @@
 name: Creator 8595 frozen Windows diagnosis
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        type: choice
+        options: [released, current, both]
+        default: released
 permissions:
   contents: read
 jobs:
   released-desktop:
+    if: inputs.target != 'current'
     runs-on: windows-2025
     timeout-minutes: 25
     steps:
@@ -22,7 +28,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Release extraction failed' }
       - name: Reproduce against the real released frozen backend
         shell: pwsh
-        run: python diagnostics/creator8595/run_desktop.py --root dist/reported --label released-2.3.0b2
+        run: |
+          python diagnostics/creator8595/run_desktop.py --root dist/reported --label released-pristine --untraced
+          python diagnostics/creator8595/run_desktop.py --root dist/reported --label released-seeded
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -34,6 +42,7 @@ jobs:
             diagnostic-results/**/stderr.log
             diagnostic-results/**/backend-logs/*.log
   current-frozen:
+    if: inputs.target != 'released'
     runs-on: windows-2025
     timeout-minutes: 55
     steps:
