@@ -28,7 +28,7 @@ jobs:
       - name: Record environment
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force diagnostic-output | Out-Null
+          New-Item -ItemType Directory -Force diagnostic-output, diagnostic-runtime | Out-Null
           python -c "import json,sys,platform,locale,os;from pathlib import Path;Path('diagnostic-output/environment.json').write_text(json.dumps({'python':sys.version,'executable':sys.executable,'platform':platform.platform(),'encoding':locale.getpreferredencoding(False),'utf8_mode':sys.flags.utf8_mode,'frozen':getattr(sys,'frozen',False),'runner_os':os.environ.get('RUNNER_OS')},indent=2),encoding='utf-8')"
           python -m pip freeze | Out-File -Encoding utf8 diagnostic-output/installed-packages.txt
           git rev-parse HEAD | Out-File -Encoding utf8 diagnostic-output/commit.txt

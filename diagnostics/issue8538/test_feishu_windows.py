@@ -73,6 +73,17 @@ async def host(tmp_path, monkeypatch):
     case = await Host.create(tmp_path, monkeypatch)
     case.registry.channel_runtime = replace(case.registry.channel_runtime, startup_timeout=10.0, shutdown_timeout=2.0, connection_timeout=None)
     from qwenpaw.app.channels.isolated_proxy import IsolatedChannelProxy
+    from qwenpaw.plugins.execution.worker_logs import WorkerLogs
+    import hashlib
+    original_feed = WorkerLogs.feed
+    def capture_stderr(self, chunk):
+        RESULTS.mkdir(exist_ok=True, parents=True)
+        key = hashlib.sha256(self.prefix.encode()).hexdigest()[:16]
+        path = RESULTS / ("raw-worker-" + key + ".log")
+        with path.open("ab") as stream:
+            stream.write(chunk)
+        return original_feed(self, chunk)
+    monkeypatch.setattr(WorkerLogs, "feed", capture_stderr)
     original = IsolatedChannelProxy._wait_connected
     async def observed(self):
         started = time.monotonic()

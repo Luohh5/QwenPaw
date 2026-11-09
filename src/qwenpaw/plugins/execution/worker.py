@@ -184,6 +184,9 @@ async def run(
     async def connect() -> None:
         import time
         import traceback
+        import faulthandler
+        faulthandler.enable(file=sys.stderr)
+        faulthandler.dump_traceback_later(8.0, file=sys.stderr)
         started = time.monotonic()
         print("ISSUE8538_WORKER_CONNECT_BEGIN", json.dumps({"pid": os.getpid(), "loop": type(asyncio.get_running_loop()).__name__}), file=sys.stderr, flush=True)
         try:
@@ -194,6 +197,8 @@ async def run(
             await runtime.state(context, runtime.failed_state)
         else:
             print("ISSUE8538_WORKER_CONNECT_OK", json.dumps({"pid": os.getpid(), "elapsed": time.monotonic()-started}), file=sys.stderr, flush=True)
+        finally:
+            faulthandler.cancel_dump_traceback_later()
 
     mode = packet.get("mode", "run")
     if not isinstance(mode, str) or mode not in {
