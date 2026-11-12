@@ -1,0 +1,178 @@
+name: Channel context cross-platform probe
+
+on:
+  push:
+    branches:
+      - codex/verify-channel-context-8682-20261112
+    paths:
+      - .github/workflows/channel-context-probe.yml
+      - scripts/verify/channel_context_probe.py
+      - src/qwenpaw/**
+      - tests/unit/channels/test_channel_host.py
+      - tests/unit/plugins/test_plugin_process.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: channel-context-8682-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Native ${{ matrix.os }} Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022, macos-15]
+        python: ["3.11", "3.13"]
+    env:
+      QWENPAW_RUNTIME_ID: channel-actions
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Isolate runtime and dependency state
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as output:
+              output.write(f'QWENPAW_WORKING_DIR={root / "channel-actions-working"}\n')
+              output.write(f'QWENPAW_DEPENDENCY_STATE_DIR={root / "channel-actions-state"}\n')
+          PY
+      - name: Install supported project and channel test dependencies
+        run: |
+          python -m pip install --upgrade 'pip>=26.2.2' 'certifi>=2026.10.19'
+          python -m pip install 'setuptools<82' wheel build
+          python -m pip install -e '.[test,channels]'
+      - name: Existing channel suite on Python 3.11
+        if: matrix.python == '3.11'
+        run: |
+          python scripts/check_channel_contracts.py
+          python -m pytest --no-cov -q --tb=short \
+            tests/contract/channels tests/unit/channels \
+            tests/unit/plugins/test_plugin_process.py \
+            --junitxml=native-tests.xml
+      - name: Core worker and WeChat tests on Python 3.13
+        if: matrix.python == '3.13'
+        run: |
+          python -m pytest --no-cov -q --tb=short \
+            tests/unit/channels/test_channel_host.py::test_channel_worker_preserves_canonical_runtime_context \
+            tests/unit/channels/test_channel_host.py::test_execution_preparation_yields_and_consumes_session_snapshot \
+            tests/unit/plugins/test_plugin_process.py::test_lifecycle_bidirectional_ipc_logs_and_repeated_stop \
+            tests/unit/plugins/test_plugin_process.py::test_runtime_roots_interpreter_and_dependency_visible_in_worker \
+            tests/unit/channels/test_wechat.py \
+            --junitxml=native-tests.xml
+      - name: Probe source workers and baseline rejection
+        run: |
+          for mode in run manage probe; do
+            python scripts/verify/channel_context_probe.py worker \
+              --data-root "$RUNNER_TEMP/source-$mode 数据" --mode "$mode"
+          done
+          python scripts/verify/channel_context_probe.py worker \
+            --data-root "$RUNNER_TEMP/source-plain" --plain
+          python scripts/verify/channel_context_probe.py worker \
+            --data-root "$RUNNER_TEMP/source-missing-home" --missing-home
+          python scripts/verify/channel_context_probe.py worker \
+            --data-root "$RUNNER_TEMP/source-negative" --negative
+      - name: Build and install wheel outside checkout
+        run: |
+          python -m build --wheel --no-isolation
+          python -m venv --system-site-packages "$RUNNER_TEMP/context-wheel"
+          if [ "$RUNNER_OS" = Windows ]; then
+            wheel_python="$RUNNER_TEMP/context-wheel/Scripts/python.exe"
+          else
+            wheel_python="$RUNNER_TEMP/context-wheel/bin/python"
+          fi
+          "$wheel_python" -m pip install --no-deps dist/*.whl
+          probe_script="$GITHUB_WORKSPACE/scripts/verify/channel_context_probe.py"
+          cd "$RUNNER_TEMP"
+          unset PYTHONPATH
+          "$wheel_python" -I "$probe_script" worker --installed \
+            --data-root "$RUNNER_TEMP/wheel 数据" --missing-home
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.os }}-py${{ matrix.python }}
+          path: native-tests.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+  linux-bubblewrap:
+    name: Real Linux Hub bubblewrap
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      QWENPAW_RUNTIME_ID: bubblewrap-host
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Isolate host runtime and dependency state
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as output:
+              output.write(f'QWENPAW_WORKING_DIR={root / "bubblewrap-host-working"}\n')
+              output.write(f'QWENPAW_DEPENDENCY_STATE_DIR={root / "bubblewrap-host-state"}\n')
+          PY
+      - name: Prepare real Linux user namespaces
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Install runtime
+        run: |
+          python -m pip install --upgrade 'pip>=26.2.2' 'certifi>=2026.10.19'
+          python -m pip install 'setuptools<82' wheel
+          python -m pip install -e .
+      - name: Actual Hub boundary, no HOME and no passwd entry
+        run: |
+          python scripts/verify/channel_context_probe.py bubblewrap \
+            --data-root '${{ runner.temp }}/bubblewrap-acceptance'
+
+  docker:
+    name: Real product Docker image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build existing product Dockerfile with public base images
+        run: |
+          docker build -f deploy/Dockerfile -t qwenpaw-context:8682 \
+            --build-arg NODE_IMAGE=node:22.23.4-slim \
+            --build-arg UV_IMAGE=ghcr.io/astral-sh/uv:0.13.4 \
+            --build-arg QWENPAW_MANAGED_RUNTIME_BOUNDARY_VERSION=context-8682 .
+      - name: Exercise actual image and persisted volume
+        run: |
+          mkdir -p "$RUNNER_TEMP/context-docker-volume"
+          docker run --rm --entrypoint /app/venv/bin/python \
+            -v "$GITHUB_WORKSPACE/scripts/verify/channel_context_probe.py:/tmp/context_probe.py:ro" \
+            -v "$RUNNER_TEMP/context-docker-volume:/app/working" \
+            qwenpaw-context:8682 -I /tmp/context_probe.py worker --installed \
+            --data-root '/app/working/数据 data' --missing-home
