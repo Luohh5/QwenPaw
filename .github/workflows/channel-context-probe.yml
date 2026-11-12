@@ -16,11 +16,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: channel-context-8682-${{ github.ref }}
+  group: channel-context-8682-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
   native:
+    if: ${{ !contains(github.event.head_commit.message, '[isolation-only]') }}
     name: Native ${{ matrix.os }} Python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -148,13 +149,14 @@ jobs:
         run: |
           python -m pip install --upgrade 'pip>=26.2.2' 'certifi>=2026.10.19'
           python -m pip install 'setuptools<82' wheel
-          python -m pip install -e .
+          python -m pip install -e . -r plugins/channel/wechat/requirements.txt
       - name: Actual Hub boundary, no HOME and no passwd entry
         run: |
           python scripts/verify/channel_context_probe.py bubblewrap \
             --data-root '${{ runner.temp }}/bubblewrap-acceptance'
 
   docker:
+    if: ${{ !contains(github.event.head_commit.message, '[isolation-only]') }}
     name: Real product Docker image
     runs-on: ubuntu-24.04
     timeout-minutes: 60

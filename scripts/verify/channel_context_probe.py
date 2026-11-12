@@ -158,8 +158,8 @@ async def worker(args):
                         ):
                             raise AssertionError("Worker component failed")
                         await asyncio.sleep(0.02)
-        except ProcessError:
-            if not args.negative:
+        except ProcessError as error:
+            if not args.negative or error.reason_code != "WORKER_START_FAILED":
                 raise
             rejected = True
         assert rejected == args.negative
