@@ -29,8 +29,8 @@ jobs:
 
       - name: Repeat original timeout test
         run: |
-          $case = 'tests/unit/plugins/test_dependency_install_shutdown.py::test_installer_reaps_stubborn_child_after_parent_exits[timeout-None]'
-          python -m pytest $case --count=20 --timeout=25 -q --tb=short *> "timeout-baseline.log"
+          $case = 'tests/unit/plugins/test_dependency_install_shutdown.py::test_installer_reaps_stubborn_child_after_parent_exits'
+          python -m pytest $case -k timeout-None --count=20 --timeout=25 -q --tb=short *> "timeout-baseline.log"
           $result = $LASTEXITCODE
           Get-Content "timeout-baseline.log"
           exit $result
@@ -39,8 +39,8 @@ jobs:
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         run: |
           $env:PYTHONPATH = Join-Path $PWD 'scripts/diagnostics'
-          $case = 'tests/unit/plugins/test_dependency_install_shutdown.py::test_installer_reaps_stubborn_child_after_parent_exits[timeout-None]'
-          python -m pytest $case -p windows_installer_timeout --count=20 --timeout=25 -q -s --tb=short *> "timeout-handle.log"
+          $case = 'tests/unit/plugins/test_dependency_install_shutdown.py::test_installer_reaps_stubborn_child_after_parent_exits'
+          python -m pytest $case -k timeout-None -p windows_installer_timeout --count=20 --timeout=25 -q -s --tb=short *> "timeout-handle.log"
           $result = $LASTEXITCODE
           Get-Content "timeout-handle.log"
           exit $result
