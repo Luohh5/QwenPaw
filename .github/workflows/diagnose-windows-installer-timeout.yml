@@ -27,20 +27,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip install -e ".[dev,test,full]" "setuptools<82" "psutil==7.2.2" "pytest==9.2.0" "pytest-repeat==0.9.4"
 
-      - name: Repeat original timeout test
+      - name: Repeat original timeout and cancellation tests
         run: |
           $case = 'tests/unit/plugins/test_dependency_install_shutdown.py::test_installer_reaps_stubborn_child_after_parent_exits'
-          python -m pytest $case -k timeout-None --count=20 --timeout=25 -q --tb=short *> "timeout-baseline.log"
+          python -m pytest $case -k 'timeout-None or cancel-None' --count=20 --timeout=25 -q --tb=short *> "timeout-baseline.log"
           $result = $LASTEXITCODE
           Get-Content "timeout-baseline.log"
           exit $result
 
-      - name: Repeat timeout test with a native process handle
+      - name: Verify timeout and cancellation with native process handles
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         run: |
           $env:PYTHONPATH = Join-Path $PWD 'scripts/diagnostics'
           $case = 'tests/unit/plugins/test_dependency_install_shutdown.py::test_installer_reaps_stubborn_child_after_parent_exits'
-          python -m pytest $case -k timeout-None -p windows_installer_timeout --count=20 --timeout=25 -q -s --tb=short *> "timeout-handle.log"
+          python -m pytest $case -k 'timeout-None or cancel-None' -p windows_installer_timeout --count=20 --timeout=25 -q -s --tb=short *> "timeout-handle.log"
           $result = $LASTEXITCODE
           Get-Content "timeout-handle.log"
           exit $result

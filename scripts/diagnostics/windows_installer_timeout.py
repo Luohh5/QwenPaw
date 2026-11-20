@@ -6,7 +6,6 @@ from ctypes import wintypes
 import json
 import sys
 
-import psutil
 import pytest
 
 
@@ -32,9 +31,7 @@ def observe_installer_exit(tmp_path, monkeypatch):
 
     stop = dependency_process._stop_process_tree
     install = dependency_process.run_install_command
-    status = psutil.Process.status
     observation = {}
-    child_pid = None
     handle = None
 
     def handle_status():
@@ -48,7 +45,7 @@ def observe_installer_exit(tmp_path, monkeypatch):
         return f"wait error {ctypes.get_last_error()}"
 
     def observe_cleanup(proc, tree=None):
-        nonlocal child_pid, handle
+        nonlocal handle
         try:
             child_pid = int(
                 (tmp_path / "child.pid").read_text(encoding="utf-8"),
@@ -66,24 +63,14 @@ def observe_installer_exit(tmp_path, monkeypatch):
             observation["cleanup_return"] = handle_status()
 
     def observe_return(*args, **kwargs):
+        nonlocal handle
         try:
             return install(*args, **kwargs)
         finally:
             observation["installer_return"] = handle_status()
-
-    def observe_status(proc):
-        if proc.pid != child_pid:
-            return status(proc)
-        try:
-            value = status(proc)
-        except psutil.NoSuchProcess:
-            observation["psutil_status"] = "NoSuchProcess"
-            raise
-        else:
-            observation["psutil_status"] = str(value)
-            return value
-        finally:
-            observation["handle_at_psutil_status"] = handle_status()
+            if handle:
+                kernel.CloseHandle(handle)
+                handle = None
 
     monkeypatch.setattr(
         dependency_process,
@@ -95,10 +82,11 @@ def observe_installer_exit(tmp_path, monkeypatch):
         "run_install_command",
         observe_return,
     )
-    monkeypatch.setattr(psutil.Process, "status", observe_status)
     try:
         yield
     finally:
         if handle:
             kernel.CloseHandle(handle)
         print("PROCESS_EXIT " + json.dumps(observation, sort_keys=True))
+        assert observation.get("cleanup_return") == "signaled", observation
+        assert observation.get("installer_return") == "signaled", observation
